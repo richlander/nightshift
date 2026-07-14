@@ -6,6 +6,7 @@
     <RootNamespace>Turnstile</RootNamespace>
     <ToolCommandName>turnstile</ToolCommandName>
     <IsAotCompatible>true</IsAotCompatible>
+    <EnableRequestDelegateGenerator>true</EnableRequestDelegateGenerator>
   </PropertyGroup>
 
   <ItemGroup>
