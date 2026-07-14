@@ -48,7 +48,7 @@ internal static class NextCommand
         {
             if (await TryClaimOneAsync(client, readyPrefix, leaseId, ct) is { } packet)
             {
-                Session.Save(new SessionState(leaseId, packet.Fence, packet.ClaimKey, packet.SliceBase));
+                Session.Save(new SessionState(leaseId, packet.Fence, packet.ClaimKey, packet.SliceBase, packet.ReadyKey));
                 Print(packet);
                 return 0;
             }
@@ -90,7 +90,7 @@ internal static class NextCommand
 
             KvItem? spec = await client.GetAsync($"{sliceBase}/spec", ct);
             SliceSpec parsed = spec is null ? SliceSpec.Empty : SliceSpec.Parse(spec.Text);
-            return new WorkPacket(sliceBase, claimKey, claim.Revision, parsed);
+            return new WorkPacket(sliceBase, claimKey, ready.Key, claim.Revision, parsed);
         }
 
         return null;
@@ -166,7 +166,7 @@ internal static class NextCommand
 
     private static int ParseInt(string? value, int fallback) => int.TryParse(value, out int v) ? v : fallback;
 
-    private sealed record WorkPacket(string SliceBase, string ClaimKey, long Fence, SliceSpec Spec);
+    private sealed record WorkPacket(string SliceBase, string ClaimKey, string ReadyKey, long Fence, SliceSpec Spec);
 
     private sealed record SliceSpec(string[] Paths, string? Standard, string? Brief)
     {

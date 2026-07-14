@@ -90,6 +90,45 @@ internal sealed class TurnstileClient : IDisposable
         return res.StatusCode != HttpStatusCode.Gone && res.IsSuccessStatusCode;
     }
 
+    /// <summary>Revokes a lease, deleting every key attached to it (e.g. the agent's claim).</summary>
+    public async Task RevokeLeaseAsync(string leaseId, CancellationToken ct)
+    {
+        using HttpResponseMessage res = await _http.DeleteAsync($"/lease/{leaseId}", ct);
+        if (res.StatusCode != HttpStatusCode.NotFound)
+        {
+            res.EnsureSuccessStatusCode();
+        }
+    }
+
+    /// <summary>Blind-writes an owned key: creates it, or overwrites unconditionally if it exists.</summary>
+    public async Task SetAsync(string key, string value, CancellationToken ct)
+    {
+        var bytes = new ByteArrayContent(Encoding.UTF8.GetBytes(value));
+        using (bytes)
+        {
+            using HttpResponseMessage created = await _http.PostAsync($"/kv{key}", bytes, ct);
+            if (created.StatusCode != HttpStatusCode.Conflict)
+            {
+                created.EnsureSuccessStatusCode();
+                return;
+            }
+        }
+
+        using var overwrite = new ByteArrayContent(Encoding.UTF8.GetBytes(value));
+        using HttpResponseMessage put = await _http.PutAsync($"/kv{key}?unconditional=true", overwrite, ct);
+        put.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>Unconditionally deletes a key (idempotent — a missing key is not an error).</summary>
+    public async Task DeleteAsync(string key, CancellationToken ct)
+    {
+        using HttpResponseMessage res = await _http.DeleteAsync($"/kv{key}?unconditional=true", ct);
+        if (res.StatusCode != HttpStatusCode.NotFound)
+        {
+            res.EnsureSuccessStatusCode();
+        }
+    }
+
     /// <summary>
     /// Claims <paramref name="key"/> for exactly one caller: a txn that puts it (under
     /// <paramref name="leaseId"/>) iff it does not yet exist (create_revision == 0). The returned

@@ -5,7 +5,7 @@ using Nightshift.Commands;
 /// <summary>Entry dispatch for the <c>nightshift</c> agent/operator CLI.</summary>
 public static class Cli
 {
-    private const string Usage = "usage: nightshift <next|check|done|decline> ...";
+    private const string Usage = "usage: nightshift <next|check|release> ...";
 
     public static async Task<int> RunAsync(string[] args)
     {
@@ -23,10 +23,9 @@ public static class Cli
             case "next":
                 return await NextCommand.RunAsync(rest);
             case "check":
-            case "done":
-            case "decline":
-                Console.Error.WriteLine($"nightshift {verb}: not implemented yet");
-                return 3;
+                return await CheckCommand.RunAsync(rest);
+            case "release":
+                return await ReleaseCommand.RunAsync(rest);
             default:
                 Console.Error.WriteLine(Usage);
                 return 2;
