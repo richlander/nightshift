@@ -1,13 +1,13 @@
 namespace Nightshift.Commands;
 
-/// <summary>Shared loading of a work-order file: resolves the commit SHA and parses the model.</summary>
-internal static class OrderFile
+/// <summary>Shared loading of a plan file (<c>orders.json</c>): resolves the commit SHA and parses it.</summary>
+internal static class PlanFile
 {
-    public static async Task<(WorkOrder Order, string Sha)> LoadAsync(string path, string[] args, CancellationToken ct)
+    public static async Task<(Plan Plan, string Sha)> LoadAsync(string path, string[] args, CancellationToken ct)
     {
         string sha = Options.Value(args, "--sha") ?? GitHead(Path.GetDirectoryName(Path.GetFullPath(path))!);
-        WorkOrder order = WorkOrder.Parse(await File.ReadAllTextAsync(path, ct), sha);
-        return (order, sha);
+        Plan plan = Plan.Parse(await File.ReadAllTextAsync(path, ct), sha);
+        return (plan, sha);
     }
 
     public static string ShortSha(string sha) => sha.Length > 0 ? sha[..Math.Min(sha.Length, 12)] : "(no sha)";

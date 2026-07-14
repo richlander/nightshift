@@ -4,11 +4,11 @@ using System.Text;
 using System.Text.Json;
 using Nightshift.Turnstile;
 
-/// <summary>Writes a slice's outcome to its owned <c>{base}/state</c> key as small JSON.</summary>
-internal static class SliceState
+/// <summary>Writes an order's outcome to its owned <c>{base}/state</c> key as small JSON.</summary>
+internal static class OrderState
 {
-    public static Task WriteAsync(TurnstileClient client, string sliceBase, string status, string? reason, string by, CancellationToken ct)
-        => client.SetAsync($"{sliceBase}/state", Build(status, reason, by), ct);
+    public static Task WriteAsync(TurnstileClient client, string orderBase, string status, string? reason, string by, CancellationToken ct)
+        => client.SetAsync($"{orderBase}/state", Build(status, reason, by), ct);
 
     private static string Build(string status, string? reason, string by)
     {

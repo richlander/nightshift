@@ -4,16 +4,16 @@ using System.Text.Json;
 using Nightshift.Turnstile;
 
 /// <summary>
-/// <c>nightshift next [scope]</c> — the Uber-driver gesture: request one slice of work. Scans the ready set
-/// under the scope's prefix, CAS-claims the first unclaimed slice under this agent's lease, and prints its
-/// brief. Blocks (watching for change) until a slice is claimable or the timeout expires.
+/// <c>nightshift next [scope]</c> — the Uber-driver gesture: request one order of work. Scans the ready set
+/// under the scope's prefix, CAS-claims the first unclaimed order under this agent's lease, and prints its
+/// brief. Blocks (watching for change) until an order is claimable or the timeout expires.
 /// </summary>
 internal static class NextCommand
 {
-    // Slice lifecycle is 45 minutes of lease; a quiet build survives without a check.
+    // Order lifecycle is 45 minutes of lease; a quiet build survives without a check.
     private const long LeaseTtlSecs = 45 * 60;
 
-    // The ready set is owned rows written by ns-plan; each value is the slice base path.
+    // The ready set is owned rows written by ns-plan; each value is the order base path.
     private const string ReadyRoot = "/ready/";
 
     // A single durable flag flips the whole shift into drain: dispatch stops, running agents finish.
@@ -48,7 +48,7 @@ internal static class NextCommand
         {
             if (await TryClaimOneAsync(client, readyPrefix, leaseId, ct) is { } packet)
             {
-                Session.Save(new SessionState(leaseId, packet.Fence, packet.ClaimKey, packet.SliceBase, packet.ReadyKey));
+                Session.Save(new SessionState(leaseId, packet.Fence, packet.ClaimKey, packet.OrderBase, packet.ReadyKey));
                 Print(packet);
                 return 0;
             }
@@ -70,13 +70,13 @@ internal static class NextCommand
         // Ready rows are returned in key order — that order is the scheduling priority.
         foreach (KvItem ready in await client.RangeAsync(readyPrefix, ct))
         {
-            string sliceBase = ready.Text.Trim();
-            if (sliceBase.Length == 0)
+            string orderBase = ready.Text.Trim();
+            if (orderBase.Length == 0)
             {
                 continue;
             }
 
-            string claimKey = $"{sliceBase}/claim";
+            string claimKey = $"{orderBase}/claim";
             if (await client.GetAsync(claimKey, ct) is not null)
             {
                 continue; // already claimed
@@ -88,9 +88,9 @@ internal static class NextCommand
                 continue; // lost the race to a peer
             }
 
-            KvItem? spec = await client.GetAsync($"{sliceBase}/spec", ct);
-            SliceSpec parsed = spec is null ? SliceSpec.Empty : SliceSpec.Parse(spec.Text);
-            return new WorkPacket(sliceBase, claimKey, ready.Key, claim.Revision, parsed);
+            KvItem? spec = await client.GetAsync($"{orderBase}/spec", ct);
+            OrderSpec parsed = spec is null ? OrderSpec.Empty : OrderSpec.Parse(spec.Text);
+            return new WorkPacket(orderBase, claimKey, ready.Key, claim.Revision, parsed);
         }
 
         return null;
@@ -129,8 +129,8 @@ internal static class NextCommand
 
     private static void Print(WorkPacket packet)
     {
-        SliceSpec spec = packet.Spec;
-        Console.WriteLine($"WORK {packet.SliceBase}");
+        OrderSpec spec = packet.Spec;
+        Console.WriteLine($"WORK {packet.OrderBase}");
         if (spec.Title is { Length: > 0 } title)
         {
             Console.WriteLine($"title: {title}");
@@ -197,9 +197,9 @@ internal static class NextCommand
 
     private static int ParseInt(string? value, int fallback) => int.TryParse(value, out int v) ? v : fallback;
 
-    private sealed record WorkPacket(string SliceBase, string ClaimKey, string ReadyKey, long Fence, SliceSpec Spec);
+    private sealed record WorkPacket(string OrderBase, string ClaimKey, string ReadyKey, long Fence, OrderSpec Spec);
 
-    private sealed record SliceSpec(
+    private sealed record OrderSpec(
         string[] Paths,
         string[] Supersedes,
         string[] Related,
@@ -210,15 +210,15 @@ internal static class NextCommand
         string? OrderSha,
         string? Brief)
     {
-        public static SliceSpec Empty { get; } = new([], [], [], [], null, null, null, null, null);
+        public static OrderSpec Empty { get; } = new([], [], [], [], null, null, null, null, null);
 
-        public static SliceSpec Parse(string json)
+        public static OrderSpec Parse(string json)
         {
             try
             {
                 using JsonDocument doc = JsonDocument.Parse(json);
                 JsonElement root = doc.RootElement;
-                return new SliceSpec(
+                return new OrderSpec(
                     StringArray(root, "paths"),
                     StringArray(root, "supersedes"),
                     StringArray(root, "related"),

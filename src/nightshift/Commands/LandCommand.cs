@@ -3,20 +3,20 @@ namespace Nightshift.Commands;
 using Nightshift.Turnstile;
 
 /// <summary>
-/// <c>nightshift land &lt;slice&gt;</c> — mark a slice merged. This is the DAG-advancing signal, distinct from
-/// the agent's self-declared <c>done</c>: a slice only opens its dependents once it has <b>landed</b> on
-/// main. Triggered at merge time (by the operator or a merge-watcher), it wakes the live <c>plan</c>
-/// controller, which promotes every now-unblocked slice. <c>&lt;slice&gt;</c> is the base path `next` printed,
-/// e.g. <c>/order/1234/op/0004/slice/a</c>.
+/// <c>nightshift land &lt;order&gt;</c> — mark an order (one landable PR) merged. This is the DAG-advancing
+/// signal, distinct from the agent's self-declared <c>done</c>: an order only opens its dependents once it
+/// has <b>landed</b> on main. Triggered at merge time (by the operator or a merge-watcher), it wakes the
+/// live <c>plan</c> controller, which promotes every now-unblocked order. <c>&lt;order&gt;</c> is the base
+/// path `next` printed, e.g. <c>/plan/1234/order/op4</c>.
 /// </summary>
 internal static class LandCommand
 {
     public static async Task<int> RunAsync(string[] args)
     {
-        string? sliceBase = OrderFile.FirstPositional(args);
-        if (sliceBase is null || !sliceBase.StartsWith("/order/", StringComparison.Ordinal))
+        string? orderBase = PlanFile.FirstPositional(args);
+        if (orderBase is null || !orderBase.StartsWith("/plan/", StringComparison.Ordinal))
         {
-            Console.Error.WriteLine("usage: nightshift land <slice>   (e.g. /order/1234/op/0004/slice/a)");
+            Console.Error.WriteLine("usage: nightshift land <order>   (e.g. /plan/1234/order/op4)");
             return 2;
         }
 
@@ -26,14 +26,14 @@ internal static class LandCommand
 
         using TurnstileClient client = TurnstileClient.Connect(Paths.Socket);
 
-        if (await client.GetAsync($"{sliceBase}/spec", ct) is null)
+        if (await client.GetAsync($"{orderBase}/spec", ct) is null)
         {
-            Console.Error.WriteLine($"nightshift land: no such slice: {sliceBase}");
+            Console.Error.WriteLine($"nightshift land: no such order: {orderBase}");
             return 3;
         }
 
-        await SliceState.WriteAsync(client, sliceBase, "landed", Options.Value(args, "--reason"), "operator", ct);
-        Console.WriteLine($"LANDED {sliceBase}");
+        await OrderState.WriteAsync(client, orderBase, "landed", Options.Value(args, "--reason"), "operator", ct);
+        Console.WriteLine($"LANDED {orderBase}");
         return 0;
     }
 }

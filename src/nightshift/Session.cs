@@ -10,7 +10,7 @@ using System.Text.Json.Serialization;
 /// fence for its active claim. The agent never sees the lease — it lives here, keyed by worktree, at 0600.
 /// One agent per worktree.
 /// </summary>
-internal sealed record SessionState(string LeaseId, long Fence, string ClaimKey, string SliceBase, string ReadyKey);
+internal sealed record SessionState(string LeaseId, long Fence, string ClaimKey, string OrderBase, string ReadyKey);
 
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower, WriteIndented = true)]
 [JsonSerializable(typeof(SessionState))]

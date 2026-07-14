@@ -51,7 +51,7 @@ internal static class CheckCommand
             return 0;
         }
 
-        KvItem? directive = await client.GetAsync($"{session.SliceBase}/directive", ct);
+        KvItem? directive = await client.GetAsync($"{session.OrderBase}/directive", ct);
         if (directive is not null && directive.Text.Trim() is { Length: > 0 } text)
         {
             Console.WriteLine("QUERY");
