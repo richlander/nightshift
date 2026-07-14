@@ -41,6 +41,9 @@ public sealed class Daemon
         WebApplication app = builder.Build();
         MapEndpoints(app);
 
+        using var sweeper = new LeaseSweeper(store);
+        sweeper.Start(ct);
+
         Console.WriteLine($"turnstile: listening on {socketPath} (db: {dbPath})");
         await app.RunAsync(ct);
         return 0;
@@ -112,6 +115,34 @@ public sealed class Daemon
         {
             WriteResult r = await store.DeleteAsync(Key(key), ParseIfMatch(ctx), unconditional ?? false);
             return ToResult(ctx, Key(key), r);
+        });
+
+        app.MapPost("/lease", async (KvStore store, LeaseCreateRequest req) =>
+        {
+            LeaseInfo lease = await store.CreateLeaseAsync(req.Ttl);
+            return Results.Json(new LeaseCreatedResponse(lease.Id, lease.TtlSecs), TurnstileJson.Default.LeaseCreatedResponse, statusCode: StatusCodes.Status201Created);
+        });
+
+        app.MapPut("/lease/{id}", async (string id, KvStore store) =>
+        {
+            long? remaining = await store.KeepAliveAsync(id);
+            return remaining is null
+                ? Error(StatusCodes.Status410Gone, "lease expired or unknown; stop, do not re-acquire")
+                : Results.Json(new LeaseKeepaliveResponse(remaining.Value), TurnstileJson.Default.LeaseKeepaliveResponse);
+        });
+
+        app.MapDelete("/lease/{id}", async (string id, KvStore store) =>
+        {
+            bool revoked = await store.RevokeLeaseAsync(id);
+            return revoked ? Results.NoContent() : Error(StatusCodes.Status404NotFound, "lease does not exist");
+        });
+
+        app.MapGet("/lease/{id}", (string id, KvStore store) =>
+        {
+            LeaseView? v = store.GetLease(id);
+            return v is null
+                ? Error(StatusCodes.Status404NotFound, "lease does not exist")
+                : Results.Json(new LeaseViewResponse(v.Id, v.TtlSecs, v.TtlRemaining, [.. v.Keys]), TurnstileJson.Default.LeaseViewResponse);
         });
     }
 

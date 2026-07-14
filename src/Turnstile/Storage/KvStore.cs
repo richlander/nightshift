@@ -110,6 +110,11 @@ public sealed class KvStore : IDisposable
         Validate(key, value);
         return _writer.ExecuteAsync((conn, next) =>
         {
+            if (lease is not null && !LeaseIsLive(conn, lease))
+            {
+                throw new TurnstileValidationException("lease not found or expired");
+            }
+
             LatestRow? latest = ReadLatest(conn, key);
             if (latest is LatestRow live && !live.Deleted)
             {
@@ -185,6 +190,178 @@ public sealed class KvStore : IDisposable
     }
 
     public void Dispose() => _writer.Dispose();
+
+    // ---- lease layer ---------------------------------------------------------------------------
+    // A lease groups lifetime: on expiry or revoke, every attached key is deleted (a tombstone,
+    // which is a delete event on the watch). Agent death = lease expiry = key deletion = event.
+
+    /// <summary>Grants a new lease with the given TTL (seconds).</summary>
+    public Task<LeaseInfo> CreateLeaseAsync(long ttlSecs)
+    {
+        if (ttlSecs <= 0)
+        {
+            throw new TurnstileValidationException("ttl must be a positive number of seconds");
+        }
+
+        string id = NewLeaseId();
+        long expiresAt = Now() + ttlSecs;
+        return _writer.ExecuteAsync<LeaseInfo>((conn, next) =>
+        {
+            using SqliteCommand cmd = conn.CreateCommand();
+            cmd.CommandText = "INSERT INTO lease (id, ttl_secs, expires_at) VALUES ($id, $ttl, $exp);";
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.Parameters.AddWithValue("$ttl", ttlSecs);
+            cmd.Parameters.AddWithValue("$exp", expiresAt);
+            cmd.ExecuteNonQuery();
+            return new LeaseInfo(id, ttlSecs, expiresAt);
+        });
+    }
+
+    /// <summary>
+    /// Renews a lease. Returns the remaining TTL in seconds, or null if the lease is already gone —
+    /// a keepalive that loses the race with the sweeper fails, and the client must stop, never re-acquire.
+    /// </summary>
+    public Task<long?> KeepAliveAsync(string id)
+        => _writer.ExecuteAsync<long?>((conn, next) =>
+        {
+            if (ReadLease(conn, id) is not (long ttl, long exp) || exp <= Now())
+            {
+                return null;
+            }
+
+            long expiresAt = Now() + ttl;
+            using SqliteCommand cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE lease SET expires_at = $exp WHERE id = $id;";
+            cmd.Parameters.AddWithValue("$exp", expiresAt);
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.ExecuteNonQuery();
+            return ttl;
+        });
+
+    /// <summary>Revokes a lease, deleting all attached keys. Returns false if the lease did not exist.</summary>
+    public Task<bool> RevokeLeaseAsync(string id)
+        => _writer.ExecuteAsync((conn, next) =>
+        {
+            if (ReadLease(conn, id) is null)
+            {
+                return false;
+            }
+
+            foreach (string key in AttachedKeys(conn, id))
+            {
+                TombstoneAttachedKey(conn, next, key);
+            }
+
+            DeleteLeaseRow(conn, id);
+            return true;
+        });
+
+    /// <summary>Reads a lease's state and attached keys, or null if it does not exist.</summary>
+    public LeaseView? GetLease(string id)
+    {
+        using var conn = new SqliteConnection(_readConnectionString);
+        conn.Open();
+        if (ReadLease(conn, id) is not (long ttl, long exp))
+        {
+            return null;
+        }
+
+        long remaining = Math.Max(0, exp - Now());
+        return new LeaseView(id, ttl, remaining, AttachedKeys(conn, id));
+    }
+
+    /// <summary>
+    /// Deletes attached keys for every lease whose deadline has passed (server clock). Runs eagerly on
+    /// the sweeper tick so expiry produces delete events — lazy expiry would be correct but silent.
+    /// Returns the number of keys deleted.
+    /// </summary>
+    public Task<int> SweepExpiredAsync()
+        => _writer.ExecuteAsync((conn, next) =>
+        {
+            long now = Now();
+            var expired = new List<string>();
+            using (SqliteCommand find = conn.CreateCommand())
+            {
+                find.CommandText = "SELECT id FROM lease WHERE expires_at <= $now;";
+                find.Parameters.AddWithValue("$now", now);
+                using SqliteDataReader reader = find.ExecuteReader();
+                while (reader.Read())
+                {
+                    expired.Add(reader.GetString(0));
+                }
+            }
+
+            int deleted = 0;
+            foreach (string id in expired)
+            {
+                foreach (string key in AttachedKeys(conn, id))
+                {
+                    TombstoneAttachedKey(conn, next, key);
+                    deleted++;
+                }
+
+                DeleteLeaseRow(conn, id);
+            }
+
+            return deleted;
+        });
+
+    private bool LeaseIsLive(SqliteConnection conn, string id)
+        => ReadLease(conn, id) is (long _, long exp) && exp > Now();
+
+    private static (long Ttl, long Exp)? ReadLease(SqliteConnection conn, string id)
+    {
+        using SqliteCommand cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT ttl_secs, expires_at FROM lease WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$id", id);
+        using SqliteDataReader reader = cmd.ExecuteReader();
+        return reader.Read() ? (reader.GetInt64(0), reader.GetInt64(1)) : null;
+    }
+
+    private static List<string> AttachedKeys(SqliteConnection conn, string id)
+    {
+        using SqliteCommand cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT k.key FROM kv k
+            JOIN (SELECT key, MAX(id) AS mid FROM kv GROUP BY key) m ON k.key = m.key AND k.id = m.mid
+            WHERE k.deleted = 0 AND k.lease = $id
+            ORDER BY k.key;
+            """;
+        cmd.Parameters.AddWithValue("$id", id);
+        var keys = new List<string>();
+        using SqliteDataReader reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            keys.Add(reader.GetString(0));
+        }
+
+        return keys;
+    }
+
+    private static void TombstoneAttachedKey(SqliteConnection conn, Func<long> next, string key)
+    {
+        LatestRow? latest = ReadLatest(conn, key);
+        // Immutable keys are never deleted, preserving the immutability invariant even under a lease.
+        if (latest is not LatestRow live || live.Deleted || live.Immutable)
+        {
+            return;
+        }
+
+        long id = next();
+        InsertRow(conn, id, key, created: false, deleted: true, live.Immutable, live.CreateRev, prevRev: live.Id, lease: null, value: null, oldValue: live.Value);
+    }
+
+    private static void DeleteLeaseRow(SqliteConnection conn, string id)
+    {
+        using SqliteCommand cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM lease WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.ExecuteNonQuery();
+    }
+
+    private static string NewLeaseId() => Convert.ToHexStringLower(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));
+
+    private static long Now() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
     private static WriteResult? CheckPrecondition(string key, LatestRow live, long? ifMatch, bool unconditional)
     {

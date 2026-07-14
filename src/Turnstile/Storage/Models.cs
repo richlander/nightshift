@@ -57,3 +57,9 @@ internal readonly record struct LatestRow(
     long CreateRev,
     string? Lease,
     byte[]? Value);
+
+/// <summary>A newly granted lease.</summary>
+public sealed record LeaseInfo(string Id, long TtlSecs, long ExpiresAt);
+
+/// <summary>A lease's current state, including the keys attached to it.</summary>
+public sealed record LeaseView(string Id, long TtlSecs, long TtlRemaining, IReadOnlyList<string> Keys);

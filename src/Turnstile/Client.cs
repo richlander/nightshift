@@ -23,7 +23,8 @@ internal static class Client
                 "create" => await CreateAsync(http, args),
                 "put" => await PutAsync(http, args),
                 "delete" => await DeleteAsync(http, args),
-                "watch" or "lease" => NotYet(verb),
+                "lease" => await LeaseAsync(http, args),
+                "watch" => NotYet(verb),
                 _ => Unknown(verb),
             };
         }
@@ -111,6 +112,56 @@ internal static class Client
 
         HttpResponseMessage res = await http.SendAsync(req);
         return await Emit(res);
+    }
+
+    private static async Task<int> LeaseAsync(HttpClient http, string[] args)
+    {
+        string? sub = Positional(args);
+        switch (sub)
+        {
+            case "create":
+                string ttl = Cli.OptionValue(args, "--ttl") ?? "2700";
+                using (var body = new StringContent($"{{\"ttl\":{ttl}}}", System.Text.Encoding.UTF8, "application/json"))
+                {
+                    return await Emit(await http.PostAsync("/lease", body));
+                }
+
+            case "keepalive":
+                return await Emit(await http.PutAsync($"/lease/{LeaseId(args)}", null));
+
+            case "revoke":
+                return await Emit(await http.DeleteAsync($"/lease/{LeaseId(args)}"));
+
+            case "get":
+                return await Emit(await http.GetAsync($"/lease/{LeaseId(args)}"));
+
+            default:
+                Console.Error.WriteLine("turnstile: usage: turnstile lease <create|keepalive|revoke|get> [id] [--ttl N]");
+                return 2;
+        }
+    }
+
+    private static string LeaseId(string[] args)
+    {
+        // The subcommand is the first positional; the lease id is the second.
+        bool seenSub = false;
+        foreach (string arg in args)
+        {
+            if (arg.StartsWith('-'))
+            {
+                continue;
+            }
+
+            if (!seenSub)
+            {
+                seenSub = true;
+                continue;
+            }
+
+            return arg;
+        }
+
+        return string.Empty;
     }
 
     private static async Task<HttpContent> BodyContent(string[] args)
