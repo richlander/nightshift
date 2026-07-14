@@ -2,4 +2,5 @@
   <Project Path="src/Turnstile/Turnstile.csproj" />
   <Project Path="src/nightshift/nightshift.csproj" />
   <Project Path="tests/Turnstile.Tests/Turnstile.Tests.csproj" />
+  <Project Path="tests/Nightshift.Tests/Nightshift.Tests.csproj" />
 </Solution>

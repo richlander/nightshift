@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Nightshift.Tests</RootNamespace>
+    <AssemblyName>Nightshift.Tests</AssemblyName>
+    <IsPackable>false</IsPackable>
+    <IsAotCompatible>false</IsAotCompatible>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" Version="3.1.0" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.0.0" />
+  </ItemGroup>
+
+  <!--
+    The test project references BOTH the product (for its internals, via InternalsVisibleTo) and
+    Turnstile (only to HOST a daemon in-process for wire-level tests). The product itself never
+    references the Turnstile assembly — that boundary is preserved; only the tests cross it.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="../../src/nightshift/nightshift.csproj" />
+    <ProjectReference Include="../../src/Turnstile/Turnstile.csproj" />
+  </ItemGroup>
+
+</Project>
