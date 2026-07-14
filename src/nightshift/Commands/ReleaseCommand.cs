@@ -1,7 +1,5 @@
 namespace Nightshift.Commands;
 
-using System.Text;
-using System.Text.Json;
 using Nightshift.Turnstile;
 
 /// <summary>
@@ -37,10 +35,13 @@ internal static class ReleaseCommand
 
         using TurnstileClient client = TurnstileClient.Connect(Paths.Socket);
 
-        // Record the outcome (owned key, blind write) so the shift report and controllers can read it.
-        await client.SetAsync($"{session.SliceBase}/state", BuildState(status, reason), ct);
+        // Record the agent's outcome. Note `done` here means "submitted, awaiting merge" — it does NOT
+        // open dependents. Only `land` (the merge signal) advances the DAG. See LandCommand.
+        await SliceState.WriteAsync(client, session.SliceBase, status, reason, Session.Identity, ct);
 
-        // Terminal outcomes leave the ready set; `declined` returns the slice to the pool for another agent.
+        // The live `plan` controller owns /ready/* and will reconcile it. We proactively drop this slice's
+        // ready row (except for `declined`, which returns to the pool) to close the re-dispatch gap before
+        // the controller wakes — a blind delete, harmless if the controller already handled it.
         if (status != "declined")
         {
             await client.DeleteAsync(session.ReadyKey, ct);
@@ -52,25 +53,5 @@ internal static class ReleaseCommand
 
         Console.WriteLine($"RELEASED {status}");
         return 0;
-    }
-
-    private static string BuildState(string status, string? reason)
-    {
-        var buffer = new System.Buffers.ArrayBufferWriter<byte>();
-        using (var writer = new Utf8JsonWriter(buffer))
-        {
-            writer.WriteStartObject();
-            writer.WriteString("status", status);
-            if (reason is { Length: > 0 })
-            {
-                writer.WriteString("reason", reason);
-            }
-
-            writer.WriteString("by", Session.Identity);
-            writer.WriteString("at", DateTime.UtcNow.ToString("o"));
-            writer.WriteEndObject();
-        }
-
-        return Encoding.UTF8.GetString(buffer.WrittenSpan);
     }
 }
