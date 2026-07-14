@@ -129,20 +129,51 @@ internal static class NextCommand
 
     private static void Print(WorkPacket packet)
     {
+        SliceSpec spec = packet.Spec;
         Console.WriteLine($"WORK {packet.SliceBase}");
-        if (packet.Spec.Paths.Length > 0)
+        if (spec.Title is { Length: > 0 } title)
         {
-            Console.WriteLine($"paths: {string.Join(", ", packet.Spec.Paths)}");
+            Console.WriteLine($"title: {title}");
         }
 
-        if (packet.Spec.Standard is { Length: > 0 } standard)
+        if (spec.Issue is { Length: > 0 } issue)
+        {
+            Console.WriteLine($"issue: {issue}");
+        }
+
+        if (spec.Paths.Length > 0)
+        {
+            Console.WriteLine($"paths: {string.Join(", ", spec.Paths)}");
+        }
+
+        if (spec.Supersedes.Length > 0)
+        {
+            Console.WriteLine($"supersedes: {string.Join(", ", spec.Supersedes)}");
+        }
+
+        if (spec.Standard is { Length: > 0 } standard)
         {
             Console.WriteLine($"standard: {standard}");
         }
 
-        if (packet.Spec.Brief is { Length: > 0 } brief)
+        if (spec.Related.Length > 0)
+        {
+            Console.WriteLine($"related: {string.Join(", ", spec.Related)}");
+        }
+
+        if (spec.Antipatterns.Length > 0)
+        {
+            Console.WriteLine($"antipatterns: {string.Join(", ", spec.Antipatterns)}");
+        }
+
+        if (spec.Brief is { Length: > 0 } brief)
         {
             Console.WriteLine($"brief: {brief}");
+        }
+
+        if (spec.OrderSha is { Length: > 0 } sha)
+        {
+            Console.WriteLine($"order_sha: {sha}");
         }
 
         Console.WriteLine($"fence: {packet.Fence}");
@@ -168,9 +199,18 @@ internal static class NextCommand
 
     private sealed record WorkPacket(string SliceBase, string ClaimKey, string ReadyKey, long Fence, SliceSpec Spec);
 
-    private sealed record SliceSpec(string[] Paths, string? Standard, string? Brief)
+    private sealed record SliceSpec(
+        string[] Paths,
+        string[] Supersedes,
+        string[] Related,
+        string[] Antipatterns,
+        string? Standard,
+        string? Issue,
+        string? Title,
+        string? OrderSha,
+        string? Brief)
     {
-        public static SliceSpec Empty { get; } = new([], null, null);
+        public static SliceSpec Empty { get; } = new([], [], [], [], null, null, null, null, null);
 
         public static SliceSpec Parse(string json)
         {
@@ -178,18 +218,40 @@ internal static class NextCommand
             {
                 using JsonDocument doc = JsonDocument.Parse(json);
                 JsonElement root = doc.RootElement;
-                string[] paths = root.TryGetProperty("paths", out JsonElement p) && p.ValueKind == JsonValueKind.Array
-                    ? p.EnumerateArray().Select(e => e.GetString() ?? string.Empty).Where(s => s.Length > 0).ToArray()
-                    : [];
-                string? standard = root.TryGetProperty("standard", out JsonElement s) ? s.GetString() : null;
-                string? brief = root.TryGetProperty("brief", out JsonElement b) ? b.GetString() : null;
-                return new SliceSpec(paths, standard, brief);
+                return new SliceSpec(
+                    StringArray(root, "paths"),
+                    StringArray(root, "supersedes"),
+                    StringArray(root, "related"),
+                    StringArray(root, "antipatterns"),
+                    Str(root, "standard"),
+                    Str(root, "issue"),
+                    Str(root, "title"),
+                    Str(root, "order_sha"),
+                    Str(root, "brief"));
             }
             catch (JsonException)
             {
                 return Empty;
             }
         }
+
+        private static string[] StringArray(JsonElement root, string name)
+            => root.TryGetProperty(name, out JsonElement a) && a.ValueKind == JsonValueKind.Array
+                ? a.EnumerateArray()
+                    .Select(e => e.ValueKind == JsonValueKind.String ? e.GetString() ?? string.Empty : e.GetRawText())
+                    .Where(s => s.Length > 0)
+                    .ToArray()
+                : [];
+
+        private static string? Str(JsonElement root, string name)
+            => root.TryGetProperty(name, out JsonElement v)
+                ? v.ValueKind switch
+                {
+                    JsonValueKind.String => v.GetString(),
+                    JsonValueKind.Number => v.GetRawText(),
+                    _ => null,
+                }
+                : null;
     }
 }
 

@@ -100,6 +100,23 @@ internal sealed class TurnstileClient : IDisposable
         }
     }
 
+    /// <summary>
+    /// Creates an immutable key. Returns true if newly created, false if it already exists (idempotent —
+    /// re-seeding an unchanged work order is a no-op). Immutable keys can never be altered thereafter.
+    /// </summary>
+    public async Task<bool> CreateImmutableAsync(string key, string value, CancellationToken ct)
+    {
+        using var content = new ByteArrayContent(Encoding.UTF8.GetBytes(value));
+        using HttpResponseMessage res = await _http.PostAsync($"/kv{key}?immutable=true", content, ct);
+        if (res.StatusCode == HttpStatusCode.Conflict)
+        {
+            return false;
+        }
+
+        res.EnsureSuccessStatusCode();
+        return true;
+    }
+
     /// <summary>Blind-writes an owned key: creates it, or overwrites unconditionally if it exists.</summary>
     public async Task SetAsync(string key, string value, CancellationToken ct)
     {

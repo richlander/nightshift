@@ -5,7 +5,7 @@ using Nightshift.Commands;
 /// <summary>Entry dispatch for the <c>nightshift</c> agent/operator CLI.</summary>
 public static class Cli
 {
-    private const string Usage = "usage: nightshift <next|check|release> ...";
+    private const string Usage = "usage: nightshift <add|next|check|release> ...";
 
     public static async Task<int> RunAsync(string[] args)
     {
@@ -20,6 +20,8 @@ public static class Cli
 
         switch (verb)
         {
+            case "add":
+                return await AddCommand.RunAsync(rest);
             case "next":
                 return await NextCommand.RunAsync(rest);
             case "check":
