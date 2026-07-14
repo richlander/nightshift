@@ -1,5 +1,6 @@
 namespace Turnstile.Storage;
 
+using System.Runtime.CompilerServices;
 using Microsoft.Data.Sqlite;
 
 /// <summary>
@@ -164,6 +165,46 @@ public sealed class KvStore : IDisposable
     /// commit that races the drain still wakes them — a pulse is never lost, only coalesced.
     /// </summary>
     public Task WaitForChangeAsync() => _changed.WaitAsync();
+
+    /// <summary>
+    /// Streams the change log under <paramref name="prefix"/> starting after <paramref name="fromExclusive"/>:
+    /// the backlog as <see cref="WatchEventMessage"/>s, then a one-shot <see cref="WatchSyncMessage"/> when
+    /// caught up, then live events as they commit. Runs until <paramref name="ct"/> is cancelled. The wake
+    /// signal is captured before each drain so a commit racing the drain is never missed.
+    /// </summary>
+    public async IAsyncEnumerable<WatchMessage> WatchAsync(
+        string prefix,
+        long fromExclusive,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        long cursor = fromExclusive;
+        bool synced = false;
+
+        while (!ct.IsCancellationRequested)
+        {
+            Task changed = WaitForChangeAsync();
+
+            IReadOnlyList<WatchEvent> batch;
+            do
+            {
+                batch = ReadEvents(prefix, cursor, 256);
+                foreach (WatchEvent e in batch)
+                {
+                    yield return new WatchEventMessage(e);
+                    cursor = e.Revision;
+                }
+            }
+            while (batch.Count == 256);
+
+            if (!synced)
+            {
+                yield return new WatchSyncMessage(CurrentRevision);
+                synced = true;
+            }
+
+            await changed.WaitAsync(ct).ConfigureAwait(false);
+        }
+    }
 
     /// <summary>Creates a key if absent. Returns <see cref="WriteStatus.Exists"/> if it is already live.</summary>
     public Task<WriteResult> CreateAsync(string key, byte[] value, bool immutable = false, string? lease = null)

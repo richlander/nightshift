@@ -185,41 +185,35 @@ public sealed class Daemon
 
         CancellationToken ct = ctx.RequestAborted;
         string p = prefix ?? "/";
-        long cursor = from ?? 0;
-        bool synced = false;
         var heartbeat = TimeSpan.FromSeconds(30);
 
         try
         {
-            while (!ct.IsCancellationRequested)
+            await using IAsyncEnumerator<WatchMessage> events =
+                store.WatchAsync(p, from ?? 0, ct).GetAsyncEnumerator(ct);
+
+            // Race the next message against a heartbeat timer. The move task persists across heartbeats,
+            // so a quiet stream still gets a ": heartbeat" comment every 30s without dropping events.
+            Task<bool> moveTask = events.MoveNextAsync().AsTask();
+            while (true)
             {
-                // Capture the wake signal before draining so a commit racing the drain is never missed.
-                Task changed = store.WaitForChangeAsync();
-
-                IReadOnlyList<WatchEvent> batch;
-                do
-                {
-                    batch = store.ReadEvents(p, cursor, 256);
-                    foreach (WatchEvent e in batch)
-                    {
-                        await WriteWatchEventAsync(ctx, e, ct);
-                        cursor = e.Revision;
-                    }
-                }
-                while (batch.Count == 256);
-
-                if (!synced)
-                {
-                    await WriteSseAsync(ctx, "sync", JsonSerializer.Serialize(new WatchSyncDto(store.CurrentRevision), TurnstileJson.Default.WatchSyncDto), ct);
-                    synced = true;
-                }
-
-                Task finished = await Task.WhenAny(changed, Task.Delay(heartbeat, ct));
-                if (finished != changed)
+                using var delayCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                Task finished = await Task.WhenAny(moveTask, Task.Delay(heartbeat, delayCts.Token));
+                if (finished != moveTask)
                 {
                     await ctx.Response.WriteAsync(": heartbeat\n\n", ct);
                     await ctx.Response.Body.FlushAsync(ct);
+                    continue;
                 }
+
+                delayCts.Cancel();
+                if (!await moveTask)
+                {
+                    break;
+                }
+
+                await WriteWatchMessageAsync(ctx, events.Current, ct);
+                moveTask = events.MoveNextAsync().AsTask();
             }
         }
         catch (OperationCanceledException)
@@ -227,6 +221,14 @@ public sealed class Daemon
             // The client disconnected; a watch ending is normal, not an error.
         }
     }
+
+    private static Task WriteWatchMessageAsync(HttpContext ctx, WatchMessage msg, CancellationToken ct)
+        => msg switch
+        {
+            WatchEventMessage ev => WriteWatchEventAsync(ctx, ev.Event, ct),
+            WatchSyncMessage sync => WriteSseAsync(ctx, "sync", JsonSerializer.Serialize(new WatchSyncDto(sync.Revision), TurnstileJson.Default.WatchSyncDto), ct),
+            _ => Task.CompletedTask,
+        };
 
     private static Task WriteWatchEventAsync(HttpContext ctx, WatchEvent e, CancellationToken ct)
     {

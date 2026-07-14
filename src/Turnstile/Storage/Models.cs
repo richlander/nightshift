@@ -114,3 +114,12 @@ public sealed record WatchEvent(
     string? Lease,
     byte[]? Value,
     byte[]? PrevValue);
+
+/// <summary>A message on a watch stream: either a change event or the one-shot "caught up" marker.</summary>
+public abstract record WatchMessage;
+
+/// <summary>A change-log event (put or delete).</summary>
+public sealed record WatchEventMessage(WatchEvent Event) : WatchMessage;
+
+/// <summary>Emitted once when the backlog drains: the watcher is caught up to <see cref="Revision"/>.</summary>
+public sealed record WatchSyncMessage(long Revision) : WatchMessage;
