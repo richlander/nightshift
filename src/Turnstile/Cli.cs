@@ -5,7 +5,7 @@ using Turnstile.Server;
 /// <summary>Entry dispatch: <c>turnstile serve</c> runs the daemon; everything else is a thin client.</summary>
 public static class Cli
 {
-    private const string Usage = "usage: turnstile <serve|get|create|put|delete|txn|watch|lease|status> ...";
+    private const string Usage = "usage: turnstile <serve|get|create|put|delete|txn|watch|lease|status|lock|elect|queue> ...";
 
     public static async Task<int> RunAsync(string[] args)
     {
@@ -21,6 +21,9 @@ public static class Cli
         return verb switch
         {
             "serve" => await ServeAsync(rest),
+            "lock" => await Helpers.LockAsync(rest),
+            "elect" => await Helpers.ElectAsync(rest),
+            "queue" => await Helpers.QueueAsync(rest),
             _ => await Client.RunAsync(verb, rest),
         };
     }
