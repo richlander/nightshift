@@ -191,6 +191,180 @@ public sealed class KvStore : IDisposable
 
     public void Dispose() => _writer.Dispose();
 
+    // ---- txn: single-key compare-and-swap ------------------------------------------------------
+    // The hot path. An agent races other agents for one thing, and its whole world is one CAS:
+    // compare create_revision == 0 (does not exist), and on success put the claim under its lease.
+    // All compares are ANDed; the chosen branch runs atomically in one write transaction.
+
+    /// <summary>
+    /// Evaluates the compare clauses (ANDed) and atomically runs the success or failure branch.
+    /// Put is an upsert; the compares are the only guard. Immutable keys reject put/delete.
+    /// </summary>
+    public Task<TxnResult> TxnAsync(
+        IReadOnlyList<TxnCompare> compare,
+        IReadOnlyList<TxnOp> success,
+        IReadOnlyList<TxnOp> failure)
+    {
+        foreach (TxnCompare c in compare)
+        {
+            if (Keys.ValidateKey(c.Key) is string ck)
+            {
+                throw new TurnstileValidationException(ck);
+            }
+        }
+
+        foreach (TxnOp op in success.Concat(failure))
+        {
+            if (Keys.ValidateKey(op.Key) is string ok)
+            {
+                throw new TurnstileValidationException(ok);
+            }
+
+            if (op.Kind is TxnOpKind.Put && Keys.ValidateValue(op.Value ?? []) is string ov)
+            {
+                throw new TurnstileValidationException(ov);
+            }
+        }
+
+        return _writer.ExecuteAsync((conn, next) =>
+        {
+            bool succeeded = compare.All(c => EvalCompare(conn, c));
+            IReadOnlyList<TxnOp> branch = succeeded ? success : failure;
+
+            long maxRev = 0;
+            var responses = new List<TxnOpResult>(branch.Count);
+            foreach (TxnOp op in branch)
+            {
+                switch (op.Kind)
+                {
+                    case TxnOpKind.Put:
+                        maxRev = ApplyPut(conn, next, op);
+                        break;
+
+                    case TxnOpKind.Delete:
+                        if (ApplyDelete(conn, next, op) is long del)
+                        {
+                            maxRev = del;
+                        }
+
+                        break;
+
+                    case TxnOpKind.Get:
+                        LatestRow? latest = ReadLatest(conn, op.Key);
+                        KeyState? state = latest is LatestRow row && !row.Deleted ? ToState(op.Key, row) : null;
+                        responses.Add(new TxnOpResult(TxnOpKind.Get, op.Key, state));
+                        break;
+                }
+            }
+
+            long revision = maxRev > 0 ? maxRev : CurrentRev(conn);
+            return new TxnResult(succeeded, revision, responses);
+        });
+    }
+
+    private bool EvalCompare(SqliteConnection conn, TxnCompare c)
+    {
+        LatestRow? latest = ReadLatest(conn, c.Key);
+        LatestRow? live = latest is LatestRow row && !row.Deleted ? row : null;
+        switch (c.Target)
+        {
+            case TxnTarget.CreateRevision:
+                return CompareLong(live?.CreateRev ?? 0, c.Op, c.Revision);
+
+            case TxnTarget.ModRevision:
+                return CompareLong(live?.Id ?? 0, c.Op, c.Revision);
+
+            case TxnTarget.Value:
+                bool valueEqual = BytesEqual(live?.Value, c.Value);
+                return c.Op switch
+                {
+                    TxnCompareOp.Equal => valueEqual,
+                    TxnCompareOp.NotEqual => !valueEqual,
+                    _ => throw new TurnstileValidationException("value comparison supports only == and !="),
+                };
+
+            case TxnTarget.Lease:
+                bool leaseEqual = string.Equals(live?.Lease, c.Lease, StringComparison.Ordinal);
+                return c.Op switch
+                {
+                    TxnCompareOp.Equal => leaseEqual,
+                    TxnCompareOp.NotEqual => !leaseEqual,
+                    _ => throw new TurnstileValidationException("lease comparison supports only == and !="),
+                };
+
+            default:
+                throw new TurnstileValidationException("unknown compare target");
+        }
+    }
+
+    // Upsert: create if absent, overwrite if present. Immutable live keys are refused.
+    private long ApplyPut(SqliteConnection conn, Func<long> next, TxnOp op)
+    {
+        if (op.Lease is not null && !LeaseIsLive(conn, op.Lease))
+        {
+            throw new TurnstileValidationException("lease not found or expired");
+        }
+
+        LatestRow? latest = ReadLatest(conn, op.Key);
+        long id = next();
+        if (latest is LatestRow live && !live.Deleted)
+        {
+            if (live.Immutable)
+            {
+                throw new TurnstileValidationException($"cannot modify immutable key {op.Key}");
+            }
+
+            InsertRow(conn, id, op.Key, created: false, deleted: false, immutable: op.Immutable || live.Immutable,
+                live.CreateRev, prevRev: live.Id, op.Lease ?? live.Lease, op.Value ?? [], oldValue: live.Value);
+            return id;
+        }
+
+        InsertRow(conn, id, op.Key, created: true, deleted: false, op.Immutable,
+            createRev: id, prevRev: latest?.Id ?? 0, op.Lease, op.Value ?? [], oldValue: null);
+        return id;
+    }
+
+    // Deleting an absent key is a no-op (returns null, allocating no revision).
+    private static long? ApplyDelete(SqliteConnection conn, Func<long> next, TxnOp op)
+    {
+        LatestRow? latest = ReadLatest(conn, op.Key);
+        if (latest is not LatestRow live || live.Deleted)
+        {
+            return null;
+        }
+
+        if (live.Immutable)
+        {
+            throw new TurnstileValidationException($"cannot delete immutable key {op.Key}");
+        }
+
+        long id = next();
+        InsertRow(conn, id, op.Key, created: false, deleted: true, live.Immutable, live.CreateRev,
+            prevRev: live.Id, lease: null, value: null, oldValue: live.Value);
+        return id;
+    }
+
+    private static bool CompareLong(long actual, TxnCompareOp op, long expected) => op switch
+    {
+        TxnCompareOp.Equal => actual == expected,
+        TxnCompareOp.NotEqual => actual != expected,
+        TxnCompareOp.Less => actual < expected,
+        TxnCompareOp.Greater => actual > expected,
+        _ => false,
+    };
+
+    private static bool BytesEqual(byte[]? a, byte[]? b)
+    {
+        if (a is null || b is null)
+        {
+            return a is null && b is null;
+        }
+
+        return a.AsSpan().SequenceEqual(b);
+    }
+
+    private static long CurrentRev(SqliteConnection conn) => ScalarLong(conn, "SELECT COALESCE(MAX(id), 0) FROM kv;");
+
     // ---- lease layer ---------------------------------------------------------------------------
     // A lease groups lifetime: on expiry or revoke, every attached key is deleted (a tombstone,
     // which is a delete event on the watch). Agent death = lease expiry = key deletion = event.

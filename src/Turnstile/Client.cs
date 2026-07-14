@@ -24,6 +24,7 @@ internal static class Client
                 "put" => await PutAsync(http, args),
                 "delete" => await DeleteAsync(http, args),
                 "lease" => await LeaseAsync(http, args),
+                "txn" => await TxnAsync(http, args),
                 "watch" => NotYet(verb),
                 _ => Unknown(verb),
             };
@@ -112,6 +113,25 @@ internal static class Client
 
         HttpResponseMessage res = await http.SendAsync(req);
         return await Emit(res);
+    }
+
+    private static async Task<int> TxnAsync(HttpClient http, string[] args)
+    {
+        // The txn body is JSON (compare/success/failure). Read it from --file or stdin and pass it
+        // straight through — the client stays ignorant of the protocol so callers can build any txn.
+        string json;
+        if (Cli.OptionValue(args, "--file") is string path)
+        {
+            json = await File.ReadAllTextAsync(path);
+        }
+        else
+        {
+            using var reader = new StreamReader(Console.OpenStandardInput());
+            json = await reader.ReadToEndAsync();
+        }
+
+        using var content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+        return await Emit(await http.PostAsync("/txn", content));
     }
 
     private static async Task<int> LeaseAsync(HttpClient http, string[] args)

@@ -63,3 +63,41 @@ public sealed record LeaseInfo(string Id, long TtlSecs, long ExpiresAt);
 
 /// <summary>A lease's current state, including the keys attached to it.</summary>
 public sealed record LeaseView(string Id, long TtlSecs, long TtlRemaining, IReadOnlyList<string> Keys);
+
+/// <summary>What a txn compare clause inspects on a key. <c>create_revision == 0</c> means "does not exist".</summary>
+public enum TxnTarget
+{
+    CreateRevision,
+    ModRevision,
+    Value,
+    Lease,
+}
+
+/// <summary>The comparison operator for a txn compare clause. Value/Lease targets support only == and !=.</summary>
+public enum TxnCompareOp
+{
+    Equal,
+    NotEqual,
+    Less,
+    Greater,
+}
+
+/// <summary>What a txn branch op does. Put is an upsert; the guard lives in the compare clauses.</summary>
+public enum TxnOpKind
+{
+    Put,
+    Delete,
+    Get,
+}
+
+/// <summary>One compare clause. All clauses in a txn are ANDed to choose the success or failure branch.</summary>
+public sealed record TxnCompare(string Key, TxnTarget Target, TxnCompareOp Op, long Revision, byte[]? Value, string? Lease);
+
+/// <summary>One branch op. Put upserts the key (optionally under a lease); Get reads it into the response.</summary>
+public sealed record TxnOp(TxnOpKind Kind, string Key, byte[]? Value, string? Lease, bool Immutable);
+
+/// <summary>The result of a single branch op — only Get ops carry state.</summary>
+public sealed record TxnOpResult(TxnOpKind Kind, string Key, KeyState? State);
+
+/// <summary>The outcome of a txn: which branch ran, the store revision, and any Get responses.</summary>
+public sealed record TxnResult(bool Succeeded, long Revision, IReadOnlyList<TxnOpResult> Responses);

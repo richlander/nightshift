@@ -144,6 +144,106 @@ public sealed class Daemon
                 ? Error(StatusCodes.Status404NotFound, "lease does not exist")
                 : Results.Json(new LeaseViewResponse(v.Id, v.TtlSecs, v.TtlRemaining, [.. v.Keys]), TurnstileJson.Default.LeaseViewResponse);
         });
+
+        app.MapPost("/txn", async (KvStore store, TxnRequest req) =>
+        {
+            TxnResult result = await store.TxnAsync(
+                MapCompares(req.Compare),
+                MapOps(req.Success),
+                MapOps(req.Failure));
+
+            TxnOpResponseDto[] responses = new TxnOpResponseDto[result.Responses.Count];
+            for (int i = 0; i < responses.Length; i++)
+            {
+                TxnOpResult r = result.Responses[i];
+                KeyState? s = r.State;
+                responses[i] = new TxnOpResponseDto(
+                    Op: r.Kind.ToString().ToLowerInvariant(),
+                    Key: r.Key,
+                    Found: s is not null,
+                    CreateRevision: s?.CreateRevision ?? 0,
+                    ModRevision: s?.ModRevision ?? 0,
+                    Lease: s?.Lease,
+                    Value: s?.Value is null ? null : Convert.ToBase64String(s.Value));
+            }
+
+            return Results.Json(new TxnResponseDto(result.Succeeded, result.Revision, responses), TurnstileJson.Default.TxnResponseDto);
+        });
+    }
+
+    private static IReadOnlyList<TxnCompare> MapCompares(TxnCompareDto[]? compares)
+    {
+        if (compares is null || compares.Length == 0)
+        {
+            return [];
+        }
+
+        var result = new List<TxnCompare>(compares.Length);
+        foreach (TxnCompareDto c in compares)
+        {
+            result.Add(new TxnCompare(c.Key, ParseTarget(c.Target), ParseCompareOp(c.Op), c.Revision ?? 0, DecodeValue(c.Value), c.Lease));
+        }
+
+        return result;
+    }
+
+    private static IReadOnlyList<TxnOp> MapOps(TxnOpDto[]? ops)
+    {
+        if (ops is null || ops.Length == 0)
+        {
+            return [];
+        }
+
+        var result = new List<TxnOp>(ops.Length);
+        foreach (TxnOpDto o in ops)
+        {
+            result.Add(new TxnOp(ParseOpKind(o.Op), o.Key, DecodeValue(o.Value), o.Lease, o.Immutable ?? false));
+        }
+
+        return result;
+    }
+
+    private static TxnTarget ParseTarget(string target) => target switch
+    {
+        "create_revision" => TxnTarget.CreateRevision,
+        "mod_revision" => TxnTarget.ModRevision,
+        "value" => TxnTarget.Value,
+        "lease" => TxnTarget.Lease,
+        _ => throw new TurnstileValidationException($"unknown compare target '{target}'"),
+    };
+
+    private static TxnCompareOp ParseCompareOp(string op) => op switch
+    {
+        "==" => TxnCompareOp.Equal,
+        "!=" => TxnCompareOp.NotEqual,
+        "<" => TxnCompareOp.Less,
+        ">" => TxnCompareOp.Greater,
+        _ => throw new TurnstileValidationException($"unknown compare op '{op}'"),
+    };
+
+    private static TxnOpKind ParseOpKind(string op) => op switch
+    {
+        "put" => TxnOpKind.Put,
+        "delete" => TxnOpKind.Delete,
+        "get" => TxnOpKind.Get,
+        _ => throw new TurnstileValidationException($"unknown txn op '{op}'"),
+    };
+
+    private static byte[]? DecodeValue(string? value)
+    {
+        if (value is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return Convert.FromBase64String(value);
+        }
+        catch (FormatException)
+        {
+            throw new TurnstileValidationException("value must be base64-encoded");
+        }
     }
 
     // Route captures the key without its leading slash; keys are canonically rooted at '/'.

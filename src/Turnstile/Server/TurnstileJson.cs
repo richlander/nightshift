@@ -35,6 +35,21 @@ public sealed record LeaseViewResponse(string Id, long TtlSecs, long TtlRemainin
 /// <summary>Uniform error envelope.</summary>
 public sealed record ErrorResponse(string Error);
 
+/// <summary>A txn compare clause. Value is base64 (opaque bytes); Revision is used for revision targets.</summary>
+public sealed record TxnCompareDto(string Key, string Target, string Op, long? Revision, string? Value, string? Lease);
+
+/// <summary>A txn branch op: put (upsert), delete, or get. Value is base64 for put.</summary>
+public sealed record TxnOpDto(string Op, string Key, string? Value, string? Lease, bool? Immutable);
+
+/// <summary>Request body for POST /txn: compare clauses (ANDed) select the success or failure branch.</summary>
+public sealed record TxnRequest(TxnCompareDto[]? Compare, TxnOpDto[]? Success, TxnOpDto[]? Failure);
+
+/// <summary>One entry in a txn response — populated for get ops. Value is base64.</summary>
+public sealed record TxnOpResponseDto(string Op, string Key, bool Found, long CreateRevision, long ModRevision, string? Lease, string? Value);
+
+/// <summary>Response for POST /txn: which branch ran, the store revision, and any get responses.</summary>
+public sealed record TxnResponseDto(bool Succeeded, long Revision, TxnOpResponseDto[] Responses);
+
 /// <summary>Source-generated JSON for AOT. snake_case on the wire.</summary>
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]
 [JsonSerializable(typeof(RangeResponse))]
@@ -45,4 +60,6 @@ public sealed record ErrorResponse(string Error);
 [JsonSerializable(typeof(LeaseKeepaliveResponse))]
 [JsonSerializable(typeof(LeaseViewResponse))]
 [JsonSerializable(typeof(ErrorResponse))]
+[JsonSerializable(typeof(TxnRequest))]
+[JsonSerializable(typeof(TxnResponseDto))]
 public partial class TurnstileJson : JsonSerializerContext;
