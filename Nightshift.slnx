@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/Turnstile/Turnstile.csproj" />
+  <Project Path="tests/Turnstile.Tests/Turnstile.Tests.csproj" />
+</Solution>
