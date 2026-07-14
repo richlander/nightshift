@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using System.Text.Json;
 using Turnstile.Storage;
 
 /// <summary>
@@ -169,6 +170,80 @@ public sealed class Daemon
 
             return Results.Json(new TxnResponseDto(result.Succeeded, result.Revision, responses), TurnstileJson.Default.TxnResponseDto);
         });
+
+        app.MapGet("/watch", WatchAsync);
+    }
+
+    // SSE watch: stream the change log from ?from in revision order, emit `sync` when caught up, then
+    // stream live events; heartbeat every 30s. The log-structured store makes "everything after N" a
+    // WHERE id > N scan on short-lived connections, so a watcher never pins the WAL.
+    private static async Task WatchAsync(HttpContext ctx, KvStore store, string? prefix, long? from)
+    {
+        ctx.Response.Headers.ContentType = "text/event-stream";
+        ctx.Response.Headers.CacheControl = "no-cache";
+        ctx.Response.Headers["X-Accel-Buffering"] = "no";
+
+        CancellationToken ct = ctx.RequestAborted;
+        string p = prefix ?? "/";
+        long cursor = from ?? 0;
+        bool synced = false;
+        var heartbeat = TimeSpan.FromSeconds(30);
+
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                // Capture the wake signal before draining so a commit racing the drain is never missed.
+                Task changed = store.WaitForChangeAsync();
+
+                IReadOnlyList<WatchEvent> batch;
+                do
+                {
+                    batch = store.ReadEvents(p, cursor, 256);
+                    foreach (WatchEvent e in batch)
+                    {
+                        await WriteWatchEventAsync(ctx, e, ct);
+                        cursor = e.Revision;
+                    }
+                }
+                while (batch.Count == 256);
+
+                if (!synced)
+                {
+                    await WriteSseAsync(ctx, "sync", JsonSerializer.Serialize(new WatchSyncDto(store.CurrentRevision), TurnstileJson.Default.WatchSyncDto), ct);
+                    synced = true;
+                }
+
+                Task finished = await Task.WhenAny(changed, Task.Delay(heartbeat, ct));
+                if (finished != changed)
+                {
+                    await ctx.Response.WriteAsync(": heartbeat\n\n", ct);
+                    await ctx.Response.Body.FlushAsync(ct);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The client disconnected; a watch ending is normal, not an error.
+        }
+    }
+
+    private static Task WriteWatchEventAsync(HttpContext ctx, WatchEvent e, CancellationToken ct)
+    {
+        if (e.Deleted)
+        {
+            var dto = new WatchDeleteEventDto(e.Key, e.Revision, e.PrevValue is null ? null : Convert.ToBase64String(e.PrevValue));
+            return WriteSseAsync(ctx, "delete", JsonSerializer.Serialize(dto, TurnstileJson.Default.WatchDeleteEventDto), ct);
+        }
+
+        var put = new WatchPutEventDto(e.Key, e.CreateRevision, e.Revision, e.Lease, e.Value is null ? null : Convert.ToBase64String(e.Value));
+        return WriteSseAsync(ctx, "put", JsonSerializer.Serialize(put, TurnstileJson.Default.WatchPutEventDto), ct);
+    }
+
+    private static async Task WriteSseAsync(HttpContext ctx, string eventName, string data, CancellationToken ct)
+    {
+        await ctx.Response.WriteAsync($"event: {eventName}\ndata: {data}\n\n", ct);
+        await ctx.Response.Body.FlushAsync(ct);
     }
 
     private static IReadOnlyList<TxnCompare> MapCompares(TxnCompareDto[]? compares)

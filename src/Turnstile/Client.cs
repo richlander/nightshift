@@ -25,7 +25,7 @@ internal static class Client
                 "delete" => await DeleteAsync(http, args),
                 "lease" => await LeaseAsync(http, args),
                 "txn" => await TxnAsync(http, args),
-                "watch" => NotYet(verb),
+                "watch" => await WatchAsync(http, args),
                 _ => Unknown(verb),
             };
         }
@@ -113,6 +113,30 @@ internal static class Client
 
         HttpResponseMessage res = await http.SendAsync(req);
         return await Emit(res);
+    }
+
+    private static async Task<int> WatchAsync(HttpClient http, string[] args)
+    {
+        // Stream SSE to stdout until the daemon closes the stream or the process is interrupted.
+        string prefix = Cli.OptionValue(args, "--prefix") ?? Positional(args) ?? "/";
+        string query = BuildQuery(("prefix", prefix), ("from", Cli.OptionValue(args, "--from")));
+
+        http.Timeout = Timeout.InfiniteTimeSpan;
+        using var req = new HttpRequestMessage(HttpMethod.Get, $"/watch{query}");
+        using HttpResponseMessage res = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
+        if (!res.IsSuccessStatusCode)
+        {
+            return await Emit(res);
+        }
+
+        await using Stream stream = await res.Content.ReadAsStreamAsync();
+        using var reader = new StreamReader(stream);
+        while (await reader.ReadLineAsync() is string line)
+        {
+            Console.WriteLine(line);
+        }
+
+        return 0;
     }
 
     private static async Task<int> TxnAsync(HttpClient http, string[] args)

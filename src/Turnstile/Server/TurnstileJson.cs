@@ -50,6 +50,15 @@ public sealed record TxnOpResponseDto(string Op, string Key, bool Found, long Cr
 /// <summary>Response for POST /txn: which branch ran, the store revision, and any get responses.</summary>
 public sealed record TxnResponseDto(bool Succeeded, long Revision, TxnOpResponseDto[] Responses);
 
+/// <summary>A watch put event. Value is base64 (opaque bytes).</summary>
+public sealed record WatchPutEventDto(string Key, long CreateRevision, long ModRevision, string? Lease, string? Value);
+
+/// <summary>A watch delete event, carrying the previous value (base64) for reverse-index maintenance.</summary>
+public sealed record WatchDeleteEventDto(string Key, long ModRevision, string? PrevValue);
+
+/// <summary>The watch sync event: the backlog has drained and the client is caught up to this revision.</summary>
+public sealed record WatchSyncDto(long Revision);
+
 /// <summary>Source-generated JSON for AOT. snake_case on the wire.</summary>
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]
 [JsonSerializable(typeof(RangeResponse))]
@@ -62,4 +71,7 @@ public sealed record TxnResponseDto(bool Succeeded, long Revision, TxnOpResponse
 [JsonSerializable(typeof(ErrorResponse))]
 [JsonSerializable(typeof(TxnRequest))]
 [JsonSerializable(typeof(TxnResponseDto))]
+[JsonSerializable(typeof(WatchPutEventDto))]
+[JsonSerializable(typeof(WatchDeleteEventDto))]
+[JsonSerializable(typeof(WatchSyncDto))]
 public partial class TurnstileJson : JsonSerializerContext;

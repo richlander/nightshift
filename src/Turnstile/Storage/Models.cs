@@ -101,3 +101,16 @@ public sealed record TxnOpResult(TxnOpKind Kind, string Key, KeyState? State);
 
 /// <summary>The outcome of a txn: which branch ran, the store revision, and any Get responses.</summary>
 public sealed record TxnResult(bool Succeeded, long Revision, IReadOnlyList<TxnOpResult> Responses);
+
+/// <summary>
+/// One row of the change log, as streamed to a watcher. A deleted row is a delete event carrying the
+/// previous value; every other row is a put. <see cref="Revision"/> is the row's mod_revision.
+/// </summary>
+public sealed record WatchEvent(
+    long Revision,
+    string Key,
+    bool Deleted,
+    long CreateRevision,
+    string? Lease,
+    byte[]? Value,
+    byte[]? PrevValue);

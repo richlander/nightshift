@@ -10,11 +10,13 @@ public sealed class KvStore : IDisposable
 {
     private readonly string _readConnectionString;
     private readonly WriteActor _writer;
+    private readonly ChangeSignal _changed;
 
-    private KvStore(string readConnectionString, WriteActor writer)
+    private KvStore(string readConnectionString, WriteActor writer, ChangeSignal changed)
     {
         _readConnectionString = readConnectionString;
         _writer = writer;
+        _changed = changed;
     }
 
     /// <summary>The highest committed revision.</summary>
@@ -38,7 +40,8 @@ public sealed class KvStore : IDisposable
         Schema.Ensure(writeConn);
 
         long startRevision = ScalarLong(writeConn, "SELECT COALESCE(MAX(id), 0) FROM kv;");
-        var writer = new WriteActor(writeConn, startRevision);
+        var changed = new ChangeSignal();
+        var writer = new WriteActor(writeConn, startRevision, changed.Pulse);
 
         string readConnectionString = new SqliteConnectionStringBuilder
         {
@@ -47,7 +50,7 @@ public sealed class KvStore : IDisposable
             Pooling = true,
         }.ConnectionString;
 
-        return new KvStore(readConnectionString, writer);
+        return new KvStore(readConnectionString, writer, changed);
     }
 
     /// <summary>Returns the live state of a key, or null if it does not exist.</summary>
@@ -103,6 +106,64 @@ public sealed class KvStore : IDisposable
 
         return results;
     }
+
+    // ---- watch ---------------------------------------------------------------------------------
+    // Watch is why the store is log-structured: "everything after N" is WHERE id > N — resumable and
+    // gapless. Reads use short-lived connections so a watcher never pins the WAL.
+
+    /// <summary>
+    /// Reads change-log rows with <c>id &gt; fromExclusive</c> under a prefix, in revision order.
+    /// Every row is an event (a delete row is a delete; anything else is a put).
+    /// </summary>
+    public IReadOnlyList<WatchEvent> ReadEvents(string prefix, long fromExclusive, int limit)
+    {
+        using var conn = new SqliteConnection(_readConnectionString);
+        conn.Open();
+
+        string? end = Keys.PrefixEnd(prefix);
+        using SqliteCommand cmd = conn.CreateCommand();
+        cmd.CommandText = $"""
+            SELECT id, key, deleted, create_rev, lease, value, old_value
+            FROM kv
+            WHERE id > $from AND key >= $start{(end is null ? string.Empty : " AND key < $end")}
+            ORDER BY id
+            {(limit > 0 ? "LIMIT $limit" : string.Empty)};
+            """;
+        cmd.Parameters.AddWithValue("$from", fromExclusive);
+        cmd.Parameters.AddWithValue("$start", prefix);
+        if (end is not null)
+        {
+            cmd.Parameters.AddWithValue("$end", end);
+        }
+
+        if (limit > 0)
+        {
+            cmd.Parameters.AddWithValue("$limit", limit);
+        }
+
+        var events = new List<WatchEvent>();
+        using SqliteDataReader reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            bool deleted = reader.GetInt64(2) != 0;
+            events.Add(new WatchEvent(
+                Revision: reader.GetInt64(0),
+                Key: reader.GetString(1),
+                Deleted: deleted,
+                CreateRevision: reader.GetInt64(3),
+                Lease: reader.IsDBNull(4) ? null : reader.GetString(4),
+                Value: reader.IsDBNull(5) ? null : (byte[])reader[5],
+                PrevValue: reader.IsDBNull(6) ? null : (byte[])reader[6]));
+        }
+
+        return events;
+    }
+
+    /// <summary>
+    /// Completes when the log next advances. Callers should capture this <em>before</em> draining so a
+    /// commit that races the drain still wakes them — a pulse is never lost, only coalesced.
+    /// </summary>
+    public Task WaitForChangeAsync() => _changed.WaitAsync();
 
     /// <summary>Creates a key if absent. Returns <see cref="WriteStatus.Exists"/> if it is already live.</summary>
     public Task<WriteResult> CreateAsync(string key, byte[] value, bool immutable = false, string? lease = null)
@@ -623,4 +684,19 @@ public sealed class KvStore : IDisposable
         cmd.CommandText = sql;
         return Convert.ToInt64(cmd.ExecuteScalar());
     }
+}
+
+/// <summary>
+/// A one-shot, self-rearming wake signal. Each <see cref="Pulse"/> completes the current waiters and
+/// swaps in a fresh source, so waits are edge-triggered but a pulse landing between capture and await
+/// is never lost — it simply completes the already-captured task.
+/// </summary>
+internal sealed class ChangeSignal
+{
+    private TaskCompletionSource _tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public Task WaitAsync() => Volatile.Read(ref _tcs).Task;
+
+    public void Pulse()
+        => Interlocked.Exchange(ref _tcs, new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).TrySetResult();
 }

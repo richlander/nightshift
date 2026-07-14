@@ -14,12 +14,14 @@ internal sealed class WriteActor : IDisposable
     private readonly SqliteConnection _conn;
     private readonly BlockingCollection<Job> _queue = new(new ConcurrentQueue<Job>());
     private readonly Thread _thread;
+    private readonly Action? _onCommitted;
     private long _revision;
 
-    public WriteActor(SqliteConnection conn, long startRevision)
+    public WriteActor(SqliteConnection conn, long startRevision, Action? onCommitted = null)
     {
         _conn = conn;
         _revision = startRevision;
+        _onCommitted = onCommitted;
         _thread = new Thread(Loop) { IsBackground = true, Name = "turnstile-writer" };
         _thread.Start();
     }
@@ -53,6 +55,12 @@ internal sealed class WriteActor : IDisposable
                 object? result = job.Work(_conn, AllocateRevision);
                 tx.Commit();
                 job.Tcs.SetResult(result);
+
+                // Notify watchers only when the write actually advanced the log (post-commit).
+                if (Interlocked.Read(ref _revision) > snapshot)
+                {
+                    _onCommitted?.Invoke();
+                }
             }
             catch (Exception ex)
             {
