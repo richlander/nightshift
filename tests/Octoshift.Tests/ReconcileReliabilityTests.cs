@@ -58,6 +58,34 @@ public class ReconcileReliabilityTests
     }
 
     [Fact]
+    public async Task PollOnce_TruncatedSweepClampsWatermarkAndDeepMergeLandsNext()
+    {
+        DateTimeOffset boundary = T0.AddDays(-7);
+        var state = new ReconcileCommand.ReconcileState { IntervalSeconds = 60 };
+        var nightshift = new FakeNightshiftClient(BoardState.Empty);
+        var source = new FakeMergedPrSource(
+            new MergedPrPage
+            {
+                MergedPrs = [Pr(1, "op-new", T0.AddMinutes(30)), Pr(2, "op-stale", boundary)],
+                Truncated = true,
+                OldestSeenMergedAt = boundary,
+            },
+            new MergedPrPage { MergedPrs = [Pr(3, "op-deep", T0.AddDays(-1))] });
+
+        await ReconcileCommand.PollOnceAsync(nightshift, source, state, Poller, PollingTuning.Default, TestContext.Current.CancellationToken);
+        await ReconcileCommand.PollOnceAsync(nightshift, source, state, Poller, PollingTuning.Default, TestContext.Current.CancellationToken);
+
+        Assert.Equal(boundary, source.SinceArgs[1]);
+        Assert.Equal(
+            [
+                ("/plan/2/order/op-new", "merged #1"),
+                ("/plan/2/order/op-stale", "merged #2"),
+                ("/plan/2/order/op-deep", "merged #3"),
+            ],
+            nightshift.Lands);
+    }
+
+    [Fact]
     public async Task RunOnceAsync_CanceledSweepExitsOk()
     {
         using var cts = new CancellationTokenSource();

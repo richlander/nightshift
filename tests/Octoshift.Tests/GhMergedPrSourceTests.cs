@@ -61,6 +61,34 @@ public class GhMergedPrSourceTests
     }
 
     [Fact]
+    public async Task FetchMergedAsync_TruncatedFullCapNullsEtagSoNextFetchCannot304Skip()
+    {
+        int call = 0;
+        var calls = new List<IReadOnlyList<string>>();
+        var source = new GhMergedPrSource("owner/repo", perPage: 1, maxPages: 1, (args, _) =>
+        {
+            calls.Add(args);
+            if (call++ == 0)
+            {
+                return Task.FromResult(Page(PrJson(1, "nightshift/2/op-a", T0.AddMinutes(30))));
+            }
+
+            return Task.FromResult(args.Contains("-H")
+                ? new GhResult(1, "HTTP/2.0 304 Not Modified\netag: abc\n\n", "gh: HTTP 304")
+                : Page(PrJson(2, "nightshift/2/op-b", T0.AddMinutes(20))));
+        });
+
+        MergedPrPage first = await source.FetchMergedAsync(null, null, TestContext.Current.CancellationToken);
+        MergedPrPage second = await source.FetchMergedAsync(null, first.ETag, TestContext.Current.CancellationToken);
+
+        Assert.True(first.Truncated);
+        Assert.Null(first.ETag);
+        Assert.DoesNotContain("-H", calls[1]);
+        Assert.False(second.NotModified);
+        Assert.Equal(2, Assert.Single(second.MergedPrs).Number);
+    }
+
+    [Fact]
     public void ParseMerged_IncludesPrAtSameSecondAsWatermark()
     {
         string body = $"[{PrJson(10, "nightshift/2/op-a", T0)},{PrJson(11, "nightshift/2/op-b", T0)}]";

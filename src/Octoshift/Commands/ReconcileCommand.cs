@@ -127,7 +127,7 @@ internal static class ReconcileCommand
 
         ApplyResult result = await ApplyAsync(nightshift, board, page.MergedPrs, state.HandledPrs, ct);
         RecordHistory(state, page.MergedPrs, tuning.CadenceWindow);
-        state.Since = AdvanceWatermark(state.Since, page.MergedPrs, state.HandledPrs);
+        state.Since = AdvanceWatermark(state.Since, page.MergedPrs, state.HandledPrs, page.Truncated, page.OldestSeenMergedAt);
         PruneHandledPrs(state);
 
         var outcome = new PollOutcome
@@ -218,7 +218,9 @@ internal static class ReconcileCommand
     internal static DateTimeOffset? AdvanceWatermark(
         DateTimeOffset? current,
         IReadOnlyList<MergedPr> merged,
-        IReadOnlyDictionary<int, DateTimeOffset> handledPrs)
+        IReadOnlyDictionary<int, DateTimeOffset> handledPrs,
+        bool truncated = false,
+        DateTimeOffset? oldestSeenMergedAt = null)
     {
         DateTimeOffset? firstUnhandled = null;
         foreach (MergedPr pr in merged)
@@ -255,6 +257,11 @@ internal static class ReconcileCommand
                     advanced = pr.MergedAt;
                 }
             }
+        }
+
+        if (truncated && oldestSeenMergedAt is { } boundary && (advanced is null || advanced > boundary))
+        {
+            advanced = boundary;
         }
 
         return advanced;

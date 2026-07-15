@@ -46,6 +46,7 @@ internal sealed class GhMergedPrSource : IMergedPrSource
         var merged = new List<MergedPr>();
         string? responseEtag = etag;
         int pollInterval = 0;
+        DateTimeOffset? oldestSeenMergedAt = null;
 
         for (int pageNumber = 1; pageNumber <= _maxPages; pageNumber++)
         {
@@ -84,16 +85,30 @@ internal sealed class GhMergedPrSource : IMergedPrSource
                 return ErrorPage(responseEtag, pollInterval, headerBlock);
             }
 
-            merged.AddRange(ParseMerged(body, since));
+            IReadOnlyList<MergedPr> seenOnPage = ParseMerged(body, null);
+            foreach (MergedPr pr in seenOnPage)
+            {
+                oldestSeenMergedAt = oldestSeenMergedAt is null || pr.MergedAt < oldestSeenMergedAt.Value
+                    ? pr.MergedAt
+                    : oldestSeenMergedAt;
+
+                if (since is null || pr.MergedAt >= since.Value)
+                {
+                    merged.Add(pr);
+                }
+            }
 
             int pullCount = PullCount(body);
             if (pullCount < _perPage || pageNumber == _maxPages)
             {
+                bool truncated = pageNumber == _maxPages && pullCount == _perPage;
                 merged.Sort((a, b) => b.MergedAt.CompareTo(a.MergedAt));
                 return new MergedPrPage
                 {
                     MergedPrs = merged,
-                    ETag = responseEtag,
+                    ETag = truncated ? null : responseEtag,
+                    Truncated = truncated,
+                    OldestSeenMergedAt = oldestSeenMergedAt,
                     ProviderMinIntervalSeconds = pollInterval,
                 };
             }
@@ -103,6 +118,7 @@ internal sealed class GhMergedPrSource : IMergedPrSource
         {
             MergedPrs = merged,
             ETag = responseEtag,
+            OldestSeenMergedAt = oldestSeenMergedAt,
             ProviderMinIntervalSeconds = pollInterval,
         };
     }

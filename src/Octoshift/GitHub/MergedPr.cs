@@ -23,6 +23,12 @@ internal readonly record struct MergedPrPage
     /// <summary>True when the conditional request returned 304 Not Modified (idle, no rate cost).</summary>
     public bool NotModified { get; init; }
 
+    /// <summary>True when the fetch stopped at the configured page cap while the final page was still full.</summary>
+    public bool Truncated { get; init; }
+
+    /// <summary>The oldest merged nightshift PR observed in a truncated fetch, even if client-side filtered out.</summary>
+    public DateTimeOffset? OldestSeenMergedAt { get; init; }
+
     /// <summary>GitHub's <c>X-Poll-Interval</c> floor in seconds (0 when absent). Never poll below it.</summary>
     public int ProviderMinIntervalSeconds { get; init; }
 
