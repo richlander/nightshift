@@ -10,9 +10,9 @@ using Nightshift.Turnstile;
 /// </summary>
 internal static class PlanCommand
 {
-    public static async Task<int> RunAsync(string[] args)
+    public static async Task<int> RunAsync(string? positionalPath, string? planPath, string? sha)
     {
-        string? path = PlanFile.FirstPositional(args) ?? Options.Value(args, "--plan");
+        string? path = positionalPath ?? planPath;
         if (path is null || !File.Exists(path))
         {
             Console.Error.WriteLine("usage: nightshift plan --plan <orders.json> [--sha <commit>]");
@@ -23,12 +23,12 @@ internal static class PlanCommand
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
         CancellationToken ct = cts.Token;
 
-        (Plan plan, string sha) = await PlanFile.LoadAsync(path, args, ct);
+        (Plan plan, string resolvedSha) = await PlanFile.LoadAsync(path, sha, ct);
         using TurnstileClient client = TurnstileClient.Connect(Paths.Socket);
 
         Reconciler.Result initial = await Reconciler.RunAsync(client, plan, ct);
         long from = await client.CurrentRevisionAsync(ct);
-        Console.WriteLine($"plan: {plan.PlanId} @ {PlanFile.ShortSha(sha)} — {initial.SpecsCreated} spec(s), {initial.Added} ready (watching)");
+        Console.WriteLine($"plan: {plan.PlanId} @ {PlanFile.ShortSha(resolvedSha)} — {initial.SpecsCreated} spec(s), {initial.Added} ready (watching)");
 
         try
         {

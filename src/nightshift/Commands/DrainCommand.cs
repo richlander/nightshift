@@ -12,11 +12,14 @@ internal static class DrainCommand
     private const string DrainingKey = "/control/draining";
 
     public static async Task<int> RunAsync(string[] args)
+        => await RunAsync(Array.IndexOf(args, "--resume") >= 0);
+
+    public static async Task<int> RunAsync(bool resume)
     {
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
         using TurnstileClient client = TurnstileClient.Connect(Paths.Socket);
-        return await Control.ToggleAsync(client, args, DrainingKey, "DRAINING", "RESUMED", cts.Token);
+        return await Control.ToggleAsync(client, resume, DrainingKey, "DRAINING", "RESUMED", cts.Token);
     }
 }

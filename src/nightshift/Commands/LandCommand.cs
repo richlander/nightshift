@@ -11,9 +11,8 @@ using Nightshift.Turnstile;
 /// </summary>
 internal static class LandCommand
 {
-    public static async Task<int> RunAsync(string[] args)
+    public static async Task<int> RunAsync(string? orderBase, string? reason)
     {
-        string? orderBase = PlanFile.FirstPositional(args);
         if (orderBase is null || !orderBase.StartsWith("/plan/", StringComparison.Ordinal))
         {
             Console.Error.WriteLine("usage: nightshift land <order>   (e.g. /plan/1234/order/op4)");
@@ -32,7 +31,7 @@ internal static class LandCommand
             return 3;
         }
 
-        await OrderState.WriteAsync(client, orderBase, "landed", Options.Value(args, "--reason"), "operator", ct);
+        await OrderState.WriteAsync(client, orderBase, "landed", reason, "operator", ct);
         Console.WriteLine($"LANDED {orderBase}");
         return 0;
     }

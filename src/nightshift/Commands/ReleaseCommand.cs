@@ -11,16 +11,13 @@ internal static class ReleaseCommand
 {
     private static readonly string[] ValidStatuses = ["done", "blocked", "declined", "escalated", "refused"];
 
-    public static async Task<int> RunAsync(string[] args)
+    public static async Task<int> RunAsync(string? status, string? reason)
     {
-        string? status = Options.Value(args, "--status");
         if (status is null || Array.IndexOf(ValidStatuses, status) < 0)
         {
             Console.Error.WriteLine($"nightshift release: --status must be one of {string.Join('|', ValidStatuses)}");
             return ExitCode.Usage;
         }
-
-        string? reason = Options.Value(args, "--reason");
 
         SessionState? session = Session.Load();
         if (session is null)

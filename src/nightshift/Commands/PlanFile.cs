@@ -3,30 +3,14 @@ namespace Nightshift.Commands;
 /// <summary>Shared loading of a plan file (<c>orders.json</c>): resolves the commit SHA and parses it.</summary>
 internal static class PlanFile
 {
-    public static async Task<(Plan Plan, string Sha)> LoadAsync(string path, string[] args, CancellationToken ct)
+    public static async Task<(Plan Plan, string Sha)> LoadAsync(string path, string? sha, CancellationToken ct)
     {
-        string sha = Options.Value(args, "--sha") ?? GitHead(Path.GetDirectoryName(Path.GetFullPath(path))!);
-        Plan plan = Plan.Parse(await File.ReadAllTextAsync(path, ct), sha);
-        return (plan, sha);
+        string resolvedSha = sha ?? GitHead(Path.GetDirectoryName(Path.GetFullPath(path))!);
+        Plan plan = Plan.Parse(await File.ReadAllTextAsync(path, ct), resolvedSha);
+        return (plan, resolvedSha);
     }
 
     public static string ShortSha(string sha) => sha.Length > 0 ? sha[..Math.Min(sha.Length, 12)] : "(no sha)";
-
-    public static string? FirstPositional(string[] args)
-    {
-        for (int i = 0; i < args.Length; i++)
-        {
-            if (args[i].StartsWith('-'))
-            {
-                i++;
-                continue;
-            }
-
-            return args[i];
-        }
-
-        return null;
-    }
 
     private static string GitHead(string dir)
     {

@@ -1,5 +1,6 @@
 namespace Nightshift;
 
+using System.CommandLine;
 using Nightshift.Commands;
 
 /// <summary>Entry dispatch for the <c>nightshift</c> agent/operator CLI.</summary>
@@ -7,54 +8,184 @@ public static class Cli
 {
     private const string Usage = "usage: nightshift <add|plan|land|join|standby|leave|next|show|recover|check|escalate|release|drain|stop|roster|where> ...";
 
+    private static readonly HashSet<string> KnownVerbs =
+    [
+        "add", "plan", "land", "join", "standby", "leave", "next", "show",
+        "recover", "check", "escalate", "release", "drain", "stop", "roster", "where",
+    ];
+
+    /// <summary>Parses and invokes the command line, preserving Nightshift's exit-code contract.</summary>
     public static async Task<int> RunAsync(string[] args)
     {
-        if (args.Length == 0)
+        if (ShouldUseLegacyUsage(args))
         {
             Console.Error.WriteLine(Usage);
             return ExitCode.Usage;
         }
 
-        string verb = args[0];
-        string[] rest = args[1..];
-
-        switch (verb)
+        RootCommand rootCommand = CreateRootCommand();
+        ParseResult result = rootCommand.Parse(args);
+        if (result.Errors.Count > 0)
         {
-            case "add":
-                return await AddCommand.RunAsync(rest);
-            case "plan":
-                return await PlanCommand.RunAsync(rest);
-            case "land":
-                return await LandCommand.RunAsync(rest);
-            case "join":
-                return await JoinCommand.RunAsync(rest);
-            case "standby":
-                return await StandbyCommand.RunAsync(rest);
-            case "leave":
-                return await LeaveCommand.RunAsync(rest);
-            case "next":
-                return await NextCommand.RunAsync(rest);
-            case "show":
-                return await ShowCommand.RunAsync(rest);
-            case "recover":
-                return await RecoverCommand.RunAsync(rest);
-            case "check":
-                return await CheckCommand.RunAsync(rest);
-            case "escalate":
-                return await EscalateCommand.RunAsync(rest);
-            case "release":
-                return await ReleaseCommand.RunAsync(rest);
-            case "drain":
-                return await DrainCommand.RunAsync(rest);
-            case "stop":
-                return await StopCommand.RunAsync(rest);
-            case "roster":
-                return await RosterCommand.RunAsync(rest);
-            case "where":
-                return await WhereCommand.RunAsync(rest);
-            default:
-                Console.Error.WriteLine(Usage);
-                return ExitCode.Usage;
+            foreach (var error in result.Errors)
+            {
+                Console.Error.WriteLine(error.Message);
+            }
+
+            return ExitCode.Usage;
         }
+
+        return await result.InvokeAsync();
+    }
+
+    /// <summary>Builds the System.CommandLine command tree for every Nightshift verb.</summary>
+    internal static RootCommand CreateRootCommand()
+    {
+        var rootCommand = new RootCommand("nightshift wire client");
+
+        rootCommand.Subcommands.Add(CreateAddCommand());
+        rootCommand.Subcommands.Add(CreatePlanCommand());
+        rootCommand.Subcommands.Add(CreateLandCommand());
+        rootCommand.Subcommands.Add(CreateNoArgsCommand("join", "Clock in on the roster.", JoinCommand.RunAsync));
+        rootCommand.Subcommands.Add(CreateNoArgsCommand("standby", "Stay on the roster but stop taking new work.", StandbyCommand.RunAsync));
+        rootCommand.Subcommands.Add(CreateNoArgsCommand("leave", "Clock out and release roster presence.", LeaveCommand.RunAsync));
+        rootCommand.Subcommands.Add(CreateNextCommand());
+        rootCommand.Subcommands.Add(CreateNoArgsCommand("show", "Reprint the current claim's WORK packet.", ShowCommand.RunAsync));
+        rootCommand.Subcommands.Add(CreateNoArgsCommand("recover", "Re-attach to the order encoded by the current git branch.", RecoverCommand.RunAsync));
+        rootCommand.Subcommands.Add(CreateNoArgsCommand("check", "Renew the active claim lease and read directives.", CheckCommand.RunAsync));
+        rootCommand.Subcommands.Add(CreateEscalateCommand());
+        rootCommand.Subcommands.Add(CreateReleaseCommand());
+        rootCommand.Subcommands.Add(CreateToggleCommand("drain", "Stop handing out new work until resumed.", DrainCommand.RunAsync));
+        rootCommand.Subcommands.Add(CreateToggleCommand("stop", "Raise or clear the global halt flag.", StopCommand.RunAsync));
+        rootCommand.Subcommands.Add(CreateNoArgsCommand("roster", "List workers on duty.", RosterCommand.RunAsync));
+        rootCommand.Subcommands.Add(CreateNoArgsCommand("where", "List claimed or reported orders.", WhereCommand.RunAsync));
+
+        return rootCommand;
+    }
+
+    private static bool ShouldUseLegacyUsage(string[] args)
+    {
+        if (args.Length == 0)
+        {
+            return true;
+        }
+
+        // Any leading option (e.g. --help, -h, --version) or unknown token falls back to the
+        // one-line usage/exit-2 contract; System.CommandLine's own help/version output stays
+        // suppressed at the root so this migration adds no new success-path behavior.
+        return args[0].StartsWith("-", StringComparison.Ordinal) || !KnownVerbs.Contains(args[0]);
+    }
+
+    private static Command CreateAddCommand()
+    {
+        var command = new Command("add", "Seed and reconcile a plan once.");
+        var orders = new Argument<string?>("orders.json")
+        {
+            Description = "Plan file to seed.",
+            Arity = ArgumentArity.ZeroOrOne,
+        };
+        var sha = new Option<string?>("--sha") { Description = "Commit SHA for the plan." };
+
+        command.Arguments.Add(orders);
+        command.Options.Add(sha);
+        command.SetAction(async (parseResult, cancellationToken)
+            => await AddCommand.RunAsync(parseResult.GetValue(orders), parseResult.GetValue(sha)));
+        return command;
+    }
+
+    private static Command CreatePlanCommand()
+    {
+        var command = new Command("plan", "Seed a plan and keep ready work reconciled.");
+        var orders = new Argument<string?>("orders.json")
+        {
+            Description = "Plan file to seed.",
+            Arity = ArgumentArity.ZeroOrOne,
+        };
+        var plan = new Option<string?>("--plan") { Description = "Plan file to seed." };
+        var sha = new Option<string?>("--sha") { Description = "Commit SHA for the plan." };
+
+        command.Arguments.Add(orders);
+        command.Options.Add(plan);
+        command.Options.Add(sha);
+        command.SetAction(async (parseResult, cancellationToken)
+            => await PlanCommand.RunAsync(parseResult.GetValue(orders), parseResult.GetValue(plan), parseResult.GetValue(sha)));
+        return command;
+    }
+
+    private static Command CreateLandCommand()
+    {
+        var command = new Command("land", "Mark an order as landed.");
+        var orderBase = new Argument<string?>("order-base")
+        {
+            Description = "Order base path, e.g. /plan/1234/order/op4.",
+            Arity = ArgumentArity.ZeroOrOne,
+        };
+        var reason = new Option<string?>("--reason") { Description = "Reason recorded with the landed state." };
+
+        command.Arguments.Add(orderBase);
+        command.Options.Add(reason);
+        command.SetAction(async (parseResult, cancellationToken)
+            => await LandCommand.RunAsync(parseResult.GetValue(orderBase), parseResult.GetValue(reason)));
+        return command;
+    }
+
+    private static Command CreateNextCommand()
+    {
+        var command = new Command("next", "Claim the next available order of work.");
+        var scope = new Argument<string?>("scope")
+        {
+            Description = "Ready-set scope to scan.",
+            Arity = ArgumentArity.ZeroOrOne,
+        };
+        var timeout = new Option<int>("--timeout") { Description = "Seconds to wait for work." };
+        timeout.DefaultValueFactory = _ => 60;
+
+        command.Arguments.Add(scope);
+        command.Options.Add(timeout);
+        command.SetAction(async (parseResult, cancellationToken)
+            => await NextCommand.RunAsync(parseResult.GetValue(scope), parseResult.GetValue(timeout)));
+        return command;
+    }
+
+    private static Command CreateEscalateCommand()
+    {
+        var command = new Command("escalate", "Escalate the active order for judgment.");
+        var reason = new Option<string?>("--reason") { Description = "What needs judgment." };
+
+        command.Options.Add(reason);
+        command.SetAction(async (parseResult, cancellationToken)
+            => await EscalateCommand.RunAsync(parseResult.GetValue(reason)));
+        return command;
+    }
+
+    private static Command CreateReleaseCommand()
+    {
+        var command = new Command("release", "Release the active order with an outcome.");
+        var status = new Option<string?>("--status") { Description = "Outcome: done, blocked, declined, escalated, or refused." };
+        var reason = new Option<string?>("--reason") { Description = "Optional reason for the outcome." };
+
+        command.Options.Add(status);
+        command.Options.Add(reason);
+        command.SetAction(async (parseResult, cancellationToken)
+            => await ReleaseCommand.RunAsync(parseResult.GetValue(status), parseResult.GetValue(reason)));
+        return command;
+    }
+
+    private static Command CreateToggleCommand(string name, string description, Func<bool, Task<int>> runAsync)
+    {
+        var command = new Command(name, description);
+        var resume = new Option<bool>("--resume") { Description = "Clear the control flag instead of setting it." };
+
+        command.Options.Add(resume);
+        command.SetAction(async (parseResult, cancellationToken)
+            => await runAsync(parseResult.GetValue(resume)));
+        return command;
+    }
+
+    private static Command CreateNoArgsCommand(string name, string description, Func<string[], Task<int>> runAsync)
+    {
+        var command = new Command(name, description);
+        command.SetAction(async (parseResult, cancellationToken) => await runAsync([]));
+        return command;
     }
 }
