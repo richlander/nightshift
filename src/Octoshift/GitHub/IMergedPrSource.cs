@@ -9,7 +9,7 @@ namespace Octoshift.GitHub;
 internal interface IMergedPrSource
 {
     /// <summary>
-    /// Fetches merged nightshift PRs newer than <paramref name="since"/> (null = the initial sweep),
+    /// Fetches merged nightshift PRs not older than <paramref name="since"/> (null = the initial sweep),
     /// replaying <paramref name="etag"/> as a conditional request so an unchanged result comes back as a
     /// cheap 304. The returned page also surfaces GitHub's poll-interval and rate-limit signals.
     /// </summary>

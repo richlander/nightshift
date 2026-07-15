@@ -1,5 +1,6 @@
 namespace Octoshift.Coordination;
 
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Text;
 
@@ -19,7 +20,14 @@ internal sealed class NightshiftCli : INightshiftClient
     public async Task<BoardState> GetBoardAsync(CancellationToken ct)
     {
         ProcessRun run = await RunAsync(["where", "--output", "json"], ct);
-        return run.ExitCode == 0 ? BoardState.Parse(run.Stdout) : BoardState.Empty;
+        if (run.ExitCode == 0)
+        {
+            return BoardState.Parse(run.Stdout);
+        }
+
+        string detail = run.Stderr.Trim();
+        Console.Error.WriteLine($"octoshift: nightshift where failed (exit {run.ExitCode}){(detail.Length > 0 ? $": {detail}" : string.Empty)}");
+        return BoardState.Empty;
     }
 
     public async Task<bool> LandAsync(string orderBase, string reason, CancellationToken ct)
@@ -58,7 +66,15 @@ internal sealed class NightshiftCli : INightshiftClient
         proc.OutputDataReceived += (_, e) => { if (e.Data is not null) { stdout.AppendLine(e.Data); } };
         proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) { stderr.AppendLine(e.Data); } };
 
-        proc.Start();
+        try
+        {
+            proc.Start();
+        }
+        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
+        {
+            return new ProcessRun(127, stdout.ToString(), ex.Message);
+        }
+
         proc.BeginOutputReadLine();
         proc.BeginErrorReadLine();
         await proc.WaitForExitAsync(ct);

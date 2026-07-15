@@ -14,7 +14,7 @@ internal readonly record struct MergedPr(int Number, string HeadBranch, DateTime
 /// </summary>
 internal readonly record struct MergedPrPage
 {
-    /// <summary>Merged nightshift PRs newer than the watermark, newest first. Empty on 304 or error.</summary>
+    /// <summary>Merged nightshift PRs not older than the watermark, newest first. Empty on 304 or error.</summary>
     public IReadOnlyList<MergedPr> MergedPrs { get; init; }
 
     /// <summary>The response ETag to replay as <c>If-None-Match</c> on the next poll, or null.</summary>

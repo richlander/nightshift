@@ -62,6 +62,10 @@ internal sealed class BoardState
 
     /// <summary>True when some order is at <c>done</c> (a worker submitted a PR, awaiting land): a land is imminent.</summary>
     public bool HasOutstandingDone => _statuses.Values.Any(status => status == DoneStatus);
+
+    /// <summary>The orders at <c>done</c>, which octoshift retries via <c>nightshift land</c> independent of the PR feed.</summary>
+    public IReadOnlyList<string> OutstandingDoneOrders
+        => _statuses.Where(kvp => kvp.Value == DoneStatus).Select(kvp => kvp.Key).ToArray();
 }
 
 /// <summary>One row of the <c>where</c> board: the order base, its status, and its branch (snake_case JSON).</summary>

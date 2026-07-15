@@ -47,8 +47,7 @@ internal static class ReconcileCommand
 
         if (once)
         {
-            await SweepOnceAsync(nightshift, source, ct);
-            return ExitCode.Ok;
+            return await RunOnceAsync(nightshift, source, ct);
         }
 
         await RunLoopAsync(nightshift, source, poller, tuning, ct);
@@ -63,7 +62,25 @@ internal static class ReconcileCommand
     {
         BoardState board = await nightshift.GetBoardAsync(ct);
         MergedPrPage page = await source.FetchMergedAsync(null, null, ct);
-        return await ApplyAsync(nightshift, board, page.MergedPrs, ct);
+        ApplyResult result = await ApplyAsync(nightshift, board, page.MergedPrs, new Dictionary<int, DateTimeOffset>(), ct);
+        return result.Actions;
+    }
+
+    internal static async Task<int> RunOnceAsync(
+        INightshiftClient nightshift,
+        IMergedPrSource source,
+        CancellationToken ct)
+    {
+        try
+        {
+            await SweepOnceAsync(nightshift, source, ct);
+            return ExitCode.Ok;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            Console.WriteLine("octoshift: stopped");
+            return ExitCode.Ok;
+        }
     }
 
     private static async Task RunLoopAsync(
@@ -73,10 +90,7 @@ internal static class ReconcileCommand
         PollingTuning tuning,
         CancellationToken ct)
     {
-        var history = new List<DateTimeOffset>();
-        string? etag = null;
-        DateTimeOffset? since = null;
-        double interval = tuning.MinIntervalSeconds;
+        var state = new ReconcileState { IntervalSeconds = tuning.MinIntervalSeconds };
         string? lastMode = null;
 
         Console.WriteLine("octoshift: reconciling merged PRs -> nightshift land (Ctrl-C to stop)");
@@ -85,41 +99,12 @@ internal static class ReconcileCommand
         {
             while (!ct.IsCancellationRequested)
             {
-                BoardState board = await nightshift.GetBoardAsync(ct);
-                MergedPrPage page = await source.FetchMergedAsync(since, etag, ct);
-                etag = page.ETag;
+                PollerState pollerState = await PollOnceAsync(nightshift, source, state, poller, tuning, ct);
 
-                IReadOnlyList<LandAction> actions = await ApplyAsync(nightshift, board, page.MergedPrs, ct);
+                state.IntervalSeconds = poller.NextIntervalSeconds(pollerState, Random.Shared.NextDouble());
+                lastMode = NoteTransition(pollerState, state.IntervalSeconds, lastMode);
 
-                foreach (MergedPr pr in page.MergedPrs)
-                {
-                    history.Add(pr.MergedAt);
-                    if (since is null || pr.MergedAt > since)
-                    {
-                        since = pr.MergedAt;
-                    }
-                }
-
-                var outcome = new PollOutcome
-                {
-                    LandedSomething = actions.Count > 0,
-                    RateLimited = page.RateLimited,
-                    ProviderMinIntervalSeconds = page.ProviderMinIntervalSeconds,
-                    RateLimitResetSeconds = page.RateLimitResetSeconds,
-                };
-
-                var state = new PollerState
-                {
-                    PreviousIntervalSeconds = interval,
-                    EstimatedGapSeconds = poller.EstimateGapSeconds(history),
-                    BoardHasOutstandingDone = board.HasOutstandingDone,
-                    LastPoll = outcome,
-                };
-
-                interval = poller.NextIntervalSeconds(state, Random.Shared.NextDouble());
-                lastMode = NoteTransition(state, interval, lastMode);
-
-                await Task.Delay(TimeSpan.FromSeconds(interval), ct);
+                await Task.Delay(TimeSpan.FromSeconds(state.IntervalSeconds), ct);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -128,23 +113,184 @@ internal static class ReconcileCommand
         }
     }
 
+    internal static async Task<PollerState> PollOnceAsync(
+        INightshiftClient nightshift,
+        IMergedPrSource source,
+        ReconcileState state,
+        AdaptivePoller poller,
+        PollingTuning tuning,
+        CancellationToken ct)
+    {
+        BoardState board = await nightshift.GetBoardAsync(ct);
+        MergedPrPage page = await source.FetchMergedAsync(state.Since, state.ETag, ct);
+        state.ETag = page.ETag;
+
+        ApplyResult result = await ApplyAsync(nightshift, board, page.MergedPrs, state.HandledPrs, ct);
+        RecordHistory(state, page.MergedPrs, tuning.CadenceWindow);
+        state.Since = AdvanceWatermark(state.Since, page.MergedPrs, state.HandledPrs);
+        PruneHandledPrs(state);
+
+        var outcome = new PollOutcome
+        {
+            LandedSomething = result.LandedSomething,
+            RateLimited = page.RateLimited,
+            ProviderMinIntervalSeconds = page.ProviderMinIntervalSeconds,
+            RateLimitResetSeconds = page.RateLimitResetSeconds,
+        };
+
+        return new PollerState
+        {
+            PreviousIntervalSeconds = state.IntervalSeconds,
+            EstimatedGapSeconds = poller.EstimateGapSeconds(state.RecentMerges.Select(pr => pr.MergedAt).ToArray()),
+            BoardHasOutstandingDone = board.HasOutstandingDone,
+            LastPoll = outcome,
+        };
+    }
+
     /// <summary>Lands every decided order via <c>nightshift land</c> (idempotent) and echoes one line each.</summary>
-    private static async Task<IReadOnlyList<LandAction>> ApplyAsync(
+    private static async Task<ApplyResult> ApplyAsync(
         INightshiftClient nightshift,
         BoardState board,
         IEnumerable<MergedPr> merged,
+        IDictionary<int, DateTimeOffset> handledPrs,
         CancellationToken ct)
     {
-        IReadOnlyList<LandAction> actions = LandDecision.Decide(merged, board);
-        foreach (LandAction action in actions)
+        var actions = new List<LandAction>();
+        var attemptedOrders = new HashSet<string>(StringComparer.Ordinal);
+        var landedOrders = new HashSet<string>(StringComparer.Ordinal);
+        bool landedSomething = false;
+
+        foreach (MergedPr pr in merged)
         {
+            if (OrderRef.FromBranch(pr.HeadBranch) is not { } order)
+            {
+                continue;
+            }
+
+            string orderBase = order.Base;
+            if (handledPrs.ContainsKey(pr.Number))
+            {
+                landedOrders.Add(orderBase);
+                continue;
+            }
+
+            if (board.IsLanded(orderBase) || landedOrders.Contains(orderBase))
+            {
+                handledPrs[pr.Number] = pr.MergedAt;
+                landedOrders.Add(orderBase);
+                continue;
+            }
+
+            if (!attemptedOrders.Add(orderBase))
+            {
+                continue;
+            }
+
+            var action = new LandAction(orderBase, pr.Number);
             if (await nightshift.LandAsync(action.OrderBase, action.Reason, ct))
             {
                 Console.WriteLine($"LANDED {action.OrderBase} ({action.Reason})");
+                actions.Add(action);
+                handledPrs[pr.Number] = pr.MergedAt;
+                landedOrders.Add(orderBase);
+                landedSomething = true;
             }
         }
 
-        return actions;
+        foreach (string orderBase in board.OutstandingDoneOrders)
+        {
+            if (attemptedOrders.Contains(orderBase) || landedOrders.Contains(orderBase))
+            {
+                continue;
+            }
+
+            const string reason = "board done";
+            if (await nightshift.LandAsync(orderBase, reason, ct))
+            {
+                Console.WriteLine($"LANDED {orderBase} ({reason})");
+                landedSomething = true;
+            }
+        }
+
+        return new ApplyResult(actions, landedSomething);
+    }
+
+    internal static DateTimeOffset? AdvanceWatermark(
+        DateTimeOffset? current,
+        IReadOnlyList<MergedPr> merged,
+        IReadOnlyDictionary<int, DateTimeOffset> handledPrs)
+    {
+        DateTimeOffset? firstUnhandled = null;
+        foreach (MergedPr pr in merged)
+        {
+            if (handledPrs.ContainsKey(pr.Number))
+            {
+                continue;
+            }
+
+            firstUnhandled = firstUnhandled is null || pr.MergedAt < firstUnhandled.Value ? pr.MergedAt : firstUnhandled;
+        }
+
+        DateTimeOffset? advanced = current;
+        foreach (MergedPr pr in merged)
+        {
+            if (!handledPrs.ContainsKey(pr.Number)
+                || (firstUnhandled is { } barrier && pr.MergedAt >= barrier))
+            {
+                continue;
+            }
+
+            if (advanced is null || pr.MergedAt > advanced)
+            {
+                advanced = pr.MergedAt;
+            }
+        }
+
+        if (firstUnhandled is null)
+        {
+            foreach (MergedPr pr in merged)
+            {
+                if (handledPrs.ContainsKey(pr.Number) && (advanced is null || pr.MergedAt > advanced))
+                {
+                    advanced = pr.MergedAt;
+                }
+            }
+        }
+
+        return advanced;
+    }
+
+    private static void RecordHistory(ReconcileState state, IReadOnlyList<MergedPr> merged, int cadenceWindow)
+    {
+        foreach (MergedPr pr in merged)
+        {
+            if (state.RecentMerges.Any(existing => existing.Number == pr.Number))
+            {
+                continue;
+            }
+
+            state.RecentMerges.Add(pr);
+        }
+
+        int maxCount = Math.Max(2, cadenceWindow + 1);
+        state.RecentMerges.Sort((a, b) => a.MergedAt.CompareTo(b.MergedAt));
+        if (state.RecentMerges.Count > maxCount)
+        {
+            state.RecentMerges.RemoveRange(0, state.RecentMerges.Count - maxCount);
+        }
+    }
+
+    private static void PruneHandledPrs(ReconcileState state)
+    {
+        if (state.Since is not { } since)
+        {
+            return;
+        }
+
+        foreach (int number in state.HandledPrs.Where(kvp => kvp.Value < since).Select(kvp => kvp.Key).ToArray())
+        {
+            state.HandledPrs.Remove(number);
+        }
     }
 
     /// <summary>Prints a low-verbosity note only when the pacing mode changes; returns the new mode.</summary>
@@ -175,4 +321,15 @@ internal static class ReconcileCommand
             BackoffFactor = backoff is { } b && b > 1 ? b : t.BackoffFactor,
         };
     }
+
+    internal sealed class ReconcileState
+    {
+        public DateTimeOffset? Since { get; set; }
+        public string? ETag { get; set; }
+        public double IntervalSeconds { get; set; }
+        public Dictionary<int, DateTimeOffset> HandledPrs { get; } = [];
+        public List<MergedPr> RecentMerges { get; } = [];
+    }
+
+    private sealed record ApplyResult(IReadOnlyList<LandAction> Actions, bool LandedSomething);
 }

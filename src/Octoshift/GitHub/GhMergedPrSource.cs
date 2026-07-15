@@ -1,5 +1,6 @@
 namespace Octoshift.GitHub;
 
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
@@ -19,55 +20,80 @@ internal sealed class GhMergedPrSource : IMergedPrSource
     private const string BranchPrefix = "nightshift/";
     private readonly string _repo;
     private readonly int _perPage;
+    private readonly Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> _runGhAsync;
 
     public GhMergedPrSource(string repo, int perPage = 50)
+        : this(repo, perPage, RunGhAsync)
+    {
+    }
+
+    internal GhMergedPrSource(string repo, int perPage, Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> runGhAsync)
     {
         _repo = repo;
-        _perPage = perPage;
+        _perPage = Math.Max(1, perPage);
+        _runGhAsync = runGhAsync;
     }
 
     public async Task<MergedPrPage> FetchMergedAsync(DateTimeOffset? since, string? etag, CancellationToken ct)
     {
-        string path = $"repos/{_repo}/pulls?state=closed&sort=updated&direction=desc&per_page={_perPage}";
-        var args = new List<string> { "api", path, "-i" };
-        if (!string.IsNullOrEmpty(etag))
-        {
-            args.Add("-H");
-            args.Add($"If-None-Match: {etag}");
-        }
+        var merged = new List<MergedPr>();
+        string? responseEtag = etag;
+        int pollInterval = 0;
 
-        GhResult gh = await RunGhAsync(args, ct);
-        (string headerBlock, string body) = SplitHeadersAndBody(gh.Stdout);
-        int status = StatusCode(headerBlock, gh.Stderr);
-        string? responseEtag = HeaderValue(headerBlock, "etag") ?? etag;
-        int pollInterval = HeaderInt(headerBlock, "x-poll-interval");
-
-        if (status == 304)
+        for (int pageNumber = 1; ; pageNumber++)
         {
-            return MergedPrPage.NotModifiedWith(responseEtag) with { ProviderMinIntervalSeconds = pollInterval };
-        }
-
-        if (status is 403 or 429 || status >= 500 || RateBudgetDepleted(headerBlock))
-        {
-            return new MergedPrPage
+            string path = $"repos/{_repo}/pulls?state=closed&sort=updated&direction=desc&per_page={_perPage}&page={pageNumber}";
+            var args = new List<string> { "api", path, "-i" };
+            if (pageNumber == 1 && !string.IsNullOrEmpty(etag))
             {
-                MergedPrs = [],
-                ETag = responseEtag,
-                ProviderMinIntervalSeconds = pollInterval,
-                RateLimited = true,
-                RateLimitResetSeconds = SecondsUntilReset(headerBlock),
-            };
-        }
+                args.Add("-H");
+                args.Add($"If-None-Match: {etag}");
+            }
 
-        return new MergedPrPage
-        {
-            MergedPrs = ParseMerged(body, since),
-            ETag = responseEtag,
-            ProviderMinIntervalSeconds = pollInterval,
-        };
+            GhResult gh = await _runGhAsync(args, ct);
+            (string headerBlock, string body) = SplitHeadersAndBody(gh.Stdout);
+            int status = StatusCode(headerBlock, gh.Stderr);
+            if (pageNumber == 1)
+            {
+                responseEtag = HeaderValue(headerBlock, "etag") ?? etag;
+            }
+
+            pollInterval = Math.Max(pollInterval, HeaderInt(headerBlock, "x-poll-interval"));
+
+            if (gh.ExitCode != 0)
+            {
+                string detail = gh.Stderr.Trim();
+                Console.Error.WriteLine($"octoshift: gh api failed (exit {gh.ExitCode}){(detail.Length > 0 ? $": {detail}" : string.Empty)}");
+                return ErrorPage(responseEtag, pollInterval, headerBlock);
+            }
+
+            if (status == 304)
+            {
+                return MergedPrPage.NotModifiedWith(responseEtag) with { ProviderMinIntervalSeconds = pollInterval };
+            }
+
+            if (status is 403 or 429 || status >= 500 || RateBudgetDepleted(headerBlock))
+            {
+                return ErrorPage(responseEtag, pollInterval, headerBlock);
+            }
+
+            merged.AddRange(ParseMerged(body, since));
+
+            int pullCount = PullCount(body);
+            if (pullCount < _perPage || PagePassedWatermark(body, since))
+            {
+                merged.Sort((a, b) => b.MergedAt.CompareTo(a.MergedAt));
+                return new MergedPrPage
+                {
+                    MergedPrs = merged,
+                    ETag = responseEtag,
+                    ProviderMinIntervalSeconds = pollInterval,
+                };
+            }
+        }
     }
 
-    /// <summary>Filters the pulls payload to merged nightshift branches newer than the watermark, newest first.</summary>
+    /// <summary>Filters the pulls payload to merged nightshift branches not older than the watermark, newest first.</summary>
     internal static IReadOnlyList<MergedPr> ParseMerged(string body, DateTimeOffset? since)
     {
         if (string.IsNullOrWhiteSpace(body))
@@ -105,7 +131,7 @@ internal sealed class GhMergedPrSource : IMergedPrSource
                 continue;
             }
 
-            if (since is { } watermark && mergedAt <= watermark)
+            if (since is { } watermark && mergedAt < watermark)
             {
                 continue;
             }
@@ -115,6 +141,70 @@ internal sealed class GhMergedPrSource : IMergedPrSource
 
         merged.Sort((a, b) => b.MergedAt.CompareTo(a.MergedAt));
         return merged;
+    }
+
+    private static MergedPrPage ErrorPage(string? etag, int pollInterval, string headerBlock) => new()
+    {
+        MergedPrs = [],
+        ETag = etag,
+        ProviderMinIntervalSeconds = pollInterval,
+        RateLimited = true,
+        RateLimitResetSeconds = SecondsUntilReset(headerBlock),
+    };
+
+    private static int PullCount(string body)
+    {
+        PullDto[]? pulls = DeserializePulls(body);
+        return pulls?.Length ?? 0;
+    }
+
+    private static bool PagePassedWatermark(string body, DateTimeOffset? since)
+    {
+        if (since is not { } watermark)
+        {
+            return false;
+        }
+
+        PullDto[]? pulls = DeserializePulls(body);
+        if (pulls is null)
+        {
+            return true;
+        }
+
+        foreach (PullDto pull in pulls)
+        {
+            if (pull.MergedAt is not { } mergedAtRaw
+                || pull.Head?.Ref is not { Length: > 0 } headRef
+                || !headRef.StartsWith(BranchPrefix, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (DateTimeOffset.TryParse(mergedAtRaw, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out DateTimeOffset mergedAt)
+                && mergedAt < watermark)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static PullDto[]? DeserializePulls(string body)
+    {
+        if (string.IsNullOrWhiteSpace(body))
+        {
+            return [];
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize(body, GhJsonContext.Default.PullDtoArray);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
     }
 
     /// <summary>Splits a <c>gh api -i</c> response into its header block and JSON body at the first blank line.</summary>
@@ -217,15 +307,23 @@ internal sealed class GhMergedPrSource : IMergedPrSource
         proc.OutputDataReceived += (_, e) => { if (e.Data is not null) { stdout.AppendLine(e.Data); } };
         proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) { stderr.AppendLine(e.Data); } };
 
-        proc.Start();
+        try
+        {
+            proc.Start();
+        }
+        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
+        {
+            return new GhResult(127, stdout.ToString(), ex.Message);
+        }
+
         proc.BeginOutputReadLine();
         proc.BeginErrorReadLine();
         await proc.WaitForExitAsync(ct);
         return new GhResult(proc.ExitCode, stdout.ToString(), stderr.ToString());
     }
-
-    private readonly record struct GhResult(int ExitCode, string Stdout, string Stderr);
 }
+
+internal readonly record struct GhResult(int ExitCode, string Stdout, string Stderr);
 
 /// <summary>The slice of a GitHub pull object octoshift reads: number, merge instant, and head branch.</summary>
 internal sealed record PullDto
