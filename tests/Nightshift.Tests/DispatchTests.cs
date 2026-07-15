@@ -80,6 +80,7 @@ public sealed class DispatchTests : IClassFixture<TurnstileFixture>
 
     [Theory]
     [InlineData("xml")]
+    [InlineData("bogus")]
     [InlineData("999")]
     public async Task InvalidWhereOutput_ReturnsUsage(string output)
     {
@@ -88,6 +89,23 @@ public sealed class DispatchTests : IClassFixture<TurnstileFixture>
         Assert.Equal(ExitCode.Usage, result.ExitCode);
         Assert.Empty(result.Stdout);
         Assert.NotEmpty(result.Stderr);
+        Assert.DoesNotContain("Unhandled exception", result.Stderr, StringComparison.Ordinal);
+        Assert.DoesNotContain("System.InvalidOperationException", result.Stderr, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("plaintext")]
+    [InlineData("TABLE")]
+    [InlineData("Markdown")]
+    [InlineData("json")]
+    [InlineData("JSONL")]
+    [InlineData("tsv")]
+    public async Task ValidWhereOutput_ReturnsOk(string output)
+    {
+        InvocationResult result = await InvokeAsync(_fixture.Socket, "where", "--output", output);
+
+        Assert.Equal(ExitCode.Ok, result.ExitCode);
+        Assert.Empty(result.Stderr);
     }
 
     [Fact]

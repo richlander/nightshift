@@ -18,10 +18,14 @@ internal static class OutputFormatter
         option.DefaultValueFactory = _ => OutputFormat.Plaintext;
         option.Validators.Add(result =>
         {
-            OutputFormat value = result.GetValueOrDefault<OutputFormat>();
-            if (!Enum.IsDefined(typeof(OutputFormat), value))
+            foreach (var token in result.Tokens)
             {
-                result.AddError($"--output must be one of plaintext|table|markdown|json|jsonl|tsv");
+                if (!Enum.TryParse<OutputFormat>(token.Value, ignoreCase: true, out var value)
+                    || !Enum.IsDefined(typeof(OutputFormat), value))
+                {
+                    result.AddError("--output must be one of plaintext|table|markdown|json|jsonl|tsv");
+                    break;
+                }
             }
         });
         return option;
