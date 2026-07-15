@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Octoshift.Tests</RootNamespace>
+    <AssemblyName>Octoshift.Tests</AssemblyName>
+    <IsPackable>false</IsPackable>
+    <IsAotCompatible>false</IsAotCompatible>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" Version="3.1.0" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.0.0" />
+  </ItemGroup>
+
+  <!--
+    Octoshift's tests reference only the Octoshift product (for its internals, via InternalsVisibleTo).
+    They inject fakes for the gh and nightshift seams, so no test hits the network or a live daemon.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="../../src/Octoshift/Octoshift.csproj" />
+  </ItemGroup>
+
+</Project>
