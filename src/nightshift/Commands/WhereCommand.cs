@@ -30,7 +30,7 @@ internal static class WhereCommand
         List<WhereRow> rows = BuildRows(items);
         if (rows.Count == 0)
         {
-            Console.WriteLine("(no orders)");
+            RenderEmpty(output, Console.Out);
             return ExitCode.Ok;
         }
 
@@ -72,6 +72,26 @@ internal static class WhereCommand
             output,
             WhereViewContext.Default,
             WhereJsonContext.Default.ListWhereRow);
+
+    internal static void RenderEmpty(OutputFormat output, TextWriter writer)
+    {
+        switch (output)
+        {
+            case OutputFormat.Json:
+                RenderRows([], OutputFormat.Json, writer);
+                break;
+            case OutputFormat.Jsonl:
+                break;
+            case OutputFormat.Plaintext:
+            case OutputFormat.Table:
+            case OutputFormat.Markdown:
+            case OutputFormat.Tsv:
+                writer.WriteLine("(no orders)");
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(output), output, null);
+        }
+    }
 
     /// <summary>Returns the order base for a <c>{base}{suffix}</c> key, or null when the key does not end in the suffix.</summary>
     internal static string? BaseOf(string key, string suffix)

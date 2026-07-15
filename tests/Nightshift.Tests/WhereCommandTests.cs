@@ -117,6 +117,24 @@ public class WhereCommandTests
             jsonl.ToString());
     }
 
+    [Fact]
+    public void RenderEmpty_JsonEmitsEmptyArray()
+    {
+        using var writer = new StringWriter();
+        WhereCommand.RenderEmpty(OutputFormat.Json, writer);
+
+        Assert.Equal($"[]{Environment.NewLine}", writer.ToString());
+    }
+
+    [Fact]
+    public void RenderEmpty_JsonlEmitsNothing()
+    {
+        using var writer = new StringWriter();
+        WhereCommand.RenderEmpty(OutputFormat.Jsonl, writer);
+
+        Assert.Equal(string.Empty, writer.ToString());
+    }
+
     private static KvItem Item(string key, string text)
         => new(key, 1, 1, Lease: null, Immutable: false, Encoding.UTF8.GetBytes(text));
 }

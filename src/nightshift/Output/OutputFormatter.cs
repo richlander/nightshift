@@ -16,6 +16,14 @@ internal static class OutputFormatter
             Description = "Output format: plaintext, table, markdown, json, jsonl, or tsv.",
         };
         option.DefaultValueFactory = _ => OutputFormat.Plaintext;
+        option.Validators.Add(result =>
+        {
+            OutputFormat value = result.GetValueOrDefault<OutputFormat>();
+            if (!Enum.IsDefined(typeof(OutputFormat), value))
+            {
+                result.AddError($"--output must be one of plaintext|table|markdown|json|jsonl|tsv");
+            }
+        });
         return option;
     }
 
@@ -57,6 +65,8 @@ internal static class OutputFormatter
                     markoutContext,
                     new MarkoutWriterOptions { TableMode = MarkoutTableMode.Tsv });
                 break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(format), format, null);
         }
     }
 }

@@ -78,10 +78,12 @@ public sealed class DispatchTests : IClassFixture<TurnstileFixture>
         Assert.NotEmpty(result.Stderr);
     }
 
-    [Fact]
-    public async Task InvalidWhereOutput_ReturnsUsage()
+    [Theory]
+    [InlineData("xml")]
+    [InlineData("999")]
+    public async Task InvalidWhereOutput_ReturnsUsage(string output)
     {
-        InvocationResult result = await InvokeAsync("where", "--output", "xml");
+        InvocationResult result = await InvokeAsync("where", "--output", output);
 
         Assert.Equal(ExitCode.Usage, result.ExitCode);
         Assert.Empty(result.Stdout);
