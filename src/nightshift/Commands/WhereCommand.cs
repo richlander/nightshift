@@ -10,7 +10,7 @@ using Nightshift.Turnstile;
 /// <c>nightshift where</c> — the coordinator's board. Ranges <c>/plan/</c> and, for every order that has
 /// been claimed or reported, prints one row: <c>&lt;order-base&gt;  &lt;status&gt;  &lt;branch&gt;</c>. An order
 /// surfaces the moment its <c>/branch</c> key is minted (at claim); its status is drawn from <c>/state</c>
-/// when a worker has released it, or <c>open</c> while still in hand. Read-only.
+/// when a worker has released it, or <c>claimed</c> while still in hand. Read-only.
 /// </summary>
 internal static class WhereCommand
 {
@@ -60,7 +60,7 @@ internal static class WhereCommand
             .Select(orderBase => new WhereRow
             {
                 OrderBase = orderBase,
-                Status = statuses.TryGetValue(orderBase, out string? status) ? status : "open",
+                Status = statuses.TryGetValue(orderBase, out string? status) ? status : "claimed",
                 Branch = branches.TryGetValue(orderBase, out string? branch) ? branch : string.Empty,
             })
             .ToList();

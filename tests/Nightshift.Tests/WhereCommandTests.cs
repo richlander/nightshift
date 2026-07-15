@@ -62,7 +62,7 @@ public class WhereCommandTests
             row =>
             {
                 Assert.Equal("/plan/2/order/op-b", row.OrderBase);
-                Assert.Equal("open", row.Status);
+                Assert.Equal("claimed", row.Status);
                 Assert.Equal("nightshift/2/op-b", row.Branch);
             },
             row =>
@@ -79,7 +79,7 @@ public class WhereCommandTests
         List<WhereRow> rows =
         [
             new() { OrderBase = "/plan/1/order/op-a", Status = "done", Branch = "nightshift/1/op-a" },
-            new() { OrderBase = "/plan/2/order/op-b", Status = "open", Branch = "nightshift/2/op-b" },
+            new() { OrderBase = "/plan/2/order/op-b", Status = "claimed", Branch = "nightshift/2/op-b" },
             new() { OrderBase = "/plan/3/order/op-c", Status = "blocked", Branch = string.Empty },
         ];
 
@@ -88,7 +88,7 @@ public class WhereCommandTests
 
         string expected =
             "/plan/1/order/op-a\tdone\tnightshift/1/op-a\n"
-            + "/plan/2/order/op-b\topen\tnightshift/2/op-b\n"
+            + "/plan/2/order/op-b\tclaimed\tnightshift/2/op-b\n"
             + "/plan/3/order/op-c\tblocked\t\n";
         Assert.Equal(
             Encoding.UTF8.GetBytes(expected),
