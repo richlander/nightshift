@@ -138,6 +138,35 @@ public sealed class DispatchTests : IClassFixture<TurnstileFixture>
         Assert.Empty(result.Stderr);
     }
 
+    [Theory]
+    [InlineData("plaintext")]
+    [InlineData("markdown")]
+    [InlineData("json")]
+    [InlineData("tsv")]
+    [InlineData("xml")]
+    [InlineData("999")]
+    public async Task InvalidWatchOutput_ReturnsUsage(string output)
+    {
+        // watch is long-running, so only the rejected (parse-failing) path is safe to invoke end to end.
+        InvocationResult result = await InvokeAsync("watch", "--output", output);
+
+        Assert.Equal(ExitCode.Usage, result.ExitCode);
+        Assert.Empty(result.Stdout);
+        Assert.NotEmpty(result.Stderr);
+        Assert.DoesNotContain("Unhandled exception", result.Stderr, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("table")]
+    [InlineData("JSONL")]
+    public void ValidWatchOutput_ParsesWithoutError(string output)
+    {
+        // watch blocks once invoked, so assert the option contract at the parse layer instead.
+        var result = Cli.CreateRootCommand().Parse(["watch", "--output", output]);
+
+        Assert.Empty(result.Errors);
+    }
+
     [Fact]
     public async Task DrainResume_PrintsResumedToken()
     {

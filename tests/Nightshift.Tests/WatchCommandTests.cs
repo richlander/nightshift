@@ -1,0 +1,115 @@
+namespace Nightshift.Tests;
+
+using System.Text;
+using Nightshift.Commands;
+using Nightshift.Output;
+using Nightshift.Turnstile;
+using Xunit;
+
+/// <summary>
+/// The event→render core of <c>nightshift watch</c>, driven by a replayable stream instead of a live
+/// daemon: <c>jsonl</c> emits one structured row per change, and <c>table</c> redraws the <c>where</c> board
+/// from a fresh snapshot on each change.
+/// </summary>
+public class WatchCommandTests
+{
+    [Theory]
+    [InlineData(false, "put")]
+    [InlineData(true, "delete")]
+    public void RenderEvent_MapsSignalToJsonlRow(bool deleted, string op)
+    {
+        string row = WatchCommand.RenderEvent(new WatchSignal("/plan/1/order/op-a/state", deleted, 42));
+
+        Assert.Equal(
+            $"{{\"revision\":42,\"key\":\"/plan/1/order/op-a/state\",\"op\":\"{op}\"}}",
+            row);
+    }
+
+    [Fact]
+    public async Task RunLoop_Jsonl_EmitsOneRowPerEvent()
+    {
+        WatchSignal[] events =
+        [
+            new("/plan/1/order/op-a/branch", Deleted: false, 5),
+            new("/plan/1/order/op-a/state", Deleted: false, 6),
+            new("/plan/1/order/op-a/claim", Deleted: true, 7),
+        ];
+
+        using var writer = new StringWriter();
+        await WatchCommand.RunLoopAsync(
+            Replay(events),
+            OutputFormat.Jsonl,
+            writer,
+            _ => throw new InvalidOperationException("jsonl mode must not snapshot the board"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(
+            "{\"revision\":5,\"key\":\"/plan/1/order/op-a/branch\",\"op\":\"put\"}\n"
+            + "{\"revision\":6,\"key\":\"/plan/1/order/op-a/state\",\"op\":\"put\"}\n"
+            + "{\"revision\":7,\"key\":\"/plan/1/order/op-a/claim\",\"op\":\"delete\"}\n",
+            writer.ToString());
+    }
+
+    [Fact]
+    public async Task RunLoop_Table_RedrawsBoardOnEachEvent()
+    {
+        WatchSignal[] events =
+        [
+            new("/plan/1/order/op-a/branch", Deleted: false, 5),
+            new("/plan/1/order/op-a/state", Deleted: false, 6),
+        ];
+
+        IReadOnlyList<KvItem> snapshot =
+        [
+            Item("/plan/1/order/op-a/branch", "nightshift/1/op-a"),
+            Item("/plan/1/order/op-a/state", "{\"status\":\"done\"}"),
+        ];
+
+        using var writer = new StringWriter();
+        await WatchCommand.RunLoopAsync(
+            Replay(events),
+            OutputFormat.Table,
+            writer,
+            _ => Task.FromResult(snapshot),
+            TestContext.Current.CancellationToken);
+
+        string output = writer.ToString();
+        // One redraw (clear + home) per change event.
+        Assert.Equal(2, CountOccurrences(output, "\u001b[2J\u001b[H"));
+        Assert.Contains("/plan/1/order/op-a", output);
+        Assert.Contains("done", output);
+    }
+
+    [Fact]
+    public void Redraw_EmptyBoard_ClearsAndPrintsNoOrders()
+    {
+        using var writer = new StringWriter();
+        WatchCommand.Redraw([], writer);
+
+        Assert.StartsWith("\u001b[2J\u001b[H", writer.ToString(), StringComparison.Ordinal);
+        Assert.Contains("(no orders)", writer.ToString());
+    }
+
+    private static async IAsyncEnumerable<WatchSignal> Replay(WatchSignal[] events)
+    {
+        foreach (WatchSignal signal in events)
+        {
+            yield return signal;
+            await Task.Yield();
+        }
+    }
+
+    private static int CountOccurrences(string haystack, string needle)
+    {
+        int count = 0;
+        for (int i = haystack.IndexOf(needle, StringComparison.Ordinal); i >= 0; i = haystack.IndexOf(needle, i + needle.Length, StringComparison.Ordinal))
+        {
+            count++;
+        }
+
+        return count;
+    }
+
+    private static KvItem Item(string key, string text)
+        => new(key, 1, 1, Lease: null, Immutable: false, Encoding.UTF8.GetBytes(text));
+}

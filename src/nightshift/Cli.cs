@@ -7,12 +7,12 @@ using Nightshift.Output;
 /// <summary>Entry dispatch for the <c>nightshift</c> agent/operator CLI.</summary>
 public static class Cli
 {
-    private const string Usage = "usage: nightshift <add|plan|land|join|standby|leave|next|show|recover|check|escalate|release|drain|stop|roster|where> ...";
+    private const string Usage = "usage: nightshift <add|plan|land|join|standby|leave|next|show|recover|check|escalate|release|drain|stop|roster|where|watch> ...";
 
     private static readonly HashSet<string> KnownVerbs =
     [
         "add", "plan", "land", "join", "standby", "leave", "next", "show",
-        "recover", "check", "escalate", "release", "drain", "stop", "roster", "where",
+        "recover", "check", "escalate", "release", "drain", "stop", "roster", "where", "watch",
     ];
 
     /// <summary>Parses and invokes the command line, preserving Nightshift's exit-code contract.</summary>
@@ -60,6 +60,7 @@ public static class Cli
         rootCommand.Subcommands.Add(CreateToggleCommand("stop", "Raise or clear the global halt flag.", StopCommand.RunAsync));
         rootCommand.Subcommands.Add(CreateRosterCommand());
         rootCommand.Subcommands.Add(CreateWhereCommand());
+        rootCommand.Subcommands.Add(CreateWatchCommand());
 
         return rootCommand;
     }
@@ -220,6 +221,17 @@ public static class Cli
         command.Options.Add(output);
         command.SetAction(async (parseResult, cancellationToken)
             => await ShowCommand.RunAsync(parseResult.GetValue(output)));
+        return command;
+    }
+
+    private static Command CreateWatchCommand()
+    {
+        var command = new Command("watch", "Follow the coordinator board live.");
+        Option<OutputFormat> output = OutputFormatter.CreateWatchOutputOption();
+
+        command.Options.Add(output);
+        command.SetAction(async (parseResult, cancellationToken)
+            => await WatchCommand.RunAsync(parseResult.GetValue(output)));
         return command;
     }
 }
