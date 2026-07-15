@@ -24,17 +24,20 @@ internal static class WatchCommand
 
         using TurnstileClient client = TurnstileClient.Connect(Paths.Socket);
 
-        // Draw the current board first, then follow every change after this revision so the initial state
-        // is not replayed as events.
-        if (output == OutputFormat.Table)
-        {
-            Redraw(await client.RangeAsync(PlanRoot, ct), Console.Out);
-        }
-
-        long from = await client.CurrentRevisionAsync(ct);
-
         try
         {
+            // Establish the watch boundary BEFORE snapshotting, not after: reading the revision first
+            // guarantees the snapshot reflects state at or after `from`, and the watch backlog (from `from`
+            // exclusive) covers every change beyond it. The two windows can only overlap — which costs an
+            // idempotent redraw — never leave a gap. Reading the revision after the range would let any
+            // write in between fall into neither the snapshot nor the backlog, silently missing it.
+            long from = await client.CurrentRevisionAsync(ct);
+
+            if (output == OutputFormat.Table)
+            {
+                Redraw(await client.RangeAsync(PlanRoot, ct), Console.Out);
+            }
+
             await RunLoopAsync(
                 client.WatchAsync(PlanRoot, from, ct),
                 output,
@@ -44,7 +47,8 @@ internal static class WatchCommand
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            // Ctrl-C: a live follow has no natural end, so cancellation is the clean exit.
+            // Ctrl-C anywhere — the startup handshake or the live follow — is the clean exit (a follow has
+            // no natural end), so cancellation resolves to exit 0.
         }
 
         return ExitCode.Ok;
