@@ -5,7 +5,7 @@ using Nightshift.Commands;
 /// <summary>Entry dispatch for the <c>nightshift</c> agent/operator CLI.</summary>
 public static class Cli
 {
-    private const string Usage = "usage: nightshift <add|plan|land|join|standby|leave|next|show|recover|check|escalate|release> ...";
+    private const string Usage = "usage: nightshift <add|plan|land|join|standby|leave|next|show|recover|check|escalate|release|drain|stop|roster|where> ...";
 
     public static async Task<int> RunAsync(string[] args)
     {
@@ -44,6 +44,14 @@ public static class Cli
                 return await EscalateCommand.RunAsync(rest);
             case "release":
                 return await ReleaseCommand.RunAsync(rest);
+            case "drain":
+                return await DrainCommand.RunAsync(rest);
+            case "stop":
+                return await StopCommand.RunAsync(rest);
+            case "roster":
+                return await RosterCommand.RunAsync(rest);
+            case "where":
+                return await WhereCommand.RunAsync(rest);
             default:
                 Console.Error.WriteLine(Usage);
                 return ExitCode.Usage;
