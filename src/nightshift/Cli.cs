@@ -2,6 +2,7 @@ namespace Nightshift;
 
 using System.CommandLine;
 using Nightshift.Commands;
+using Nightshift.Output;
 
 /// <summary>Entry dispatch for the <c>nightshift</c> agent/operator CLI.</summary>
 public static class Cli
@@ -58,7 +59,7 @@ public static class Cli
         rootCommand.Subcommands.Add(CreateToggleCommand("drain", "Stop handing out new work until resumed.", DrainCommand.RunAsync));
         rootCommand.Subcommands.Add(CreateToggleCommand("stop", "Raise or clear the global halt flag.", StopCommand.RunAsync));
         rootCommand.Subcommands.Add(CreateNoArgsCommand("roster", "List workers on duty.", RosterCommand.RunAsync));
-        rootCommand.Subcommands.Add(CreateNoArgsCommand("where", "List claimed or reported orders.", WhereCommand.RunAsync));
+        rootCommand.Subcommands.Add(CreateWhereCommand());
 
         return rootCommand;
     }
@@ -168,6 +169,17 @@ public static class Cli
         command.Options.Add(reason);
         command.SetAction(async (parseResult, cancellationToken)
             => await ReleaseCommand.RunAsync(parseResult.GetValue(status), parseResult.GetValue(reason)));
+        return command;
+    }
+
+    private static Command CreateWhereCommand()
+    {
+        var command = new Command("where", "List claimed or reported orders.");
+        Option<OutputFormat> output = OutputFormatter.CreateOutputOption();
+
+        command.Options.Add(output);
+        command.SetAction(async (parseResult, cancellationToken)
+            => await WhereCommand.RunAsync(parseResult.GetValue(output)));
         return command;
     }
 

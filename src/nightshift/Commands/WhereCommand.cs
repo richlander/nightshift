@@ -1,6 +1,7 @@
 namespace Nightshift.Commands;
 
 using System.Text.Json;
+using Nightshift.Output;
 using Nightshift.Turnstile;
 
 /// <summary>
@@ -15,7 +16,7 @@ internal static class WhereCommand
     private const string StateSuffix = "/state";
     private const string BranchSuffix = "/branch";
 
-    public static async Task<int> RunAsync(string[] args)
+    public static async Task<int> RunAsync(OutputFormat outputFormat)
     {
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
@@ -23,7 +24,21 @@ internal static class WhereCommand
 
         using TurnstileClient client = TurnstileClient.Connect(Paths.Socket);
         IReadOnlyList<KvItem> items = await client.RangeAsync(PlanRoot, ct);
+        OutputTable table = BuildTable(items);
 
+        if (table.Rows.Count == 0)
+        {
+            Console.WriteLine("(no orders)");
+            return ExitCode.Ok;
+        }
+
+        OutputFormatter.WriteTable(Console.Out, outputFormat, table);
+
+        return ExitCode.Ok;
+    }
+
+    internal static OutputTable BuildTable(IEnumerable<KvItem> items)
+    {
         var statuses = new Dictionary<string, string>(StringComparer.Ordinal);
         var branches = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (KvItem item in items)
@@ -40,20 +55,22 @@ internal static class WhereCommand
 
         var bases = new SortedSet<string>(statuses.Keys, StringComparer.Ordinal);
         bases.UnionWith(branches.Keys);
-        if (bases.Count == 0)
-        {
-            Console.WriteLine("(no orders)");
-            return ExitCode.Ok;
-        }
 
+        List<IReadOnlyList<string>> rows = [];
         foreach (string orderBase in bases)
         {
             string status = statuses.TryGetValue(orderBase, out string? s) ? s : "open";
             string branch = branches.TryGetValue(orderBase, out string? b) ? b : string.Empty;
-            Console.WriteLine($"{orderBase}\t{status}\t{branch}");
+            rows.Add([orderBase, status, branch]);
         }
 
-        return ExitCode.Ok;
+        return new OutputTable(
+            [
+                new OutputColumn("Order Base", "order_base"),
+                new OutputColumn("Status", "status"),
+                new OutputColumn("Branch", "branch"),
+            ],
+            rows);
     }
 
     /// <summary>Returns the order base for a <c>{base}{suffix}</c> key, or null when the key does not end in the suffix.</summary>
