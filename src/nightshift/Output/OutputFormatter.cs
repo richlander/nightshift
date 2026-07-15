@@ -31,6 +31,28 @@ internal static class OutputFormatter
         return option;
     }
 
+    public static Option<OutputFormat> CreateWatchOutputOption()
+    {
+        var option = new Option<OutputFormat>("--output")
+        {
+            Description = "Output mode: table (live redraw) or jsonl (one row per change).",
+        };
+        option.DefaultValueFactory = _ => OutputFormat.Table;
+        option.Validators.Add(result =>
+        {
+            foreach (var token in result.Tokens)
+            {
+                if (!Enum.TryParse<OutputFormat>(token.Value, ignoreCase: true, out var value)
+                    || (value != OutputFormat.Table && value != OutputFormat.Jsonl))
+                {
+                    result.AddError("--output must be one of table|jsonl");
+                    break;
+                }
+            }
+        });
+        return option;
+    }
+
     public static void Render<TView, TJson>(
         TView view,
         TJson jsonValue,
