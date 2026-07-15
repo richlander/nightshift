@@ -79,6 +79,16 @@ public sealed class DispatchTests : IClassFixture<TurnstileFixture>
     }
 
     [Fact]
+    public async Task InvalidWhereOutput_ReturnsUsage()
+    {
+        InvocationResult result = await InvokeAsync("where", "--output", "xml");
+
+        Assert.Equal(ExitCode.Usage, result.ExitCode);
+        Assert.Empty(result.Stdout);
+        Assert.NotEmpty(result.Stderr);
+    }
+
+    [Fact]
     public async Task DrainResume_PrintsResumedToken()
     {
         InvocationResult result = await InvokeAsync(_fixture.Socket, "drain", "--resume");
