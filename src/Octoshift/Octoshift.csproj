@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>octoshift</AssemblyName>
+    <RootNamespace>Octoshift</RootNamespace>
+    <ToolCommandName>octoshift</ToolCommandName>
+    <PublishAot>true</PublishAot>
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.CommandLine" Version="3.0.0-preview.5.26302.115" />
+    <InternalsVisibleTo Include="Octoshift.Tests" />
+  </ItemGroup>
+
+  <!--
+    Octoshift is the GitHub membrane. It COMPOSES `nightshift` and `gh` as SUBPROCESSES and links neither:
+    there is intentionally NO ProjectReference to nightshift or Turnstile. Nightshift stays GitHub-unaware,
+    and octoshift stays the single gh-aware component. The only coupling is the observable CLI contracts
+    (nightshift where json output, nightshift land, gh api).
+  -->
+
+</Project>
