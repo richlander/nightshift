@@ -51,14 +51,14 @@ public static class Cli
         rootCommand.Subcommands.Add(CreateNoArgsCommand("standby", "Stay on the roster but stop taking new work.", StandbyCommand.RunAsync));
         rootCommand.Subcommands.Add(CreateNoArgsCommand("leave", "Clock out and release roster presence.", LeaveCommand.RunAsync));
         rootCommand.Subcommands.Add(CreateNextCommand());
-        rootCommand.Subcommands.Add(CreateNoArgsCommand("show", "Reprint the current claim's WORK packet.", ShowCommand.RunAsync));
+        rootCommand.Subcommands.Add(CreateShowCommand());
         rootCommand.Subcommands.Add(CreateNoArgsCommand("recover", "Re-attach to the order encoded by the current git branch.", RecoverCommand.RunAsync));
         rootCommand.Subcommands.Add(CreateNoArgsCommand("check", "Renew the active claim lease and read directives.", CheckCommand.RunAsync));
         rootCommand.Subcommands.Add(CreateEscalateCommand());
         rootCommand.Subcommands.Add(CreateReleaseCommand());
         rootCommand.Subcommands.Add(CreateToggleCommand("drain", "Stop handing out new work until resumed.", DrainCommand.RunAsync));
         rootCommand.Subcommands.Add(CreateToggleCommand("stop", "Raise or clear the global halt flag.", StopCommand.RunAsync));
-        rootCommand.Subcommands.Add(CreateNoArgsCommand("roster", "List workers on duty.", RosterCommand.RunAsync));
+        rootCommand.Subcommands.Add(CreateRosterCommand());
         rootCommand.Subcommands.Add(CreateWhereCommand());
 
         return rootCommand;
@@ -198,6 +198,28 @@ public static class Cli
         command.Options.Add(output);
         command.SetAction(async (parseResult, cancellationToken)
             => await WhereCommand.RunAsync(parseResult.GetValue(output)));
+        return command;
+    }
+
+    private static Command CreateRosterCommand()
+    {
+        var command = new Command("roster", "List workers on duty.");
+        Option<OutputFormat> output = OutputFormatter.CreateOutputOption();
+
+        command.Options.Add(output);
+        command.SetAction(async (parseResult, cancellationToken)
+            => await RosterCommand.RunAsync(parseResult.GetValue(output)));
+        return command;
+    }
+
+    private static Command CreateShowCommand()
+    {
+        var command = new Command("show", "Reprint the current claim's WORK packet.");
+        Option<OutputFormat> output = OutputFormatter.CreateOutputOption();
+
+        command.Options.Add(output);
+        command.SetAction(async (parseResult, cancellationToken)
+            => await ShowCommand.RunAsync(parseResult.GetValue(output)));
         return command;
     }
 }

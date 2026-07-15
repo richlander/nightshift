@@ -108,6 +108,36 @@ public sealed class DispatchTests : IClassFixture<TurnstileFixture>
         Assert.Empty(result.Stderr);
     }
 
+    [Theory]
+    [InlineData("xml")]
+    [InlineData("bogus")]
+    [InlineData("999")]
+    public async Task InvalidRosterOutput_ReturnsUsage(string output)
+    {
+        InvocationResult result = await InvokeAsync("roster", "--output", output);
+
+        Assert.Equal(ExitCode.Usage, result.ExitCode);
+        Assert.Empty(result.Stdout);
+        Assert.NotEmpty(result.Stderr);
+        Assert.DoesNotContain("Unhandled exception", result.Stderr, StringComparison.Ordinal);
+        Assert.DoesNotContain("System.InvalidOperationException", result.Stderr, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("plaintext")]
+    [InlineData("TABLE")]
+    [InlineData("Markdown")]
+    [InlineData("json")]
+    [InlineData("JSONL")]
+    [InlineData("tsv")]
+    public async Task ValidRosterOutput_ReturnsOk(string output)
+    {
+        InvocationResult result = await InvokeAsync(_fixture.Socket, "roster", "--output", output);
+
+        Assert.Equal(ExitCode.Ok, result.ExitCode);
+        Assert.Empty(result.Stderr);
+    }
+
     [Fact]
     public async Task DrainResume_PrintsResumedToken()
     {
