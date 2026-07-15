@@ -10,9 +10,6 @@ using Nightshift.Turnstile;
 /// </summary>
 internal static class PlanCommand
 {
-    public static async Task<int> RunAsync(string[] args)
-        => await RunAsync(PlanFile.FirstPositional(args), Options.Value(args, "--plan"), Options.Value(args, "--sha"));
-
     public static async Task<int> RunAsync(string? positionalPath, string? planPath, string? sha)
     {
         string? path = positionalPath ?? planPath;

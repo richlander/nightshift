@@ -11,9 +11,6 @@ using Nightshift.Turnstile;
 /// </summary>
 internal static class LandCommand
 {
-    public static async Task<int> RunAsync(string[] args)
-        => await RunAsync(PlanFile.FirstPositional(args), Options.Value(args, "--reason"));
-
     public static async Task<int> RunAsync(string? orderBase, string? reason)
     {
         if (orderBase is null || !orderBase.StartsWith("/plan/", StringComparison.Ordinal))

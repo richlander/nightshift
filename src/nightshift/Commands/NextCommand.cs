@@ -18,9 +18,6 @@ internal static class NextCommand
     // A single durable flag flips the whole shift into drain: dispatch stops, running agents finish.
     private const string DrainingKey = "/control/draining";
 
-    public static async Task<int> RunAsync(string[] args)
-        => await RunAsync(FirstPositional(args), ParseInt(Options.Value(args, "--timeout"), 60));
-
     public static async Task<int> RunAsync(string? scope, int timeoutSecs)
     {
         string readyPrefix = scope is null ? ReadyRoot : $"{ReadyRoot}{scope}/";
@@ -142,40 +139,5 @@ internal static class NextCommand
         return fromRevision;
     }
 
-    private static string? FirstPositional(string[] args)
-    {
-        for (int i = 0; i < args.Length; i++)
-        {
-            if (args[i].StartsWith('-'))
-            {
-                i++; // skip an option's value
-                continue;
-            }
-
-            return args[i];
-        }
-
-        return null;
-    }
-
-    private static int ParseInt(string? value, int fallback) => int.TryParse(value, out int v) ? v : fallback;
-
     private sealed record WorkPacket(string OrderBase, string ClaimKey, string ReadyKey, long Fence, OrderView Spec);
-}
-
-/// <summary>Minimal option reader shared by Nightshift commands.</summary>
-internal static class Options
-{
-    public static string? Value(string[] args, string name)
-    {
-        for (int i = 0; i < args.Length - 1; i++)
-        {
-            if (args[i] == name)
-            {
-                return args[i + 1];
-            }
-        }
-
-        return null;
-    }
 }

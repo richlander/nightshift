@@ -11,9 +11,6 @@ internal static class ReleaseCommand
 {
     private static readonly string[] ValidStatuses = ["done", "blocked", "declined", "escalated", "refused"];
 
-    public static async Task<int> RunAsync(string[] args)
-        => await RunAsync(Options.Value(args, "--status"), Options.Value(args, "--reason"));
-
     public static async Task<int> RunAsync(string? status, string? reason)
     {
         if (status is null || Array.IndexOf(ValidStatuses, status) < 0)

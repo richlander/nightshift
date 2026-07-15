@@ -9,9 +9,6 @@ using Nightshift.Turnstile;
 /// </summary>
 internal static class AddCommand
 {
-    public static async Task<int> RunAsync(string[] args)
-        => await RunAsync(PlanFile.FirstPositional(args), Options.Value(args, "--sha"));
-
     public static async Task<int> RunAsync(string? path, string? sha)
     {
         if (path is null || !File.Exists(path))

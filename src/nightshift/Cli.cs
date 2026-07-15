@@ -65,16 +65,14 @@ public static class Cli
 
     private static bool ShouldUseLegacyUsage(string[] args)
     {
-        if (args.Length == 0 || args[0] == "--version" || args[0] == "-h")
+        if (args.Length == 0)
         {
             return true;
         }
 
-        if (args[0] == "--help")
-        {
-            return false;
-        }
-
+        // Any leading option (e.g. --help, -h, --version) or unknown token falls back to the
+        // one-line usage/exit-2 contract; System.CommandLine's own help/version output stays
+        // suppressed at the root so this migration adds no new success-path behavior.
         return args[0].StartsWith("-", StringComparison.Ordinal) || !KnownVerbs.Contains(args[0]);
     }
 

@@ -31,14 +31,27 @@ public sealed class DispatchTests : IClassFixture<TurnstileFixture>
         Assert.StartsWith("usage: nightshift", result.Stderr, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public async Task VersionOption_PrintsUsageAndReturnsUsage()
+    [Theory]
+    [InlineData("--version")]
+    [InlineData("--help")]
+    [InlineData("-h")]
+    public async Task TopLevelHelpOrVersion_PrintsUsageAndReturnsUsage(string arg)
     {
-        InvocationResult result = await InvokeAsync("--version");
+        InvocationResult result = await InvokeAsync(arg);
 
         Assert.Equal(ExitCode.Usage, result.ExitCode);
         Assert.Empty(result.Stdout);
         Assert.StartsWith("usage: nightshift", result.Stderr, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task NoArgVerbWithTrailingToken_ReturnsUsage()
+    {
+        InvocationResult result = await InvokeAsync("join", "extra");
+
+        Assert.Equal(ExitCode.Usage, result.ExitCode);
+        Assert.Empty(result.Stdout);
+        Assert.NotEmpty(result.Stderr);
     }
 
     [Theory]

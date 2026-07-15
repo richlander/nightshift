@@ -12,9 +12,6 @@ using Nightshift.Turnstile;
 /// </summary>
 internal static class EscalateCommand
 {
-    public static async Task<int> RunAsync(string[] args)
-        => await RunAsync(Options.Value(args, "--reason"));
-
     public static async Task<int> RunAsync(string? reason)
     {
         if (string.IsNullOrWhiteSpace(reason))

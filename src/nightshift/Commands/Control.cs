@@ -10,10 +10,6 @@ using Nightshift.Turnstile;
 internal static class Control
 {
     public static async Task<int> ToggleAsync(
-        TurnstileClient client, string[] args, string key, string onLabel, string offLabel, CancellationToken ct)
-        => await ToggleAsync(client, Array.IndexOf(args, "--resume") >= 0, key, onLabel, offLabel, ct);
-
-    public static async Task<int> ToggleAsync(
         TurnstileClient client, bool resume, string key, string onLabel, string offLabel, CancellationToken ct)
     {
         if (resume)
