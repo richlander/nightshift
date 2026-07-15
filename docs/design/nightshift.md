@@ -14,6 +14,8 @@ Nightshift lets a team of coding agents (Claude Code, Copilot CLI) work one repo
 
 It is a **CLI plus a family of small controllers** over [Turnstile](turnstile.md), a credential-free coordination store. There is no monolith. There is no god-mode daemon.
 
+Nightshift is deliberately **not GitHub-aware**: agents produce branches; turning those into PRs, merges, and issue updates — and doing so *as whom* — is a separate, governable concern owned by [Octoshift](octoshift.md), the GitHub membrane. Delete Octoshift and Nightshift still coordinates a local swarm; you merge and `land` by hand.
+
 Two commitments define it.
 
 > **1. The coordinator is not an AI.**
