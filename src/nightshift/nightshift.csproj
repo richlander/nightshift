@@ -9,6 +9,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Markout" Version="0.22.0" />
     <PackageReference Include="System.CommandLine" Version="3.0.0-preview.5.26302.115" />
     <InternalsVisibleTo Include="Nightshift.Tests" />
   </ItemGroup>
