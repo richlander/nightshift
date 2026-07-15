@@ -76,14 +76,19 @@ fence: 7
 
 ### Do the work
 
-1. **Branch off `origin/main`**, using the **exact `branch` from the WORK packet**:
+1. **Create a dedicated worktree for this order** and branch off `origin/main` inside it, using
+   the **exact `branch` from the WORK packet**. Do NOT build in a shared checkout: one order gets
+   one worktree, so you can never collide with another worker in the same directory. Worktree
+   management is your job and it is mechanical — always these three lines:
    ```
    git fetch origin
-   git switch -c nightshift/<plan>/<order> origin/main
+   git worktree add ../nightshift-<plan>-<order> -b nightshift/<plan>/<order> origin/main
+   cd ../nightshift-<plan>-<order>
    ```
    e.g. for `WORK /plan/9001/order/op4` (`branch: nightshift/9001/op4`) →
-   `git switch -c nightshift/9001/op4 origin/main`. The name is not yours to choose — it is the key
-   the system uses to recover you and to map the eventual merge back to this order.
+   `git worktree add ../nightshift-9001-op4 -b nightshift/9001/op4 origin/main`. Do all your work
+   from inside this worktree. The branch name is not yours to choose — it is the key the system uses
+   to recover you and to map the eventual merge back to this order.
 2. **Get context.** Read the `standard` note. If `issue` is set and `gh` is available,
    `gh issue view <issue>` for the full ask. Read any `related` PRs/issues; treat listed
    `antipatterns` as things NOT to do (a prior failed attempt).
@@ -165,6 +170,17 @@ nightshift leave
 ```
 
 Clocks you out: returns any in-flight order to the pool and drops your roster entry. Idempotent.
+
+Then tear down your worktree — you own its lifecycle end-to-end. Once your branch has merged and
+landed (or you have left the order), remove it so stale worktrees don't accumulate:
+
+```
+cd -                                          # back out of the worktree first
+git worktree remove ../nightshift-<plan>-<order>
+```
+
+If the order is still open on the branch, keep the worktree — `nightshift recover` re-attaches you
+from the branch you are standing on.
 
 ## Golden rules
 
