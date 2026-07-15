@@ -129,6 +129,25 @@ public class ReconcilerTests : IClassFixture<TurnstileFixture>
         await AssertReady(client, plan, "a", expected: true);
     }
 
+    [Fact]
+    public async Task Escalated_IsNotAutoRedispatched()
+    {
+        // `escalate` sets state=escalated but keeps the claim; if the agent then exits and the claim frees,
+        // the order must still NOT return to the pool — it waits for a human, unlike a lease-revoked claim.
+        using TurnstileClient client = _fixture.Connect();
+        Plan plan = MakePlan(PlanId());
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        await Reconciler.RunAsync(client, plan, ct);
+
+        await OrderState.WriteAsync(client, plan.Orders[0].Base, "escalated", "need judgment", "test", ct);
+        Reconciler.Result first = await Reconciler.RunAsync(client, plan, ct);
+        Reconciler.Result second = await Reconciler.RunAsync(client, plan, ct);
+
+        Assert.Equal(1, first.Removed);      // leaves ready when escalated
+        Assert.Equal(0, second.Added);       // and never comes back on its own
+        await AssertReady(client, plan, "a", expected: false);
+    }
+
     private static async Task AssertReady(TurnstileClient client, Plan plan, string orderId, bool expected)
     {
         Order order = plan.Orders.Single(o => o.Id == orderId);
