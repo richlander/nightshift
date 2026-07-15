@@ -168,6 +168,8 @@ public sealed class DispatchTests : IClassFixture<TurnstileFixture>
         TextWriter originalOut = Console.Out;
         TextWriter originalError = Console.Error;
         string? originalSocket = Environment.GetEnvironmentVariable("TURNSTILE_SOCKET");
+        string? originalNightshiftSocket = Environment.GetEnvironmentVariable("NIGHTSHIFT_SOCKET");
+        string? originalNightshiftConfig = Environment.GetEnvironmentVariable("NIGHTSHIFT_CONFIG");
         string? originalRuntime = Environment.GetEnvironmentVariable("XDG_RUNTIME_DIR");
         string runtimeDir = Path.Combine(AppContext.BaseDirectory, "dispatch-runtime", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(runtimeDir);
@@ -177,6 +179,9 @@ public sealed class DispatchTests : IClassFixture<TurnstileFixture>
         try
         {
             Environment.SetEnvironmentVariable("TURNSTILE_SOCKET", socket);
+            // These outrank TURNSTILE_SOCKET, so clear them or a stray env var would hijack every case.
+            Environment.SetEnvironmentVariable("NIGHTSHIFT_SOCKET", null);
+            Environment.SetEnvironmentVariable("NIGHTSHIFT_CONFIG", null);
             Environment.SetEnvironmentVariable("XDG_RUNTIME_DIR", runtimeDir);
             Console.SetOut(stdout);
             Console.SetError(stderr);
@@ -189,6 +194,8 @@ public sealed class DispatchTests : IClassFixture<TurnstileFixture>
             Console.SetOut(originalOut);
             Console.SetError(originalError);
             Environment.SetEnvironmentVariable("TURNSTILE_SOCKET", originalSocket);
+            Environment.SetEnvironmentVariable("NIGHTSHIFT_SOCKET", originalNightshiftSocket);
+            Environment.SetEnvironmentVariable("NIGHTSHIFT_CONFIG", originalNightshiftConfig);
             Environment.SetEnvironmentVariable("XDG_RUNTIME_DIR", originalRuntime);
             try
             {

@@ -19,7 +19,7 @@ internal static class SocketResolver
     private static string? _flagOverride;
 
     /// <summary>Pins (or clears, when null/empty) the <c>--socket</c> flag for this dispatch.</summary>
-    public static void UseFlag(string? flag) => _flagOverride = string.IsNullOrEmpty(flag) ? null : flag;
+    public static void UseFlag(string? flag) => _flagOverride = string.IsNullOrWhiteSpace(flag) ? null : flag.Trim();
 
     /// <summary>The socket to connect to, honouring the pinned flag then env/config/default.</summary>
     public static string Current => Resolve(_flagOverride);
@@ -34,29 +34,29 @@ internal static class SocketResolver
 
     /// <summary>
     /// The pure precedence core over already-read sources — flag &gt; <c>NIGHTSHIFT_SOCKET</c> &gt; config
-    /// &gt; <c>TURNSTILE_SOCKET</c> &gt; default. Empty strings count as unset so a blank env/flag never
-    /// pins an empty socket path.
+    /// &gt; <c>TURNSTILE_SOCKET</c> &gt; default. Blank (empty or whitespace-only) values count as unset, so
+    /// a stray space never pins an unusable socket path and overrides a valid lower-precedence source.
     /// </summary>
     public static string ResolveFrom(string? flag, string? nightshiftSocket, string? configSocket, string? turnstileSocket)
     {
-        if (!string.IsNullOrEmpty(flag))
+        if (!string.IsNullOrWhiteSpace(flag))
         {
-            return flag;
+            return flag.Trim();
         }
 
-        if (!string.IsNullOrEmpty(nightshiftSocket))
+        if (!string.IsNullOrWhiteSpace(nightshiftSocket))
         {
-            return nightshiftSocket;
+            return nightshiftSocket.Trim();
         }
 
-        if (!string.IsNullOrEmpty(configSocket))
+        if (!string.IsNullOrWhiteSpace(configSocket))
         {
-            return configSocket;
+            return configSocket.Trim();
         }
 
-        if (!string.IsNullOrEmpty(turnstileSocket))
+        if (!string.IsNullOrWhiteSpace(turnstileSocket))
         {
-            return turnstileSocket;
+            return turnstileSocket.Trim();
         }
 
         return Paths.DefaultSocket;

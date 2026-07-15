@@ -41,6 +41,23 @@ public class SocketResolverTests
         Assert.Equal(Paths.DefaultSocket, SocketResolver.ResolveFrom(blank, blank, blank, blank));
     }
 
+    [Theory]
+    [InlineData("   ")]
+    [InlineData("\t")]
+    [InlineData(" \n ")]
+    public void WhitespaceOnlySourcesAreSkipped(string blank)
+    {
+        // A whitespace-only value (e.g. NIGHTSHIFT_SOCKET='   ') must count as unset so it never overrides
+        // a valid lower-precedence source and breaks connectivity.
+        Assert.Equal("/turnstile.sock", SocketResolver.ResolveFrom(blank, blank, blank, "/turnstile.sock"));
+        Assert.Equal("/config.sock", SocketResolver.ResolveFrom(blank, blank, "/config.sock", "/turnstile.sock"));
+        Assert.Equal(Paths.DefaultSocket, SocketResolver.ResolveFrom(blank, blank, blank, blank));
+    }
+
+    [Fact]
+    public void AcceptedValuesAreTrimmed()
+        => Assert.Equal("/padded.sock", SocketResolver.ResolveFrom("  /padded.sock  ", null, null, null));
+
     [Fact]
     public void FullChain_FallsThroughInOrder()
     {
