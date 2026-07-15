@@ -180,12 +180,12 @@ nightshift leave
 
 Clocks you out: returns any in-flight order to the pool and drops your roster entry. Idempotent.
 
-Then tear down your WORKER worktree — you own its lifecycle end-to-end. At the end of the shift
-(after `leave`), remove the one dedicated worktree you created in Setup so stale worktrees don't
-accumulate:
+Then tear down your WORKER worktree at the end of the shift (after `leave`). git won't remove the
+worktree you're standing in, so step back into the main clone first, then remove the worker worktree
+by its sibling path:
 
 ```
-cd ..                                         # back out of the worktree first
+cd "$(git rev-parse --path-format=absolute --git-common-dir)/.."   # into the main clone
 git worktree remove ../nightshift-worker-<you>
 ```
 
