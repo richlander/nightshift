@@ -36,10 +36,23 @@ working notes and, later, the order ledger — never as running commentary on th
 
 ## Run a review
 
-Get the diff and hand each reviewer full context:
+Get the diff and hand each reviewer full context. Give each reviewer its **own detached
+worktree** at the branch head — never review from a shared checkout, and never
+`git checkout`/`switch` the branch in the working repo (that yanks the tree out from under a
+concurrent worker or the coordinator). Creating and removing these worktrees is your job and it
+is mechanical:
 
 ```
-git -C <repo> diff main...<branch>          # the exact change under review
+git fetch origin
+git worktree add --detach ../review-<order>-<model> origin/nightshift/<plan>/<order>
+git -C ../review-<order>-<model> diff main...HEAD    # the exact change under review
+```
+
+A reviewer may read and build inside its worktree but must never write to it (no edits, stages,
+commits, or resets). When the gate closes, remove each one:
+
+```
+git worktree remove ../review-<order>-<model>        # per reviewer, after clearance
 ```
 
 Give each independent reviewer:

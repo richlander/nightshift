@@ -100,6 +100,17 @@ nightshift land /plan/9001/order/op1
 `after: [op1]`. This is the human-in-the-merge-loop invariant: dispatch is autonomous, merging is
 deliberate. (A future gh-aware bridge will call `land` for you off merged PRs; today it's manual.)
 
+**Gate from isolated worktrees — never from your shared checkout.** To review or build a worker's
+branch, add a detached worktree at its head; never `git checkout`/`switch` the branch in your
+working repo (it corrupts a concurrent worker or the controller running there). This is mechanical
+and it is yours to manage — one worktree per reviewer/build, removed when the gate closes:
+
+```
+git worktree add --detach ../gate-<order> origin/nightshift/<plan>/<order>
+# review/build inside ../gate-<order>, then:
+git worktree remove ../gate-<order>
+```
+
 ## 5. Watch the board
 
 `nightshift where` is the board — one row per order that has been claimed or reported:
