@@ -20,17 +20,24 @@ internal sealed class GhMergedPrSource : IMergedPrSource
     private const string BranchPrefix = "nightshift/";
     private readonly string _repo;
     private readonly int _perPage;
+    private readonly int _maxPages;
     private readonly Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> _runGhAsync;
 
     public GhMergedPrSource(string repo, int perPage = 50)
-        : this(repo, perPage, RunGhAsync)
+        : this(repo, perPage, 20, RunGhAsync)
     {
     }
 
     internal GhMergedPrSource(string repo, int perPage, Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> runGhAsync)
+        : this(repo, perPage, 20, runGhAsync)
+    {
+    }
+
+    internal GhMergedPrSource(string repo, int perPage, int maxPages, Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> runGhAsync)
     {
         _repo = repo;
         _perPage = Math.Max(1, perPage);
+        _maxPages = Math.Max(1, maxPages);
         _runGhAsync = runGhAsync;
     }
 
@@ -40,7 +47,7 @@ internal sealed class GhMergedPrSource : IMergedPrSource
         string? responseEtag = etag;
         int pollInterval = 0;
 
-        for (int pageNumber = 1; ; pageNumber++)
+        for (int pageNumber = 1; pageNumber <= _maxPages; pageNumber++)
         {
             string path = $"repos/{_repo}/pulls?state=closed&sort=updated&direction=desc&per_page={_perPage}&page={pageNumber}";
             var args = new List<string> { "api", path, "-i" };
@@ -60,16 +67,16 @@ internal sealed class GhMergedPrSource : IMergedPrSource
 
             pollInterval = Math.Max(pollInterval, HeaderInt(headerBlock, "x-poll-interval"));
 
+            if (status == 304)
+            {
+                return MergedPrPage.NotModifiedWith(responseEtag) with { ProviderMinIntervalSeconds = pollInterval };
+            }
+
             if (gh.ExitCode != 0)
             {
                 string detail = gh.Stderr.Trim();
                 Console.Error.WriteLine($"octoshift: gh api failed (exit {gh.ExitCode}){(detail.Length > 0 ? $": {detail}" : string.Empty)}");
                 return ErrorPage(responseEtag, pollInterval, headerBlock);
-            }
-
-            if (status == 304)
-            {
-                return MergedPrPage.NotModifiedWith(responseEtag) with { ProviderMinIntervalSeconds = pollInterval };
             }
 
             if (status is 403 or 429 || status >= 500 || RateBudgetDepleted(headerBlock))
@@ -80,7 +87,7 @@ internal sealed class GhMergedPrSource : IMergedPrSource
             merged.AddRange(ParseMerged(body, since));
 
             int pullCount = PullCount(body);
-            if (pullCount < _perPage || PagePassedWatermark(body, since))
+            if (pullCount < _perPage || pageNumber == _maxPages)
             {
                 merged.Sort((a, b) => b.MergedAt.CompareTo(a.MergedAt));
                 return new MergedPrPage
@@ -91,6 +98,13 @@ internal sealed class GhMergedPrSource : IMergedPrSource
                 };
             }
         }
+
+        return new MergedPrPage
+        {
+            MergedPrs = merged,
+            ETag = responseEtag,
+            ProviderMinIntervalSeconds = pollInterval,
+        };
     }
 
     /// <summary>Filters the pulls payload to merged nightshift branches not older than the watermark, newest first.</summary>
@@ -158,38 +172,6 @@ internal sealed class GhMergedPrSource : IMergedPrSource
         return pulls?.Length ?? 0;
     }
 
-    private static bool PagePassedWatermark(string body, DateTimeOffset? since)
-    {
-        if (since is not { } watermark)
-        {
-            return false;
-        }
-
-        PullDto[]? pulls = DeserializePulls(body);
-        if (pulls is null)
-        {
-            return true;
-        }
-
-        foreach (PullDto pull in pulls)
-        {
-            if (pull.MergedAt is not { } mergedAtRaw
-                || pull.Head?.Ref is not { Length: > 0 } headRef
-                || !headRef.StartsWith(BranchPrefix, StringComparison.Ordinal))
-            {
-                continue;
-            }
-
-            if (DateTimeOffset.TryParse(mergedAtRaw, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out DateTimeOffset mergedAt)
-                && mergedAt < watermark)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
     private static PullDto[]? DeserializePulls(string body)
     {
         if (string.IsNullOrWhiteSpace(body))
@@ -241,6 +223,17 @@ internal sealed class GhMergedPrSource : IMergedPrSource
         if (marker >= 0)
         {
             string tail = stderr[(marker + 6)..];
+            var digits = new string(tail.TakeWhile(char.IsDigit).ToArray());
+            if (int.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out int code))
+            {
+                return code;
+            }
+        }
+
+        marker = stderr.IndexOf("HTTP ", StringComparison.OrdinalIgnoreCase);
+        if (marker >= 0)
+        {
+            string tail = stderr[(marker + 5)..];
             var digits = new string(tail.TakeWhile(char.IsDigit).ToArray());
             if (int.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out int code))
             {
