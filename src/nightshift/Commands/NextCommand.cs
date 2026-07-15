@@ -35,7 +35,7 @@ internal static class NextCommand
         if (await client.GetAsync(DrainingKey, ct) is not null)
         {
             Console.WriteLine("DRAINING");
-            return 0;
+            return ExitCode.Draining;
         }
 
         // The client owns the lease; the agent never sees it. Reuse an existing session lease if one is live.
@@ -44,24 +44,32 @@ internal static class NextCommand
         DateTime deadline = DateTime.UtcNow.AddSeconds(timeoutSecs);
         long fromRevision = await client.CurrentRevisionAsync(ct);
 
-        while (true)
+        try
         {
-            if (await TryClaimOneAsync(client, readyPrefix, leaseId, ct) is { } packet)
+            while (true)
             {
-                Session.Save(new SessionState(leaseId, packet.Fence, packet.ClaimKey, packet.OrderBase, packet.ReadyKey));
-                Print(packet);
-                return 0;
-            }
+                if (await TryClaimOneAsync(client, readyPrefix, leaseId, ct) is { } packet)
+                {
+                    Session.Save(new SessionState(leaseId, packet.Fence, packet.ClaimKey, packet.OrderBase, packet.ReadyKey));
+                    Print(packet);
+                    return ExitCode.Ok;
+                }
 
-            TimeSpan remaining = deadline - DateTime.UtcNow;
-            if (remaining <= TimeSpan.Zero)
-            {
-                Console.WriteLine("NOWORK");
-                return 0;
-            }
+                TimeSpan remaining = deadline - DateTime.UtcNow;
+                if (remaining <= TimeSpan.Zero)
+                {
+                    Console.WriteLine("NOWORK");
+                    return ExitCode.NoWork;
+                }
 
-            // Block on change rather than spin: a new ready row or a freed claim wakes us to re-scan.
-            fromRevision = await WaitForChangeAsync(client, fromRevision, remaining, ct);
+                // Block on change rather than spin: a new ready row or a freed claim wakes us to re-scan.
+                fromRevision = await WaitForChangeAsync(client, fromRevision, remaining, ct);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            Console.WriteLine("INTERRUPTED");
+            return ExitCode.Interrupted;
         }
     }
 

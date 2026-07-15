@@ -17,7 +17,7 @@ internal static class ReleaseCommand
         if (status is null || Array.IndexOf(ValidStatuses, status) < 0)
         {
             Console.Error.WriteLine($"nightshift release: --status must be one of {string.Join('|', ValidStatuses)}");
-            return 2;
+            return ExitCode.Usage;
         }
 
         string? reason = Options.Value(args, "--reason");
@@ -26,7 +26,7 @@ internal static class ReleaseCommand
         if (session is null)
         {
             Console.Error.WriteLine("nightshift release: no active claim (nothing to release)");
-            return 3;
+            return ExitCode.NoClaim;
         }
 
         using var cts = new CancellationTokenSource();
@@ -52,6 +52,6 @@ internal static class ReleaseCommand
         Session.Clear();
 
         Console.WriteLine($"RELEASED {status}");
-        return 0;
+        return ExitCode.Ok;
     }
 }

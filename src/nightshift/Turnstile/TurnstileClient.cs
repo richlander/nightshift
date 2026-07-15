@@ -147,6 +147,35 @@ internal sealed class TurnstileClient : IDisposable
     }
 
     /// <summary>
+    /// Writes a lease-attached key, replacing any existing value. Turnstile only attaches a lease on
+    /// create, so an existing key is deleted first — safe here because each roster key has a single writer
+    /// (the agent that owns it). When its lease expires the key vanishes, so the roster self-heals.
+    /// </summary>
+    public async Task PutLeasedAsync(string key, string value, string leaseId, CancellationToken ct)
+    {
+        if (await CreateLeasedAsync(key, value, leaseId, ct))
+        {
+            return;
+        }
+
+        await DeleteAsync(key, ct);
+        await CreateLeasedAsync(key, value, leaseId, ct);
+    }
+
+    private async Task<bool> CreateLeasedAsync(string key, string value, string leaseId, CancellationToken ct)
+    {
+        using var content = new ByteArrayContent(Encoding.UTF8.GetBytes(value));
+        using HttpResponseMessage res = await _http.PostAsync($"/kv{key}?lease={Uri.EscapeDataString(leaseId)}", content, ct);
+        if (res.StatusCode == HttpStatusCode.Conflict)
+        {
+            return false;
+        }
+
+        res.EnsureSuccessStatusCode();
+        return true;
+    }
+
+    /// <summary>
     /// Claims <paramref name="key"/> for exactly one caller: a txn that puts it (under
     /// <paramref name="leaseId"/>) iff it does not yet exist (create_revision == 0). The returned
     /// revision is the claim's fence.

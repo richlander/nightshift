@@ -108,6 +108,27 @@ public class ReconcilerTests : IClassFixture<TurnstileFixture>
         await AssertReady(client, plan, "a", expected: false);
     }
 
+    [Fact]
+    public async Task ClaimLeaseRevoked_ReturnsOrderToPool()
+    {
+        // This is the `leave` (and lease-expiry) mechanism: a freed claim with no terminal state re-offers.
+        using TurnstileClient client = _fixture.Connect();
+        Plan plan = MakePlan(PlanId());
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        await Reconciler.RunAsync(client, plan, ct);
+
+        string lease = await client.CreateLeaseAsync(60, ct);
+        await client.TryClaimAsync($"{plan.Orders[0].Base}/claim", lease, "agent", ct);
+        await Reconciler.RunAsync(client, plan, ct);
+        await AssertReady(client, plan, "a", expected: false); // claimed → out of ready
+
+        await client.RevokeLeaseAsync(lease, ct); // agent leaves; claim is lease-attached, so it vanishes
+        Reconciler.Result result = await Reconciler.RunAsync(client, plan, ct);
+
+        Assert.Equal(1, result.Added);
+        await AssertReady(client, plan, "a", expected: true);
+    }
+
     private static async Task AssertReady(TurnstileClient client, Plan plan, string orderId, bool expected)
     {
         Order order = plan.Orders.Single(o => o.Id == orderId);

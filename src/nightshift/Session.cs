@@ -37,7 +37,7 @@ internal static class Session
     {
         string json = JsonSerializer.Serialize(state, SessionJson.Default.SessionState);
         // Create at 0600 before writing so the lease id is never briefly world-readable.
-        WriteRestricted(FilePath, json);
+        RuntimeFile.WriteRestricted(FilePath, json);
     }
 
     public static void Clear()
@@ -82,25 +82,5 @@ internal static class Session
         }
 
         return Directory.GetCurrentDirectory();
-    }
-
-    private static void WriteRestricted(string path, string content)
-    {
-        if (OperatingSystem.IsWindows())
-        {
-            File.WriteAllText(path, content);
-            return;
-        }
-
-        using var stream = new FileStream(
-            path,
-            new FileStreamOptions
-            {
-                Mode = FileMode.Create,
-                Access = FileAccess.Write,
-                UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite,
-            });
-        using var writer = new StreamWriter(stream);
-        writer.Write(content);
     }
 }

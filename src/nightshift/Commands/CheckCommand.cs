@@ -18,7 +18,7 @@ internal static class CheckCommand
         if (session is null)
         {
             Console.Error.WriteLine("nightshift check: no active claim (run `nightshift next` first)");
-            return 3;
+            return ExitCode.NoClaim;
         }
 
         using var cts = new CancellationTokenSource();
@@ -33,7 +33,7 @@ internal static class CheckCommand
         {
             Session.Clear();
             Console.WriteLine("FENCE_STALE");
-            return 0;
+            return ExitCode.FenceStale;
         }
 
         // The claim is lease-attached, but verify it is still ours at the fence we were issued.
@@ -42,13 +42,13 @@ internal static class CheckCommand
         {
             Session.Clear();
             Console.WriteLine("FENCE_STALE");
-            return 0;
+            return ExitCode.FenceStale;
         }
 
         if (await client.GetAsync(HaltKey, ct) is not null)
         {
             Console.WriteLine("HALT");
-            return 0;
+            return ExitCode.Halt;
         }
 
         KvItem? directive = await client.GetAsync($"{session.OrderBase}/directive", ct);
@@ -56,10 +56,10 @@ internal static class CheckCommand
         {
             Console.WriteLine("QUERY");
             Console.WriteLine(text);
-            return 0;
+            return ExitCode.Query;
         }
 
         Console.WriteLine("OK");
-        return 0;
+        return ExitCode.Ok;
     }
 }
