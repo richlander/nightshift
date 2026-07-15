@@ -148,6 +148,17 @@ public sealed class DispatchTests : IClassFixture<TurnstileFixture>
         Assert.Empty(result.Stderr);
     }
 
+    [Fact]
+    public async Task SocketFlag_OutranksEnvAndRoutesToDaemon()
+    {
+        // TURNSTILE_SOCKET points nowhere; the global --socket flag must win and reach the call site.
+        InvocationResult result = await InvokeAsync(
+            "/tmp/ns-nonexistent.sock", "where", "--socket", _fixture.Socket, "--output", "json");
+
+        Assert.Equal(ExitCode.Ok, result.ExitCode);
+        Assert.Empty(result.Stderr);
+    }
+
     private static Task<InvocationResult> InvokeAsync(params string[] args)
         => InvokeAsync(socket: null, args);
 

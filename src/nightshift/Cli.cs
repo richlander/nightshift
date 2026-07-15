@@ -2,12 +2,24 @@ namespace Nightshift;
 
 using System.CommandLine;
 using Nightshift.Commands;
+using Nightshift.Config;
 using Nightshift.Output;
 
 /// <summary>Entry dispatch for the <c>nightshift</c> agent/operator CLI.</summary>
 public static class Cli
 {
     private const string Usage = "usage: nightshift <add|plan|land|join|standby|leave|next|show|recover|check|escalate|release|drain|stop|roster|where> ...";
+
+    /// <summary>
+    /// The global <c>--socket</c> override, inherited by every verb. Parsed once at dispatch and pinned via
+    /// <see cref="SocketResolver.UseFlag"/> so it reaches the command call sites (which read
+    /// <see cref="Paths.Socket"/>) and outranks the env vars and config file.
+    /// </summary>
+    private static readonly Option<string?> SocketOption = new("--socket")
+    {
+        Description = "Path to the Turnstile socket (overrides NIGHTSHIFT_SOCKET, config, and TURNSTILE_SOCKET).",
+        Recursive = true,
+    };
 
     private static readonly HashSet<string> KnownVerbs =
     [
@@ -36,6 +48,10 @@ public static class Cli
             return ExitCode.Usage;
         }
 
+        // Resolve the socket once, before any verb runs: the flag is pinned so every command's
+        // Paths.Socket call site sees the same override, and it outranks env/config.
+        SocketResolver.UseFlag(result.GetValue(SocketOption));
+
         return await result.InvokeAsync();
     }
 
@@ -43,6 +59,8 @@ public static class Cli
     internal static RootCommand CreateRootCommand()
     {
         var rootCommand = new RootCommand("nightshift wire client");
+
+        rootCommand.Options.Add(SocketOption);
 
         rootCommand.Subcommands.Add(CreateAddCommand());
         rootCommand.Subcommands.Add(CreatePlanCommand());
