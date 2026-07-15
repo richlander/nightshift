@@ -294,6 +294,8 @@ Two vocabularies, opposite constraints. **Agent verbs are called constantly and 
 
 Naming principle: **plain English on the CLI.** The factory vocabulary (standard work, first article, rework rate, jidoka) lives in the docs and the SKILL.md, where it does semantic work at zero token cost — models have absorbed a century of manufacturing literature and *"pull the andon cord"* means something to them that *"escalate"* doesn't. But **no `e-stop` when `stop` will do.**
 
+> **Lineage.** `escalate` is the [andon cord](https://en.wikipedia.org/wiki/Andon_(manufacturing)) of the Toyota Production System: any worker may stop the line to surface a defect, and the line never hides a problem to keep moving. Commitment 1 — *"where judgment is required, the system does not guess; it halts and escalates with a safe default"* — is `jidoka` (autonomation: stop-on-defect, human decides). The convergence was independent, but the debt is real.
+
 ### Agent verbs — eight
 
 ```
