@@ -1,6 +1,5 @@
 namespace Nightshift.Commands;
 
-using System.Text.Json;
 using Nightshift.Turnstile;
 
 /// <summary>
@@ -51,7 +50,7 @@ internal static class NextCommand
                 if (await TryClaimOneAsync(client, readyPrefix, leaseId, ct) is { } packet)
                 {
                     Session.Save(new SessionState(leaseId, packet.Fence, packet.ClaimKey, packet.OrderBase, packet.ReadyKey));
-                    Print(packet);
+                    packet.Spec.PrintWork(Console.Out, packet.OrderBase, packet.Fence);
                     return ExitCode.Ok;
                 }
 
@@ -97,7 +96,7 @@ internal static class NextCommand
             }
 
             KvItem? spec = await client.GetAsync($"{orderBase}/spec", ct);
-            OrderSpec parsed = spec is null ? OrderSpec.Empty : OrderSpec.Parse(spec.Text);
+            OrderView parsed = spec is null ? OrderView.Empty : OrderView.Parse(spec.Text);
             return new WorkPacket(orderBase, claimKey, ready.Key, claim.Revision, parsed);
         }
 
@@ -135,58 +134,6 @@ internal static class NextCommand
         return fromRevision;
     }
 
-    private static void Print(WorkPacket packet)
-    {
-        OrderSpec spec = packet.Spec;
-        Console.WriteLine($"WORK {packet.OrderBase}");
-        if (spec.Title is { Length: > 0 } title)
-        {
-            Console.WriteLine($"title: {title}");
-        }
-
-        if (spec.Issue is { Length: > 0 } issue)
-        {
-            Console.WriteLine($"issue: {issue}");
-        }
-
-        if (spec.Paths.Length > 0)
-        {
-            Console.WriteLine($"paths: {string.Join(", ", spec.Paths)}");
-        }
-
-        if (spec.Supersedes.Length > 0)
-        {
-            Console.WriteLine($"supersedes: {string.Join(", ", spec.Supersedes)}");
-        }
-
-        if (spec.Standard is { Length: > 0 } standard)
-        {
-            Console.WriteLine($"standard: {standard}");
-        }
-
-        if (spec.Related.Length > 0)
-        {
-            Console.WriteLine($"related: {string.Join(", ", spec.Related)}");
-        }
-
-        if (spec.Antipatterns.Length > 0)
-        {
-            Console.WriteLine($"antipatterns: {string.Join(", ", spec.Antipatterns)}");
-        }
-
-        if (spec.Brief is { Length: > 0 } brief)
-        {
-            Console.WriteLine($"brief: {brief}");
-        }
-
-        if (spec.OrderSha is { Length: > 0 } sha)
-        {
-            Console.WriteLine($"order_sha: {sha}");
-        }
-
-        Console.WriteLine($"fence: {packet.Fence}");
-    }
-
     private static string? FirstPositional(string[] args)
     {
         for (int i = 0; i < args.Length; i++)
@@ -205,62 +152,7 @@ internal static class NextCommand
 
     private static int ParseInt(string? value, int fallback) => int.TryParse(value, out int v) ? v : fallback;
 
-    private sealed record WorkPacket(string OrderBase, string ClaimKey, string ReadyKey, long Fence, OrderSpec Spec);
-
-    private sealed record OrderSpec(
-        string[] Paths,
-        string[] Supersedes,
-        string[] Related,
-        string[] Antipatterns,
-        string? Standard,
-        string? Issue,
-        string? Title,
-        string? OrderSha,
-        string? Brief)
-    {
-        public static OrderSpec Empty { get; } = new([], [], [], [], null, null, null, null, null);
-
-        public static OrderSpec Parse(string json)
-        {
-            try
-            {
-                using JsonDocument doc = JsonDocument.Parse(json);
-                JsonElement root = doc.RootElement;
-                return new OrderSpec(
-                    StringArray(root, "paths"),
-                    StringArray(root, "supersedes"),
-                    StringArray(root, "related"),
-                    StringArray(root, "antipatterns"),
-                    Str(root, "standard"),
-                    Str(root, "issue"),
-                    Str(root, "title"),
-                    Str(root, "order_sha"),
-                    Str(root, "brief"));
-            }
-            catch (JsonException)
-            {
-                return Empty;
-            }
-        }
-
-        private static string[] StringArray(JsonElement root, string name)
-            => root.TryGetProperty(name, out JsonElement a) && a.ValueKind == JsonValueKind.Array
-                ? a.EnumerateArray()
-                    .Select(e => e.ValueKind == JsonValueKind.String ? e.GetString() ?? string.Empty : e.GetRawText())
-                    .Where(s => s.Length > 0)
-                    .ToArray()
-                : [];
-
-        private static string? Str(JsonElement root, string name)
-            => root.TryGetProperty(name, out JsonElement v)
-                ? v.ValueKind switch
-                {
-                    JsonValueKind.String => v.GetString(),
-                    JsonValueKind.Number => v.GetRawText(),
-                    _ => null,
-                }
-                : null;
-    }
+    private sealed record WorkPacket(string OrderBase, string ClaimKey, string ReadyKey, long Fence, OrderView Spec);
 }
 
 /// <summary>Minimal option reader shared by Nightshift commands.</summary>
