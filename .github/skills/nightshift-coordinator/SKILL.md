@@ -102,7 +102,14 @@ deliberate. (A future gh-aware bridge will call `land` for you off merged PRs; t
 
 ## 5. Watch the board
 
-There is no `board` verb yet. Inspect state directly:
+`nightshift where` is the board — one row per order that has been claimed or reported:
+
+```
+nightshift where            # <order-base>  <status>  <branch>   (status=open while in hand)
+nightshift roster           # who is on duty: <agent-id>  active|standby
+```
+
+Or inspect the raw keys directly:
 
 ```
 turnstile get /plan/9001/order/op1/state          # {"status":"done"|"landed"|"escalated"|...}
@@ -123,16 +130,18 @@ printf 'Fail closed; do not retry.' | turnstile create /plan/9001/order/op3/dire
 
 ## 6. Drain and stop
 
-Two different gestures (dedicated verbs are planned; today set the control keys directly):
+Two different gestures, each a first-class verb (the raw control keys they wrap are shown for reference):
 
 ```
 # Drain: stop handing out NEW work; let running workers finish. The 95% case.
-printf 1 | turnstile create /control/draining      # workers' next → DRAINING
-turnstile delete /control/draining                 # resume
+nightshift drain                                   # workers' next → DRAINING
+nightshift drain --resume                           # resume dispatch
+#   (raw: printf 1 | turnstile create /control/draining ; turnstile delete /control/draining)
 
 # Stop: every worker halts at its next check. Nothing new commits.
-printf 1 | turnstile create /control/halt           # workers' check → HALT
-turnstile delete /control/halt                      # lift
+nightshift stop                                     # workers' check → HALT
+nightshift stop --resume                             # lift the halt
+#   (raw: printf 1 | turnstile create /control/halt ; turnstile delete /control/halt)
 ```
 
 ## Invariants
