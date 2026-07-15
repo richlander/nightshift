@@ -19,10 +19,10 @@ internal static class NextCommand
     private const string DrainingKey = "/control/draining";
 
     public static async Task<int> RunAsync(string[] args)
-    {
-        string? scope = FirstPositional(args);
-        int timeoutSecs = ParseInt(Options.Value(args, "--timeout"), 60);
+        => await RunAsync(FirstPositional(args), ParseInt(Options.Value(args, "--timeout"), 60));
 
+    public static async Task<int> RunAsync(string? scope, int timeoutSecs)
+    {
         string readyPrefix = scope is null ? ReadyRoot : $"{ReadyRoot}{scope}/";
 
         using var cts = new CancellationTokenSource();

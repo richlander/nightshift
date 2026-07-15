@@ -13,8 +13,10 @@ using Nightshift.Turnstile;
 internal static class EscalateCommand
 {
     public static async Task<int> RunAsync(string[] args)
+        => await RunAsync(Options.Value(args, "--reason"));
+
+    public static async Task<int> RunAsync(string? reason)
     {
-        string? reason = Options.Value(args, "--reason");
         if (string.IsNullOrWhiteSpace(reason))
         {
             Console.Error.WriteLine("nightshift escalate: --reason is required (say what needs judgment)");

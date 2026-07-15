@@ -4,10 +4,13 @@ namespace Nightshift.Commands;
 internal static class PlanFile
 {
     public static async Task<(Plan Plan, string Sha)> LoadAsync(string path, string[] args, CancellationToken ct)
+        => await LoadAsync(path, Options.Value(args, "--sha"), ct);
+
+    public static async Task<(Plan Plan, string Sha)> LoadAsync(string path, string? sha, CancellationToken ct)
     {
-        string sha = Options.Value(args, "--sha") ?? GitHead(Path.GetDirectoryName(Path.GetFullPath(path))!);
-        Plan plan = Plan.Parse(await File.ReadAllTextAsync(path, ct), sha);
-        return (plan, sha);
+        string resolvedSha = sha ?? GitHead(Path.GetDirectoryName(Path.GetFullPath(path))!);
+        Plan plan = Plan.Parse(await File.ReadAllTextAsync(path, ct), resolvedSha);
+        return (plan, resolvedSha);
     }
 
     public static string ShortSha(string sha) => sha.Length > 0 ? sha[..Math.Min(sha.Length, 12)] : "(no sha)";

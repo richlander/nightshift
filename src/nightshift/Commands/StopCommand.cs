@@ -12,11 +12,14 @@ internal static class StopCommand
     private const string HaltKey = "/control/halt";
 
     public static async Task<int> RunAsync(string[] args)
+        => await RunAsync(Array.IndexOf(args, "--resume") >= 0);
+
+    public static async Task<int> RunAsync(bool resume)
     {
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
         using TurnstileClient client = TurnstileClient.Connect(Paths.Socket);
-        return await Control.ToggleAsync(client, args, HaltKey, "HALT", "LIFTED", cts.Token);
+        return await Control.ToggleAsync(client, resume, HaltKey, "HALT", "LIFTED", cts.Token);
     }
 }
