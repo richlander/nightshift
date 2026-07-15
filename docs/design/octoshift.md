@@ -77,6 +77,7 @@ branches** (a parallel root, no shared history with `main`) holding a directory 
 ```
 orders/9001/op1/order.json      # the spec (authored by the coordinator)
 orders/9001/op1/status.jsonl    # append-only state transitions (claimed, done, rework, landed)
+orders/9001/op1/pr              # the PR this order landed as (durable binding: order ↔ PR)
 orders/9001/op1/review.md       # the full adversarial-review record — every round, every model
 ```
 
@@ -100,13 +101,37 @@ This unifies "audit log" and "durable store": they are the same mechanism. If a 
 hot, shard by plan (`nightshift-orders/9001`); per-order branches are possible but explode the ref count.
 Start with one, shard only if needed.
 
+### PRs are derived, not registered
+
+A PR is a GitHub object; Nightshift must not know it exists. It does not need to. Because every order-PR's
+head branch is `nightshift/{plan}/{order}`, **the branch namespace makes GitHub self-indexing** — octoshift
+reconstructs the full set of order-PRs from GitHub alone, any time:
+
+```
+gh pr list --search "head:nightshift/"          # all order PRs
+gh pr list --search "head:nightshift/9001/"     # just plan 9001's
+```
+
+So PR knowledge lives in three tiers, none of which is a registry Nightshift maintains:
+
+| Tier | Holds | Role |
+|---|---|---|
+| **GitHub** | the PRs themselves | authoritative, always derivable via the branch prefix |
+| **Turnstile** | optional `{base}/pr` | hot reverse-lookup cache while work is live — **opaque to Nightshift**, written only by octoshift |
+| **Ledger** | `orders/{plan}/{order}/pr` + `status.jsonl` | durable audit — which PR landed which order, forever |
+
+The Turnstile tier is octoshift bookkeeping: the kernel stores the string and never reads or acts on it, so
+Nightshift stays GitHub-unaware. Octoshift writes it (and the ledger binding) when it opens a PR itself; in
+local-dev it skips the cache and relies on the convention. **Branches are registered (in Turnstile); PRs are
+derived (from GitHub); the branch is the hinge between the two.**
+
 ---
 
 ## 4. Inbound: GitHub → Turnstile
 
 ### 4.1 Merge → land (the MVP)
 
-The watcher that makes the DAG advance. Poll `gh pr list --state merged` past a `/control/pr-cursor`; for
+The `reconcile` loop that makes the DAG advance. Poll `gh pr list --state merged` past a `/control/pr-cursor`; for
 each merged PR, resolve the order (`headRefName` → `OrderRef`, cross-checked against the `Nightshift-Order:`
 trailer, with `Fixes:` as a weak confirm) and call `nightshift land <base>`. Idempotent via the cursor. This
 alone closes the loop for local-dev mode: **you merge; octoshift lands.**
@@ -199,24 +224,69 @@ GitHub-unaware.
 
 ---
 
-## 8. Form factor and the minimal first cut
+## 8. Execution model — `wait`, `watch`, `reconcile`
 
-- **MVP = an inbound poller**, read-only on GitHub except for reading merges: `gh pr list` + `nightshift land`
-  + `/control/pr-cursor`. No webhooks, no bot identity, no auto-merge, no outbound PRs. This is the smallest
-  thing that makes the running system autonomous end-to-end.
-- **Next:** the rework loop (§4.2) and the single review-clearance note (§5.1) — the two that most improve
-  correctness and quiet.
+One watch *engine* observes GitHub; it is surfaced three ways, by lifetime and by whether it mutates. The
+split follows `kubectl`, which keeps observation read-only and puts action in a separate controller:
+
+| Verb | `kubectl` analog | Lifetime | Mutates? | Who uses it |
+|---|---|---|---|---|
+| `octoshift wait <scope>` | `kubectl wait --for=…` | one-shot: **blocks until** a PR resolves, then **returns the change** | no | an agent awaiting a merge |
+| `octoshift watch <scope>` | `kubectl get --watch` | **streams** PR state changes until stopped | no | a human/dashboard tailing a wave |
+| `octoshift reconcile` | a k8s controller | resident, continuous | **yes** — `land`, ledger, notes | the always-on membrane |
+
+- **`wait`** is the agent primitive from the design discussion: *"spawn it over a set of PRs, backgrounded, it
+  returns with the change when one merges."* It resolves on **any** terminal event — merge, conflict, or close
+  — not only merges, so it is also how the rework loop (§4.2) is driven in the agent-spawned mode. `--all`
+  waits for the whole set instead of returning on the first.
+- **`watch`** is the streaming, read-only view — a live tail of PR transitions for a human or a UI. It never
+  returns "the change" as a single result; it emits a stream.
+- **`reconcile`** is the controller (what earlier drafts called `serve`): it *consumes* the watch engine and
+  *adds* the durable side effects. The name is literal — it reconciles GitHub's **merge truth** against
+  Turnstile's **dispatch truth**. This is the resident membrane; it owns `/control/pr-cursor` and is the sole
+  ledger writer.
+
+### Scope, not PR numbers
+
+Every verb takes a **scope** in Turnstile-native terms — a plan, an order, a wave — never raw PR numbers.
+Octoshift resolves scope → branches → PRs via the namespace (`gh pr list head:nightshift/<scope>`). An agent
+thinks in orders; octoshift does the GitHub pivot. `reconcile` with no scope means "everything."
+
+### The durable-write-through rule
+
+> A resolution must be delivered to **durable state** — `nightshift land`, the ledger — **not only** to the
+> caller that is blocked in `wait`. The caller may be gone by the time the PR merges.
+
+This is why `wait`/`watch` are read-only and `reconcile` is the thing that *acts*: an ephemeral agent may
+`wait` and, if still alive, react (its harness supports async continuation); but the guarantee that a merge
+becomes a `land` — even overnight, even if every agent has exited — belongs to `reconcile`. Once the merge is
+landed, Turnstile carries it the rest of the way: `land` wakes the live `plan` controller, which opens
+dependents, which unblocks some worker's `next`. **No live spawner required.**
+
+### The minimal first cut
+
+- **MVP = `reconcile`, inbound only**: `gh pr list --state merged` past `/control/pr-cursor` → `nightshift
+  land`. Read-only on GitHub except reading merges. No webhooks, no bot identity, no auto-merge, no outbound
+  PRs. The smallest thing that makes the running system autonomous end-to-end, and the only one that survives
+  every agent exiting.
+- **Next:** the rework loop (§4.2) and the single review-clearance note (§5.1); `wait` falls out of the same
+  engine almost for free and is the nicer agent-facing primitive.
 - **Later:** outbound PR creation, the bot identity, auto-merge under policy, and a webhook or merge-triggered
-  Action fronting the resident process (which still owns the socket).
+  Action fronting `reconcile` (which still owns the socket).
 
 ---
 
 ## 9. Open decisions
 
-1. **Single-writer ledger** — agents → Turnstile → octoshift → orphan branch. Confirmed as the way to avoid
+1. **Single-writer ledger** — agents → Turnstile → octoshift → orphan branch. *Resolved:* the way to avoid
    push contention and unify audit with storage.
-2. **Rework routing** — a distinct `rework` state that the reconciler re-readies (preferred, visibly
+2. **Verb taxonomy** — `wait` (block+return, read-only) / `watch` (stream, read-only) / `reconcile` (resident
+   controller, acts). *Resolved,* following `kubectl`'s read-vs-controller split; `reconcile` replaces the
+   earlier `serve`.
+3. **PR knowledge** — derived from GitHub via the branch prefix; cached opaquely in Turnstile; recorded
+   durably in the ledger. *Resolved:* branches are registered, PRs are derived.
+4. **Rework routing** — a distinct `rework` state that the reconciler re-readies (preferred, visibly
    different from an untouched `declined`), vs. reusing `declined` → pool with a directive.
-3. **Closed-unmerged policy default** — `rework` / pool / escalate.
-4. **Ledger sharding** — one branch, per-plan, or per-order. Start with one.
-5. **Bot identity** — introduced at first auto-merge, or from the first outbound PR.
+5. **Closed-unmerged policy default** — `rework` / pool / escalate.
+6. **Ledger sharding** — one branch, per-plan, or per-order. Start with one.
+7. **Bot identity** — introduced at first auto-merge, or from the first outbound PR.
