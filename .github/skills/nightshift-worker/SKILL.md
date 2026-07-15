@@ -27,7 +27,8 @@ workers directly — the system serializes and schedules for you.
 > lose your work.**
 
 You never see or manage the lease. The CLI owns it, keyed to this worktree. Do not try to track
-or pass any token. If your context resets, your claim is intact — recover with `nightshift show`.
+or pass any token. If your context resets, recover with **`nightshift show`** (session intact) or
+**`nightshift recover`** (session gone — see *Recovery* below).
 
 ## Setup — once per shift
 
@@ -55,6 +56,7 @@ A `WORK` packet looks like:
 
 ```
 WORK /plan/9001/order/op4
+branch: nightshift/9001/op4
 title: Retain build outcomes across reboot
 issue: 1238
 paths: src/Foo.cs, src/Bar.cs
@@ -65,6 +67,8 @@ fence: 7
 ```
 
 - `base` = `/plan/<plan>/order/<order>` — your order's identity. Note it.
+- `branch` = the exact branch you must create for this order. It also encodes the order, so it is
+  your **recovery anchor**: if you wake on this branch with no session, `nightshift recover` re-attaches.
 - `paths` = the files you are cleared to touch. Stay inside them.
 - `issue` = the GitHub issue this order fixes (may be absent).
 - `standard` = the design note you must conform to. Read it.
@@ -72,12 +76,14 @@ fence: 7
 
 ### Do the work
 
-1. **Branch off `origin/main`**, named for the order:
+1. **Branch off `origin/main`**, using the **exact `branch` from the WORK packet**:
    ```
    git fetch origin
    git switch -c nightshift/<plan>/<order> origin/main
    ```
-   e.g. for `WORK /plan/9001/order/op4` → `git switch -c nightshift/9001/op4 origin/main`.
+   e.g. for `WORK /plan/9001/order/op4` (`branch: nightshift/9001/op4`) →
+   `git switch -c nightshift/9001/op4 origin/main`. The name is not yours to choose — it is the key
+   the system uses to recover you and to map the eventual merge back to this order.
 2. **Get context.** Read the `standard` note. If `issue` is set and `gh` is available,
    `gh issue view <issue>` for the full ask. Read any `related` PRs/issues; treat listed
    `antipatterns` as things NOT to do (a prior failed attempt).
@@ -137,6 +143,21 @@ This **pauses** on the order (you keep the claim) and marks it as needing a huma
 back through `check` as `QUERY`. If you can keep running, poll `check` for the answer; if you must
 exit, the order will wait for a human — it is never silently reassigned.
 
+## Recovery — after a context reset or a reboot
+
+Your task lives in Turnstile and in your git branch, never in your memory. Two ways back:
+
+- **`nightshift show`** — reprints your current WORK packet. Use it when your context was compacted
+  but the process/worktree is intact (the session is still on disk). Read-only.
+- **`nightshift recover`** — use it when the session is gone (a reboot, a wiped runtime dir, or you
+  were relaunched into the worktree fresh). It reads the **branch you are standing on**
+  (`nightshift/<plan>/<order>`), finds the order, and — if it is still yours or free — re-attaches you
+  under a fresh lease and reprints the WORK packet. You resume exactly where you left off.
+  - If it prints the WORK packet → you're back; continue the loop (remember: `check` before commits).
+  - If it says the order is `done`/`landed`/etc. or held by another agent → stand down: that work is
+    no longer yours. Go to `nightshift next`.
+  - **So always land on your order's branch before recovering** — the branch is the key.
+
 ## Leaving
 
 ```
@@ -150,8 +171,8 @@ Clocks you out: returns any in-flight order to the pool and drops your roster en
 1. **`check` before every commit.** The lease is your claim; `check` renews it.
 2. **You cannot sleep.** Headless, you have no next turn after you yield. Never "wait to be
    notified" — block in-line or exit. `NOWORK`/`DRAINING` mean *exit*, not *idle*.
-3. **Never remember a lease or token.** The CLI owns it. `nightshift show` recovers your order if
-   you reset.
+3. **Never remember a lease or token.** The CLI owns it. Recover your order with `nightshift show`
+   (session intact) or `nightshift recover` (session gone — from your branch).
 4. **Stay inside `paths`.** They are the conflict-avoidance contract with other workers.
 5. **One order, one branch, one worktree.** Don't claim a second order while holding one.
 6. **Read the return value, not your assumptions.** `HALT`, `FENCE_STALE`, `DRAINING` override

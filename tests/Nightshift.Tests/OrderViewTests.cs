@@ -23,9 +23,10 @@ public class OrderViewTests
         string output = sb.ToString();
         string[] lines = output.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
         Assert.Equal("WORK /plan/9001/order/op4", lines[0]);
-        Assert.Equal("title: Retain outcomes", lines[1]);
-        Assert.Equal("issue: 1238", lines[2]);
-        Assert.Equal("paths: src/A.cs, src/B.cs", lines[3]);
+        Assert.Equal("branch: nightshift/9001/op4", lines[1]);
+        Assert.Equal("title: Retain outcomes", lines[2]);
+        Assert.Equal("issue: 1238", lines[3]);
+        Assert.Equal("paths: src/A.cs, src/B.cs", lines[4]);
         Assert.Equal("fence: 7", lines[^1]);
         Assert.DoesNotContain("supersedes:", output); // absent fields are omitted
     }
@@ -39,8 +40,8 @@ public class OrderViewTests
         using var writer = new StringWriter(sb);
         view.PrintWork(writer, "/plan/p/order/x", fence: 1);
 
-        // Empty view prints only the header and fence — no field lines.
+        // Empty view prints only the header, the derived branch, and the fence — no field lines.
         string[] lines = sb.ToString().Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
-        Assert.Equal(["WORK /plan/p/order/x", "fence: 1"], lines);
+        Assert.Equal(["WORK /plan/p/order/x", "branch: nightshift/p/x", "fence: 1"], lines);
     }
 }

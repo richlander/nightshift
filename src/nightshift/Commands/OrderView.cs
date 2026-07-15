@@ -47,6 +47,11 @@ internal sealed record OrderView(
     public void PrintWork(TextWriter output, string orderBase, long fence)
     {
         output.WriteLine($"WORK {orderBase}");
+        if (OrderRef.FromBase(orderBase) is { } order)
+        {
+            Line(output, "branch", order.Branch);
+        }
+
         Line(output, "title", Title);
         Line(output, "issue", Issue);
         Line(output, "paths", Paths);

@@ -50,37 +50,8 @@ internal static class Session
 
     private static string ComputeIdentity()
     {
-        string root = WorktreeRoot();
+        string root = Git.WorktreeRoot();
         byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(root));
         return Convert.ToHexStringLower(hash)[..16];
-    }
-
-    private static string WorktreeRoot()
-    {
-        try
-        {
-            var psi = new System.Diagnostics.ProcessStartInfo("git", "rev-parse --show-toplevel")
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-            };
-            using var proc = System.Diagnostics.Process.Start(psi);
-            if (proc is not null)
-            {
-                string output = proc.StandardOutput.ReadToEnd().Trim();
-                proc.WaitForExit();
-                if (proc.ExitCode == 0 && output.Length > 0)
-                {
-                    return output;
-                }
-            }
-        }
-        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
-        {
-            // git not installed or not runnable — fall back to the working directory.
-        }
-
-        return Directory.GetCurrentDirectory();
     }
 }

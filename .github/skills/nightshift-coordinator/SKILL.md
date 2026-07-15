@@ -106,8 +106,13 @@ There is no `board` verb yet. Inspect state directly:
 
 ```
 turnstile get /plan/9001/order/op1/state          # {"status":"done"|"landed"|"escalated"|...}
+turnstile get /plan/9001/order/op1/branch          # the worker's branch for this order
 turnstile get /agent/<id>                          # a worker's roster entry: active|standby
 ```
+
+The `/branch` key is written when the order is claimed: it maps the order to `nightshift/<plan>/<order>`.
+Today it aids inspection and human review; a future merge→land bridge will use it (with the PR's
+`Fixes:` / `Nightshift-Order:` trailers) to map a merged PR back to the order it lands.
 
 Orders with `state.status == escalated` need your judgment. Answer a worker by creating a
 directive on its order; the worker sees it as `QUERY` on its next `check`:

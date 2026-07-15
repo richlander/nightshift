@@ -50,6 +50,14 @@ internal static class NextCommand
                 if (await TryClaimOneAsync(client, readyPrefix, leaseId, ct) is { } packet)
                 {
                     Session.Save(new SessionState(leaseId, packet.Fence, packet.ClaimKey, packet.OrderBase, packet.ReadyKey));
+
+                    // Mint the branch↔order association at claim time: the branch is the durable recovery
+                    // anchor and the future merge→land bridge's join key. Recorded before any work starts.
+                    if (OrderRef.FromBase(packet.OrderBase) is { } order)
+                    {
+                        await client.SetAsync($"{packet.OrderBase}/branch", order.Branch, ct);
+                    }
+
                     packet.Spec.PrintWork(Console.Out, packet.OrderBase, packet.Fence);
                     return ExitCode.Ok;
                 }
