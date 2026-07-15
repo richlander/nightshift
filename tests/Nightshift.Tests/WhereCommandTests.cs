@@ -78,9 +78,9 @@ public class WhereCommandTests
     {
         List<WhereRow> rows =
         [
-            new("/plan/1/order/op-a", "done", "nightshift/1/op-a"),
-            new("/plan/2/order/op-b", "open", "nightshift/2/op-b"),
-            new("/plan/3/order/op-c", "blocked", string.Empty),
+            new() { OrderBase = "/plan/1/order/op-a", Status = "done", Branch = "nightshift/1/op-a" },
+            new() { OrderBase = "/plan/2/order/op-b", Status = "open", Branch = "nightshift/2/op-b" },
+            new() { OrderBase = "/plan/3/order/op-c", Status = "blocked", Branch = string.Empty },
         ];
 
         using var writer = new StringWriter();
@@ -100,7 +100,7 @@ public class WhereCommandTests
     {
         List<WhereRow> rows =
         [
-            new("/plan/1/order/op-a", "done", "nightshift/1/op-a"),
+            new() { OrderBase = "/plan/1/order/op-a", Status = "done", Branch = "nightshift/1/op-a" },
         ];
 
         using var json = new StringWriter();

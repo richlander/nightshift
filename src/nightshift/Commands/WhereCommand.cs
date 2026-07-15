@@ -57,10 +57,12 @@ internal static class WhereCommand
         var bases = new SortedSet<string>(statuses.Keys, StringComparer.Ordinal);
         bases.UnionWith(branches.Keys);
         return bases
-            .Select(orderBase => new WhereRow(
-                orderBase,
-                statuses.TryGetValue(orderBase, out string? status) ? status : "open",
-                branches.TryGetValue(orderBase, out string? branch) ? branch : string.Empty))
+            .Select(orderBase => new WhereRow
+            {
+                OrderBase = orderBase,
+                Status = statuses.TryGetValue(orderBase, out string? status) ? status : "open",
+                Branch = branches.TryGetValue(orderBase, out string? branch) ? branch : string.Empty,
+            })
             .ToList();
     }
 
@@ -123,14 +125,17 @@ internal static class WhereCommand
 internal sealed class WhereView
 {
     [MarkoutSection(Headless = true)]
-    public List<WhereRow> Rows { get; set; } = [];
+    public required List<WhereRow> Rows { get; init; }
 }
 
 [MarkoutSerializable]
-internal sealed record WhereRow(
-    [property: MarkoutPropertyName("Order base")] string OrderBase,
-    string Status,
-    string Branch);
+internal sealed record WhereRow
+{
+    [MarkoutPropertyName("Order base")]
+    public required string OrderBase { get; init; }
+    public required string Status { get; init; }
+    public required string Branch { get; init; }
+}
 
 [MarkoutContext(typeof(WhereView))]
 internal partial class WhereViewContext : MarkoutSerializerContext
