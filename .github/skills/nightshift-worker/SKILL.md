@@ -98,17 +98,22 @@ fence: 7
    `git switch -c nightshift/9001/op4 origin/main`. Do all your work here. The branch name is not
    yours to choose — it is the key the system uses to recover you and to map the eventual merge back
    to this order. (Your worker worktree is reused across orders: finish one, `git switch` to the next.)
-2. **Get context.** Read the `standard` note. If `issue` is set and `gh` is available,
+2. **Re-read your guidance.** You just cut this branch from fresh `origin/main`, so re-read this
+   skill (`.github/skills/nightshift-worker/SKILL.md`) — and any repo-level guidance such as
+   `AGENTS.md`, if present — before you start. Guidance evolves during a shift, and a worker can stay
+   up for days — re-reading on every order is what makes you self-healing: you always work to the
+   current rules, never a stale copy you read when you first started.
+3. **Get context.** Read the `standard` note. If `issue` is set and `gh` is available,
    `gh issue view <issue>` for the full ask. Read any `related` PRs/issues; treat listed
    `antipatterns` as things NOT to do (a prior failed attempt).
-3. **Make the change**, touching only files under `paths`.
-4. **Before each commit, `nightshift check`** (see table below). Then commit. Repeat.
-5. **Commit trailers** — always include, so the merge can be mapped back to this order:
+4. **Make the change**, touching only files under `paths`.
+5. **Before each commit, `nightshift check`** (see table below). Then commit. Repeat.
+6. **Commit trailers** — always include, so the merge can be mapped back to this order:
    ```
    Fixes: #<issue>
    Nightshift-Order: /plan/<plan>/order/<order>
    ```
-6. **Push the branch:** `git push -u origin nightshift/<plan>/<order>`.
+7. **Push the branch:** `git push -u origin nightshift/<plan>/<order>`.
    (Local-dev mode: you produce a branch. A human reviews, merges, and runs `nightshift land`.
    Do **not** open or merge a PR unless explicitly told to.)
 
