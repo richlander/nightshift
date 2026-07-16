@@ -23,11 +23,11 @@ supervision.
 Four levels of control are the point; each pairs something to hold onto with the part
 of the machine that holds it:
 
-- **Control who posts as you — and how much.** *Centralize the GitHub surface.* Only
-  the coordinator pushes, opens PRs, and comments — under your account or a distinct
-  bot identity, dialed from fully-by-hand toward automated as you grant autonomy, never
-  an agent wielding a maintainer's credentials. ([`octoshift.md`](octoshift.md) owns
-  that identity boundary.)
+- **Control who posts as you — and how much.** *Centralize the GitHub surface.* All
+  pushes, PRs, and comments go through the coordinator alone — under your account or a
+  distinct bot identity — so the one place that touches GitHub is dialable, from
+  fully-by-hand toward automated as you grant autonomy. ([`octoshift.md`](octoshift.md)
+  owns that identity boundary.)
 - **Scale execution to whatever the incoming work allows.** *A strong planner.* It
   parcels a plan into sequenced and parallel orders and — with visibility into GitHub
   merges — keeps the frontier moving, so work continues when `main` crosses a boundary
