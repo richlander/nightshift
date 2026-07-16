@@ -4,8 +4,7 @@ description: >-
   Build one Nightshift order into a set of commits on its branch: make the change
   within the order's declared file scope, keep the claim alive with `nightshift
   check` before every commit, use the required commit trailers, and push. Use this
-  when a Nightshift worker dispatches you to build (or rework) a single order, or
-  when you are the worker building an order yourself.
+  when a Nightshift worker dispatches you to build (or rework) a single order.
 ---
 
 # Nightshift builder
@@ -13,13 +12,7 @@ description: >-
 You **build one order**. An order is one landable PR: a single, self-contained
 change bound to at most one issue. You make the change on the order's branch, prove
 the claim stays alive as you go, and push. You do **not** review your own work, open
-a PR, comment on GitHub, or merge — you hand a pushed branch back to the worker that
-dispatched you.
-
-You may be **the worker itself** building in its own session, or a **builder
-subagent** the worker spawned to preserve its context window. Either way the rules
-below are the same, because they are keyed to the **worktree** you are working in,
-not to who you are.
+a PR, comment on GitHub, or merge — you hand the pushed branch back for review.
 
 ## The one rule that makes this work
 

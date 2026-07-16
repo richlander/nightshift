@@ -26,9 +26,7 @@ coordinate with other workers directly — the system serializes and schedules f
 > **`nightshift check` must run before every commit.** `check` renews your lease. Your
 > claim on the order is a lease; if it stops being renewed, the system concludes you
 > died and gives your order to someone else. There is no other heartbeat. **If nobody
-> `check`s, the work is lost.** (If a builder subagent is doing the commits, it runs
-> `check` — it is in your worktree, so it renews *your* lease. If you build directly,
-> you run it.)
+> `check`s, the work is lost.**
 
 You never see or manage the lease. The CLI owns it, keyed to this worktree. Do not
 track or pass any token. If your context resets, recover with **`nightshift show`**
