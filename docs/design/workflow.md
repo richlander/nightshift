@@ -116,7 +116,7 @@ sequenceDiagram
     Note over CO: land → dependents open
 ```
 
-### 1 — Shape and plan (product manager, then planner)
+### 1 — Shape and plan (Product Manager, then Planner)
 
 The product manager defines the change as issues — a feature to add, or a
 taste/re-shape note where existing features must adapt to enable a UX or a composed
@@ -136,7 +136,7 @@ nightshift plan --plan orders.json  # live controller: seed, then reconcile unti
 whose dependencies have all **landed**, and keeps that frontier current as orders
 land — no manual re-run.
 
-### 2 — Build and review (worker)
+### 2 — Build and review (Worker)
 
 A worker joins the shift and claims one order:
 
@@ -181,7 +181,7 @@ work *inward*, to a branch and to Turnstile; the coordinator pushes it.
 If the gate will not converge — four rounds without two clean — the worker does not
 keep looping. It **escalates to the coordinator** (§Escalation).
 
-### 3 — Open and clear the PR (coordinator)
+### 3 — Open and clear the PR (Coordinator)
 
 The coordinator sees the released order on the board (`nightshift where`/`roster`),
 **pushes the worker's branch to origin**, and creates or updates the PR from it. It
@@ -208,7 +208,7 @@ review from a third model** that was not one of the final two before it clears. 
 fresh model on a much-revised change sometimes catches something new; the extra time
 is cheaper than shipping a bad PR.
 
-### 4 — Merge and land (pr lander, then coordinator)
+### 4 — Merge and land (PR Lander, then Coordinator)
 
 The **PR Lander** holds merge authority and merges (squash). This is the one
 deliberate act kept out of automation by default, and it is what keeps the pipeline
@@ -226,7 +226,7 @@ was `after` this one — a dependent going from blocked to ready with no one's t
 is the payoff. Today a bridge or the coordinator calls `land` after observing the
 merge; [`octoshift.md`](octoshift.md) is the future membrane that watches merges and
 calls `land` automatically. *(Merge authority and the `land` signal can be different
-actors: the lander merges, the coordinator/bridge lands.)*
+actors: the PR Lander merges, the coordinator/bridge lands.)*
 
 ## Many orders at once
 
@@ -244,7 +244,7 @@ would touch the same files, give the second an `after` on the first so a merge
 conflict becomes a scheduling wait instead of a race. See
 [`nightshift.md`](nightshift.md) §5 for the DAG-as-scheduler details.
 
-## Escalation — the coordinator's call
+## Escalation — the Coordinator's call
 
 When a worker cannot converge — a review that will not reach two clean, or an order
 whose premise is ambiguous — it escalates:
