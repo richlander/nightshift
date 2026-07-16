@@ -100,8 +100,7 @@ internal static class NextCommand
                 continue; // lost the race to a peer
             }
 
-            KvItem? spec = await client.GetAsync($"{orderBase}/spec", ct);
-            OrderView parsed = spec is null ? OrderView.Empty : OrderView.Parse(spec.Text);
+            OrderView parsed = await OrderView.LoadAsync(client, orderBase, ct);
             return new WorkPacket(orderBase, claimKey, ready.Key, claim.Revision, parsed);
         }
 

@@ -17,6 +17,38 @@ public class ShowCommandTests
         """;
 
     [Fact]
+    public void Render_Plaintext_ReworkPacket_IsWorkPacketVerbatim()
+    {
+        // show reuses the SAME renderer, so a compacted worker recovers the rework directive (mode+findings)
+        // byte-identical to what `next` printed on claim.
+        OrderView view = OrderView.Parse(Spec) with { Mode = "rework", Findings = "reviewer: fix the retry loop" };
+
+        using var actual = new StringWriter();
+        ShowCommand.Render(view, "/plan/9001/order/op4", fence: 7, OutputFormat.Plaintext, actual);
+
+        using var expected = new StringWriter();
+        view.PrintWork(expected, "/plan/9001/order/op4", fence: 7);
+
+        Assert.Equal(expected.ToString(), actual.ToString());
+        Assert.Contains("mode: rework", actual.ToString());
+        Assert.Contains("findings: reviewer: fix the retry loop", actual.ToString());
+    }
+
+    [Fact]
+    public void BuildFields_ReworkPacket_IncludesModeAndFindings()
+    {
+        OrderView view = OrderView.Parse(Spec) with { Mode = "rework", Findings = "fix it" };
+
+        List<OrderField> fields = ShowCommand.BuildFields(view, "/plan/9001/order/op4", fence: 7);
+
+        Assert.Equal("rework", fields.Single(f => f.Field == "mode").Value);
+        Assert.Equal("fix it", fields.Single(f => f.Field == "findings").Value);
+        // mode sits right after branch; findings right after brief.
+        Assert.Equal("branch", fields[fields.FindIndex(f => f.Field == "mode") - 1].Field);
+        Assert.Equal("brief", fields[fields.FindIndex(f => f.Field == "findings") - 1].Field);
+    }
+
+    [Fact]
     public void Render_Plaintext_IsWorkPacketVerbatim()
     {
         OrderView view = OrderView.Parse(Spec);
