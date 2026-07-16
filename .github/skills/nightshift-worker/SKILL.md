@@ -32,11 +32,21 @@ or pass any token. If your context resets, recover with **`nightshift show`** (s
 
 ## Setup — once per shift
 
+Everything you do this shift runs from ONE dedicated worktree — that stable directory is what keeps
+your identity (and therefore your claim and lease) attached to you. Create it off `origin/main` and
+work inside it for the whole shift:
+
 ```
+git fetch origin
+git worktree add ../nightshift-worker-<you> --detach origin/main
+cd ../nightshift-worker-<you>
 nightshift join
 ```
 
-Registers you on the roster (`active`). That's it. Everything after is handled for you.
+`<you>` is any stable name for this worker (e.g. `a`, `b`). `join` registers you on the roster
+(`active`). Stay in this directory: every gate call (`next`, `check`, `recover`, `release`) is keyed
+to it. Do NOT create a new worktree per order — switching directories changes your identity and
+orphans your claim.
 
 ## The loop
 
@@ -76,19 +86,18 @@ fence: 7
 
 ### Do the work
 
-1. **Create a dedicated worktree for this order** and branch off `origin/main` inside it, using
-   the **exact `branch` from the WORK packet**. Do NOT build in a shared checkout: one order gets
-   one worktree, so you can never collide with another worker in the same directory. Worktree
-   management is your job and it is mechanical — always these three lines:
+1. **Switch onto the order's branch inside your worker worktree**, using the **exact `branch` from
+   the WORK packet**. You are already in your dedicated directory (from Setup) — do NOT create a
+   nested worktree; that changes your identity and orphans the claim. Just move onto the order branch,
+   freshly cut from `origin/main`:
    ```
    git fetch origin
-   git worktree add ../nightshift-<plan>-<order> -b nightshift/<plan>/<order> origin/main
-   cd ../nightshift-<plan>-<order>
+   git switch -c nightshift/<plan>/<order> origin/main
    ```
    e.g. for `WORK /plan/9001/order/op4` (`branch: nightshift/9001/op4`) →
-   `git worktree add ../nightshift-9001-op4 -b nightshift/9001/op4 origin/main`. Do all your work
-   from inside this worktree. The branch name is not yours to choose — it is the key the system uses
-   to recover you and to map the eventual merge back to this order.
+   `git switch -c nightshift/9001/op4 origin/main`. Do all your work here. The branch name is not
+   yours to choose — it is the key the system uses to recover you and to map the eventual merge back
+   to this order. (Your worker worktree is reused across orders: finish one, `git switch` to the next.)
 2. **Get context.** Read the `standard` note. If `issue` is set and `gh` is available,
    `gh issue view <issue>` for the full ask. Read any `related` PRs/issues; treat listed
    `antipatterns` as things NOT to do (a prior failed attempt).
@@ -171,16 +180,17 @@ nightshift leave
 
 Clocks you out: returns any in-flight order to the pool and drops your roster entry. Idempotent.
 
-Then tear down your worktree — you own its lifecycle end-to-end. Once your branch has merged and
-landed (or you have left the order), remove it so stale worktrees don't accumulate:
+Then tear down your WORKER worktree at the end of the shift (after `leave`). git won't remove the
+worktree you're standing in, so step back into the main clone first, then remove the worker worktree
+by its sibling path:
 
 ```
-cd -                                          # back out of the worktree first
-git worktree remove ../nightshift-<plan>-<order>
+cd "$(git rev-parse --path-format=absolute --git-common-dir)/.."   # into the main clone
+git worktree remove ../nightshift-worker-<you>
 ```
 
-If the order is still open on the branch, keep the worktree — `nightshift recover` re-attaches you
-from the branch you are standing on.
+Do NOT remove it between orders — it is your home for the whole shift. While you are standing on an
+order branch, `nightshift recover` re-attaches you from that branch.
 
 ## Golden rules
 
@@ -190,6 +200,8 @@ from the branch you are standing on.
 3. **Never remember a lease or token.** The CLI owns it. Recover your order with `nightshift show`
    (session intact) or `nightshift recover` (session gone — from your branch).
 4. **Stay inside `paths`.** They are the conflict-avoidance contract with other workers.
-5. **One order, one branch, one worktree.** Don't claim a second order while holding one.
+5. **One worker, one worktree; one order at a time.** Work the whole shift from your single dedicated
+   worktree (Setup), `git switch`-ing onto each order's branch. Never nest a per-order worktree, and
+   never claim a second order while holding one.
 6. **Read the return value, not your assumptions.** `HALT`, `FENCE_STALE`, `DRAINING` override
    whatever you were doing.
