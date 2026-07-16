@@ -276,15 +276,23 @@ coordinator reads it off the board like every other signal. The coordinator is
 order waits and is never silently reassigned. At night, with no coordinator awake, the
 default is **halt and hold**.
 
-## Rework — main moves under a branch
+## Rework — a submitted order goes back
 
-Between `done` and `land`, `main` moves — landing `op1` can break `op2`'s pre-land
-branch with a merge conflict or a red CI run. This is common. The order routes to a
-`rework` state with a directive; the **builder** integrates `main` and hands back a new
-commit (nothing about the GitHub membrane touches code) — the coordinator pushes it. Once
-the branch is public it **merges** `main` rather than rebasing — a rebase forces a
-force-push that rewrites history, kills diffability, and voids the reviews already done.
-`done → land` is a retry loop, not a one-shot.
+Between `done` and `land` an order can need another pass: `main` moves — landing `op1`
+breaks `op2`'s pre-land branch with a merge conflict or a red CI run — or a
+coordinator-side check (the optional triple-check, say) rejects it. Either way the
+coordinator sends it back with `rework`, the sibling of `land`:
+
+```
+nightshift rework /plan/9001/order/op2 --reason-file findings.md
+```
+
+`rework` flips the order from `done` to the non-terminal `changes-requested`, carrying
+the reason/findings, and **leaves the branch and claim intact** — the re-claiming worker's
+WORK packet arrives with `mode: rework`, so it **continues the existing branch** rather
+than cutting a fresh one. The **builder** integrates `main` and hands back a new commit
+(merging — not rebasing — a public branch, so prior commits and their reviews survive);
+the coordinator pushes it. `done → land` is a retry loop, not a one-shot.
 
 ## Two systems of record
 

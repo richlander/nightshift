@@ -97,6 +97,13 @@ Once you re-pull `origin/main` at the start of an order, **re-read your guidance
 skill + `AGENTS.md` + the order's `standard`). Re-reading each order is what makes a
 long-lived worker self-healing.
 
+**A rework packet** — `mode: rework` with a `findings:` brief — means this order was
+**sent back after being submitted** (the coordinator rejected the `done` order, or `main`
+broke its branch). The branch already exists on origin with prior work: **fetch and
+continue it — do not cut a fresh one** (that would orphan the reviews already done).
+Address the `findings`, keep history append-only (merge `main` if you must integrate it;
+never rebase or force-push a public branch), and drive it back through review.
+
 ## Build and review the order
 
 You take the order from claim to a reviewed branch. You do this by orchestrating

@@ -154,7 +154,19 @@ deliberate spend of time to avoid shipping a bad PR: a fresh model on a much-rev
 catches something genuinely new. Direct the worker (or dispatch a reviewer yourself) to run the extra
 pass, and clear only if it too is clean.
 
-## 5. Escalation and issue curation — your call
+**Not clean? Send it back with `rework` — the sibling of `land`.** If a coordinator-side check rejects
+a `done` order (the triple-check caught something), or `main` moved under it and broke the branch, do
+not clear it — return it for another pass instead of retiring it:
+
+```
+nightshift rework /plan/9001/order/op1 --reason-file findings.md   # or --reason "<short>"
+```
+
+`rework` flips the order from `done` to the non-terminal `changes-requested`, carrying your findings,
+and **leaves the `branch` and `claim` keys intact** — so the re-claiming worker **continues the existing
+branch** rather than cutting a fresh one. Prior commits and the reviews already done on them survive; no
+force-push, no lost diffability. It is pure Turnstile state (no git); the live `plan` controller returns
+the order to the ready set, and the next worker's WORK packet carries `mode: rework` and your `findings:`.
 
 You are **first-level escalation**. When a worker hits something that needs judgment it runs
 `nightshift escalate --reason "..."`, which pauses the order at `state=escalated` (the reconciler
