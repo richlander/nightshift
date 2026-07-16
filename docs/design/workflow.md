@@ -17,21 +17,14 @@ at which point its dependents open. A **plan** (`orders.json`) is a DAG of order
 for a feature; the `after` edges express which orders must land before others can
 start.
 
-**Roles are responsibilities, not people.** Nightshift has no "human" role and no
-"AI" role. A role is a set of responsibilities and boundaries, and any role can be
-filled by a person or an agent. There are five:
-
-| Role | Owns |
-|---|---|
-| **Product Manager** | The expanding shape of the product: new issues, taste, and where existing features must be re-shaped or composed to enable a UX or a non-obvious whole. Sets direction. |
-| **Planner** | Turns intent (often issues) into orders and registers them with nightshift. |
-| **Coordinator** | Keeps local work moving. First-level escalation with decision authority. Pushes worker branches, creates and updates PRs, and posts the one clearance note. Curates issues — files new ones, retires stale ones. |
-| **Worker** | Claims one order and takes it to a reviewed branch (handed back for the coordinator to push) — building it *and* reviewing it. Most sessions on a machine are workers. |
-| **PR Lander** | Holds merge authority; keeps sequenced PRs flowing; may be on another machine or a phone. |
-
-The boundaries are about **responsibility, not process count**. One session can
-fill several roles: Planner and Coordinator commonly collapse into one, and a
-worker can build and review within a single session. Most sessions are workers.
+**Roles are responsibilities, not processes.** A role names *what* work is done and
+its boundaries — build versus review, who writes to GitHub, which model runs — not
+how many processes call `nightshift`. Nightshift has no "human" role and no "AI"
+role; any role can be filled by a person or an agent, and one session can fill
+several — Planner and Coordinator commonly collapse, and a worker can build and
+review within a single session. The invariants hold regardless of the split: the
+builder never reviews its own work, the reviewer is a different model than the
+builder, and only the coordinator writes to GitHub.
 
 Because roles can be distinct sessions — or distinct machines — they do not talk
 directly. **They coordinate through Nightshift/Turnstile state.** An escalation a
@@ -44,85 +37,51 @@ everything between a committed plan and a cleared PR runs without anyone spendin
 attention on mechanics — and without anyone's name on an uninterpretable storm of
 contributions.
 
-## Roles are responsibilities, not processes
+## The five roles
 
-A role names *what* work is done and its boundaries — build versus review, who
-writes to GitHub, which model runs — not how many processes call `nightshift`. The
-invariants that matter hold regardless of how work is divided across processes:
-the builder never reviews its own work, the reviewer is a different model than the
-builder, and only the coordinator writes to GitHub.
+Any role can be filled by a person or an agent; most sessions on a machine are
+workers. Each role's authoritative guidance lives in its skill.
 
-### The worker is an orchestrator
+| Role | Owns | Skill |
+|---|---|---|
+| **Product Manager** | The expanding shape of the product: new issues, taste, and where existing features must be re-shaped or composed to enable a UX or a non-obvious whole. Sets direction. | — |
+| **Planner** | Turns intent (often issues) into orders and registers them with nightshift. | `nightshift-coordinator` |
+| **Coordinator** | Keeps local work moving. First-level escalation with decision authority. Pushes worker branches, creates and updates PRs, and posts the one clearance note. Curates issues — files new ones, retires stale ones. | `nightshift-coordinator` |
+| **Worker** | Claims one order and takes it to a reviewed branch (handed back for the coordinator to push) — building it *and* reviewing it, spawning `nightshift-builder` / `nightshift-reviewer` subagents as an optimization. | `nightshift-worker` |
+| **PR Lander** | Holds merge authority; keeps sequenced PRs flowing; may be on another machine or a phone. | — |
 
-The worker claims the order, owns the worktree and the lease, and takes the order
-all the way to a reviewed branch, handed back for the coordinator to push. It
-**builds and reviews** — and it may do both by spawning subagents.
-
-**Subagents are encouraged, not required.** Their value is **context-window
-preservation**: a builder subagent and a reviewer subagent each work in their own
-context, so the orchestrating worker's window stays clean across a long shift.
-They also buy parallelism and — critically — **model diversity**. But a worker is
-free to do the work in its own session instead. Two shapes are legal:
-
-- **With subagents.** The worker spawns a builder subagent (one model) to make the
-  change and a reviewer subagent (a *different* model) to review it. Because the
-  reviewer runs a different model, a single worker can legitimately **build and
-  review the same order**.
-- **Without subagents.** The worker is a single model. It can build the order or
-  review the order — but **not both for the same order**: a model reviewing its own
-  build is grading its own homework. Its build and its review must be different
-  models, which without subagents means the review goes to a *different* worker.
-
-> **The self-review rule.** The builder never reviews its own work. Enforced with
-> subagents by the worker choosing a different model for the reviewer; enforced
-> without subagents by the order's review going to a different worker (model).
-
-**Declining as an invalid choice.** When review is dispatched as work and it lands
-on the worker that built the order, that worker must **decline as a structurally
-invalid choice** — "I built this order; I am not a valid reviewer for it." This is
-distinct from an ordinary decline (which returns the order to the pool and could
-loop straight back to the same worker): an invalid-choice decline tells the router
-*never re-offer this to me*. *(A dedicated decline variant for this is a design gap
-— see the invariants — today the worker declines with an explicit reason.)*
-
-**Subagents load skills by file path.** A spawned subagent does not inherit the
-parent's skill menu; it reads the skill file directly. So the worker hands each
-subagent its role explicitly — "read `.github/skills/nightshift-builder/SKILL.md`;
-you are the builder" or the reviewer skill with a different model. This is where
-diversity is enforced: the worker chooses the reviewer subagent's model, so the
-build model can never review its own work.
-
-**Subagents are an optimization, not a role.** Progress flows back to the worker
-through the subagent channel intrinsically, so there is no reason to route it
-through a nightshift round-trip. The worker may reuse a subagent across orders,
-reuse a branch, or neither.
-
-### Where the gate protocol is load-bearing
+## Where the gate protocol matters
 
 `nightshift`'s claim/lease/check protocol matters **between distinct participants
 that no one is watching**. Independent workers — headless, or on another machine —
 call `next`/`check`/`release` themselves; nobody supervises them, the lease does. A
 worker that dies stops renewing, and its order returns to the pool. That
 recovery-by-lease is why the protocol exists. Between a worker and its own subagent
-the protocol is unnecessary; between a worker and the coordinator it is the comms
-channel.
+the protocol is unnecessary — progress flows back through the subagent channel
+intrinsically; between a worker and the coordinator it is the comms channel.
 
 ## The spine: the life of one order
 
-```
- product mgr    planner        coordinator          worker (orchestrator)      pr lander
-    │ issue ──────▶ orders.json                          │                         │
-    │              register (add/plan) ─▶ seed specs+ready│                         │
-    │                            │                        │◀── next (claim) ───┐   │
-    │                            │                        │  build (subagent, model A)
-    │                            │                        │  review (subagent, model B≠A)
-    │                            │                        │  fix ↺ re-review → two clean
-    │                            │◀── branch handed back ──┤  release done           │
-    │                            │  push · open/update PR  │  (+ attestation)        │
-    │                            │  post one clearance note│                         │
-    │                            │                         │            merge (squash)◀┤
-    │                            │  land ◀── merged ───────┼─────────────────────────┤
-    │                            │  → dependents open      │                         │
+```mermaid
+sequenceDiagram
+    participant PM as Product Manager
+    participant PL as Planner
+    participant CO as Coordinator
+    participant WK as Worker
+    participant LN as PR Lander
+
+    PM->>PL: issue
+    PL->>CO: orders.json — register (add/plan)
+    Note over CO: seed specs + ready
+    CO-->>WK: next (claim)
+    Note over WK: build (subagent, model A)
+    Note over WK: review (subagent, model B≠A)
+    Note over WK: fix ↺ re-review → two clean
+    WK->>CO: branch handed back — release done (+ attestation)
+    Note over CO: push · open/update PR · post one clearance note
+    CO->>LN: PR ready
+    LN->>CO: merge (squash)
+    Note over CO: land → dependents open
 ```
 
 ### 1 — Shape and plan (product manager, then planner)
@@ -157,7 +116,11 @@ nightshift next            # blocks until one ready order is claimed, exclusivel
 `next` hands back one order, mints its branch name `nightshift/{plan}/{order}`, and
 records it in Turnstile. In **its own worktree** cut from fresh `origin/main` — and
 re-reading its guidance (SKILL.md + `AGENTS.md`) every order, which makes a
-long-lived worker self-healing — the worker builds and reviews the order:
+long-lived worker self-healing — the worker builds and reviews the order. It may do
+both directly, or spawn `nightshift-builder` / `nightshift-reviewer` subagents — an
+optimization that preserves its context window and supplies model diversity, not a
+separate role. The `nightshift-worker` skill is the authoritative account; the shape
+below is the summary:
 
 1. **Build.** Either directly, or by spawning a builder subagent (which reads the
    `nightshift-builder` skill). The change touches only the order's `paths`, and

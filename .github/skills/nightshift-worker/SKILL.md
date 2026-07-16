@@ -32,7 +32,9 @@ coordinate with other workers directly — the system serializes and schedules f
 > `check`s, the work is lost.**
 
 You never see or manage the lease. The CLI owns it, keyed to this worktree. Do not
-track or pass any token. If your context resets, recover with **`nightshift show`**
+track or pass any token. **If you spawn a builder subagent, it carries this same rule**
+— the `nightshift-builder` skill makes the builder responsible for its own commits and
+for running `check` before each one. If your context resets, recover with **`nightshift show`**
 (session intact) or **`nightshift recover`** (session gone — see *Recovery*).
 
 ## Setup — once per shift
@@ -106,9 +108,9 @@ context, so your window stays clean across a long shift. They also buy paralleli
 **model diversity**. But you may also do the work in your own session. Two legal shapes:
 
 - **With subagents (preferred for long shifts).** Spawn a **builder subagent** (one
-  model) to make the change, then a **reviewer subagent** with a **different model** to
-  review it. Because the reviewer runs a different model, you can legitimately **build
-  and review the same order** yourself, through them.
+  model) to make the change, then **reviewer subagents** on **different models** to
+  review it. Because the reviewers run models different from the builder's, you can
+  legitimately **build and review the same order** yourself, through them.
 - **Without subagents.** You are a single model. You can build the order or review the
   order — but **not both for the same order**: a model reviewing its own build is
   grading its own homework. The order's build and its review must be different models,
@@ -154,6 +156,12 @@ from two different models** on its *final* head:
    them in your report to the coordinator, which files them as follow-up issues.
 4. **Bound the loop:** four rounds without two clean → **escalate to the coordinator**
    (below), do not keep looping.
+
+**Reviewers don't renew the lease — you do.** The lease is keyed to *your* worktree, so
+a reviewer subagent never runs `check` and doesn't need to. But the lease has a **45-minute
+TTL** and `check` only fires before *commits* — a long review with no fix commits can go
+quiet long enough to let it lapse. While you wait on reviews, run `nightshift check`
+periodically (e.g. between rounds) to keep your claim alive.
 
 **Declining review as an invalid choice.** If review work for an order **you built** is
 ever dispatched to you, you are a **structurally invalid** reviewer — decline it with an
