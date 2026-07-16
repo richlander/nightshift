@@ -35,8 +35,8 @@ worker can build and review within a single session. Most sessions are workers.
 
 Because roles can be distinct sessions — or distinct machines — they do not talk
 directly. **They coordinate through Nightshift/Turnstile state.** An escalation a
-worker raises surfaces to the coordinator as state, even when a person is sitting
-with the coordinator.
+worker raises surfaces to the coordinator as state, read off the board like every
+other signal.
 
 This is the accountability story made operational: direction-setting (Product
 Manager, Planner) and the merge decision (PR Lander) are deliberate acts;
@@ -258,9 +258,9 @@ whose premise is ambiguous — it escalates:
 nightshift escalate --reason "review did not converge after 4 rounds: <findings>"
 ```
 
-The escalation surfaces to the coordinator **as state**, never as direct chat — so
-even a person sitting with the coordinator is notified through the same channel every
-other role uses. The coordinator is **first-level escalation** and makes the call:
+The escalation surfaces to the coordinator **as state**, never as direct chat — the
+coordinator reads it off the board like every other signal. The coordinator is
+**first-level escalation** and makes the call:
 
 - **Converging → continue.** The work is on track; let it run another round.
 - **Wrong design → abandon.** The order's premise is flawed. Retire it and file a

@@ -150,8 +150,8 @@ pass, and clear only if it too is clean.
 
 You are **first-level escalation**. When a worker hits something that needs judgment it runs
 `nightshift escalate --reason "..."`, which pauses the order at `state=escalated` (the reconciler
-never auto-redispatches it) and surfaces to you **as state**, not chat — so even when a person is
-sitting with you, the escalation arrives through the same channel every role uses. Common triggers: a
+never auto-redispatches it) and surfaces to you **as state**, not chat — you read escalations off
+the board like every other signal. Common triggers: a
 review that won't reach two clean in four rounds, an ambiguous spec, a design that looks wrong as the
 worker builds it.
 
