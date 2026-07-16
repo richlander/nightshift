@@ -8,6 +8,29 @@ role owns each step. This is the operational spine the tools (`turnstile`,
 for the GitHub membrane, and the `nightshift-reviewer` skill for the review gate;
 this note is the thread that ties them together.
 
+## What this is in service of
+
+Nightshift lets one operator direct many coding agents without spending their
+attention on mechanics. Four levels of control are the point; each pairs something to
+hold onto with the part of the machine that holds it:
+
+- **Control who posts as you — and how much.** *Centralize the GitHub surface.* Only
+  the coordinator pushes, opens PRs, and comments — under your account or a distinct
+  bot identity, dialed from fully-by-hand toward automated as you grant autonomy, never
+  an agent wielding a maintainer's credentials. ([`octoshift.md`](octoshift.md) owns
+  that identity boundary.)
+- **Scale execution to whatever the incoming work allows.** *A strong planner.* It
+  parcels a plan into sequenced and parallel orders and — with visibility into GitHub
+  merges — keeps the frontier moving, so work continues when `main` crosses a boundary
+  of consistency.
+- **Hold a high-confidence engineering bar.** *A strong coordinator.* It gates the work
+  against what the project values; poor compliance wastes time and tokens but never
+  reaches GitHub.
+- **Reduce time spent tending execution.** *Strong skills and specs.* Planner and
+  coordinator post on issues that need clarity; the product manager engages directly on
+  the workflows and product shapes that need real tradeoff decisions. The clearer the
+  guidance, the less anyone hovers over a running agent.
+
 ## Summary
 
 The unit of work is an **order** — one landable PR, bound to at most one issue.
@@ -260,27 +283,6 @@ The workflow has exactly two sources of truth, and one translator between them:
 
 Nightshift itself never calls `gh` and never parses a PR. `land` is a pure primitive:
 "this order shipped." It does not know a merge caused it.
-
-## Governance and identity — the "as me" boundary
-
-The reason the coordinator monopolizes the GitHub surface is the reason Nightshift
-exists at all: **work done on the shift must not post under a maintainer's identity
-as if they did it by hand.** GitHub is a public forum; a name on it should mean
-deliberate authorship, not presiding over an uninterpretable storm of generated
-contributions.
-
-That yields a dial, run today at its most conservative setting:
-
-| | Local (today) | Remote | Factory |
-|---|---|---|---|
-| **Branches** | coordinator pushes | coordinator pushes | coordinator/octoshift pushes |
-| **PR + clearance note** | coordinator, by hand | coordinator, as a bot/App identity | coordinator/octoshift, automatic |
-| **Merge** | PR Lander, deliberate | PR Lander, deliberate | bot, under policy |
-
-Moving right is a single authority knob on a **distinct bot/App identity** — never a
-maintainer's credentials handed to an agent. The merge stays a deliberate PR-Lander
-act until it is deliberately dialed up. [`octoshift.md`](octoshift.md) §6 owns the
-mechanics of that identity boundary.
 
 ## Invariants
 
