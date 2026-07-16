@@ -28,8 +28,10 @@ Read, in order:
    solution.
 2. `docs/design/nightshift.md` — the Nightshift mechanics (plans, orders, ready
    set, landing).
-3. `docs/design/turnstile.md` — the coordination kernel underneath.
-4. The skill for the role you are playing (below) before you act.
+3. `docs/design/workflow.md` — the end-to-end workflow: how an order travels from
+   idea to merge, and which role owns each step.
+4. `docs/design/turnstile.md` — the coordination kernel underneath.
+5. The skill for the role you are playing (below) before you act.
 
 Keep this file to repository-wide engineering and workflow rules. Role
 mechanics live in the skills; subsystem design lives in `docs/design/`. When the
@@ -42,14 +44,15 @@ of truth for that role's flow.
 
 | Role | You do | Read first |
 | --- | --- | --- |
-| **Coordinator** | Start the daemon, author/register a plan, keep the ready set live, land merged orders, drain the shift | `.github/skills/nightshift-coordinator/SKILL.md` |
-| **Worker** | Claim one order, build it on an isolated branch, hand it back | `.github/skills/nightshift-worker/SKILL.md` |
-| **Reviewer** | Run the two-model adversarial gate on a PR and post one clearance note | `.github/skills/nightshift-reviewer/SKILL.md` |
+| **Coordinator** | Start the daemon, author/register a plan, keep the ready set live, own the GitHub surface (open PRs, post the clearance note), land merged orders, drain the shift | `.github/skills/nightshift-coordinator/SKILL.md` |
+| **Worker** | Claim one order, build it on an isolated branch, push, hand it back; fix review findings | `.github/skills/nightshift-worker/SKILL.md` |
+| **Reviewer** | Run the two-model adversarial gate on a PR read-only and report the verdict to the coordinator | `.github/skills/nightshift-reviewer/SKILL.md` |
 
 ## Task-specific guidance
 
 | Area | Read first |
 | --- | --- |
+| End-to-end workflow and role ownership | `docs/design/workflow.md` |
 | Nightshift plans, orders, landing | `docs/design/nightshift.md` |
 | Turnstile kernel (kv/lease/watch, socket) | `docs/design/turnstile.md` |
 | Octoshift GitHub→land bridge | `docs/design/octoshift.md` |
@@ -145,8 +148,9 @@ the models from:
 
 - **The builder never reviews or gates its own work.** As a worker you build the
   order and hand it back with `release`; you do not run the adversarial review,
-  and you do not touch GitHub at all. A builder grading its own homework is not a
-  review.
+  and you do not open PRs, post to, or merge on GitHub (reading an order's issue
+  with `gh issue view` is fine — that is context, not a write). A builder grading
+  its own homework is not a review.
 - **The reviewer runs the gate.** Two independent models (never the same model
   twice; never the builder self-reviewing), each in an isolated **read-only**
   checkout at the exact head, given the same self-contained prompt (exact base
@@ -156,9 +160,11 @@ the models from:
   gate passes only when both reviews are clean on the final head. The reviewer
   reports that verdict to the coordinator; it does **not** post to GitHub.
 - **The coordinator owns the GitHub surface.** Only the coordinator opens PRs,
-  posts the single clearance note, merges, and lands. A verdict reaches GitHub
-  through the coordinator and nowhere else. (A future gh-aware tool — octoshift —
-  may take over these mechanics; until then the coordinator does them by hand.)
+  posts the single clearance note, and lands merged orders. A verdict reaches
+  GitHub through the coordinator and nowhere else. The **human** owns the merge
+  itself — the one deliberate step kept in the loop. (A future gh-aware tool —
+  octoshift — may take over the coordinator's mechanics, and a factory dial may
+  automate the merge; until then the coordinator does its part by hand.)
 
 The PR gets exactly **one** clearance note (a sidecar comment naming the models
 and rounds), never a running commentary. GitHub carries decisions; the

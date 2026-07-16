@@ -109,8 +109,9 @@ fence: 7
    Nightshift-Order: /plan/<plan>/order/<order>
    ```
 6. **Push the branch:** `git push -u origin nightshift/<plan>/<order>`.
-   (Local-dev mode: you produce a branch. A human reviews, merges, and runs `nightshift land`.
-   Do **not** open or merge a PR unless explicitly told to.)
+   Your deliverable is a **pushed branch**, not a PR. The **coordinator** opens the PR, drives the
+   review, posts the clearance note, and (after a human merges) runs `nightshift land`. You do
+   **not** open, comment on, or merge a PR — the coordinator owns the GitHub surface.
 
 ### `check` — the heartbeat, read before every commit
 
