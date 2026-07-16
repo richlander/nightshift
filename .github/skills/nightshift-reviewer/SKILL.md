@@ -32,10 +32,10 @@ never as running commentary on the PR.
    one GPT (e.g. `gpt-5.x-codex`); add a third (e.g. Gemini) for high-blast-radius orders.
 2. **Reviews are READ-ONLY.** A reviewer inspects and reports; it never edits, stages,
    commits, or resets. Point reviewers at a diff, not a shared working tree.
-3. **Re-review the FIXED head.** If a reviewer finds a real issue, fix it on the branch,
-   then run the review **again on the new head**. The gate passes only when two models
-   sign off on the *same, final* commit with **zero outstanding findings** — not when an
-   earlier round was clean and findings were fixed afterward.
+3. **Re-review the FIXED head.** If a reviewer finds a real issue, hand it back to the
+   **worker** to fix on the branch, then run the review **again on the new head**. The gate
+   passes only when two models sign off on the *same, final* commit with **zero outstanding
+   findings** — not when an earlier round was clean and findings were fixed afterward.
 
 ## Run a review
 
@@ -70,8 +70,9 @@ Run the reviewers **in parallel** (they are independent and read-only).
 
 ## Drive findings to zero
 
-- Triage each finding: real bug → fix on the branch; false positive → note why and move on.
-- After any fix, **re-review the new head** (both models). Loop until two clean.
+- Triage each finding: real bug → hand it back to the **worker** to fix on the branch;
+  false positive → note why and move on. You never edit the code yourself.
+- After the worker pushes a fix, **re-review the new head** (both models). Loop until two clean.
 - **Bound the loop: after 4 rounds without convergence, stop and escalate.** If findings keep
   reappearing or new ones surface across four rounds without reaching two clean, the order
   isn't reviewable as-is. Escalate it for human judgment rather than looping further:

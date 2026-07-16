@@ -13,9 +13,9 @@ description: >-
 You run the shift. Workers claim and execute orders; **you** set up the board, register work, and
 land merges. Nightshift is **not GitHub-aware** — it coordinates branches and state over a local
 Unix socket. You (a human, or a future bridge) own the GitHub side: opening the PR, gating it through
-the adversarial review, posting the one clearance note the reviewer's verdict earns, merging, and
-telling Nightshift when a merge happened. The reviewer runs the gate and reports its verdict to you;
-**you** are the only one who posts to GitHub.
+the adversarial review, posting the one clearance note the reviewer's verdict earns, and — after the
+human merges — telling Nightshift with `land`. The reviewer runs the gate and reports its verdict to
+you; **you** are the only one who posts to GitHub, and the merge itself stays the human's.
 
 Vocabulary: an **order** = one **landable PR** (atomic claim + merge unit), bound to ≤1 issue.
 A **plan** (`orders.json`) = the set of orders for a feature, with an order→order dependency DAG.
@@ -93,7 +93,7 @@ Only ready orders are claimable; a worker's `next` hands out exactly one, exclus
 A worker's `release --status done` means **"submitted, awaiting merge"** — it does NOT open
 dependents. **You** keep the merge loop: open the PR, run it through the adversarial-review gate
 (the **reviewer** role clears it and reports a clean verdict to you — see the reviewer skill), post
-the one clearance note that verdict earns, merge, then tell Nightshift the merge happened:
+the one clearance note that verdict earns; the **human** merges, then you tell Nightshift it happened:
 
 ```
 nightshift land /plan/9001/order/op1
@@ -161,8 +161,9 @@ nightshift stop --resume                             # lift the halt
 ## Invariants
 
 1. **Nightshift never touches GitHub.** Registering, dispatch, and `land` are local. You own the
-   GitHub surface — opening PRs, posting the clearance note the reviewer's verdict earns, merging;
-   `land` is how you report a merge back. The reviewer reports its verdict to you and never posts.
+   GitHub surface — opening PRs, posting the clearance note the reviewer's verdict earns, and landing;
+   the **human** performs the merge, and `land` is how you report it back. The reviewer reports its
+   verdict to you and never posts.
 2. **`landed`, not `done`, advances the DAG.** Keep yourself in the merge loop.
 3. **Orders are self-healing.** A worker that dies (lease expiry) returns its order to the pool
    automatically — no dead-agent detector, just the lease. An `escalated` order waits for you and
