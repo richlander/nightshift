@@ -57,6 +57,14 @@ Work out the design first — the Product Manager shapes it, the Planner turns i
 commit it (the `standard` notes and the plan file live in the repo; that commit is the authorization
 root). Then write the plan:
 
+> **Readiness is a gate, not a formality — the planner's release valve.** Not every issue is ready to
+> scale through this pipeline. An order needs a design solid enough to slice into `paths`-bounded
+> pieces against a concrete `standard`; an issue that is still a sketch — unsettled scope, no agreed
+> shape, tradeoffs unresolved — only burns worker time and tokens on churn if you force it into orders.
+> When an issue is **not design-ready, do not plan it.** Post on the issue naming the specific design
+> it still needs (the decisions to make, the `standard` to write), and leave it for the product manager
+> to shape. Only well-formed issues become orders.
+
 ```json
 {
   "plan": "9001",
@@ -165,6 +173,12 @@ Make the call:
   manager's shape-setting.)
 - **Wrong path → requeue.** The design is fine but the implementation went sideways. Return the order
   to the pool for reassignment, with updated guidance attached.
+- **Not design-ready → send it back for design.** Sometimes the trouble is that the underlying issue
+  was never shaped well enough to scale — the order keeps failing because the design isn't settled, not
+  because the implementation slipped. That is your release valve: **pull it from the pipeline and post
+  on the issue** describing the design work it needs before it can be re-planned. A comment now is
+  cheaper than looping workers on an under-designed order; the product manager (or planner) reshapes it
+  before it re-enters.
 
 Answer a worker by creating a directive on its order; the worker sees it as `QUERY` on its next
 `check`:

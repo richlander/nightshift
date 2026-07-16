@@ -255,6 +255,13 @@ coordinator reads it off the board like every other signal. The coordinator is
   coordinator's issue-curation hat meets the product manager's shape-setting hat.)*
 - **Wrong path → requeue.** The design is fine but the implementation went sideways.
   Return the order to the pool for reassignment, with updated guidance attached.
+- **Not design-ready → send it back.** If the order keeps failing because the
+  underlying issue was never shaped well enough to scale — not because the
+  implementation slipped — pull it from the pipeline and **post on the issue** naming
+  the design it still needs. This release valve keeps under-designed work from burning
+  worker time and tokens; the product manager (or planner) reshapes it before it
+  re-enters. The planner applies the same gate up front — an issue that is still a
+  sketch never becomes orders.
 
 `escalate` records `state=escalated`, which the reconciler treats as ineligible — the
 order waits and is never silently reassigned. At night, with no coordinator awake, the
