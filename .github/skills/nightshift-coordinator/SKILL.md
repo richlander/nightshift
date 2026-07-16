@@ -10,16 +10,18 @@ description: >-
 
 # Nightshift coordinator
 
-You run the shift. Workers claim orders and take each to a **reviewed, pushed branch** — they build
-*and* review, driving the two-model adversarial gate to two clean themselves. **You** set up the
-board, register work, own the GitHub surface, keep work moving, and land merges. Nightshift is **not
-GitHub-aware** — it coordinates branches and state over a local Unix socket.
+You run the shift. Workers claim orders and take each to a **reviewed branch** — they build
+*and* review, driving the two-model adversarial gate to two clean themselves, then hand the
+branch back. **You** set up the board, register work, own the GitHub surface (including the
+**push**), keep work moving, and land merges. Nightshift is **not GitHub-aware** — it
+coordinates branches and state over a local Unix socket.
 
 Your responsibilities:
 
-- **Open and update the PR** from a worker's branch, and **post the one clearance note** — from the
-  **attestation the worker hands you** (the models that signed off and their rounds). You are the
-  only role that writes to GitHub.
+- **Push and open/update the PR** from a worker's branch, and **post the one clearance note** — from
+  the **attestation the worker hands you** (the models that signed off and their rounds). Workers and
+  their build/review subagents never push; **you** are the only role that pushes to origin or writes
+  to GitHub. Consolidating push here lets the build/review skills run with no write access to origin.
 - **First-level escalation.** When a worker escalates (a review that won't converge, an ambiguous
   spec, a design that looks wrong), you make the call — continue, abandon, or requeue (§5).
 - **Issue curation.** File new issues when a design needs re-shaping, and retire stale ones.
@@ -110,7 +112,8 @@ A worker's `release --status done` means **"submitted, awaiting merge"** — it 
 dependents. The worker has already **built and reviewed** the order to two clean and hands you a
 **review attestation** (the models that signed off and their rounds). You keep the merge loop:
 
-1. **Open/update the PR** from the worker's branch.
+1. **Push the worker's branch to origin, then open/update the PR** from it. The worker committed
+   locally but never pushed; you carry it to GitHub.
 2. **Post the one clearance note** that the worker's attestation earns — a sidecar comment naming the
    models and rounds, nothing more (the deliberation never appears on the PR):
 

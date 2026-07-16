@@ -3,7 +3,7 @@ name: nightshift-worker
 description: >-
   Operate as a Nightshift night-shift worker: claim one unit of work (an "order"
   = one landable PR) from the Turnstile coordination kernel and take it to a
-  reviewed, pushed branch — building it and reviewing it (usually by spawning
+  reviewed branch — building it and reviewing it (usually by spawning
   subagents), driving the adversarial gate to two clean, then handing it back.
   Use this whenever you are launched to work a Nightshift backlog, or told to "run
   nightshift", "take the next order", or "join the shift".
@@ -11,11 +11,14 @@ description: >-
 
 # Nightshift worker
 
-You are **one worker** on a shift, and you are an **orchestrator**. You take **one
-order at a time**, take it all the way to a **reviewed, pushed branch**, and hand it
-back. You **build and review** each order. Coordination is not chat — it is state you
-read from the `nightshift` CLI. There is no one to talk to. Every instruction you need
-arrives as the **return value of a gate call** (`next`, `check`).
+You are **one worker** on a shift. You take **one order at a time**, take it all the way
+to a **reviewed branch**, and hand it back. You **build and review** each order.
+
+Work comes from head office — the planner and coordinator — and you satisfy it with the
+**automated tools on hand**: the `nightshift` CLI hands you orders and carries directives
+both ways, and the **subagents** you spawn do the building and reviewing. Coordination is
+not chat; there is no one to talk to. Every instruction you need arrives as the **return
+value of a gate call** (`next`, `check`).
 
 An **order** is one **landable PR**: the atomic unit of claim and of merge. It belongs
 to a **plan** (a feature/campaign) and may point at a GitHub issue. You never
@@ -94,7 +97,7 @@ long-lived worker self-healing.
 
 ## Build and review the order
 
-You take the order from claim to a reviewed, pushed branch. You do this by orchestrating
+You take the order from claim to a reviewed branch. You do this by orchestrating
 two pieces of work: **building** it and **reviewing** it.
 
 **Subagents are encouraged, not required.** Their value is **context-window
@@ -140,11 +143,12 @@ and its worktree explicitly:
 **Drive the gate to two clean.** An order is not done until it has **two clean reviews
 from two different models** on its *final* head:
 
-1. Build → push (the builder does this, or you do).
-2. Review the pushed head with two different models (reviewer subagents, or a
+1. Build → local commits (the builder does this, or you do). Nobody pushes — the
+   branch stays local; the coordinator pushes it when it opens the PR.
+2. Review the head with two different models (reviewer subagents, or a
    second/third worker).
 3. Reviewers classify findings **blocking / non-blocking / pre-existing**. **Blocking**
-   findings go back to the **builder** to fix on the branch; a new push is a new head → a
+   findings go back to the **builder** to fix on the branch; a new commit is a new head → a
    fresh round; the gate passes only when both models are clean on the *same, final*
    commit. **Non-blocking** and **pre-existing** findings don't hold the order — carry
    them in your report to the coordinator, which files them as follow-up issues.
@@ -158,7 +162,7 @@ This is distinct from an ordinary decline, which could loop the same work back t
 
 ### Finish — hand back a reviewed branch
 
-Ensure the branch is pushed with the required trailers (the builder skill owns those),
+Ensure the branch is committed with the required trailers (the builder skill owns those),
 then:
 
 ```
@@ -168,15 +172,16 @@ nightshift release --status done
 `done` means **"submitted, awaiting merge"** — it does **not** merge and does **not**
 open dependent orders. Include the **review attestation** (the models that signed off
 and how many rounds each needed) in your release/report — the coordinator posts it as
-the single clearance note. Your deliverable is a **reviewed, pushed branch**; you never
-open, comment on, or merge a PR — the coordinator owns the GitHub surface. After
-`release`, loop back to `nightshift next` (or exit if you were told to do one order).
+the single clearance note. Your deliverable is a **reviewed branch**; you never push,
+open, comment on, or merge a PR — the coordinator owns the GitHub surface, including the
+push. After `release`, loop back to `nightshift next` (or exit if you were told to do one
+order).
 
 Other outcomes (use the honest one):
 
 | `release --status` | When |
 |---|---|
-| `done` | Built, reviewed to two clean, branch pushed, awaiting merge |
+| `done` | Built, reviewed to two clean, branch committed, awaiting merge |
 | `blocked --reason "..."` | Cannot proceed until something external happens |
 | `declined --reason "..."` | Returning it to the pool untouched (someone/something else should do it) — including "invalid reviewer: I built this order" |
 | `refused --reason "..."` | You will not do this (unsafe, out of scope) |
@@ -193,7 +198,7 @@ nightshift check
 | `OK` | Claim healthy, no directives | Continue; commit |
 | `QUERY` + text | An operator/coordinator answered/asked something | Read it, comply, keep working |
 | `HALT` | Global stop | Stop now. Do not commit. Exit |
-| `FENCE_STALE` | You lost the claim (expired/reassigned) | Abandon this order. Do not push. Exit |
+| `FENCE_STALE` | You lost the claim (expired/reassigned) | Abandon this order. Do not hand it back. Exit |
 
 ## When you need judgment — escalate to the coordinator
 
@@ -260,8 +265,8 @@ standing on an order branch, `nightshift recover` re-attaches you from that bran
 6. **One worker, one worktree; one order at a time.** Work the whole shift from your
    single dedicated worktree, `git switch`-ing onto each order's branch. Never nest a
    per-order worktree, and never claim a second order while holding one.
-7. **Hand results inward, never to GitHub.** You push a branch and report a verdict to
-   the coordinator; the coordinator opens the PR and posts the one clearance note; the
-   PR Lander merges.
+7. **Hand results inward, never to GitHub.** You hand back a committed branch and report
+   a verdict to the coordinator; the coordinator pushes it, opens the PR, and posts the
+   one clearance note; the PR Lander merges.
 8. **Read the return value, not your assumptions.** `HALT`, `FENCE_STALE`, `DRAINING`
    override whatever you were doing.

@@ -50,8 +50,8 @@ commonly do — and most sessions on a machine are workers.
 | --- | --- | --- |
 | **Product Manager** | The expanding shape of the product: new issues, taste, where features must be re-shaped or composed | `docs/design/workflow.md` |
 | **Planner** | Turns intent (often issues) into orders and registers them with nightshift | `.github/skills/nightshift-coordinator/SKILL.md` (§2–3) |
-| **Coordinator** | Run the shift: register a plan, keep the ready set live, own the GitHub surface (open PRs, post the one clearance note), first-level escalation, issue curation, land merged orders, drain/stop | `.github/skills/nightshift-coordinator/SKILL.md` |
-| **Worker** | Claim one order and take it to a reviewed, pushed branch — orchestrating its build **and** review | `.github/skills/nightshift-worker/SKILL.md` |
+| **Coordinator** | Run the shift: register a plan, keep the ready set live, own the GitHub surface (push branches, open PRs, post the one clearance note), first-level escalation, issue curation, land merged orders, drain/stop | `.github/skills/nightshift-coordinator/SKILL.md` |
+| **Worker** | Claim one order and take it to a reviewed branch (handed back for the coordinator to push) — orchestrating its build **and** review | `.github/skills/nightshift-worker/SKILL.md` |
 | **PR Lander** | Merge authority; keep sequenced PRs flowing | `docs/design/workflow.md` |
 
 The **Worker** builds and reviews by spawning subagents (an optimization that
@@ -160,9 +160,10 @@ the models from:
 **Who does what — the responsibilities do not overlap:**
 
 - **The builder builds; it never reviews its own work.** Building an order — as
-  the worker itself or a builder subagent it spawns — produces a pushed branch. A
-  builder does not review that branch, and it does not open PRs, post to, or merge
-  on GitHub (reading an order's issue with `gh issue view` is fine — that is
+  the worker itself or a builder subagent it spawns — produces a committed branch,
+  handed back for the coordinator to push. A builder never pushes (it is read-only
+  w.r.t. origin), does not review that branch, and does not open PRs, post to, or
+  merge on GitHub (reading an order's issue with `gh issue view` is fine — that is
   context, not a write). A builder grading its own homework is not a review.
 - **The worker runs the gate.** It drives two clean reviews from two **different**
   models on the final head — preferably as reviewer subagents on models different
@@ -175,13 +176,14 @@ the models from:
   build — the review goes to a different worker, and a worker offered review of an
   order it built declines as an invalid choice. The worker hands the coordinator
   the **attestation** (models and rounds); it never posts to GitHub.
-- **The coordinator owns the GitHub surface.** Only the coordinator opens PRs,
-  posts the single clearance note (from the worker's attestation), and lands
-  merged orders. A verdict reaches GitHub through the coordinator and nowhere else.
-  The **PR Lander** owns the merge itself — the one deliberate step kept in the
-  loop. (A future gh-aware tool — octoshift — may take over the coordinator's
-  mechanics, and a factory dial may automate the merge; until then the coordinator
-  does its part by hand.)
+- **The coordinator owns the GitHub surface — and the push.** Only the coordinator
+  pushes worker branches to origin, opens PRs, posts the single clearance note (from
+  the worker's attestation), and lands merged orders. A verdict reaches GitHub through
+  the coordinator and nowhere else. Consolidating the push here lets the build/review
+  roles run with no write access to origin. The **PR Lander** owns the merge itself —
+  the one deliberate step kept in the loop. (A future gh-aware tool — octoshift — may
+  take over the coordinator's mechanics, and a factory dial may automate the merge;
+  until then the coordinator does its part by hand.)
 
 The PR gets exactly **one** clearance note (a sidecar comment naming the models
 and rounds), never a running commentary. GitHub carries decisions; the

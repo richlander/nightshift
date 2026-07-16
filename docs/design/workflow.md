@@ -25,8 +25,8 @@ filled by a person or an agent. There are five:
 |---|---|
 | **Product Manager** | The expanding shape of the product: new issues, taste, and where existing features must be re-shaped or composed to enable a UX or a non-obvious whole. Sets direction. |
 | **Planner** | Turns intent (often issues) into orders and registers them with nightshift. |
-| **Coordinator** | Keeps local work moving. First-level escalation with decision authority. Creates and updates PRs and posts the one clearance note. Curates issues — files new ones, retires stale ones. |
-| **Worker** | Claims one order and takes it to a reviewed, pushed branch — building it *and* reviewing it. Most sessions on a machine are workers. |
+| **Coordinator** | Keeps local work moving. First-level escalation with decision authority. Pushes worker branches, creates and updates PRs, and posts the one clearance note. Curates issues — files new ones, retires stale ones. |
+| **Worker** | Claims one order and takes it to a reviewed branch (handed back for the coordinator to push) — building it *and* reviewing it. Most sessions on a machine are workers. |
 | **PR Lander** | Holds merge authority; keeps sequenced PRs flowing; may be on another machine or a phone. |
 
 The boundaries are about **responsibility, not process count**. One session can
@@ -55,8 +55,8 @@ builder, and only the coordinator writes to GitHub.
 ### The worker is an orchestrator
 
 The worker claims the order, owns the worktree and the lease, and takes the order
-all the way to a reviewed, pushed branch. It **builds and reviews** — and it may
-do both by spawning subagents.
+all the way to a reviewed branch, handed back for the coordinator to push. It
+**builds and reviews** — and it may do both by spawning subagents.
 
 **Subagents are encouraged, not required.** Their value is **context-window
 preservation**: a builder subagent and a reviewer subagent each work in their own
@@ -117,8 +117,8 @@ channel.
     │                            │                        │  build (subagent, model A)
     │                            │                        │  review (subagent, model B≠A)
     │                            │                        │  fix ↺ re-review → two clean
-    │                            │◀── branch pushed ───────┤  push · release done    │
-    │                            │  open/update PR         │  (+ attestation)        │
+    │                            │◀── branch handed back ──┤  release done           │
+    │                            │  push · open/update PR  │  (+ attestation)        │
     │                            │  post one clearance note│                         │
     │                            │                         │            merge (squash)◀┤
     │                            │  land ◀── merged ───────┼─────────────────────────┤
@@ -168,29 +168,30 @@ long-lived worker self-healing — the worker builds and reviews the order:
    with a model *different* from the builder's; a worker not using subagents sends
    the review to a *different* worker (it cannot review its own build). Reviewers
    classify findings **blocking / non-blocking / pre-existing**: blocking findings go
-   back to the **builder** to fix (a new push is a new head and a fresh round; the
+   back to the **builder** to fix (a new commit is a new head and a fresh round; the
    gate passes only when both models are clean on the same, final commit), while
    non-blocking and pre-existing findings are carried to the coordinator to file as
    follow-up issues rather than held against this order.
-3. **Push and release.** The worker pushes the branch and reports it:
+3. **Release.** The worker hands the committed branch back and reports it:
 
    ```
    nightshift release --status done   # "submitted, awaiting merge" (+ review attestation)
    ```
 
 `done` does **not** advance the DAG — only `land` does. The worker's deliverable is
-a **reviewed, pushed branch** plus the review attestation (the models and rounds).
-The worker never opens a PR, comments, or merges — it hands its work *inward*, to a
-branch and to Turnstile.
+a **reviewed branch** (committed, not pushed) plus the review attestation (the models
+and rounds). The worker never pushes, opens a PR, comments, or merges — it hands its
+work *inward*, to a branch and to Turnstile; the coordinator pushes it.
 
 If the gate will not converge — four rounds without two clean — the worker does not
 keep looping. It **escalates to the coordinator** (§Escalation).
 
 ### 3 — Open and clear the PR (coordinator)
 
-The coordinator sees the released order on the board (`nightshift where`/`roster`)
-and creates or updates the PR from the worker's branch. It posts exactly **one**
-clearance note — the attestation the worker produced, nothing more:
+The coordinator sees the released order on the board (`nightshift where`/`roster`),
+**pushes the worker's branch to origin**, and creates or updates the PR from it. It
+posts exactly **one** clearance note — the attestation the worker produced, nothing
+more:
 
 ```
 ✅ Adversarial review clear — two independent reviews.
@@ -276,11 +277,11 @@ default is **halt and hold**.
 
 Between `done` and `land`, `main` moves — landing `op1` can break `op2`'s pre-land
 branch with a merge conflict or a red CI run. This is common. The order routes to a
-`rework` state with a directive; the **builder** integrates `main` and pushes a new
-commit (nothing about the GitHub membrane touches code). Once the branch is public it
-**merges** `main` rather than rebasing — a rebase forces a force-push that rewrites
-history, kills diffability, and voids the reviews already done. `done → land` is a
-retry loop, not a one-shot.
+`rework` state with a directive; the **builder** integrates `main` and hands back a new
+commit (nothing about the GitHub membrane touches code) — the coordinator pushes it. Once
+the branch is public it **merges** `main` rather than rebasing — a rebase forces a
+force-push that rewrites history, kills diffability, and voids the reviews already done.
+`done → land` is a retry loop, not a one-shot.
 
 ## Two systems of record
 
@@ -308,7 +309,7 @@ That yields a dial, run today at its most conservative setting:
 
 | | Local (today) | Remote | Factory |
 |---|---|---|---|
-| **Branches** | worker pushes | worker pushes | worker pushes |
+| **Branches** | coordinator pushes | coordinator pushes | coordinator/octoshift pushes |
 | **PR + clearance note** | coordinator, by hand | coordinator, as a bot/App identity | coordinator/octoshift, automatic |
 | **Merge** | PR Lander, deliberate | PR Lander, deliberate | bot, under policy |
 
@@ -323,8 +324,9 @@ mechanics of that identity boundary.
    merge unit are the same thing.
 2. **`landed`, not `done`, advances the DAG.** Dispatch is autonomous; the merge is
    the PR Lander's deliberate act.
-3. **Only the coordinator writes to GitHub.** Workers push branches and hand results
-   inward; reviewers report verdicts. Nothing else touches the public surface.
+3. **Only the coordinator writes to GitHub — and only it pushes.** Workers hand
+   committed branches inward and report results; reviewers report verdicts. Nothing else
+   touches origin or the public surface.
 4. **The builder never reviews its own work; the reviewer is a different model.**
    Enforced with subagents by the worker choosing the reviewer's model, and without
    subagents by the review going to a different worker. A worker offered review of an
