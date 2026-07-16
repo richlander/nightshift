@@ -11,8 +11,17 @@ this note is the thread that ties them together.
 ## What this is in service of
 
 Nightshift lets one operator direct many coding agents without spending their
-attention on mechanics. Four levels of control are the point; each pairs something to
-hold onto with the part of the machine that holds it:
+attention on mechanics. It is a **loose harness**: where a coding agent's own harness
+(Copilot CLI, Claude Code) tightly wraps one model's every turn, Nightshift sits above
+many such harnesses and coordinates them through state — leases, orders, directives —
+never their inner loops. **Loosely overlaid; strictly gated.** It touches nothing about
+how an agent thinks and everything about which work flows and who may act: the coupling
+between roles is loose, but the boundaries (claim, `check`, two clean reviews, `paths`,
+land, escalate) are hard gates. That is what buys strong outcomes without step-level
+supervision.
+
+Four levels of control are the point; each pairs something to hold onto with the part
+of the machine that holds it:
 
 - **Control who posts as you — and how much.** *Centralize the GitHub surface.* Only
   the coordinator pushes, opens PRs, and comments — under your account or a distinct
