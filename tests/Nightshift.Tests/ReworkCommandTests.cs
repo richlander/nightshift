@@ -168,6 +168,104 @@ public class ReworkCommandTests : IClassFixture<TurnstileFixture>
         Assert.Equal(ExitCode.Usage, code);
     }
 
+    [Fact]
+    public async Task Rework_EmptyReasonFile_RejectedWithNoMutation()
+    {
+        using TurnstileClient client = _fixture.Connect();
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        string orderBase = NewBase();
+
+        await client.CreateImmutableAsync($"{orderBase}/spec", "{}", ct);
+        await OrderState.WriteAsync(client, orderBase, "done", null, "worker", ct);
+
+        string path = Path.Combine(AppContext.BaseDirectory, $"rework-empty-{Guid.NewGuid():N}.txt");
+        await File.WriteAllTextAsync(path, "   \n\t ", ct); // whitespace-only
+        try
+        {
+            int code = await ReworkCommand.RunAsync(client, orderBase, "short", path, "operator", ct);
+
+            Assert.Equal(ExitCode.Usage, code);
+            Assert.Equal("done", await StatusAsync(client, orderBase, ct)); // state untouched
+            Assert.Null(await client.GetAsync($"{orderBase}/rework", ct));  // no findings written
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Rework_UnreadableReasonFile_RejectedWithNoMutation()
+    {
+        // chmod 000 is a POSIX affordance; the test asserts a clean usage exit rather than a crash.
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        using TurnstileClient client = _fixture.Connect();
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        string orderBase = NewBase();
+
+        await client.CreateImmutableAsync($"{orderBase}/spec", "{}", ct);
+        await OrderState.WriteAsync(client, orderBase, "done", null, "worker", ct);
+
+        string path = Path.Combine(AppContext.BaseDirectory, $"rework-locked-{Guid.NewGuid():N}.txt");
+        await File.WriteAllTextAsync(path, "real findings", ct);
+        File.SetUnixFileMode(path, UnixFileMode.None); // chmod 000 → read throws
+        try
+        {
+            int code = await ReworkCommand.RunAsync(client, orderBase, "short", path, "operator", ct);
+
+            Assert.Equal(ExitCode.Usage, code);
+            Assert.Equal("done", await StatusAsync(client, orderBase, ct)); // state untouched
+            Assert.Null(await client.GetAsync($"{orderBase}/rework", ct));
+        }
+        finally
+        {
+            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Rework_MissingReasonFile_RejectedWithNoMutation()
+    {
+        using TurnstileClient client = _fixture.Connect();
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        string orderBase = NewBase();
+
+        await client.CreateImmutableAsync($"{orderBase}/spec", "{}", ct);
+        await OrderState.WriteAsync(client, orderBase, "done", null, "worker", ct);
+
+        string path = Path.Combine(AppContext.BaseDirectory, $"rework-missing-{Guid.NewGuid():N}.txt");
+
+        int code = await ReworkCommand.RunAsync(client, orderBase, "short", path, "operator", ct);
+
+        Assert.Equal(ExitCode.Usage, code);
+        Assert.Equal("done", await StatusAsync(client, orderBase, ct));
+        Assert.Null(await client.GetAsync($"{orderBase}/rework", ct));
+    }
+
+    [Fact]
+    public async Task Rework_Success_AlwaysWritesNonEmptyFindingsWithChangesRequested()
+    {
+        // The invariant behind the packet: a changes-requested order always has a non-empty {base}/rework.
+        using TurnstileClient client = _fixture.Connect();
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        string orderBase = NewBase();
+
+        await client.CreateImmutableAsync($"{orderBase}/spec", "{}", ct);
+        await OrderState.WriteAsync(client, orderBase, "done", null, "worker", ct);
+
+        int code = await ReworkCommand.RunAsync(client, orderBase, null, null, "operator", ct);
+
+        Assert.Equal(ExitCode.Ok, code);
+        Assert.Equal("changes-requested", await StatusAsync(client, orderBase, ct));
+        string? findings = (await client.GetAsync($"{orderBase}/rework", ct))?.Text;
+        Assert.False(string.IsNullOrWhiteSpace(findings));
+    }
+
     private static async Task<string?> StatusAsync(TurnstileClient client, string orderBase, CancellationToken ct)
         => await FieldAsync(client, orderBase, "status", ct);
 

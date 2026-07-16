@@ -32,7 +32,8 @@ internal static class ShowCommand
 
         OrderView view = await OrderView.LoadAsync(client, session.OrderBase, ct);
         Render(view, session.OrderBase, session.Fence, output, Console.Out);
-        return ExitCode.Ok;    }
+        return ExitCode.Ok;
+    }
 
     internal static void Render(OrderView view, string orderBase, long fence, OutputFormat output, TextWriter writer)
     {

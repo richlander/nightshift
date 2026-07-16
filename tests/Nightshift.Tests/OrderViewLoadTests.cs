@@ -77,6 +77,26 @@ public class OrderViewLoadTests : IClassFixture<TurnstileFixture>
         Assert.Null(view.Findings);
     }
 
+    [Fact]
+    public async Task LoadAsync_Rework_PacketNeverHasModeWithoutFindings()
+    {
+        // The write-order + empty-file guards guarantee a changes-requested order always has non-empty
+        // findings; the packet must therefore never show `mode: rework` without a `findings:` line.
+        using TurnstileClient client = _fixture.Connect();
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        string orderBase = NewBase();
+
+        await client.CreateImmutableAsync($"{orderBase}/spec", "{ \"title\": \"T\" }", ct);
+        await OrderState.WriteAsync(client, orderBase, "done", null, "worker", ct);
+        await ReworkCommand.RunAsync(client, orderBase, "reviewer: address the race", null, "operator", ct);
+
+        OrderView view = await OrderView.LoadAsync(client, orderBase, ct);
+        string packet = Render(view, orderBase);
+
+        Assert.Contains("mode: rework", packet);
+        Assert.Contains("findings:", packet);
+    }
+
     private static string Render(OrderView view, string orderBase)
     {
         var sb = new StringBuilder();

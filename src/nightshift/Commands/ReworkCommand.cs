@@ -58,11 +58,12 @@ internal static class ReworkCommand
 
         string shortReason = reason is { Length: > 0 } ? reason : DefaultReason;
 
-        // Record the non-terminal outcome and the durable findings brief. The claim/branch keys are left
-        // as-is so the order re-serves on its existing branch. The live `plan` controller reconciles
-        // `changes-requested` back into the ready set.
-        await OrderState.WriteAsync(client, orderBase, OrderView.ChangesRequested, shortReason, by, ct);
+        // Write the findings brief BEFORE the state flip: any observer (`next`/`show`) that later sees
+        // `changes-requested` is then guaranteed the `{base}/rework` key already exists, so a rework packet
+        // never carries `mode: rework` without `findings:`. The claim/branch keys are left as-is so the
+        // order re-serves on its existing branch; the live `plan` controller reconciles it back to ready.
         await client.SetAsync($"{orderBase}/rework", findings, ct);
+        await OrderState.WriteAsync(client, orderBase, OrderView.ChangesRequested, shortReason, by, ct);
 
         Console.WriteLine($"REWORK {orderBase}");
         return ExitCode.Ok;
@@ -79,7 +80,26 @@ internal static class ReworkCommand
                 return null;
             }
 
-            return await File.ReadAllTextAsync(reasonFile, ct);
+            string contents;
+            try
+            {
+                contents = await File.ReadAllTextAsync(reasonFile, ct);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Console.Error.WriteLine($"nightshift rework: --reason-file unreadable: {reasonFile}");
+                return null;
+            }
+
+            // A rework must carry real findings; an empty/whitespace file would yield an empty `{base}/rework`
+            // and a packet with `mode: rework` but no `findings:` line. Reject it as a usage error.
+            if (string.IsNullOrWhiteSpace(contents))
+            {
+                Console.Error.WriteLine($"nightshift rework: --reason-file is empty: {reasonFile}");
+                return null;
+            }
+
+            return contents;
         }
 
         return reason is { Length: > 0 } ? reason : DefaultReason;
