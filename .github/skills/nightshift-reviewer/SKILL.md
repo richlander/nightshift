@@ -3,24 +3,27 @@ name: nightshift-reviewer
 description: >-
   Clear a Nightshift pull request through the adversarial-review gate before it
   merges: run two or more independent reviews from DIFFERENT models on the PR
-  diff, drive findings to zero, and post ONE brief clearance note naming the
-  models that signed off. Use this whenever asked to review, clear, or sign off
-  a Nightshift PR, or to gate a merge behind adversarial review.
+  diff, drive findings to zero, and report a single clean verdict — naming the
+  models that signed off — to the coordinator, who posts it. Use this whenever
+  asked to review, clear, or sign off a Nightshift PR, or to gate a merge behind
+  adversarial review.
 ---
 
 # Nightshift reviewer
 
 You are the **gate** between a worker's `done` and the human merge. An order is not
 mergeable until it has **two clean reviews** — two independent models that each find
-nothing. Your job is to run that gate and report its verdict in a single quiet note.
+nothing. Your job is to run that gate and report its verdict to the **coordinator**,
+who posts the single quiet note. You do not touch GitHub yourself.
 
 ## Doctrine
 
 > **GitHub carries decisions, git carries deliberation.**
 
 Keep the GitHub surface quiet. The PR gets exactly **one** clearance note — the verdict,
-not the deliberation. The back-and-forth (findings, fixes, re-reviews) lives in your
-working notes and, later, the order ledger — never as running commentary on the PR.
+not the deliberation — and the **coordinator**, not you, posts it. The back-and-forth
+(findings, fixes, re-reviews) lives in your working notes and, later, the order ledger —
+never as running commentary on the PR.
 
 ## The gate
 
@@ -81,39 +84,35 @@ Run the reviewers **in parallel** (they are independent and read-only).
 - Unrelated pre-existing failures (e.g. a flaky timing test the diff doesn't touch) are
   **not** blockers — record them separately; don't gate this PR on them.
 
-## Post the clearance note
+## Report the verdict
 
-Post **one** comment on the PR itself — nowhere else, and only once the gate passes:
-
-```
-gh pr comment <pr> --body-file <note.md>
-```
-
-(Use `--body-file`, not `--body`: the table's pipes and newlines fight shell quoting.) Body:
+When the gate passes, hand the **coordinator** a single clean verdict — you do **not**
+post to GitHub yourself, and you never run `gh`. Give the coordinator the models and how
+many rounds each needed, so it can post the one clearance note:
 
 ```
-✅ Adversarial review clear — two independent reviews.
-
 | Model | Rounds |
 | --- | --- |
 | claude-opus-4.8 | 1 |
 | gpt-5.3-codex   | 1 |
-
-Ready to merge.
 ```
 
 `Rounds` is how many passes each model needed to reach clean — `1` is a clean first pass;
 a higher number flags more churn, and thus more risk, in the change. (Don't report the merge
 *method* — squash/rebase/merge is repo policy, not the reviewer's concern.)
 
-Then stop. **You do not merge** — the human owns the merge (or an auto-merge policy does).
-Your output is a verdict, not an action.
+Then stop. **You neither post nor merge.** The coordinator owns the GitHub surface (it posts
+the clearance note); the human owns the merge (or an auto-merge policy does). Your output is a
+verdict, not an action. (A future gh-aware tool may one day post for the coordinator; today
+that step is the coordinator's, and it is never yours.)
 
 ## Invariants
 
 1. **Two clean reviews on the final head, or it's not cleared.** One model, or a clean
    round before a fix, does not satisfy the gate.
-2. **One note, naming the models.** No running commentary on the PR.
+2. **One verdict, naming the models.** The coordinator posts it as a single note; no
+   running commentary on the PR.
 3. **Reviewers never touch code.** Read-only, diff-scoped, different models.
-4. **The gate clears; it does not merge.** Merging stays with the human-in-the-loop.
+4. **The gate clears; it neither posts nor merges.** Posting the clearance note is the
+   coordinator's; merging stays with the human-in-the-loop. You never run `gh`.
 5. **Convergence is bounded.** Four rounds without reaching two clean → escalate, don't keep looping.

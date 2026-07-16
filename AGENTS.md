@@ -133,25 +133,36 @@ Documentation-only changes need Markdown review, not a product build or tests.
 ## Adversarial review
 
 **Every change clears the gate before it merges** — an order is not mergeable
-until it has **two clean reviews from two DIFFERENT models** on its final head
-(see the reviewer skill). This holds for governance and documentation PRs too,
-not just plan orders. Draw the models from:
+until it has **two clean reviews from two DIFFERENT models** on its final head.
+This holds for governance and documentation PRs too, not just plan orders. Draw
+the models from:
 
 - Claude Opus 4.8
 - GPT-5.x-Codex (e.g. `gpt-5.3-codex`)
 - Gemini Pro (e.g. Gemini 3.1 Pro) — add as a third for high-blast-radius orders
 
-Diversity is the point: a single model's blind spots are not a review. Give both
-reviewers the same self-contained prompt (exact base and head, design intent,
-diff, concrete attack points), isolate each in its own checkout, and reproduce
-any blocking finding on a clean exact-head checkout before acting. After fixing
-findings, **re-review the fixed head** — the gate passes only when both reviews
-are clean on the final head.
+**Who does what — the roles do not overlap:**
 
-Record the verdict as **one** clearance note on the PR (a sidecar comment naming
-the models and rounds), not a running commentary. GitHub carries decisions; the
-deliberation (findings, fixes, re-reviews) stays in your working notes and the
-order ledger.
+- **The builder never reviews or gates its own work.** As a worker you build the
+  order and hand it back with `release`; you do not run the adversarial review,
+  and you do not touch GitHub at all. A builder grading its own homework is not a
+  review.
+- **The reviewer runs the gate.** Two independent models (never the same model
+  twice; never the builder self-reviewing), each in an isolated **read-only**
+  checkout at the exact head, given the same self-contained prompt (exact base
+  and head, design intent, diff, concrete attack points). The reviewer drives
+  findings to zero, reproduces any blocking finding on a clean exact-head
+  checkout before acting, and — after fixes — **re-reviews the fixed head**. The
+  gate passes only when both reviews are clean on the final head. The reviewer
+  reports that verdict to the coordinator; it does **not** post to GitHub.
+- **The coordinator owns the GitHub surface.** Only the coordinator opens PRs,
+  posts the single clearance note, merges, and lands. A verdict reaches GitHub
+  through the coordinator and nowhere else. (A future gh-aware tool — octoshift —
+  may take over these mechanics; until then the coordinator does them by hand.)
+
+The PR gets exactly **one** clearance note (a sidecar comment naming the models
+and rounds), never a running commentary. GitHub carries decisions; the
+deliberation (findings, fixes, re-reviews) stays in git and the order ledger.
 
 Scale the review effort to the blast radius — a docs change is cleared by
 confirming its claims are accurate, a coordination-logic change by attacking its
