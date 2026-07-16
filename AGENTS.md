@@ -2,9 +2,12 @@
 
 ## Start here
 
-Nightshift is a coordination system that lets one human drive many AI coding
-agents without spending their attention on mechanics. Agents do structured work
-on a night shift; you evaluate the shape of the product on the day shift.
+Nightshift is a coordination system that lets one human operator drive many AI
+coding agents without spending their attention on mechanics. **You are one of
+those agents.** You do structured work on the night shift — claiming and
+executing orders through the mechanism described here; the operator works the
+day shift, evaluating the shape of the product. The whole point is that you make
+trustworthy progress without the operator having to babysit the mechanics.
 
 It has three layers:
 
