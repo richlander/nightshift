@@ -188,6 +188,15 @@ public sealed class DispatchTests : IClassFixture<TurnstileFixture>
         Assert.Empty(result.Stderr);
     }
 
+    [Fact]
+    public void ReworkVerb_ParsesWithBaseAndReasonOptions()
+    {
+        var result = Cli.CreateRootCommand().Parse(
+            ["rework", "/plan/1/order/op1", "--reason", "fix", "--reason-file", "notes.txt"]);
+
+        Assert.Empty(result.Errors);
+    }
+
     private static Task<InvocationResult> InvokeAsync(params string[] args)
         => InvokeAsync(socket: null, args);
 

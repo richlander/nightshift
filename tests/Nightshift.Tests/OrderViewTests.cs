@@ -32,6 +32,42 @@ public class OrderViewTests
     }
 
     [Fact]
+    public void PrintWork_Rework_EmitsModeAfterBranchAndFindingsAfterBrief()
+    {
+        OrderView view = OrderView.Parse(
+            """
+            { "title": "Retry loop", "paths": ["src/A.cs"], "brief": "do the thing" }
+            """) with { Mode = "rework", Findings = "reviewer says: fix the retry" };
+
+        var sb = new StringBuilder();
+        using var writer = new StringWriter(sb);
+        view.PrintWork(writer, "/plan/9001/order/op4", fence: 5);
+
+        string[] lines = sb.ToString().Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal("WORK /plan/9001/order/op4", lines[0]);
+        Assert.Equal("branch: nightshift/9001/op4", lines[1]);
+        Assert.Equal("mode: rework", lines[2]);            // mode sits right after branch
+        int briefIdx = Array.IndexOf(lines, "brief: do the thing");
+        Assert.True(briefIdx > 0);
+        Assert.Equal("findings: reviewer says: fix the retry", lines[briefIdx + 1]); // findings follows brief
+        Assert.Equal("fence: 5", lines[^1]);
+    }
+
+    [Fact]
+    public void PrintWork_NoRework_OmitsModeAndFindings()
+    {
+        OrderView view = OrderView.Parse("""{ "title": "T", "brief": "b" }""");
+
+        var sb = new StringBuilder();
+        using var writer = new StringWriter(sb);
+        view.PrintWork(writer, "/plan/1/order/x", fence: 1);
+
+        string output = sb.ToString();
+        Assert.DoesNotContain("mode:", output);
+        Assert.DoesNotContain("findings:", output);
+    }
+
+    [Fact]
     public void Parse_MalformedJson_YieldsEmpty()
     {
         OrderView view = OrderView.Parse("not json");

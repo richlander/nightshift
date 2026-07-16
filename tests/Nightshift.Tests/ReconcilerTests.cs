@@ -148,6 +148,30 @@ public class ReconcilerTests : IClassFixture<TurnstileFixture>
         await AssertReady(client, plan, "a", expected: false);
     }
 
+    [Fact]
+    public async Task ChangesRequested_ReturnsToReady_ButDoesNotOpenDependents()
+    {
+        // rework sends a reviewed-and-rejected root back: it must re-serve (unclaimed, deps ok) yet, unlike
+        // `landed`, must NOT open its dependents — only a real merge advances the DAG.
+        using TurnstileClient client = _fixture.Connect();
+        Plan plan = MakePlan(PlanId());
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        await Reconciler.RunAsync(client, plan, ct);
+
+        // Root submitted, then reworked (state=changes-requested); its claim was freed on release.
+        await OrderState.WriteAsync(client, plan.Orders[0].Base, "done", null, "worker", ct);
+        await Reconciler.RunAsync(client, plan, ct);
+        await AssertReady(client, plan, "a", expected: false); // `done` is in-flight → out of ready
+
+        await ReworkCommand.RunAsync(client, plan.Orders[0].Base, "fix it", null, "operator", ct);
+        Reconciler.Result result = await Reconciler.RunAsync(client, plan, ct);
+
+        Assert.Equal(1, result.Added);                       // a returns to the pool
+        await AssertReady(client, plan, "a", expected: true);
+        await AssertReady(client, plan, "b", expected: false); // dependents stay blocked (a not landed)
+        await AssertReady(client, plan, "c", expected: false);
+    }
+
     private static async Task AssertReady(TurnstileClient client, Plan plan, string orderId, bool expected)
     {
         Order order = plan.Orders.Single(o => o.Id == orderId);

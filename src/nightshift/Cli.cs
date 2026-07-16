@@ -8,7 +8,7 @@ using Nightshift.Output;
 /// <summary>Entry dispatch for the <c>nightshift</c> agent/operator CLI.</summary>
 public static class Cli
 {
-    private const string Usage = "usage: nightshift <add|plan|land|join|standby|leave|next|show|recover|check|escalate|release|drain|stop|roster|where|watch> ...";
+    private const string Usage = "usage: nightshift <add|plan|land|rework|join|standby|leave|next|show|recover|check|escalate|release|drain|stop|roster|where|watch> ...";
 
     /// <summary>
     /// The global <c>--socket</c> override, inherited by every verb. Parsed once at dispatch and pinned via
@@ -23,7 +23,7 @@ public static class Cli
 
     private static readonly HashSet<string> KnownVerbs =
     [
-        "add", "plan", "land", "join", "standby", "leave", "next", "show",
+        "add", "plan", "land", "rework", "join", "standby", "leave", "next", "show",
         "recover", "check", "escalate", "release", "drain", "stop", "roster", "where", "watch",
     ];
 
@@ -65,6 +65,7 @@ public static class Cli
         rootCommand.Subcommands.Add(CreateAddCommand());
         rootCommand.Subcommands.Add(CreatePlanCommand());
         rootCommand.Subcommands.Add(CreateLandCommand());
+        rootCommand.Subcommands.Add(CreateReworkCommand());
         rootCommand.Subcommands.Add(CreateNoArgsCommand("join", "Clock in on the roster.", JoinCommand.RunAsync));
         rootCommand.Subcommands.Add(CreateNoArgsCommand("standby", "Stay on the roster but stop taking new work.", StandbyCommand.RunAsync));
         rootCommand.Subcommands.Add(CreateNoArgsCommand("leave", "Clock out and release roster presence.", LeaveCommand.RunAsync));
@@ -146,6 +147,25 @@ public static class Cli
         command.Options.Add(reason);
         command.SetAction(async (parseResult, cancellationToken)
             => await LandCommand.RunAsync(parseResult.GetValue(orderBase), parseResult.GetValue(reason)));
+        return command;
+    }
+
+    private static Command CreateReworkCommand()
+    {
+        var command = new Command("rework", "Send a review-rejected order back for another pass.");
+        var orderBase = new Argument<string?>("order-base")
+        {
+            Description = "Order base path, e.g. /plan/1234/order/op4.",
+            Arity = ArgumentArity.ZeroOrOne,
+        };
+        var reason = new Option<string?>("--reason") { Description = "Short reason recorded with the changes-requested state." };
+        var reasonFile = new Option<string?>("--reason-file") { Description = "Path to a file whose contents become the full rework findings." };
+
+        command.Arguments.Add(orderBase);
+        command.Options.Add(reason);
+        command.Options.Add(reasonFile);
+        command.SetAction(async (parseResult, cancellationToken)
+            => await ReworkCommand.RunAsync(parseResult.GetValue(orderBase), parseResult.GetValue(reason), parseResult.GetValue(reasonFile)));
         return command;
     }
 

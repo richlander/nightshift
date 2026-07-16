@@ -30,11 +30,9 @@ internal static class ShowCommand
 
         using TurnstileClient client = TurnstileClient.Connect(Paths.Socket);
 
-        KvItem? spec = await client.GetAsync($"{session.OrderBase}/spec", ct);
-        OrderView view = spec is null ? OrderView.Empty : OrderView.Parse(spec.Text);
+        OrderView view = await OrderView.LoadAsync(client, session.OrderBase, ct);
         Render(view, session.OrderBase, session.Fence, output, Console.Out);
-        return ExitCode.Ok;
-    }
+        return ExitCode.Ok;    }
 
     internal static void Render(OrderView view, string orderBase, long fence, OutputFormat output, TextWriter writer)
     {
@@ -65,6 +63,7 @@ internal static class ShowCommand
             fields.Add(new OrderField { Field = "branch", Value = order.Branch });
         }
 
+        AddText(fields, "mode", view.Mode);
         AddText(fields, "title", view.Title);
         AddText(fields, "issue", view.Issue);
         AddList(fields, "paths", view.Paths);
@@ -73,6 +72,7 @@ internal static class ShowCommand
         AddList(fields, "related", view.Related);
         AddList(fields, "antipatterns", view.Antipatterns);
         AddText(fields, "brief", view.Brief);
+        AddText(fields, "findings", view.Findings);
         AddText(fields, "order_sha", view.OrderSha);
         fields.Add(new OrderField { Field = "fence", Value = fence.ToString(CultureInfo.InvariantCulture) });
         return fields;
