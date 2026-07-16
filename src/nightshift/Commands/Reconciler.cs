@@ -13,6 +13,9 @@ using Nightshift.Turnstile;
 internal static class Reconciler
 {
     // Statuses that keep an order OUT of the ready set (it is in-flight or finished, not available).
+    // `changes-requested` is deliberately ABSENT: a review-rejected order is non-terminal and must return
+    // to the claimable pool (under the normal deps-landed + unclaimed rule) so a worker can continue its
+    // branch. It is not `landed`, so it never joins `landedOrders` below and never opens its dependents.
     private static readonly HashSet<string> Ineligible = ["done", "landed", "blocked", "escalated", "refused"];
 
     public sealed record Result(int SpecsCreated, int Added, int Removed);
