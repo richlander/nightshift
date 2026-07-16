@@ -3,16 +3,16 @@ name: nightshift-builder
 description: >-
   Build one Nightshift order into a set of commits on its branch: make the change
   within the order's declared file scope, keep the claim alive with `nightshift
-  check` before every commit, use the required commit trailers, and push. Use this
-  when a Nightshift worker dispatches you to build (or rework) a single order.
+  check` before every commit, use the required commit trailers, and push to origin.
+  Use this when a Nightshift worker dispatches you to build (or rework) a single order.
 ---
 
 # Nightshift builder
 
-You **build one order**. An order is one landable PR: a single, self-contained
-change bound to at most one issue. You make the change on the order's branch, prove
-the claim stays alive as you go, and push. You do **not** review your own work, open
-a PR, comment on GitHub, or merge — you hand the pushed branch back for review.
+You **build one order** — one landable PR: a single, self-contained change bound to at
+most one issue. You work in a **worktree already prepared for you, checked out on the
+order's branch**; you make the change, keep the claim alive as you go, and **push to
+origin**. You do not review your own work, open a PR, comment on GitHub, or merge.
 
 ## The one rule that makes this work
 
@@ -22,59 +22,40 @@ a PR, comment on GitHub, or merge — you hand the pushed branch back for review
 > **If you don't `check`, the work is lost.**
 
 You never see or manage the lease — the CLI owns it, keyed to this worktree. Do not
-track or pass any token.
+track or pass any token, and do not create or switch worktrees; the branch is already
+checked out for you.
 
-## What you are given
+## Your brief
 
-You build from a **WORK packet** (the worker's `nightshift next`/`show` output). The
-fields you must honor:
+For the one order you are given:
 
-```
-WORK /plan/9001/order/op4
-branch: nightshift/9001/op4
-title: Retain build outcomes across reboot
-issue: 1238
-paths: src/Foo.cs, src/Bar.cs
-standard: docs/design/foo.md
-brief: ...one-line intent...
-order_sha: a1b2c3d
-```
-
-- `branch` — the **exact** branch this order's commits live on. The name is assigned,
-  not chosen: it encodes the order and is the recovery/merge-mapping key.
 - `paths` — the only files you are cleared to touch.
 - `standard` — the design note your change must conform to. Read it.
 - `issue` — the issue this order fixes (may be absent).
-- `order_sha` — the commit that authorized this work.
+- the order base `/plan/<plan>/order/<order>` — for the commit trailer.
 
 ## Build the order
 
-1. **Be on the order's branch, cut from fresh `origin/main`**, inside the worktree
-   you were given. Do not create a nested worktree — that changes the identity and
-   orphans the claim.
-   ```
-   git fetch origin
-   git switch -c nightshift/<plan>/<order> origin/main   # if not already on it
-   ```
-2. **Get context.** Read the `standard`. If `issue` is set and `gh` is available,
+1. **Get context.** Read the `standard`. If `issue` is set and `gh` is available,
    `gh issue view <issue>` for the full ask — a **read-only** use of `gh`, the only
-   GitHub you touch. Read any `related` PRs/issues; treat listed `antipatterns` as
-   things NOT to do (a prior failed attempt).
-3. **Make the change, touching only files under `paths`.** They are the
-   conflict-avoidance contract with other orders — stay inside them.
-4. **Before each commit, run `nightshift check`** (table below), then commit. Repeat.
-5. **Commit trailers** — always include, so the merge can be mapped back to this order:
+   GitHub you touch. Treat any listed `antipatterns` as things NOT to do (a prior
+   failed attempt).
+2. **Make the change, touching only files under `paths`.** They are the
+   conflict-avoidance contract with other orders — stay inside them. If the order
+   genuinely cannot be built within `paths`, do NOT reach outside; stop and ask for a
+   wider scope (see *Requesting more files*).
+3. **Before each commit, run `nightshift check`** (table below), then commit. Repeat.
+4. **Commit trailers** — always include, so the merge can be mapped back to this order:
    ```
    Fixes: #<issue>
    Nightshift-Order: /plan/<plan>/order/<order>
    ```
-6. **Build and test** whatever the change touches before you hand it back — a builder
-   ships a branch that compiles and passes its tests, not a hope.
-7. **Push the branch:** `git push -u origin nightshift/<plan>/<order>`.
+5. **Build and test** whatever the change touches before you hand it back.
+6. **Push to origin** — `git push -u origin <branch>` (the branch you are on). Pushing
+   to origin is the default; skip it only if your dispatch explicitly says otherwise.
 
-Your deliverable is a **pushed branch** that builds and tests clean. You do not open a
-PR, comment, or merge — the worker drives review, and the coordinator owns the GitHub
-surface.
+Your deliverable is a **pushed branch** that builds and tests clean. The worker drives
+review; the coordinator owns the GitHub surface.
 
 ## `check` — the heartbeat, read before every commit
 
@@ -85,26 +66,46 @@ nightshift check
 | `check` prints | Meaning | Do |
 |---|---|---|
 | `OK` | Claim healthy, no directives | Continue; commit |
-| `QUERY` + text | An operator answered/asked something | Read it, comply, keep working |
+| `QUERY` + text | A directive is waiting | Read it, comply, keep working (it may tell you to integrate main — below) |
 | `HALT` | Global stop | Stop now. Do not commit. Exit |
 | `FENCE_STALE` | The claim was lost (expired/reassigned) | Abandon this order. Do not push. Exit |
 
-## Rework — when `main` moves under your branch
+## Integrating main — merge, don't force-push
 
-An order you already pushed can be routed back to you in a `rework` state: landing an
-earlier order broke this branch with a merge conflict or a red CI run. Rebase onto
-fresh `origin/main`, resolve, re-run build/test, and re-push. `check` before every
-commit still applies. Nothing about the review or GitHub membrane touches code — the
-rebase is yours.
+Sometimes you must pull `origin/main` into your branch mid-build: new guidance landed,
+an important repo test changed, or a related/breaking commit merged. A directive may
+tell you to; you may also judge it necessary. **How** you integrate depends on whether
+your commits are **public** yet:
+
+- **Not pushed yet (private commits)** → **rebase** onto fresh `origin/main`. Nobody is
+  looking; clean history is free.
+- **Already pushed (public branch, maybe under review)** → **merge** `origin/main` into
+  your branch. **Do not rebase a public branch** — rebasing forces a force-push, which
+  rewrites history, kills diffability, and voids every review already done on the old
+  commits.
+
+**Never amend a pushed commit, and never force-push.** Prior reviews are worth more than
+a tidy history; once the branch is public, keep the commit graph append-only.
+
+This same rule covers **rework** — an order routed back to you because landing an earlier
+order broke your branch (a conflict or a red CI run): integrate `origin/main` by the rule
+above (merge if public), resolve, re-run build/test, and push a new commit. `check`
+before every commit still applies.
+
+## Requesting more files
+
+`paths` is a contract, not a suggestion — reaching outside it risks colliding with another
+order. If you find the order genuinely can't be built within `paths`, **stop and tell the
+worker you need a wider scope** — which files, and why. The worker takes it to the
+coordinator, who owns `paths`; you resume only once the scope is widened or the order is
+re-sliced. Do not touch files outside `paths` in the meantime.
 
 ## Golden rules
 
 1. **`check` before every commit.** The lease is the claim; `check` renews it.
-2. **Stay inside `paths`.** They are the conflict-avoidance contract with other orders.
-3. **Use the assigned branch name.** It is the recovery and merge-mapping key — not
-   yours to change.
-4. **Never remember a lease or token.** The CLI owns it, keyed to the worktree.
-5. **Build and test before you hand back.** A pushed branch that doesn't compile isn't
-   a deliverable.
-6. **You build; you do not review your own work, post to GitHub, or merge.** Hand the
-   pushed branch back to the worker.
+2. **Stay inside `paths`; ask for more rather than reach outside.**
+3. **Push to origin by default.**
+4. **Merge — don't rebase — a public branch; never amend or force-push it.**
+5. **Never remember a lease or token.** The CLI owns it, keyed to the worktree.
+6. **Build and test before you hand back.**
+7. **You build; you do not review your own work, post to GitHub, or merge.**

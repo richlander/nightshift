@@ -115,16 +115,27 @@ context, so your window stays clean across a long shift. They also buy paralleli
 > enforce it by choosing a different model for the reviewer; without subagents the
 > order's review goes to a different worker (model).
 
+**You own all branch and worktree management** — uniformly, so builders and reviewers
+just work. The build happens in your order worktree (already on the branch). For each
+reviewer, add a **detached, read-only worktree at the head** and hand it over; tear it
+down when the round closes:
+
+```
+git worktree add --detach ../review-<order>-<model> <head-sha>
+# ... the reviewer reads (never writes) it ...
+git worktree remove ../review-<order>-<model>
+```
+
 **Spawning subagents (they load skills by file path).** A subagent does **not** inherit
-your skill menu — it reads the skill file directly. So tell each one its role
-explicitly:
+your skill menu — it reads the skill file directly. So tell each one its role, its brief,
+and its worktree explicitly:
 
 - Builder subagent: "Read `.github/skills/nightshift-builder/SKILL.md`. You are the
-  builder for this order. Here is the WORK packet: … Build it and push the branch."
-  Choose its model.
+  builder; build this order in this worktree. Brief: `paths`, `standard`, `issue`, and
+  the order base." Choose its model.
 - Reviewer subagent: "Read `.github/skills/nightshift-reviewer/SKILL.md`. You are a
-  reviewer for this order at head `<sha>`. Report findings or a clean verdict to me."
-  Choose a model **different** from the builder's.
+  reviewer; review the diff in this prepared worktree at head `<sha>`. Report findings or
+  clean to me." Choose a model **different** from the builder's.
 
 **Drive the gate to two clean.** An order is not done until it has **two clean reviews
 from two different models** on its *final* head:
@@ -132,9 +143,11 @@ from two different models** on its *final* head:
 1. Build → push (the builder does this, or you do).
 2. Review the pushed head with two different models (reviewer subagents, or a
    second/third worker).
-3. Real findings go back to the **builder** to fix on the branch. A new push is a new
-   head → a fresh review round. The gate passes only when both models are clean on the
-   *same, final* commit.
+3. Reviewers classify findings **blocking / non-blocking / pre-existing**. **Blocking**
+   findings go back to the **builder** to fix on the branch; a new push is a new head → a
+   fresh round; the gate passes only when both models are clean on the *same, final*
+   commit. **Non-blocking** and **pre-existing** findings don't hold the order — carry
+   them in your report to the coordinator, which files them as follow-up issues.
 4. **Bound the loop:** four rounds without two clean → **escalate to the coordinator**
    (below), do not keep looping.
 
@@ -196,7 +209,9 @@ guidance). Its answer comes back through `check` as `QUERY`. If you can keep run
 poll `check`; if you must exit, the order waits — it is never silently reassigned.
 
 Escalate for anything that needs judgment, not just review non-convergence: an ambiguous
-spec, a design that looks wrong as you build it, a path collision you can't resolve.
+spec, a design that looks wrong as you build it, a path collision you can't resolve, or a
+builder that needs files outside its `paths` (the coordinator owns `paths` — don't widen
+scope yourself).
 
 ## Recovery — after a context reset or a reboot
 

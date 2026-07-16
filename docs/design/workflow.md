@@ -166,9 +166,12 @@ long-lived worker self-healing — the worker builds and reviews the order:
 2. **Review.** Run the adversarial gate — **two clean reviews from two different
    models** on the final head. A worker using subagents spawns a reviewer subagent
    with a model *different* from the builder's; a worker not using subagents sends
-   the review to a *different* worker (it cannot review its own build). Findings go
-   back to the **builder** to fix; a new push is a new head and a fresh round; the
-   gate passes only when both models are clean on the same, final commit.
+   the review to a *different* worker (it cannot review its own build). Reviewers
+   classify findings **blocking / non-blocking / pre-existing**: blocking findings go
+   back to the **builder** to fix (a new push is a new head and a fresh round; the
+   gate passes only when both models are clean on the same, final commit), while
+   non-blocking and pre-existing findings are carried to the coordinator to file as
+   follow-up issues rather than held against this order.
 3. **Push and release.** The worker pushes the branch and reports it:
 
    ```
@@ -202,6 +205,12 @@ The deliberation — findings, fixes, re-reviews — never appears on the PR. *G
 carries decisions; git carries deliberation.* **Only the coordinator writes to
 GitHub**: this keeps the public surface coherent and keeps a dozen workers from each
 narrating on the repo.
+
+When the two clean reviews were hard-won — a long loop that finally converged, or
+every round ran the same paired models — the coordinator may commission **one more
+review from a third model** that was not one of the final two before it clears. A
+fresh model on a much-revised change sometimes catches something new; the extra time
+is cheaper than shipping a bad PR.
 
 ### 4 — Merge and land (pr lander, then coordinator)
 
@@ -267,8 +276,11 @@ default is **halt and hold**.
 
 Between `done` and `land`, `main` moves — landing `op1` can break `op2`'s pre-land
 branch with a merge conflict or a red CI run. This is common. The order routes to a
-`rework` state with a directive; the **builder** rebases and re-pushes (nothing about
-the GitHub membrane touches code). `done → land` is a retry loop, not a one-shot.
+`rework` state with a directive; the **builder** integrates `main` and pushes a new
+commit (nothing about the GitHub membrane touches code). Once the branch is public it
+**merges** `main` rather than rebasing — a rebase forces a force-push that rewrites
+history, kills diffability, and voids the reviews already done. `done → land` is a
+retry loop, not a one-shot.
 
 ## Two systems of record
 

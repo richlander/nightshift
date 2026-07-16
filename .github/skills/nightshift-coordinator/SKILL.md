@@ -136,6 +136,13 @@ today it's manual — and merge authority and the `land` signal can be different
 You do **not** run the review gate yourself — the worker does, via subagents on different models. You
 open the PR and post the note from the worker's attestation.
 
+**Optional triple-check before you clear.** When the two-clean was hard-won — a long review loop that
+finally converged, or every round ran the *same* two paired models — you may commission **one more
+review from a third model that was not one of the final two** before you post the note. It is a
+deliberate spend of time to avoid shipping a bad PR: a fresh model on a much-revised change sometimes
+catches something genuinely new. Direct the worker (or dispatch a reviewer yourself) to run the extra
+pass, and clear only if it too is clean.
+
 ## 5. Escalation and issue curation — your call
 
 You are **first-level escalation**. When a worker hits something that needs judgment it runs
@@ -165,6 +172,13 @@ printf 'Fail closed; do not retry.' | turnstile create /plan/9001/order/op3/dire
 **Curate issues** beyond escalations, too: keep the issue tracker honest — file issues for design work
 a stalled order reveals, and retire issues that have gone stale or been overtaken. In a fully automated
 deployment you file the new design/implementation issues that the planner then turns into orders.
+
+**File follow-up issues from review.** A review sorts findings into three buckets. **Blocking** findings
+hold the order until the builder fixes them — unless you deliberately decide otherwise. **Non-blocking**
+findings (worth fixing, not worth holding this order) and **pre-existing** problems (the diff didn't
+cause them) don't hold the order, but they should not evaporate: **file them as issues** — filing is a
+GitHub write, so it is yours. **Prioritize the pre-existing ones:** an unfixed pre-existing defect
+re-surfaces as noise in every future review that brushes it, so clearing it pays off across many orders.
 
 ## 6. Watch the board
 
