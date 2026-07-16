@@ -58,9 +58,11 @@ of truth for that role's flow.
   `InvariantGlobalization`, and **`TreatWarningsAsErrors`** (see
   `Directory.Build.props`). A warning is a build break — fix it, don't suppress
   it blindly.
-- Product paths must stay **NativeAOT-friendly** (`nightshift` publishes with
-  `PublishAot=true`). Both `System.CommandLine` and `Markout` are AOT-safe;
-  don't introduce reflection-heavy or trim-unsafe dependencies on product paths.
+- Product paths must stay **NativeAOT-friendly**. `nightshift` sets
+  `IsAotCompatible=true` (analyzer-enforced) and is published AOT with
+  `-p:PublishAot=true`; `Octoshift` sets `PublishAot=true` in its csproj. Both
+  `System.CommandLine` and `Markout` are AOT-safe; don't introduce
+  reflection-heavy or trim-unsafe dependencies on product paths.
 - **The CLI contract is load-bearing. Preserve it.** Agent shell loops depend on
   two signals from every command:
   - the **exit code as signal** (`ExitCode.*`), and
@@ -87,8 +89,10 @@ Build the whole graph:
 dotnet build Nightshift.slnx
 ```
 
-Tests are **xUnit v3 executable projects**. **Use `dotnet run`, not
-`dotnet test`** — `dotnet test` silently runs nothing here.
+Tests are **xUnit v3 executable projects** (`OutputType Exe`). Run a suite with
+either `dotnet test` (VSTest, via the referenced `Microsoft.NET.Test.Sdk` +
+`xunit.runner.visualstudio`) or `dotnet run --project <proj>` (the xUnit v3
+console runner) — both discover and execute the tests here.
 
 | Area | Command |
 | --- | --- |
@@ -125,9 +129,10 @@ Documentation-only changes need Markdown review, not a product build or tests.
 
 ## Adversarial review
 
-Any PR with non-trivial behavior change, new coordination logic, or subtle
-correctness risk requires **two clean reviews from two DIFFERENT models**, drawn
-from:
+**Every change clears the gate before it merges** — an order is not mergeable
+until it has **two clean reviews from two DIFFERENT models** on its final head
+(see the reviewer skill). This holds for governance and documentation PRs too,
+not just plan orders. Draw the models from:
 
 - Claude Opus 4.8
 - GPT-5.x-Codex (e.g. `gpt-5.3-codex`)
@@ -145,6 +150,6 @@ the models and rounds), not a running commentary. GitHub carries decisions; the
 deliberation (findings, fixes, re-reviews) stays in your working notes and the
 order ledger.
 
-Simple, mechanical, or documentation-only changes don't need adversarial review;
-state why the change is low risk. If the blast radius is uncertain, default to
-review.
+Scale the review effort to the blast radius — a docs change is cleared by
+confirming its claims are accurate, a coordination-logic change by attacking its
+correctness — but the two-clean-reviews bar itself does not get waived.
