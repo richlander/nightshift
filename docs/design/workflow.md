@@ -262,7 +262,8 @@ The escalation surfaces to the coordinator **as state**, never as direct chat �
 coordinator reads it off the board like every other signal. The coordinator is
 **first-level escalation** and makes the call:
 
-- **Converging → continue.** The work is on track; let it run another round.
+- **Converging → continue.** The work is on track; grant it **one more round**, not open-ended
+  license to proceed. A fresh escalation is judged on its own.
 - **Wrong design → abandon.** The order's premise is flawed. Retire it and file a
   new issue with a corrected design and a fresh set of slices. *(This is where the
   coordinator's issue-curation hat meets the product manager's shape-setting hat.)*

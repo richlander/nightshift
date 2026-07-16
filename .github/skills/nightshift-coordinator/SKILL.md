@@ -157,8 +157,9 @@ worker builds it.
 
 Make the call:
 
-- **Converging → continue.** The work is on track. Answer with a directive telling the worker to keep
-  going.
+- **Converging → continue.** The work is on track. Answer with a directive granting **one more
+  round** — not open-ended permission to proceed. If it escalates again, judge the next round on its
+  own merits.
 - **Wrong design → abandon.** The order's premise is flawed. Retire the order, and **file a new issue**
   with a corrected design and a fresh set of slices. (This is your curation hat meeting the product
   manager's shape-setting.)
