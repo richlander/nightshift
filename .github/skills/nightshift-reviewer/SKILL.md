@@ -1,49 +1,39 @@
 ---
 name: nightshift-reviewer
 description: >-
-  Clear a Nightshift pull request through the adversarial-review gate before it
-  merges: run two or more independent reviews from DIFFERENT models on the PR
-  diff, drive findings to zero, and report a single clean verdict — naming the
-  models that signed off — to the coordinator, who posts it. Use this whenever
-  asked to review, clear, or sign off a Nightshift PR, or to gate a merge behind
-  adversarial review.
+  Review one Nightshift order's diff as an independent adversarial reviewer: work
+  read-only in your own worktree at the exact head, report only high-confidence
+  bugs with file:line, and hand a findings-or-clean verdict back to the worker that
+  dispatched you. Use this whenever a Nightshift worker dispatches you to review an
+  order, or asks you to run one pass of the adversarial-review gate.
 ---
 
 # Nightshift reviewer
 
-You are the **gate** between a worker's `done` and the human merge. An order is not
-mergeable until it has **two clean reviews** — two independent models that each find
-nothing. Your job is to run that gate and report its verdict to the **coordinator**,
-who posts the single quiet note. You do not touch GitHub yourself.
+You are **one independent review** of one order's diff. You inspect the change
+read-only and report a **verdict** — findings, or clean — to the **worker** that
+dispatched you. You are one half of an adversarial gate: an order clears only when
+**two different models** each find nothing on the *same final head*. You are one of
+those models; the worker runs the other and drives the loop.
+
+You do **not** edit the code, post to GitHub, or merge. You report inward, to the
+worker.
 
 ## Doctrine
 
 > **GitHub carries decisions, git carries deliberation.**
 
-Keep the GitHub surface quiet. The PR gets exactly **one** clearance note — the verdict,
-not the deliberation — and the **coordinator**, not you, posts it. The back-and-forth
-(findings, fixes, re-reviews) lives in your working notes and, later, the order ledger —
-never as running commentary on the PR.
+Keep the GitHub surface quiet. The deliberation — findings, fixes, re-reviews — lives
+in your report to the worker and, later, the order ledger, never as running commentary
+on the PR. The PR eventually gets exactly **one** clearance note, and the
+**coordinator** posts it from the attestation the worker assembles — not you.
 
-## The gate
+## Your review, read-only, in your own worktree
 
-1. **Two clean reviews, from two DIFFERENT models.** Diversity is the point — a single
-   model's blind spots are not a review. A good spread: one Claude (e.g. `claude-opus`),
-   one GPT (e.g. `gpt-5.x-codex`); add a third (e.g. Gemini) for high-blast-radius orders.
-2. **Reviews are READ-ONLY.** A reviewer inspects and reports; it never edits, stages,
-   commits, or resets. Point reviewers at a diff, not a shared working tree.
-3. **Re-review the FIXED head.** If a reviewer finds a real issue, hand it back to the
-   **worker** to fix on the branch, then run the review **again on the new head**. The gate
-   passes only when two models sign off on the *same, final* commit with **zero outstanding
-   findings** — not when an earlier round was clean and findings were fixed afterward.
-
-## Run a review
-
-Get the diff and hand each reviewer full context. Give each reviewer its **own detached
-worktree** at the branch head — never review from a shared checkout, and never
-`git checkout`/`switch` the branch in the working repo (that yanks the tree out from under a
-concurrent worker or the coordinator). Creating and removing these worktrees is your job and it
-is mechanical:
+Get the diff and review it in your **own detached worktree** at the branch head — never
+review from a shared checkout, and never `git checkout`/`switch` the branch in the
+working repo (that yanks the tree out from under the builder or the coordinator).
+Creating and removing this worktree is mechanical:
 
 ```
 git fetch origin
@@ -51,69 +41,66 @@ git worktree add --detach ../review-<order>-<model> origin/nightshift/<plan>/<or
 git -C ../review-<order>-<model> diff main...HEAD    # the exact change under review
 ```
 
-A reviewer may read and build inside its worktree but must never write to it (no edits, stages,
-commits, or resets). When the gate closes, remove each one:
+You may read and build inside this worktree but must **never write to it** — no edits,
+stages, commits, or resets. When you're done, remove it:
 
 ```
-git worktree remove ../review-<order>-<model>        # per reviewer, after clearance
+git worktree remove ../review-<order>-<model>
 ```
 
-Give each independent reviewer:
-- **What changed** and why (one paragraph), and the file list.
-- **Conventions** to check against (so it can spot mismatches with the rest of the system),
-  but tell it to **ignore style/formatting/naming**.
-- **Scope:** report ONLY high-confidence bugs, logic errors, correctness issues, security
-  problems, or behavioral mismatches — with `file:line`, the reason, and the fix. If clean,
-  say so explicitly.
+Review against:
+- **What changed** and why (the worker gives you one paragraph and the file list).
+- **Conventions** to check against, so you can spot mismatches with the rest of the
+  system — but **ignore style/formatting/naming**.
+- **Scope:** report ONLY high-confidence bugs, logic errors, correctness issues,
+  security problems, or behavioral mismatches — each with `file:line`, the reason, and
+  the fix. If the diff is clean, **say so explicitly**.
 
-Run the reviewers **in parallel** (they are independent and read-only).
+## Report the verdict — to the worker
 
-## Drive findings to zero
+Hand your result back to the **worker** that dispatched you. You do **not** run `gh`,
+post to GitHub, or edit code:
 
-- Triage each finding: real bug → hand it back to the **worker** to fix on the branch;
-  false positive → note why and move on. You never edit the code yourself.
-- After the worker pushes a fix, **re-review the new head** (both models). Loop until two clean.
-- **Bound the loop: after 4 rounds without convergence, stop and escalate.** If findings keep
-  reappearing or new ones surface across four rounds without reaching two clean, the order
-  isn't reviewable as-is. Escalate it for human judgment rather than looping further:
+- **Findings** → list each with `file:line`, the reason, and the fix. The worker routes
+  them to the **builder** to fix on the branch; a new push is a new head, and the worker
+  will dispatch you (or a fresh reviewer) again on it.
+- **Clean** → say so, and name your **model** so the worker can record the attestation:
 
   ```
-  nightshift escalate --reason "review did not converge after 4 rounds: <outstanding findings>"
+  clean — <model>, round <n>
   ```
 
-  This records `state=escalated` (paused for a human; the reconciler never auto-redispatches it).
+`round` is how many passes this order needed to reach clean under you — `1` is a clean
+first pass; a higher number flags more churn, and thus more risk.
+
+Then stop. **You neither post nor merge, and you never fix the code yourself** — a
+reviewer that fixed the code would be grading its own homework on the next round.
+
+## The gate you are part of (the worker drives it)
+
+You run **one** review pass; the **worker** orchestrates the gate around you:
+
+- Two clean reviews from **two different models** on the *final* head — you are one
+  model; the worker supplies a different one (a builder subagent's model can never be a
+  reviewer's).
+- Findings → builder fixes → re-review the new head. The gate passes only when both
+  models are clean on the same, final commit — not when an earlier round was clean and
+  findings were fixed afterward.
+- The loop is **bounded**: after four rounds without two clean, the worker escalates to
+  the coordinator rather than looping. If you can already see the change isn't converging,
+  say so in your report.
 - Unrelated pre-existing failures (e.g. a flaky timing test the diff doesn't touch) are
-  **not** blockers — record them separately; don't gate this PR on them.
-
-## Report the verdict
-
-When the gate passes, hand the **coordinator** a single clean verdict — you do **not**
-post to GitHub yourself, and you never run `gh`. Give the coordinator the models and how
-many rounds each needed, so it can post the one clearance note:
-
-```
-| Model | Rounds |
-| --- | --- |
-| claude-opus-4.8 | 1 |
-| gpt-5.3-codex   | 1 |
-```
-
-`Rounds` is how many passes each model needed to reach clean — `1` is a clean first pass;
-a higher number flags more churn, and thus more risk, in the change. (Don't report the merge
-*method* — squash/rebase/merge is repo policy, not the reviewer's concern.)
-
-Then stop. **You neither post nor merge.** The coordinator owns the GitHub surface (it posts
-the clearance note); the human owns the merge (or an auto-merge policy does). Your output is a
-verdict, not an action. (A future gh-aware tool may one day post for the coordinator; today
-that step is the coordinator's, and it is never yours.)
+  **not** blockers — note them separately; don't gate this order on them.
 
 ## Invariants
 
-1. **Two clean reviews on the final head, or it's not cleared.** One model, or a clean
-   round before a fix, does not satisfy the gate.
-2. **One verdict, naming the models.** The coordinator posts it as a single note; no
-   running commentary on the PR.
-3. **Reviewers never touch code.** Read-only, diff-scoped, different models.
-4. **The gate clears; it neither posts nor merges.** Posting the clearance note is the
-   coordinator's; merging stays with the human-in-the-loop. You never run `gh`.
-5. **Convergence is bounded.** Four rounds without reaching two clean → escalate, don't keep looping.
+1. **Read-only, diff-scoped, in your own worktree.** You never edit, stage, commit,
+   reset, or push.
+2. **A different model than the builder.** A model reviewing its own build is not a
+   review — the worker guarantees the difference; if you were somehow dispatched to
+   review your own build, refuse as an invalid choice.
+3. **Report a verdict, not an action.** Findings-or-clean, with `file:line`, to the
+   worker. You never run `gh`, post the clearance note, or merge — the coordinator posts,
+   the PR Lander merges.
+4. **Two clean on the final head clears the gate** — one model, or a clean round before a
+   fix, does not. The worker drives that; you supply one honest pass.

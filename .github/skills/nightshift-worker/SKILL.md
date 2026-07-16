@@ -2,39 +2,43 @@
 name: nightshift-worker
 description: >-
   Operate as a Nightshift night-shift worker: claim one unit of work (an "order"
-  = one landable PR) from the Turnstile coordination kernel, do it in an isolated
-  git branch, and hand it back. Use this whenever you are launched to work a
-  Nightshift backlog, or told to "run nightshift", "take the next order", or
-  "join the shift".
+  = one landable PR) from the Turnstile coordination kernel and take it to a
+  reviewed, pushed branch — building it and reviewing it (usually by spawning
+  subagents), driving the adversarial gate to two clean, then handing it back.
+  Use this whenever you are launched to work a Nightshift backlog, or told to "run
+  nightshift", "take the next order", or "join the shift".
 ---
 
 # Nightshift worker
 
-You are **one worker** on a shift. You take **one order at a time**, do it, and hand it back.
-Coordination is not chat — it is state you read from the `nightshift` CLI. There is no one to
-talk to. Every instruction you need arrives as the **return value of a gate call** (`next`,
-`check`).
+You are **one worker** on a shift, and you are an **orchestrator**. You take **one
+order at a time**, take it all the way to a **reviewed, pushed branch**, and hand it
+back. You **build and review** each order. Coordination is not chat — it is state you
+read from the `nightshift` CLI. There is no one to talk to. Every instruction you need
+arrives as the **return value of a gate call** (`next`, `check`).
 
-An **order** is one **landable PR**: the atomic unit of claim and of merge. It belongs to a
-**plan** (a feature/campaign) and may point at a GitHub issue. You never coordinate with other
-workers directly — the system serializes and schedules for you.
+An **order** is one **landable PR**: the atomic unit of claim and of merge. It belongs
+to a **plan** (a feature/campaign) and may point at a GitHub issue. You never
+coordinate with other workers directly — the system serializes and schedules for you.
 
 ## The one rule that makes this work
 
-> **Run `nightshift check` before every commit.** `check` renews your lease. Your claim on the
-> order is a lease; if you stop renewing it, the system concludes you died and gives your order to
-> someone else. There is no other heartbeat, no wrapper, no reminder. **If you don't `check`, you
-> lose your work.**
+> **`nightshift check` must run before every commit.** `check` renews your lease. Your
+> claim on the order is a lease; if it stops being renewed, the system concludes you
+> died and gives your order to someone else. There is no other heartbeat. **If nobody
+> `check`s, the work is lost.** (If a builder subagent is doing the commits, it runs
+> `check` — it is in your worktree, so it renews *your* lease. If you build directly,
+> you run it.)
 
-You never see or manage the lease. The CLI owns it, keyed to this worktree. Do not try to track
-or pass any token. If your context resets, recover with **`nightshift show`** (session intact) or
-**`nightshift recover`** (session gone — see *Recovery* below).
+You never see or manage the lease. The CLI owns it, keyed to this worktree. Do not
+track or pass any token. If your context resets, recover with **`nightshift show`**
+(session intact) or **`nightshift recover`** (session gone — see *Recovery*).
 
 ## Setup — once per shift
 
-Everything you do this shift runs from ONE dedicated worktree — that stable directory is what keeps
-your identity (and therefore your claim and lease) attached to you. Create it off `origin/main` and
-work inside it for the whole shift:
+Everything you do this shift runs from ONE dedicated worktree — that stable directory
+is what keeps your identity (and therefore your claim and lease) attached to you.
+Create it off `origin/main` and work inside it for the whole shift:
 
 ```
 git fetch origin
@@ -43,10 +47,10 @@ cd ../nightshift-worker-<you>
 nightshift join
 ```
 
-`<you>` is any stable name for this worker (e.g. `a`, `b`). `join` registers you on the roster
-(`active`). Stay in this directory: every gate call (`next`, `check`, `recover`, `release`) is keyed
-to it. Do NOT create a new worktree per order — switching directories changes your identity and
-orphans your claim.
+`<you>` is any stable name for this worker (e.g. `a`, `b`). `join` registers you on the
+roster (`active`). Stay in this directory: every gate call (`next`, `check`, `recover`,
+`release`) is keyed to it. Do NOT create a new worktree per order — switching
+directories changes your identity and orphans your claim.
 
 ## The loop
 
@@ -54,11 +58,12 @@ orphans your claim.
 nightshift next                 # ask for one order
 ```
 
-Read the **first line** — that is your signal (the exit code mirrors it, but read the token):
+Read the **first line** — that is your signal (the exit code mirrors it, but read the
+token):
 
 | `next` prints | Meaning | Do |
 |---|---|---|
-| `WORK <base>` + fields | You claimed an order | Work it (below) |
+| `WORK <base>` + fields | You claimed an order | Take it to a reviewed branch (below) |
 | `NOWORK` | Nothing claimable right now | You cannot sleep — exit cleanly; you'll be relaunched |
 | `DRAINING` | Shift is winding down | Stop asking; exit |
 
@@ -77,43 +82,96 @@ fence: 7
 ```
 
 - `base` = `/plan/<plan>/order/<order>` — your order's identity. Note it.
-- `branch` = the exact branch you must create for this order. It also encodes the order, so it is
-  your **recovery anchor**: if you wake on this branch with no session, `nightshift recover` re-attaches.
-- `paths` = the files you are cleared to touch. Stay inside them.
+- `branch` = the exact branch this order lives on. It also encodes the order, so it is
+  your **recovery anchor**: if you wake on this branch with no session, `nightshift
+  recover` re-attaches.
+- `paths` = the files this order is cleared to touch. Stay inside them.
 - `issue` = the GitHub issue this order fixes (may be absent).
-- `standard` = the design note you must conform to. Read it.
-- `order_sha` = the commit that authorized this work (the plan lives there).
+- `standard` = the design note the change must conform to.
+- `order_sha` = the commit that authorized this work.
 
-### Do the work
+Once you re-pull `origin/main` at the start of an order, **re-read your guidance** (this
+skill + `AGENTS.md` + the order's `standard`). Re-reading each order is what makes a
+long-lived worker self-healing.
 
-1. **Switch onto the order's branch inside your worker worktree**, using the **exact `branch` from
-   the WORK packet**. You are already in your dedicated directory (from Setup) — do NOT create a
-   nested worktree; that changes your identity and orphans the claim. Just move onto the order branch,
-   freshly cut from `origin/main`:
-   ```
-   git fetch origin
-   git switch -c nightshift/<plan>/<order> origin/main
-   ```
-   e.g. for `WORK /plan/9001/order/op4` (`branch: nightshift/9001/op4`) →
-   `git switch -c nightshift/9001/op4 origin/main`. Do all your work here. The branch name is not
-   yours to choose — it is the key the system uses to recover you and to map the eventual merge back
-   to this order. (Your worker worktree is reused across orders: finish one, `git switch` to the next.)
-2. **Get context.** Read the `standard` note. If `issue` is set and `gh` is available,
-   `gh issue view <issue>` for the full ask. Read any `related` PRs/issues; treat listed
-   `antipatterns` as things NOT to do (a prior failed attempt).
-3. **Make the change**, touching only files under `paths`.
-4. **Before each commit, `nightshift check`** (see table below). Then commit. Repeat.
-5. **Commit trailers** — always include, so the merge can be mapped back to this order:
-   ```
-   Fixes: #<issue>
-   Nightshift-Order: /plan/<plan>/order/<order>
-   ```
-6. **Push the branch:** `git push -u origin nightshift/<plan>/<order>`.
-   Your deliverable is a **pushed branch**, not a PR. The **coordinator** opens the PR, drives the
-   review, posts the clearance note, and (after a human merges) runs `nightshift land`. You do
-   **not** open, comment on, or merge a PR — the coordinator owns the GitHub surface.
+## Build and review the order
 
-### `check` — the heartbeat, read before every commit
+You take the order from claim to a reviewed, pushed branch. You do this by orchestrating
+two pieces of work: **building** it and **reviewing** it.
+
+**Subagents are encouraged, not required.** Their value is **context-window
+preservation** — a builder subagent and a reviewer subagent each work in their own
+context, so your window stays clean across a long shift. They also buy parallelism and
+**model diversity**. But you may also do the work in your own session. Two legal shapes:
+
+- **With subagents (preferred for long shifts).** Spawn a **builder subagent** (one
+  model) to make the change, then a **reviewer subagent** with a **different model** to
+  review it. Because the reviewer runs a different model, you can legitimately **build
+  and review the same order** yourself, through them.
+- **Without subagents.** You are a single model. You can build the order or review the
+  order — but **not both for the same order**: a model reviewing its own build is
+  grading its own homework. The order's build and its review must be different models,
+  which without subagents means the **review goes to a different worker**.
+
+> **The self-review rule.** The builder never reviews its own work. With subagents you
+> enforce it by choosing a different model for the reviewer; without subagents the
+> order's review goes to a different worker (model).
+
+**Spawning subagents (they load skills by file path).** A subagent does **not** inherit
+your skill menu — it reads the skill file directly. So tell each one its role
+explicitly:
+
+- Builder subagent: "Read `.github/skills/nightshift-builder/SKILL.md`. You are the
+  builder for this order. Here is the WORK packet: … Build it and push the branch."
+  Choose its model.
+- Reviewer subagent: "Read `.github/skills/nightshift-reviewer/SKILL.md`. You are a
+  reviewer for this order at head `<sha>`. Report findings or a clean verdict to me."
+  Choose a model **different** from the builder's.
+
+**Drive the gate to two clean.** An order is not done until it has **two clean reviews
+from two different models** on its *final* head:
+
+1. Build → push (the builder does this, or you do).
+2. Review the pushed head with two different models (reviewer subagents, or a
+   second/third worker).
+3. Real findings go back to the **builder** to fix on the branch. A new push is a new
+   head → a fresh review round. The gate passes only when both models are clean on the
+   *same, final* commit.
+4. **Bound the loop:** four rounds without two clean → **escalate to the coordinator**
+   (below), do not keep looping.
+
+**Declining review as an invalid choice.** If review work for an order **you built** is
+ever dispatched to you, you are a **structurally invalid** reviewer — decline it with an
+explicit reason ("I built this order; I am not a valid reviewer for it"), not silently.
+This is distinct from an ordinary decline, which could loop the same work back to you.
+
+### Finish — hand back a reviewed branch
+
+Ensure the branch is pushed with the required trailers (the builder skill owns those),
+then:
+
+```
+nightshift release --status done
+```
+
+`done` means **"submitted, awaiting merge"** — it does **not** merge and does **not**
+open dependent orders. Include the **review attestation** (the models that signed off
+and how many rounds each needed) in your release/report — the coordinator posts it as
+the single clearance note. Your deliverable is a **reviewed, pushed branch**; you never
+open, comment on, or merge a PR — the coordinator owns the GitHub surface. After
+`release`, loop back to `nightshift next` (or exit if you were told to do one order).
+
+Other outcomes (use the honest one):
+
+| `release --status` | When |
+|---|---|
+| `done` | Built, reviewed to two clean, branch pushed, awaiting merge |
+| `blocked --reason "..."` | Cannot proceed until something external happens |
+| `declined --reason "..."` | Returning it to the pool untouched (someone/something else should do it) — including "invalid reviewer: I built this order" |
+| `refused --reason "..."` | You will not do this (unsafe, out of scope) |
+| `escalated` | You handed it back after escalating (below) |
+
+## `check` — the heartbeat, read before every commit
 
 ```
 nightshift check
@@ -122,55 +180,38 @@ nightshift check
 | `check` prints | Meaning | Do |
 |---|---|---|
 | `OK` | Claim healthy, no directives | Continue; commit |
-| `QUERY` + text | An operator answered/asked something | Read the text, comply, keep working |
+| `QUERY` + text | An operator/coordinator answered/asked something | Read it, comply, keep working |
 | `HALT` | Global stop | Stop now. Do not commit. Exit |
 | `FENCE_STALE` | You lost the claim (expired/reassigned) | Abandon this order. Do not push. Exit |
 
-### Finish
-
-When the branch is pushed and ready for human review:
+## When you need judgment — escalate to the coordinator
 
 ```
-nightshift release --status done
+nightshift escalate --reason "review did not converge after 4 rounds: <outstanding findings>"
 ```
 
-`done` means **"submitted, awaiting merge"** — it does **not** merge and does **not** open
-dependent orders. Only a real merge (a human running `nightshift land`) advances the plan. After
-`release`, loop back to `nightshift next` (or exit if you were told to do one order).
+This **pauses** on the order (you keep the claim) and marks it as needing the
+coordinator, who is **first-level escalation**. The escalation reaches the coordinator
+**as state**, not as chat. The coordinator decides: continue (keep going), abandon
+(a new issue + slices replaces this order), or requeue (return to the pool with updated
+guidance). Its answer comes back through `check` as `QUERY`. If you can keep running,
+poll `check`; if you must exit, the order waits — it is never silently reassigned.
 
-Other outcomes (use the honest one):
-
-| `release --status` | When |
-|---|---|
-| `done` | Work complete, branch pushed, awaiting merge |
-| `blocked --reason "..."` | Cannot proceed until something external happens |
-| `declined --reason "..."` | Returning it to the pool untouched (someone/something else should do it) |
-| `refused --reason "..."` | You will not do this (unsafe, out of scope) |
-| `escalated` | You handed it back after escalating (see below) |
-
-### When you need judgment — escalate
-
-```
-nightshift escalate --reason "API is ambiguous: retry or fail closed?"
-```
-
-This **pauses** on the order (you keep the claim) and marks it as needing a human. The answer comes
-back through `check` as `QUERY`. If you can keep running, poll `check` for the answer; if you must
-exit, the order will wait for a human — it is never silently reassigned.
+Escalate for anything that needs judgment, not just review non-convergence: an ambiguous
+spec, a design that looks wrong as you build it, a path collision you can't resolve.
 
 ## Recovery — after a context reset or a reboot
 
 Your task lives in Turnstile and in your git branch, never in your memory. Two ways back:
 
-- **`nightshift show`** — reprints your current WORK packet. Use it when your context was compacted
-  but the process/worktree is intact (the session is still on disk). Read-only.
-- **`nightshift recover`** — use it when the session is gone (a reboot, a wiped runtime dir, or you
-  were relaunched into the worktree fresh). It reads the **branch you are standing on**
-  (`nightshift/<plan>/<order>`), finds the order, and — if it is still yours or free — re-attaches you
-  under a fresh lease and reprints the WORK packet. You resume exactly where you left off.
-  - If it prints the WORK packet → you're back; continue the loop (remember: `check` before commits).
-  - If it says the order is `done`/`landed`/etc. or held by another agent → stand down: that work is
-    no longer yours. Go to `nightshift next`.
+- **`nightshift show`** — reprints your current WORK packet. Use it when your context was
+  compacted but the process/worktree is intact (the session is still on disk). Read-only.
+- **`nightshift recover`** — use it when the session is gone (a reboot, a wiped runtime
+  dir, or you were relaunched into the worktree fresh). It reads the **branch you are
+  standing on** (`nightshift/<plan>/<order>`), finds the order, and — if it is still
+  yours or free — re-attaches you under a fresh lease and reprints the WORK packet.
+  - WORK packet → you're back; continue the loop (`check` before commits).
+  - `done`/`landed`/held by another agent → stand down; go to `nightshift next`.
   - **So always land on your order's branch before recovering** — the branch is the key.
 
 ## Leaving
@@ -179,30 +220,35 @@ Your task lives in Turnstile and in your git branch, never in your memory. Two w
 nightshift leave
 ```
 
-Clocks you out: returns any in-flight order to the pool and drops your roster entry. Idempotent.
-
-Then tear down your WORKER worktree at the end of the shift (after `leave`). git won't remove the
-worktree you're standing in, so step back into the main clone first, then remove the worker worktree
-by its sibling path:
+Clocks you out: returns any in-flight order to the pool and drops your roster entry.
+Idempotent. Then tear down your worker worktree at the end of the shift (after `leave`).
+git won't remove the worktree you're standing in, so step back into the main clone first:
 
 ```
 cd "$(git rev-parse --path-format=absolute --git-common-dir)/.."   # into the main clone
 git worktree remove ../nightshift-worker-<you>
 ```
 
-Do NOT remove it between orders — it is your home for the whole shift. While you are standing on an
-order branch, `nightshift recover` re-attaches you from that branch.
+Do NOT remove it between orders — it is your home for the whole shift. While you are
+standing on an order branch, `nightshift recover` re-attaches you from that branch.
 
 ## Golden rules
 
-1. **`check` before every commit.** The lease is your claim; `check` renews it.
-2. **You cannot sleep.** Headless, you have no next turn after you yield. Never "wait to be
-   notified" — block in-line or exit. `NOWORK`/`DRAINING` mean *exit*, not *idle*.
-3. **Never remember a lease or token.** The CLI owns it. Recover your order with `nightshift show`
+1. **`check` before every commit.** The lease is your claim; `check` renews it — whoever
+   commits from your worktree runs it.
+2. **You orchestrate build *and* review.** Prefer subagents (context preservation, model
+   diversity); a builder subagent + a different-model reviewer subagent let you build and
+   review one order. Without subagents you cannot review your own build.
+3. **You cannot sleep.** Headless, you have no next turn after you yield. Never "wait to
+   be notified" — block in-line or exit. `NOWORK`/`DRAINING` mean *exit*, not *idle*.
+4. **Never remember a lease or token.** The CLI owns it. Recover with `nightshift show`
    (session intact) or `nightshift recover` (session gone — from your branch).
-4. **Stay inside `paths`.** They are the conflict-avoidance contract with other workers.
-5. **One worker, one worktree; one order at a time.** Work the whole shift from your single dedicated
-   worktree (Setup), `git switch`-ing onto each order's branch. Never nest a per-order worktree, and
-   never claim a second order while holding one.
-6. **Read the return value, not your assumptions.** `HALT`, `FENCE_STALE`, `DRAINING` override
-   whatever you were doing.
+5. **Stay inside `paths`.** They are the conflict-avoidance contract with other workers.
+6. **One worker, one worktree; one order at a time.** Work the whole shift from your
+   single dedicated worktree, `git switch`-ing onto each order's branch. Never nest a
+   per-order worktree, and never claim a second order while holding one.
+7. **Hand results inward, never to GitHub.** You push a branch and report a verdict to
+   the coordinator; the coordinator opens the PR and posts the one clearance note; the
+   PR Lander merges.
+8. **Read the return value, not your assumptions.** `HALT`, `FENCE_STALE`, `DRAINING`
+   override whatever you were doing.

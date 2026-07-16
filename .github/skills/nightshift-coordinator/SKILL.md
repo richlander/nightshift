@@ -10,12 +10,27 @@ description: >-
 
 # Nightshift coordinator
 
-You run the shift. Workers claim and execute orders; **you** set up the board, register work, and
-land merges. Nightshift is **not GitHub-aware** — it coordinates branches and state over a local
-Unix socket. You (a human, or a future bridge) own the GitHub side: opening the PR, gating it through
-the adversarial review, posting the one clearance note the reviewer's verdict earns, and — after the
-human merges — telling Nightshift with `land`. The reviewer runs the gate and reports its verdict to
-you; **you** are the only one who posts to GitHub, and the merge itself stays the human's.
+You run the shift. Workers claim orders and take each to a **reviewed, pushed branch** — they build
+*and* review, driving the two-model adversarial gate to two clean themselves. **You** set up the
+board, register work, own the GitHub surface, keep work moving, and land merges. Nightshift is **not
+GitHub-aware** — it coordinates branches and state over a local Unix socket.
+
+Your responsibilities:
+
+- **Open and update the PR** from a worker's branch, and **post the one clearance note** — from the
+  **attestation the worker hands you** (the models that signed off and their rounds). You are the
+  only role that writes to GitHub.
+- **First-level escalation.** When a worker escalates (a review that won't converge, an ambiguous
+  spec, a design that looks wrong), you make the call — continue, abandon, or requeue (§5).
+- **Issue curation.** File new issues when a design needs re-shaping, and retire stale ones.
+- **Land** each order after it merges, so its dependents open.
+
+The **PR Lander** — not you — holds merge authority and performs the merge; `land` is how you report
+that merge back to Nightshift. (Coordinator and Planner are commonly the same session; most sessions
+on the machine are workers.)
+
+Roles are **responsibilities, not people** — any of them can be filled by a person or an agent. See
+[`docs/design/workflow.md`](../../../docs/design/workflow.md) for the full role model.
 
 Vocabulary: an **order** = one **landable PR** (atomic claim + merge unit), bound to ≤1 issue.
 A **plan** (`orders.json`) = the set of orders for a feature, with an order→order dependency DAG.
@@ -36,8 +51,9 @@ export TURNSTILE_SOCKET=~/.turnstile/turnstile.sock
 
 ## 2. Author the plan — `orders.json`
 
-Work out the design with the human first and commit it (the `standard` notes and the plan file
-live in the repo — that commit is the authorization root). Then write the plan:
+Work out the design first — the Product Manager shapes it, the Planner turns it into orders — and
+commit it (the `standard` notes and the plan file live in the repo; that commit is the authorization
+root). Then write the plan:
 
 ```json
 {
@@ -91,35 +107,71 @@ Only ready orders are claimable; a worker's `next` hands out exactly one, exclus
 ## 4. Land merges — the only thing that advances the DAG
 
 A worker's `release --status done` means **"submitted, awaiting merge"** — it does NOT open
-dependents. **You** keep the merge loop: open the PR, run it through the adversarial-review gate
-(the **reviewer** role clears it and reports a clean verdict to you — see the reviewer skill), post
-the one clearance note that verdict earns; the **human** merges, then you tell Nightshift it happened:
+dependents. The worker has already **built and reviewed** the order to two clean and hands you a
+**review attestation** (the models that signed off and their rounds). You keep the merge loop:
 
-```
-nightshift land /plan/9001/order/op1
-```
+1. **Open/update the PR** from the worker's branch.
+2. **Post the one clearance note** that the worker's attestation earns — a sidecar comment naming the
+   models and rounds, nothing more (the deliberation never appears on the PR):
+
+   ```
+   ✅ Adversarial review clear — two independent reviews.
+
+   | Model | Rounds |
+   | --- | --- |
+   | claude-opus-4.8 | 1 |
+   | gpt-5.3-codex   | 1 |
+   ```
+3. The **PR Lander** merges (squash). Then you tell Nightshift it happened:
+
+   ```
+   nightshift land /plan/9001/order/op1
+   ```
 
 `land` writes `state=landed`; the live `plan` controller then opens every order that was
-`after: [op1]`. This is the human-in-the-merge-loop invariant: dispatch is autonomous, merging is
-deliberate. (A future gh-aware bridge will call `land` for you off merged PRs; today it's manual.)
+`after: [op1]`. This is the deliberate-merge invariant: dispatch is autonomous, merging is a
+deliberate act the PR Lander owns. (A future gh-aware bridge will call `land` for you off merged PRs;
+today it's manual — and merge authority and the `land` signal can be different actors.)
 
-**Gate from isolated worktrees — never from your shared checkout.** To review or build a worker's
-branch, add a detached worktree at its head; never `git checkout`/`switch` the branch in your
-working repo (it corrupts a concurrent worker or the controller running there). This is mechanical
-and it is yours to manage — one worktree per reviewer/build, removed when the gate closes:
+You do **not** run the review gate yourself — the worker does, via subagents on different models. You
+open the PR and post the note from the worker's attestation.
+
+## 5. Escalation and issue curation — your call
+
+You are **first-level escalation**. When a worker hits something that needs judgment it runs
+`nightshift escalate --reason "..."`, which pauses the order at `state=escalated` (the reconciler
+never auto-redispatches it) and surfaces to you **as state**, not chat — so even when a person is
+sitting with you, the escalation arrives through the same channel every role uses. Common triggers: a
+review that won't reach two clean in four rounds, an ambiguous spec, a design that looks wrong as the
+worker builds it.
+
+Make the call:
+
+- **Converging → continue.** The work is on track. Answer with a directive telling the worker to keep
+  going.
+- **Wrong design → abandon.** The order's premise is flawed. Retire the order, and **file a new issue**
+  with a corrected design and a fresh set of slices. (This is your curation hat meeting the product
+  manager's shape-setting.)
+- **Wrong path → requeue.** The design is fine but the implementation went sideways. Return the order
+  to the pool for reassignment, with updated guidance attached.
+
+Answer a worker by creating a directive on its order; the worker sees it as `QUERY` on its next
+`check`:
 
 ```
-git worktree add --detach ../gate-<order> origin/nightshift/<plan>/<order>
-# review/build inside ../gate-<order>, then:
-git worktree remove ../gate-<order>
+printf 'Fail closed; do not retry.' | turnstile create /plan/9001/order/op3/directive
 ```
 
-## 5. Watch the board
+**Curate issues** beyond escalations, too: keep the issue tracker honest — file issues for design work
+a stalled order reveals, and retire issues that have gone stale or been overtaken. In a fully automated
+deployment you file the new design/implementation issues that the planner then turns into orders.
+
+## 6. Watch the board
 
 `nightshift where` is the board — one row per order that has been claimed or reported:
 
 ```
-nightshift where            # <order-base>  <status>  <branch>   (status=open while in hand)
+nightshift where            # <order-base>  <status>  <branch>   (status=claimed while in hand)
 nightshift roster           # who is on duty: <agent-id>  active|standby
 ```
 
@@ -132,17 +184,12 @@ turnstile get /agent/<id>                          # a worker's roster entry: ac
 ```
 
 The `/branch` key is written when the order is claimed: it maps the order to `nightshift/<plan>/<order>`.
-Today it aids inspection and human review; a future merge→land bridge will use it (with the PR's
+Today it aids inspection and review; a future merge→land bridge will use it (with the PR's
 `Fixes:` / `Nightshift-Order:` trailers) to map a merged PR back to the order it lands.
 
-Orders with `state.status == escalated` need your judgment. Answer a worker by creating a
-directive on its order; the worker sees it as `QUERY` on its next `check`:
+Orders with `state.status == escalated` need your judgment — see §5.
 
-```
-printf 'Fail closed; do not retry.' | turnstile create /plan/9001/order/op3/directive
-```
-
-## 6. Drain and stop
+## 7. Drain and stop
 
 Two different gestures, each a first-class verb (the raw control keys they wrap are shown for reference):
 
@@ -161,12 +208,13 @@ nightshift stop --resume                             # lift the halt
 ## Invariants
 
 1. **Nightshift never touches GitHub.** Registering, dispatch, and `land` are local. You own the
-   GitHub surface — opening PRs, posting the clearance note the reviewer's verdict earns, and landing;
-   the **human** performs the merge, and `land` is how you report it back. The reviewer reports its
-   verdict to you and never posts.
-2. **`landed`, not `done`, advances the DAG.** Keep yourself in the merge loop.
+   GitHub surface — opening PRs and posting the one clearance note the **worker's attestation** earns;
+   the **PR Lander** performs the merge, and `land` is how you report it back. Workers build and review
+   and hand results inward; nothing but you writes to the public surface.
+2. **`landed`, not `done`, advances the DAG.** Keep the merge loop moving; a stalled lander stalls
+   every dependent.
 3. **Orders are self-healing.** A worker that dies (lease expiry) returns its order to the pool
-   automatically — no dead-agent detector, just the lease. An `escalated` order waits for you and
-   is never silently reassigned.
+   automatically — no dead-agent detector, just the lease. An `escalated` order waits for your call
+   (§5) and is never silently reassigned.
 4. **`paths` overlaps serialize, they don't conflict.** If two orders touch the same files, give
    the second an `after` on the first so a merge conflict becomes a scheduling wait.

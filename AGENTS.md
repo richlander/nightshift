@@ -2,12 +2,13 @@
 
 ## Start here
 
-Nightshift is a coordination system that lets one human operator drive many AI
-coding agents without spending their attention on mechanics. **You are one of
-those agents.** You do structured work on the night shift — claiming and
-executing orders through the mechanism described here; the operator works the
-day shift, evaluating the shape of the product. The whole point is that you make
-trustworthy progress without the operator having to babysit the mechanics.
+Nightshift is a coordination system that drives many units of work to completion
+in parallel without anyone spending attention on mechanics. Work happens on a
+**night shift** — orders built and reviewed to a clean bar — while
+direction-setting and the merge decision stay deliberate acts on the **day
+shift**. **Roles are responsibilities, not people:** any role can be filled by a
+person or an agent, and you are playing one of them (below). Read its guidance
+before you act.
 
 It has three layers:
 
@@ -39,14 +40,26 @@ two disagree, the skills and current code win.
 
 ## Roles and skills
 
-You are always playing exactly one role. Read its skill first; it is the source
-of truth for that role's flow.
+Nightshift has **five roles**, each a set of responsibilities fillable by a
+person or an agent (the full model is in
+[`docs/design/workflow.md`](docs/design/workflow.md)). You are playing one; read
+its guidance first. Roles can collapse into one session — Planner and Coordinator
+commonly do — and most sessions on a machine are workers.
 
-| Role | You do | Read first |
+| Role | Owns | Read first |
 | --- | --- | --- |
-| **Coordinator** | Start the daemon, author/register a plan, keep the ready set live, own the GitHub surface (open PRs, post the clearance note), land merged orders, drain the shift | `.github/skills/nightshift-coordinator/SKILL.md` |
-| **Worker** | Claim one order, build it on an isolated branch, push, hand it back; fix review findings | `.github/skills/nightshift-worker/SKILL.md` |
-| **Reviewer** | Run the two-model adversarial gate on a PR read-only and report the verdict to the coordinator | `.github/skills/nightshift-reviewer/SKILL.md` |
+| **Product Manager** | The expanding shape of the product: new issues, taste, where features must be re-shaped or composed | `docs/design/workflow.md` |
+| **Planner** | Turns intent (often issues) into orders and registers them with nightshift | `.github/skills/nightshift-coordinator/SKILL.md` (§2–3) |
+| **Coordinator** | Run the shift: register a plan, keep the ready set live, own the GitHub surface (open PRs, post the one clearance note), first-level escalation, issue curation, land merged orders, drain/stop | `.github/skills/nightshift-coordinator/SKILL.md` |
+| **Worker** | Claim one order and take it to a reviewed, pushed branch — orchestrating its build **and** review | `.github/skills/nightshift-worker/SKILL.md` |
+| **PR Lander** | Merge authority; keep sequenced PRs flowing | `docs/design/workflow.md` |
+
+The **Worker** builds and reviews by spawning subagents (an optimization that
+preserves its context window and supplies model diversity). Those two
+responsibilities each have their own skill the worker points a subagent at:
+
+- **Builder** — build one order into commits on its branch: `.github/skills/nightshift-builder/SKILL.md`
+- **Reviewer** — review one order's diff read-only and report inward: `.github/skills/nightshift-reviewer/SKILL.md`
 
 ## Task-specific guidance
 
@@ -144,27 +157,31 @@ the models from:
 - GPT-5.x-Codex (e.g. `gpt-5.3-codex`)
 - Gemini Pro (e.g. Gemini 3.1 Pro) — add as a third for high-blast-radius orders
 
-**Who does what — the roles do not overlap:**
+**Who does what — the responsibilities do not overlap:**
 
-- **The builder never reviews or gates its own work.** As a worker you build the
-  order and hand it back with `release`; you do not run the adversarial review,
-  and you do not open PRs, post to, or merge on GitHub (reading an order's issue
-  with `gh issue view` is fine — that is context, not a write). A builder grading
-  its own homework is not a review.
-- **The reviewer runs the gate.** Two independent models (never the same model
-  twice; never the builder self-reviewing), each in an isolated **read-only**
-  checkout at the exact head, given the same self-contained prompt (exact base
-  and head, design intent, diff, concrete attack points). The reviewer drives
-  findings to zero, reproduces any blocking finding on a clean exact-head
-  checkout before acting, and — after fixes — **re-reviews the fixed head**. The
-  gate passes only when both reviews are clean on the final head. The reviewer
-  reports that verdict to the coordinator; it does **not** post to GitHub.
+- **The builder builds; it never reviews its own work.** Building an order — as
+  the worker itself or a builder subagent it spawns — produces a pushed branch. A
+  builder does not review that branch, and it does not open PRs, post to, or merge
+  on GitHub (reading an order's issue with `gh issue view` is fine — that is
+  context, not a write). A builder grading its own homework is not a review.
+- **The worker runs the gate.** It drives two clean reviews from two **different**
+  models on the final head — preferably as reviewer subagents on models different
+  from the builder's, each read-only in its own checkout, given a self-contained
+  prompt (exact base and head, design intent, diff, concrete attack points).
+  Findings go to the **builder** to fix; after fixes the worker **re-reviews the
+  fixed head**; the gate passes only when both reviews are clean on the same final
+  head. Four rounds without convergence → the worker **escalates to the
+  coordinator**. Without subagents a worker is one model and cannot review its own
+  build — the review goes to a different worker, and a worker offered review of an
+  order it built declines as an invalid choice. The worker hands the coordinator
+  the **attestation** (models and rounds); it never posts to GitHub.
 - **The coordinator owns the GitHub surface.** Only the coordinator opens PRs,
-  posts the single clearance note, and lands merged orders. A verdict reaches
-  GitHub through the coordinator and nowhere else. The **human** owns the merge
-  itself — the one deliberate step kept in the loop. (A future gh-aware tool —
-  octoshift — may take over the coordinator's mechanics, and a factory dial may
-  automate the merge; until then the coordinator does its part by hand.)
+  posts the single clearance note (from the worker's attestation), and lands
+  merged orders. A verdict reaches GitHub through the coordinator and nowhere else.
+  The **PR Lander** owns the merge itself — the one deliberate step kept in the
+  loop. (A future gh-aware tool — octoshift — may take over the coordinator's
+  mechanics, and a factory dial may automate the merge; until then the coordinator
+  does its part by hand.)
 
 The PR gets exactly **one** clearance note (a sidecar comment naming the models
 and rounds), never a running commentary. GitHub carries decisions; the
