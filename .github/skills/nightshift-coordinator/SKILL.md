@@ -28,11 +28,28 @@ Your responsibilities:
 - **Land** each order after it merges, so its dependents open.
 
 The **PR Lander** — not you — holds merge authority and performs the merge; `land` is how you report
-that merge back to Nightshift. (Coordinator and Planner are commonly the same session; most sessions
-on the machine are workers.)
+that merge back to Nightshift.
 
-Roles are **responsibilities, not people** — any of them can be filled by a person or an agent. See
-[`docs/design/workflow.md`](../../../docs/design/workflow.md) for the full role model.
+**Workers are always separate instances — you never become one and never spawn one.** Planner and
+Coordinator are commonly the **same** session (this skill covers both); a **Worker is never that
+session**. You do **not** claim orders, build, or review — and you do **not** launch workers. Workers
+are independent agent sessions that clock in (`join`) and pull work (`next`) on their own; you only see
+them through board state (roster, branches, `state`, escalations). If no worker is running, an order
+just sits ready until one claims it — that is correct, not a stall for you to fix by doing the work.
+But it **is** something to surface: if orders are ready and the roster shows no active worker, **tell
+the operator** — they may not realize a worker is a *separate* session they have to start, or know what
+to type. Instruct them to open a new terminal/session and tell that agent:
+
+> **you are a nightshift worker**
+
+That loads the `nightshift-worker` skill, which sets up its own worktree, `join`s, and pulls work.
+One worker drains the ready set serially; start several sessions to run them in parallel. Surfacing
+this — rather than silently waiting or doing the work yourself — is what makes the shift
+self-starting.
+
+Roles are **responsibilities, not people** — any of them can be filled by a person or an agent. The
+worker/coordinator/planner boundaries above are what you need to act; the roster and board state are
+your only view into the others.
 
 Vocabulary: an **order** = one **landable PR** (atomic claim + merge unit), bound to ≤1 issue.
 A **plan** (`orders.json`) = the set of orders for a feature, with an order→order dependency DAG.
@@ -56,6 +73,13 @@ export TURNSTILE_SOCKET=~/.turnstile/turnstile.sock
 Work out the design first — the Product Manager shapes it, the Planner turns it into orders — and
 commit it (the `standard` notes and the plan file live in the repo; that commit is the authorization
 root). Then write the plan:
+
+> **Map issues by the charter, not by assumption.** How issues become orders — which are in scope, how
+> finely to slice, how `paths` stay disjoint, how `after` edges are inferred — is repository policy, not
+> something you improvise. Read this repo's charter, [`NIGHTSHIFT.md`](../../../NIGHTSHIFT.md) (at the
+> repo root), together with whatever the operator told you this session; your authority is the charter
+> **plus** those instructions. Where both are silent, do not guess — ask the operator if they are
+> engaged with you this session, otherwise post on the issue (the release valve below).
 
 > **Readiness is a gate, not a formality — the planner's release valve.** Not every issue is ready to
 > scale through this pipeline. An order needs a design solid enough to slice into `paths`-bounded
@@ -151,8 +175,9 @@ open the PR and post the note from the worker's attestation.
 finally converged, or every round ran the *same* two paired models — you may commission **one more
 review from a third model that was not one of the final two** before you post the note. It is a
 deliberate spend of time to avoid shipping a bad PR: a fresh model on a much-revised change sometimes
-catches something genuinely new. Direct the worker (or dispatch a reviewer yourself) to run the extra
-pass, and clear only if it too is clean.
+catches something genuinely new. Commission it the way every review runs — through a worker/reviewer
+session, not by reviewing it yourself: send the order back with `rework` (below) carrying a
+"third-model review" note, and clear only once that pass too comes back clean.
 
 **Not clean? Send it back with `rework` — the sibling of `land`.** If a coordinator-side check rejects
 a `done` order (the triple-check caught something), or `main` moved under it and broke the branch, do

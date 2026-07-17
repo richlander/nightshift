@@ -4,7 +4,7 @@ How one unit of work travels from an idea to a merged, landed commit — and whi
 role owns each step. This is the operational spine the tools (`turnstile`,
 `nightshift`, `octoshift`) and the skills (`nightshift-coordinator`,
 `nightshift-worker`, `nightshift-builder`, `nightshift-reviewer`) serve. Read
-[`nightshift.md`](nightshift.md) for the architecture, [`octoshift.md`](octoshift.md)
+[`nightshift-spec.md`](nightshift-spec.md) for the architecture, [`octoshift.md`](octoshift.md)
 for the GitHub membrane, and the `nightshift-reviewer` skill for the review gate;
 this note is the thread that ties them together.
 
@@ -53,10 +53,13 @@ start.
 its boundaries — build versus review, who writes to GitHub, which model runs — not
 how many processes call `nightshift`. Nightshift has no "human" role and no "AI"
 role; any role can be filled by a person or an agent, and one session can fill
-several — Planner and Coordinator commonly collapse, and a worker can build and
-review within a single session. The invariants hold regardless of the split: the
-builder never reviews its own work, the reviewer is a different model than the
-builder, and only the coordinator writes to GitHub.
+several — Planner and Coordinator commonly collapse, and a worker builds and
+reviews within its own session (via subagents). **One collapse never happens: a
+Worker is always a separate instance from the Coordinator/Planner.** The
+coordinator never claims, builds, reviews, or spawns workers — workers are
+independent sessions that `join` and `next` on their own. The invariants hold
+regardless of the split: the builder never reviews its own work, the reviewer is a
+different model than the builder, and only the coordinator writes to GitHub.
 
 Because roles can be distinct sessions — or distinct machines — they do not talk
 directly. **They coordinate through Nightshift/Turnstile state.** An escalation a
@@ -125,7 +128,8 @@ scenario. The planner turns that intent into orders and registers them. The
 against it) and the **`orders.json`** plan are committed to `main` — the
 *authorization root*; nothing is dispatchable that was not first approved into the
 repo. The planner files one issue per order; the order's `issue` field points at it.
-*(Planner and coordinator are commonly the same session.)*
+*(Planner and Coordinator are commonly the same session — but never the same
+session as a Worker, which is always a separate instance.)*
 
 ```
 nightshift add orders.json          # one-shot seed (idempotent)
@@ -242,7 +246,7 @@ DAG the scheduler:
 `paths` is each order's file scope and the conflict-avoidance contract: if two orders
 would touch the same files, give the second an `after` on the first so a merge
 conflict becomes a scheduling wait instead of a race. See
-[`nightshift.md`](nightshift.md) §5 for the DAG-as-scheduler details.
+[`nightshift-spec.md`](nightshift-spec.md) §5 for the DAG-as-scheduler details.
 
 ## Escalation — the Coordinator's call
 

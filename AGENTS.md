@@ -2,15 +2,24 @@
 
 ## Start here
 
-Nightshift is a coordination system that drives many units of work to completion
-in parallel without anyone spending attention on mechanics. Work happens on a
-**night shift** — orders built and reviewed to a clean bar — while
-direction-setting and the merge decision stay deliberate acts on the **day
-shift**. **Roles are responsibilities, not people:** any role can be filled by a
-person or an agent, and you are playing one of them (below). Read its guidance
-before you act.
+Three things to hold at once — they are easy to conflate because all three are true here:
 
-It has three layers:
+- **(A) What Nightshift is.** Nightshift is a coordination system that drives many units of work to
+  completion in parallel without anyone spending attention on mechanics. Work happens on a **night
+  shift** — orders built and reviewed to a clean bar — while direction-setting and the merge decision
+  stay deliberate acts on the **day shift**.
+- **(B) What you are.** You are an agent contributing features **to** Nightshift — this repository is
+  the design *and* implementation of that system. You are not a generic assistant here; you are playing
+  one **role** in a defined process (roles are below — read yours before you act).
+- **(C) How this repo builds.** This repository builds Nightshift **using** Nightshift — it is
+  self-hosted. Every feature ships as an **order** through the very process these docs describe: an
+  issue becomes an order, a worker builds and reviews it to a clean bar, and the coordinator lands it.
+  That is *why* you are playing a role at all — there is no side channel that bypasses the process.
+
+**Roles are responsibilities, not people:** any role can be filled by a person or an agent, and you are
+playing one of them (below).
+
+Nightshift has three layers:
 
 - **Turnstile** — a credential-free coordination kernel (kv, leases, watch) over
   a local Unix socket. No GitHub, no network, no auth.
@@ -23,17 +32,6 @@ The unit of work is an **order**: one **landable PR**, the atomic unit of both
 claim and merge, bound to at most one GitHub issue. A **plan** is a DAG of
 orders for a feature, with order→order dependencies.
 
-Read, in order:
-
-1. `docs/design/nightshift-vision.md` — why this exists and the shape of the
-   solution.
-2. `docs/design/nightshift.md` — the Nightshift mechanics (plans, orders, ready
-   set, landing).
-3. `docs/design/workflow.md` — the end-to-end workflow: how an order travels from
-   idea to merge, and which role owns each step.
-4. `docs/design/turnstile.md` — the coordination kernel underneath.
-5. The skill for the role you are playing (below) before you act.
-
 Keep this file to repository-wide engineering and workflow rules. Role
 mechanics live in the skills; subsystem design lives in `docs/design/`. When the
 two disagree, the skills and current code win.
@@ -44,7 +42,10 @@ Nightshift has **five roles**, each a set of responsibilities fillable by a
 person or an agent (the full model is in
 [`docs/design/workflow.md`](docs/design/workflow.md)). You are playing one; read
 its guidance first. Roles can collapse into one session — Planner and Coordinator
-commonly do — and most sessions on a machine are workers.
+commonly do — but a **Worker is always a separate instance** (never the
+Coordinator/Planner session); most sessions on a machine are workers. The
+coordinator never claims, builds, reviews, or spawns workers — workers `join` and
+`next` on their own.
 
 | Role | Owns | Read first |
 | --- | --- | --- |
@@ -61,15 +62,19 @@ responsibilities each have their own skill the worker points a subagent at:
 - **Builder** — build one order into commits on its branch: `.github/skills/nightshift-builder/SKILL.md`
 - **Reviewer** — review one order's diff read-only and report inward: `.github/skills/nightshift-reviewer/SKILL.md`
 
-## Task-specific guidance
+## Where to read more
 
-| Area | Read first |
+New here? Read `docs/design/nightshift-vision.md`, then `docs/design/nightshift-spec.md`,
+then your role's skill (above). Reference the rest by topic:
+
+| Topic | Doc |
 | --- | --- |
+| Why this exists, product intent and direction | `docs/design/nightshift-vision.md` |
+| Nightshift mechanics — plans, orders, ready set, landing | `docs/design/nightshift-spec.md` |
 | End-to-end workflow and role ownership | `docs/design/workflow.md` |
-| Nightshift plans, orders, landing | `docs/design/nightshift.md` |
 | Turnstile kernel (kv/lease/watch, socket) | `docs/design/turnstile.md` |
 | Octoshift GitHub→land bridge | `docs/design/octoshift.md` |
-| Product intent and direction | `docs/design/nightshift-vision.md` |
+| Issue → order mapping policy (planning) | `NIGHTSHIFT.md` (concept: `docs/design/charter.md`) |
 
 ## Repository-wide engineering constraints
 
@@ -156,6 +161,12 @@ the models from:
 - Claude Opus 4.8
 - GPT-5.x-Codex (e.g. `gpt-5.3-codex`)
 - Gemini Pro (e.g. Gemini 3.1 Pro) — add as a third for high-blast-radius orders
+
+This list is the single source of truth for the reviewer roster; the skills and
+`docs/design/workflow.md` reference this section rather than restating the models.
+**Do not review with your own model** — a reviewer subagent runs on a model
+different from the builder's, and a single-model worker cannot review its own
+build (see below).
 
 **Who does what — the responsibilities do not overlap:**
 
