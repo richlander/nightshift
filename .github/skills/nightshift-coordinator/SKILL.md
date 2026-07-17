@@ -58,6 +58,35 @@ your only view into the others.
 Vocabulary: an **order** = one **landable PR** (atomic claim + merge unit), bound to ≤1 issue.
 A **plan** (`orders.json`) = the set of orders for a feature, with an order→order dependency DAG.
 
+## 0. Rebuild and redeploy the tools — every round
+
+Nightshift is self-hosted: the orders you land change the very tools the shift runs on
+(`nightshift`, `turnstile`, `octoshift`, `nightsky`). The daemon, the `nightshift plan`
+controller, and every CLI call use the **deployed** binaries on `PATH` — not `bin/`.
+A fresh `git pull` or `dotnet build` does **not** change what is running. Until you
+redeploy, the shift is coordinating itself with stale code and landed fixes are not in
+effect.
+
+So at the **start of every round** — after you refresh `main` and before you touch the
+board — rebuild and redeploy:
+
+```
+./install.sh
+```
+
+This publishes each tool as a NativeAOT native binary and installs it into `~/.local/bin`
+(override with `PREFIX=…`). The RID is inferred automatically; there is nothing to pass.
+
+Deploying a binary does **not** restart anything already running. After `install.sh`:
+
+- **Always restart the `nightshift plan` controller** so it runs the new code (stop the old
+  one, relaunch on the same plan file and `--sha` anchor — re-seeding is idempotent).
+- **Restart `turnstile serve` only if `src/Turnstile/**` changed this round.** Restarting the
+  daemon drops every watcher and can disturb an in-flight worker, so don't do it gratuitously.
+
+Overwriting a running binary is safe: `install` replaces the file, and the running process
+keeps its old inode until it exits.
+
 ## 1. Start the daemon
 
 Turnstile is the coordination kernel. One daemon per machine:
