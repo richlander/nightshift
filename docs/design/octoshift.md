@@ -256,12 +256,12 @@ Auto-merge is the single most dangerous capability, so it is never implicit — 
 | `protected` | path globs that force escalation — an order touching them never auto-merges | set |
 | `enforce-paths` | diff-vs-`paths` enforcement (below) | on |
 
-**Diff-vs-`paths` enforcement** is the knob that reconnects the claim to a real gate. An order's
-`paths`/`extend` claim is a coordination contract in Turnstile — the files it promised to stay inside. Before
-merging, octoshift diffs the PR (`gh pr diff --name-only`) and compares the touched set against the order's
-claim; **if the diff reaches outside the claim, octoshift refuses to merge and flags the order** (bounce to
-`rework` or escalate per §4.3). Until now the claim was enforced only by good behavior; here it becomes a
-checked precondition at the membrane — the claim you registered is the claim you are held to.
+**Diff-vs-`paths` enforcement** is the knob that reconnects the claim to a **checked merge precondition**. An
+order's `paths`/`extend` claim is a coordination contract in Turnstile — the files it promised to stay inside.
+Before merging, octoshift diffs the PR (`gh pr diff --name-only`) and compares the touched set against the
+order's claim; **if the diff reaches outside the claim, octoshift refuses to merge and flags the order**
+(bounce to `rework` or escalate per §4.3). Until now the claim was enforced only by good behavior; here it
+becomes a checked precondition at the membrane — the claim you registered is the claim you are held to.
 
 None of these knobs are octoshift *judging the code*. A cleared order (§5.1) is one the reviewers already
 passed; the knobs decide only whether an **already-cleared** order may merge *without a human hand on the
@@ -285,11 +285,11 @@ conservative failure mode.
 
 ### 6.4 Audit
 
-Every outbound action is recorded to the ledger, keyed to the order (`OrderRef`) and the **actor identity**
-(§6.1), through the **single-writer** mechanism of §3: agents report to Turnstile, octoshift is the sole
-ledger writer. No outbound action is silent.
+Every membrane action — the inbound `land` and every outbound act — is recorded to the ledger, keyed to the
+order (`OrderRef`) and the **actor identity** (§6.1), through the **single-writer** mechanism of §3: agents
+report to Turnstile, octoshift is the sole ledger writer. No membrane action is silent.
 
-| Outbound action | Ledger artifact | What it appends |
+| Membrane action | Ledger artifact | What it appends |
 |---|---|---|
 | land triggered | `status.jsonl` | a `landed` transition (the same record the inbound loop writes) |
 | PR opened | `pr` + `status.jsonl` | the durable order↔PR binding, and a `pr-opened` transition |
