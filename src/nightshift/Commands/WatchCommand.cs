@@ -44,11 +44,13 @@ internal static class WatchCommand
                 Redraw(await client.RangeAsync(PlanRoot, ct), Console.Out, showAll);
             }
 
-            await RunLoopAsync(
-                client.WatchAsync(PlanRoot, from, ct),
+            await RunLoopWithRecoveryAsync(
+                from,
+                (revision, token) => client.WatchAsync(PlanRoot, revision, token),
                 output,
                 Console.Out,
                 token => client.RangeAsync(PlanRoot, token),
+                client.CurrentRevisionAsync,
                 showAll,
                 ct);
         }
@@ -84,6 +86,43 @@ internal static class WatchCommand
             else
             {
                 Redraw(await snapshot(ct), writer, showAll);
+            }
+        }
+    }
+
+    internal static async Task RunLoopWithRecoveryAsync(
+        long fromRevision,
+        Func<long, CancellationToken, IAsyncEnumerable<WatchSignal>> watch,
+        OutputFormat output,
+        TextWriter writer,
+        Func<CancellationToken, Task<IReadOnlyList<KvItem>>> snapshot,
+        Func<CancellationToken, Task<long>> currentRevision,
+        bool showAll,
+        CancellationToken ct)
+    {
+        long from = fromRevision;
+        while (true)
+        {
+            try
+            {
+                await RunLoopAsync(
+                    watch(from, ct),
+                    output,
+                    writer,
+                    snapshot,
+                    showAll,
+                    ct);
+                return;
+            }
+            catch (WatchCompactedException)
+            {
+                // Canonical level-triggered recovery: re-range and re-watch from a fresh revision floor.
+                from = await currentRevision(ct);
+                IReadOnlyList<KvItem> fresh = await snapshot(ct);
+                if (output == OutputFormat.Table)
+                {
+                    Redraw(fresh, writer, showAll);
+                }
             }
         }
     }

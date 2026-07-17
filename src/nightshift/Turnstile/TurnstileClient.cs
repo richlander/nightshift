@@ -15,7 +15,7 @@ internal sealed class TurnstileClient : IDisposable
 {
     private readonly HttpClient _http;
 
-    private TurnstileClient(HttpClient http) => _http = http;
+    internal TurnstileClient(HttpClient http) => _http = http;
 
     public static TurnstileClient Connect(string socketPath)
     {
@@ -199,6 +199,11 @@ internal sealed class TurnstileClient : IDisposable
         string query = $"?prefix={Uri.EscapeDataString(prefix)}" + (fromExclusive > 0 ? $"&from={fromExclusive}" : string.Empty);
         using var req = new HttpRequestMessage(HttpMethod.Get, $"/watch{query}");
         using HttpResponseMessage res = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+        if (res.StatusCode == HttpStatusCode.Gone)
+        {
+            throw new WatchCompactedException(prefix, fromExclusive, await ReadCompactRevisionAsync(res, ct));
+        }
+
         res.EnsureSuccessStatusCode();
 
         await using Stream stream = await res.Content.ReadAsStreamAsync(ct);
@@ -241,6 +246,37 @@ internal sealed class TurnstileClient : IDisposable
         res.EnsureSuccessStatusCode();
         string body = await res.Content.ReadAsStringAsync(ct);
         return JsonSerializer.Deserialize(body, type)!;
+    }
+
+    private static async Task<long?> ReadCompactRevisionAsync(HttpResponseMessage res, CancellationToken ct)
+    {
+        if (long.TryParse(Header(res, "X-Turnstile-Compact-Revision"), out long fromHeader))
+        {
+            return fromHeader;
+        }
+
+        string body = await res.Content.ReadAsStringAsync(ct);
+        if (string.IsNullOrWhiteSpace(body))
+        {
+            return null;
+        }
+
+        try
+        {
+            using JsonDocument doc = JsonDocument.Parse(body);
+            JsonElement root = doc.RootElement;
+            if (root.ValueKind == JsonValueKind.Object
+                && root.TryGetProperty("compact_revision", out JsonElement compact)
+                && compact.TryGetInt64(out long fromBody))
+            {
+                return fromBody;
+            }
+        }
+        catch (JsonException)
+        {
+        }
+
+        return null;
     }
 
     private static string? Header(HttpResponseMessage res, string name)

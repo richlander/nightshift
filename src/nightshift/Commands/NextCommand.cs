@@ -120,15 +120,32 @@ internal static class NextCommand
 
     /// <summary>Waits for any change at/after <paramref name="fromRevision"/> or the deadline; returns the new revision floor.</summary>
     private static async Task<long> WaitForChangeAsync(TurnstileClient client, long fromRevision, TimeSpan budget, CancellationToken ct)
+        => await WaitForChangeCoreAsync(
+            (from, token) => client.WatchAsync("/", from, token),
+            client.CurrentRevisionAsync,
+            fromRevision,
+            budget,
+            ct);
+
+    internal static async Task<long> WaitForChangeCoreAsync(
+        Func<long, CancellationToken, IAsyncEnumerable<WatchSignal>> watch,
+        Func<CancellationToken, Task<long>> currentRevision,
+        long fromRevision,
+        TimeSpan budget,
+        CancellationToken ct)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(budget);
         try
         {
-            await foreach (WatchSignal signal in client.WatchAsync("/", fromRevision, timeout.Token))
+            await foreach (WatchSignal signal in watch(fromRevision, timeout.Token))
             {
                 return signal.Revision; // one change is enough to trigger a re-scan
             }
+        }
+        catch (WatchCompactedException)
+        {
+            return await currentRevision(ct);
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
