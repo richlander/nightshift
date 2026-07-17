@@ -83,6 +83,51 @@ public class WatchCommandTests
     }
 
     [Fact]
+    public async Task RunLoopWithRecovery_Table_OnCompaction_ReRangesAndResumes()
+    {
+        var watchedFrom = new List<long>();
+        int snapshots = 0;
+        using var writer = new StringWriter();
+
+        await WatchCommand.RunLoopWithRecoveryAsync(
+            fromRevision: 10,
+            watch: (from, _) =>
+            {
+                watchedFrom.Add(from);
+                if (watchedFrom.Count == 1)
+                {
+                    throw new WatchCompactedException("/plan/", from, compactRevision: 99);
+                }
+
+                return Replay(
+                [
+                    new WatchSignal("/plan/1/order/op-b/state", Deleted: false, 101),
+                ]);
+            },
+            output: OutputFormat.Table,
+            writer,
+            snapshot: _ =>
+            {
+                snapshots++;
+                return Task.FromResult<IReadOnlyList<KvItem>>(
+                    snapshots == 1
+                        ? [Item("/plan/1/order/op-a/state", "{\"status\":\"done\"}")]
+                        : [Item("/plan/1/order/op-b/state", "{\"status\":\"blocked\"}")]);
+            },
+            currentRevision: _ => Task.FromResult(100L),
+            showAll: false,
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal([10L, 100L], watchedFrom);
+        Assert.Equal(2, snapshots);
+
+        string output = writer.ToString();
+        Assert.Contains("/plan/1/order/op-a", output);
+        Assert.Contains("/plan/1/order/op-b", output);
+        Assert.Contains("blocked", output);
+    }
+
+    [Fact]
     public void Redraw_EmptyBoard_ClearsAndPrintsNoOrders()
     {
         using var writer = new StringWriter();
