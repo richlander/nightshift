@@ -36,6 +36,21 @@ session**. You do **not** claim orders, build, or review — and you do **not** 
 are independent agent sessions that clock in (`join`) and pull work (`next`) on their own; you only see
 them through board state (roster, branches, `state`, escalations). If no worker is running, an order
 just sits ready until one claims it — that is correct, not a stall for you to fix by doing the work.
+But it **is** something to surface: if orders are ready and the roster shows no active worker, **tell
+the operator** — they may not realize a worker is a *separate* session they have to start, or know what
+to type. Instruct them: open a new terminal/session, tell that agent **"you are a nightshift worker"**
+(loads the `nightshift-worker` skill), and it will set itself up:
+
+```
+git fetch origin
+git worktree add ../nightshift-worker-<name> --detach origin/main
+cd ../nightshift-worker-<name>
+nightshift join      # then: nightshift next
+```
+
+One worker drains the ready set serially; start several sessions to run them in parallel. Surfacing
+this — rather than silently waiting or doing the work yourself — is what makes the shift
+self-starting.
 
 Roles are **responsibilities, not people** — any of them can be filled by a person or an agent. The
 worker/coordinator/planner boundaries above are what you need to act; the roster and board state are
