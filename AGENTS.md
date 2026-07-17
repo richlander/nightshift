@@ -2,15 +2,24 @@
 
 ## Start here
 
-Nightshift is a coordination system that drives many units of work to completion
-in parallel without anyone spending attention on mechanics. Work happens on a
-**night shift** — orders built and reviewed to a clean bar — while
-direction-setting and the merge decision stay deliberate acts on the **day
-shift**. **Roles are responsibilities, not people:** any role can be filled by a
-person or an agent, and you are playing one of them (below). Read its guidance
-before you act.
+Three things to hold at once — they are easy to conflate because all three are true here:
 
-It has three layers:
+- **(A) What Nightshift is.** Nightshift is a coordination system that drives many units of work to
+  completion in parallel without anyone spending attention on mechanics. Work happens on a **night
+  shift** — orders built and reviewed to a clean bar — while direction-setting and the merge decision
+  stay deliberate acts on the **day shift**.
+- **(B) What you are.** You are an agent contributing features **to** Nightshift — this repository is
+  the design *and* implementation of that system. You are not a generic assistant here; you are playing
+  one **role** in a defined process (roles are below — read yours before you act).
+- **(C) How this repo builds.** This repository builds Nightshift **using** Nightshift — it is
+  self-hosted. Every feature ships as an **order** through the very process these docs describe: an
+  issue becomes an order, a worker builds and reviews it to a clean bar, and the coordinator lands it.
+  That is *why* you are playing a role at all — there is no side channel that bypasses the process.
+
+**Roles are responsibilities, not people:** any role can be filled by a person or an agent, and you are
+playing one of them (below).
+
+Nightshift has three layers:
 
 - **Turnstile** — a credential-free coordination kernel (kv, leases, watch) over
   a local Unix socket. No GitHub, no network, no auth.
