@@ -43,14 +43,24 @@ internal static class ReconcileCommand
 
         var nightshift = new NightshiftCli(socket);
         var source = new GhMergedPrSource(scope);
+        var openSource = new GhOpenPrSource(scope);
         var poller = new AdaptivePoller(tuning);
 
         if (once)
         {
-            return await RunOnceAsync(nightshift, source, ct);
+            int mergedCode = await RunOnceAsync(nightshift, source, ct);
+            try
+            {
+                await SweepReworkOnceAsync(nightshift, openSource, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+            }
+
+            return mergedCode;
         }
 
-        await RunLoopAsync(nightshift, source, poller, tuning, ct);
+        await RunLoopAsync(nightshift, source, openSource, poller, tuning, ct);
         return ExitCode.Ok;
     }
 
@@ -64,6 +74,65 @@ internal static class ReconcileCommand
         MergedPrPage page = await source.FetchMergedAsync(null, null, ct);
         ApplyResult result = await ApplyAsync(nightshift, board, page.MergedPrs, new Dictionary<int, DateTimeOffset>(), ct);
         return result.Actions;
+    }
+
+    /// <summary>A single rework sweep: read the board, fetch all open order-PRs, bounce every eligible one.</summary>
+    internal static async Task<IReadOnlyList<ReworkAction>> SweepReworkOnceAsync(
+        INightshiftClient nightshift,
+        IOpenPrSource source,
+        CancellationToken ct)
+    {
+        BoardState board = await nightshift.GetBoardAsync(ct);
+        IReadOnlyList<OpenPr> open = await source.FetchOpenAsync(ct);
+        IReadOnlyList<ReworkAction> actions = ReworkDecision.Decide(open, board);
+        await ApplyReworkAsync(nightshift, actions, new HashSet<int>(), ct);
+        return actions;
+    }
+
+    /// <summary>The resident-loop rework pass: like the sweep, but dedups escalations across polls via the run state.</summary>
+    internal static async Task<IReadOnlyList<ReworkAction>> ReworkPassAsync(
+        INightshiftClient nightshift,
+        IOpenPrSource source,
+        ReconcileState state,
+        CancellationToken ct)
+    {
+        BoardState board = await nightshift.GetBoardAsync(ct);
+        IReadOnlyList<OpenPr> open = await source.FetchOpenAsync(ct);
+        IReadOnlyList<ReworkAction> actions = ReworkDecision.Decide(open, board);
+        await ApplyReworkAsync(nightshift, actions, state.EscalatedPrs, ct);
+        return actions;
+    }
+
+    /// <summary>
+    /// Routes each decided rework action: a bounce goes to <c>nightshift rework</c> (idempotent — the board
+    /// gate stops a second bounce once it flips to <c>changes-requested</c>) and echoes <c>REWORK</c>; an
+    /// escalation takes no coordination action and surfaces a single <c>ESCALATE</c> line per closed PR,
+    /// deduped through <paramref name="escalated"/> so a resident loop never re-alerts the same PR.
+    /// </summary>
+    private static async Task ApplyReworkAsync(
+        INightshiftClient nightshift,
+        IReadOnlyList<ReworkAction> actions,
+        HashSet<int> escalated,
+        CancellationToken ct)
+    {
+        foreach (ReworkAction action in actions)
+        {
+            if (action.Kind == ReworkKind.Escalate)
+            {
+                if (escalated.Add(action.PrNumber))
+                {
+                    // Not a routed action — surfaced for a human, never as success-shaped stdout (§4.3, §9.5).
+                    Console.Error.WriteLine($"ESCALATE {action.OrderBase} (PR #{action.PrNumber} {action.Directive}: needs a human)");
+                }
+
+                continue;
+            }
+
+            if (await nightshift.ReworkAsync(action.OrderBase, action.Directive, ct))
+            {
+                Console.WriteLine($"REWORK {action.OrderBase} ({action.Directive})");
+            }
+        }
     }
 
     internal static async Task<int> RunOnceAsync(
@@ -86,6 +155,7 @@ internal static class ReconcileCommand
     private static async Task RunLoopAsync(
         INightshiftClient nightshift,
         IMergedPrSource source,
+        IOpenPrSource openSource,
         AdaptivePoller poller,
         PollingTuning tuning,
         CancellationToken ct)
@@ -93,13 +163,14 @@ internal static class ReconcileCommand
         var state = new ReconcileState { IntervalSeconds = tuning.MinIntervalSeconds };
         string? lastMode = null;
 
-        Console.WriteLine("octoshift: reconciling merged PRs -> nightshift land (Ctrl-C to stop)");
+        Console.WriteLine("octoshift: reconciling merged PRs -> nightshift land, open PRs -> nightshift rework (Ctrl-C to stop)");
 
         try
         {
             while (!ct.IsCancellationRequested)
             {
                 PollerState pollerState = await PollOnceAsync(nightshift, source, state, poller, tuning, ct);
+                await ReworkPassAsync(nightshift, openSource, state, ct);
 
                 state.IntervalSeconds = poller.NextIntervalSeconds(pollerState, Random.Shared.NextDouble());
                 lastMode = NoteTransition(pollerState, state.IntervalSeconds, lastMode);
@@ -336,6 +407,7 @@ internal static class ReconcileCommand
         public double IntervalSeconds { get; set; }
         public Dictionary<int, DateTimeOffset> HandledPrs { get; } = [];
         public List<MergedPr> RecentMerges { get; } = [];
+        public HashSet<int> EscalatedPrs { get; } = [];
     }
 
     private sealed record ApplyResult(IReadOnlyList<LandAction> Actions, bool LandedSomething);

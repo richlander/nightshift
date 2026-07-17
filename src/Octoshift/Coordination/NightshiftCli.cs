@@ -42,6 +42,18 @@ internal sealed class NightshiftCli : INightshiftClient
         return run.ExitCode == 0;
     }
 
+    public async Task<bool> ReworkAsync(string orderBase, string directive, CancellationToken ct)
+    {
+        ProcessRun run = await RunAsync(["rework", orderBase, "--reason", directive], ct);
+        if (run.ExitCode != 0)
+        {
+            string detail = run.Stderr.Trim();
+            Console.Error.WriteLine($"octoshift: nightshift rework {orderBase} failed (exit {run.ExitCode}){(detail.Length > 0 ? $": {detail}" : string.Empty)}");
+        }
+
+        return run.ExitCode == 0;
+    }
+
     private async Task<ProcessRun> RunAsync(IReadOnlyList<string> args, CancellationToken ct)
     {
         var psi = new ProcessStartInfo(Executable)

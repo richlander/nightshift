@@ -15,4 +15,12 @@ internal interface INightshiftClient
     /// that wakes the plan controller. Returns true when the land succeeded (or was already a no-op).
     /// </summary>
     Task<bool> LandAsync(string orderBase, string reason, CancellationToken ct);
+
+    /// <summary>
+    /// Bounces an order back for rework via <c>nightshift rework &lt;base&gt; --reason &lt;directive&gt;</c> — the
+    /// pure Turnstile write that returns a <c>done</c> order to the pool as <c>changes-requested</c>, keeping
+    /// its branch and claim so the re-claiming worker continues the existing branch. Returns true when the
+    /// rework succeeded (or was already a no-op). The symmetric sibling of <see cref="LandAsync"/>.
+    /// </summary>
+    Task<bool> ReworkAsync(string orderBase, string directive, CancellationToken ct);
 }
