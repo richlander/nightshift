@@ -118,9 +118,14 @@ wait on it decides whether the loop keeps running:
 - **Don't poll.** A tight check-sleep-check loop burns turns for nothing.
 - **Interactive** (a session that can go idle and be woken): issue the wait as a
   **background shell command**, end your turn, and let its completion
-  notification wake you with the result — then act and relaunch. Bound a blocking
-  stream so it returns on the signal you care about (the first
-  `done`/`landed`/`escalated`, a `QUERY`, a build exit).
+  notification wake you with the result — then act and relaunch. Bound the wait
+  so it returns on the signal you care about — but mind *what the call returns*:
+  a **token-returning** call (`next`/`check`) hands you the signal directly on
+  return (`WORK`, `QUERY`, a build exit); a **raw change stream**
+  (`nightshift watch`) only tells you *something* changed (each row carries the
+  key + op, **not** the status value), so bound it on the first relevant *key*
+  and then **reconcile** (`where` / `get …/state`) to see what actually changed.
+  Grepping a change stream for a status word like `done` never fires.
 - **Headless** (`-p`, no next turn once you yield): a backgrounded shell is
   reaped the moment you yield, so **block in-turn** on the call and read its
   return, or exit and be relaunched. `NOWORK`/`DRAINING` mean *exit*, not *idle*.
