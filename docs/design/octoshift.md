@@ -156,7 +156,13 @@ can break `op2`'s branch, which was cut from pre-land `main`.** Octoshift must h
 
 ### 4.3 Closed-unmerged, and fan-out issue closing
 
-- A PR **closed without merging** → policy: bounce to `rework`, return to the pool, or escalate to a human.
+- A PR **closed without merging** → **default: escalate to a human.** A close is a deliberate out-of-band
+  act, not a mechanical failure like a conflict or red CI (§4.2, which route to `rework`); bouncing it straight
+  back to `rework` would fight the person who just closed it, and returning it to the pool would let another
+  agent silently reopen a decision a human made. So the order is **parked and surfaced** for a human, their
+  intent left intact. The other two routes are opt-in: **rework** when the close carries a rework
+  directive/label (an explicit "redo this"), and **return to the pool** when the order is explicitly abandoned
+  or superseded. (Resolved default — §9.5; governed in §6.)
 - **Fan-out issue close** is ledger-and-bridge-only value: since an issue can split into several orders, no
   single PR's `Fixes:` closes it. Octoshift holds the cross-order view and closes `#1234` when its **last**
   slice lands.
@@ -197,20 +203,103 @@ The template is open, but the shape is fixed: **verdict + which models signed of
 ## 6. Governance and identity — the "as me" boundary
 
 Octoshift is the choke point where GitHub authority lives. That is the entire reason Nightshift stays
-GitHub-unaware.
+GitHub-unaware. Everything in this section is declared in **octoshift's config file**, read at startup — one
+place a human edits and audits, never a value an agent supplies. A compact illustration of the surface:
 
-- **Agents never use `gh` as you.** They push branches (optionally under a bot identity) and talk to the
-  socket. Only octoshift holds GitHub authority.
-- **A distinct bot / GitHub App identity** for anything octoshift authors or merges, so factory actions are
-  *attributable and separately revocable* — not indistinguishable from you. The moment anything auto-merges,
-  it should not be "you."
-- **Merge policy is the spectrum knob:** which plans/labels may auto-merge, required approvals and checks,
-  protected paths, and **diff-vs-`paths` enforcement** — refuse to merge a PR that touched files outside the
-  order's claim. That reconnects `paths`/`extend` to a real gate.
-- **Blast-radius caps:** max lands/merges per interval; a global pause (reuse `/control/halt`). Octoshift is
-  where autonomy is bounded.
-- **Audit:** every land triggered, PR opened, merge performed — recorded to the ledger, keyed to order and
-  actor identity. Same single-writer mechanism as §3.
+```
+# octoshift config (illustrative keys, not a schema)
+identity:
+  app:  nightshift-bot         # the GitHub App octoshift acts as (mechanism: #40)
+  from: first-outbound-pr      # when the identity takes over authorship
+merge:
+  auto:      [plan:2585, label:auto-merge]   # eligible plans/labels; empty = never
+  approvals: 1                 # required approving reviews
+  checks:    [build, test]     # required green checks
+  protected: [".github/**", "SECURITY.md"]   # never auto-merge; always escalate
+  enforce-paths: true          # refuse a diff outside the order's claim
+caps:
+  lands-per-hour:  20
+  merges-per-hour: 8
+  on-cap: pause                # pause, never drop
+```
+
+### 6.1 Identity — from the first outbound action, not the first merge
+
+**Agents never use `gh` as you.** They push branches (optionally under a bot identity) and talk to the
+socket; only octoshift holds GitHub authority. The governed question is *when* octoshift stops acting as you
+and starts acting as a **distinct bot identity** — and the answer is **the first outbound action, not the
+first auto-merge.**
+
+The principle that *the moment anything auto-merges it should not be "you"* generalizes: the moment octoshift
+**authors** anything on GitHub, that authorship must be attributable to octoshift and separately revocable.
+Opening a PR and posting the clearance note (§5.1) are authored acts; if they went out as you, the trail would
+read "you opened it, you cleared it, the bot merged it" — the exact blur the boundary exists to prevent, under
+a credential you could not revoke without revoking your own. So identity is a **prerequisite of going outbound
+at all** (remote-dev, §5), not a later gate bolted on at factory. The inbound-only MVP stays as-you because it
+authors nothing — it only reads merges and calls `land` on the local socket.
+
+The identity is **declared in configuration** (the `identity` block above): octoshift reads *which* identity
+to act as from its config file at startup, rather than inferring it or hard-coding it. The identity
+**mechanism** — provisioning a GitHub App, minting installation tokens, scoping permissions — is #40 and out of
+scope here; this section fixes the *when* (first outbound PR) and the governing policy, not the App plumbing.
+
+### 6.2 Merge policy knobs
+
+Auto-merge is the single most dangerous capability, so it is never implicit — an order auto-merges only when
+**every** knob in the `merge` block is satisfied:
+
+| Knob | Meaning | Default |
+|---|---|---|
+| `auto` | allowlist of plans/labels eligible to auto-merge; empty means nothing auto-merges | empty (off) |
+| `approvals` | required approving reviews before merge | policy-set |
+| `checks` | named checks that must be green | policy-set |
+| `protected` | path globs that force escalation — an order touching them never auto-merges | set |
+| `enforce-paths` | diff-vs-`paths` enforcement (below) | on |
+
+**Diff-vs-`paths` enforcement** is the knob that reconnects the claim to a real gate. An order's
+`paths`/`extend` claim is a coordination contract in Turnstile — the files it promised to stay inside. Before
+merging, octoshift diffs the PR (`gh pr diff --name-only`) and compares the touched set against the order's
+claim; **if the diff reaches outside the claim, octoshift refuses to merge and flags the order** (bounce to
+`rework` or escalate per §4.3). Until now the claim was enforced only by good behavior; here it becomes a
+checked precondition at the membrane — the claim you registered is the claim you are held to.
+
+None of these knobs are octoshift *judging the code*. A cleared order (§5.1) is one the reviewers already
+passed; the knobs decide only whether an **already-cleared** order may merge *without a human hand on the
+button*. Octoshift still reflects a verdict it did not form (§7).
+
+### 6.3 Blast-radius caps
+
+Autonomy is bounded by rate, not only by policy:
+
+- **Caps per interval** — `lands-per-hour`, `merges-per-hour`. A ceiling on how fast the membrane can move, so
+  a mis-registered plan or a runaway loop cannot drain a whole backlog before a human looks.
+- **Global pause** — the existing `/control/halt` flag. When set, octoshift performs **no outbound mutation**:
+  it opens no PR, posts no note, merges nothing. (Inbound `land` also stops; halt is a full stop.) Any actor
+  may set it; octoshift itself sets it when an anomaly trips.
+
+**Hitting a cap pauses; it never drops.** A capped order is not rejected or returned to the pool — it waits for
+the next interval (or a human clearing `/control/halt`) and resumes where it left off. The distinction matters:
+a cap is a rate limit, not a verdict. Octoshift records the pause (§6.4) so the backlog stays visible. When
+octoshift trips the global pause itself, it is choosing "stop and be looked at" over "keep going" — the
+conservative failure mode.
+
+### 6.4 Audit
+
+Every outbound action is recorded to the ledger, keyed to the order (`OrderRef`) and the **actor identity**
+(§6.1), through the **single-writer** mechanism of §3: agents report to Turnstile, octoshift is the sole
+ledger writer. No outbound action is silent.
+
+| Outbound action | Ledger artifact | What it appends |
+|---|---|---|
+| land triggered | `status.jsonl` | a `landed` transition (the same record the inbound loop writes) |
+| PR opened | `pr` + `status.jsonl` | the durable order↔PR binding, and a `pr-opened` transition |
+| clearance note posted | `status.jsonl` (+ `review.md`) | a `cleared` transition pointing at the full review record already in `review.md` |
+| merge performed | `status.jsonl` | a `merged` transition, then the `landed` it triggers |
+| cap/halt pause | `status.jsonl` | a `paused` transition naming the cap or `/control/halt` |
+
+Because every row carries the actor identity, the ledger answers "who did this, as whom" for every
+GitHub-visible act — the attributability §6.1 exists to guarantee, made durable. Agents never write these
+rows; they cannot, which is what keeps the audit trustworthy.
 
 ---
 
@@ -287,6 +376,10 @@ dependents, which unblocks some worker's `next`. **No live spawner required.**
    durably in the ledger. *Resolved:* branches are registered, PRs are derived.
 4. **Rework routing** — a distinct `rework` state that the reconciler re-readies (preferred, visibly
    different from an untouched `declined`), vs. reusing `declined` → pool with a directive.
-5. **Closed-unmerged policy default** — `rework` / pool / escalate.
+5. **Closed-unmerged policy default** — `rework` / pool / escalate. *Resolved:* **escalate to a human** is the
+   default (§4.3) — a close is a deliberate out-of-band act, not a mechanical failure; `rework` and pool are
+   opt-in via directive/label.
 6. **Ledger sharding** — one branch, per-plan, or per-order. Start with one.
-7. **Bot identity** — introduced at first auto-merge, or from the first outbound PR.
+7. **Bot identity** — introduced at first auto-merge, or from the first outbound PR. *Resolved:* from the
+   **first outbound PR** (§6.1) — authorship, not only merge, must be attributable; the identity is
+   config-declared, and the App mechanism is #40.
