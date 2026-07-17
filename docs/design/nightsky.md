@@ -77,10 +77,15 @@ There were two candidate designs:
    cache is [the opaque `{base}/pr` tier it already writes to Turnstile](octoshift.md). One SSE watch over the
    relevant prefixes sees every plane. Wrapping would re-serialize state out of the kernel only to re-parse and
    re-join it, when a single range + watch already has it joined by key.
-2. **It inherits the level-triggered contract for free.** Turnstile's [`/watch`](turnstile.md) emits a `sync`
-   once the backlog drains and returns `410 Gone` on compaction; the canonical loop is *range → reconcile → watch
-   → on 410 re-range*. Nightsky is exactly that loop with a renderer bolted on — the same shape `nightshift watch`
-   already ships. Merging three independent subprocess streams gives up that single, provable freshness boundary.
+2. **It inherits the level-triggered contract.** Turnstile's [`/watch`](turnstile.md) emits a `sync` once the
+   backlog drains and returns `410 Gone` on compaction; the canonical loop is *range → reconcile → watch → on 410
+   re-range*. `nightshift watch` today ships the front half of that loop — it establishes the watch revision
+   *before* snapshotting and then does range → watch, so the backlog can only overlap the snapshot, never gap it.
+   It does **not** yet implement the `410 Gone` re-range recovery (`TurnstileClient.WatchAsync` calls
+   `EnsureSuccessStatusCode()` with no 410 branch, and `WatchCommand` has no re-range path). Nightsky is that same
+   loop with a renderer bolted on, and it **must add** the 410 re-range recovery to be a correct level-triggered
+   watcher — the one piece `nightshift watch` has not built yet. Merging three independent subprocess streams
+   would give up that single, provable freshness boundary.
 3. **It stays credential-free** (see §6). A derived Nightsky never runs `gh` and never needs a subprocess that
    does.
 4. **It does not depend on the Octoshift observation verbs (#34).** This is the decisive consequence, stated
@@ -141,7 +146,9 @@ order            claim/lease           state     branch                         
   wedged agent shows `⚠` here without having to answer.
 - **State + branch + directive** (Nightshift plane): the order's status from `{base}/state`, its branch from
   `{base}/branch`, whether it is in the ready set, and any standing `{base}/directive` (the same `QUERY` a worker
-  reads at its gate).
+  reads at its gate). State and branch come straight from the existing `where`/`watch` projection; the
+  `{base}/directive` cell is an **extension Nightsky adds** to that projection, which today yields only state and
+  branch (see §2).
 - **PR + merge** (Octoshift plane): PR number, mergeable, CI rollup, merged/landed — from Octoshift's Turnstile
   cache, or `—` when Octoshift is quiet.
 
@@ -154,9 +161,13 @@ glance:
 - **Control flags** — is `/control/halt` raised (everything stopped)? is `/control/draining` raised (no new work
   handed out)? These change the meaning of every other row and belong on the same screen.
 
-By default, Nightsky mirrors `nightshift watch`'s **hide-landed** behavior (the op-k default): terminal `landed`
-orders drop out so the board shows live work, with an `--all` / `-a` opt-in to include them. The day shift wants
-the frontier, not the archive — until it wants the archive.
+Nightsky's default view **hides landed orders** — terminal `landed` orders drop out so the board shows live work,
+with an `--all` / `-a` opt-in to include them. The day shift wants the frontier, not the archive — until it wants
+the archive. Nightsky adopts this default **in step with the in-flight op-k order**, the sibling that introduces
+the same hide-landed default (and `--all`/`-a` flag) to `nightshift watch`; the two flags stay spelled and
+defaulted identically so the behavior is one habit across both surfaces. (On today's baseline, before op-k merges,
+`nightshift watch` has no landed filter — so this is a default the two surfaces gain together, not one Nightsky
+inherits.)
 
 ---
 
@@ -235,9 +246,11 @@ untouched.
 
 - **MVP = snapshot, derived, two planes solid + the third when present.** Range `/plan/`, `/ready/`, `/agent/`,
   `/control/`, and the Octoshift `{base}/pr` cache; join per order; print the unified board once. Reuse the
-  `where` projection helpers in-process. Depends on Turnstile only.
-- **Next = stream (`--watch`).** Wrap the snapshot in Turnstile's range→watch→(410 re-range) loop and redraw on
-  change — the same engine `nightshift watch` runs, widened to three planes. `jsonl` event output for piping.
+  `where` projection helpers in-process (which yield state + branch today), extending them to also read
+  `{base}/directive`. Depends on Turnstile only.
+- **Next = stream (`--watch`).** Wrap the snapshot in Turnstile's full range→watch→(410 re-range) loop and redraw
+  on change — building on the range→watch engine `nightshift watch` runs and **adding** the 410 re-range recovery
+  it does not yet have (§2), widened to three planes. `jsonl` event output for piping.
 - **Later = the TUI dashboard** on the same stream, and richer Octoshift detail as `octoshift reconcile` populates
   more of the cache. If Octoshift ever exposes state Nightsky wants that is not yet in Turnstile, the fix is
   *Octoshift writes it to the cache* — not *Nightsky learns to call `gh`*. The credential-free boundary is the
@@ -260,7 +273,8 @@ join, kept live.
 4. **Lease-liveness rendering** — thresholds for *fresh* / *expiring* / *stale* and whether Nightsky reads lease
    TTL directly or infers it from last-renew; align with how the roster reports liveness so one order does not
    look alive in one column and wedged in another.
-5. **Hide-landed default** — mirror `nightshift watch`'s op-k default (`--all`/`-a` to include terminal orders);
+5. **Hide-landed default** — adopt the hide-landed default (`--all`/`-a` to include terminal orders) in step with
+   the in-flight op-k order that introduces it to `nightshift watch`, not as a baseline Nightsky inherits;
    confirm the two flags stay spelled and defaulted identically so muscle memory transfers.
 6. **Standalone binary vs. `nightshift` subcommand** — Nightsky is a distinct *surface* but shares the projection
    code; whether it ships as `nightsky` or `nightshift sky` is a packaging question, not a design one.
