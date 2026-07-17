@@ -68,8 +68,8 @@ root). Then write the plan:
 > finely to slice, how `paths` stay disjoint, how `after` edges are inferred — is repository policy, not
 > something you improvise. Read this repo's charter, [`NIGHTSHIFT.md`](../../../NIGHTSHIFT.md) (at the
 > repo root), together with whatever the operator told you this session; your authority is the charter
-> **plus** those instructions. Where both are silent, do not guess — post on the issue (the release
-> valve below).
+> **plus** those instructions. Where both are silent, do not guess — ask the operator if they are
+> engaged with you this session, otherwise post on the issue (the release valve below).
 
 > **Readiness is a gate, not a formality — the planner's release valve.** Not every issue is ready to
 > scale through this pipeline. An order needs a design solid enough to slice into `paths`-bounded
