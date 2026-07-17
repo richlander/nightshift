@@ -25,9 +25,9 @@ It composes two CLIs it does not link — `nightshift` and `gh` — as subproces
 authority that agents never touch. And it enforces one doctrine above all:
 
 > **GitHub carries decisions. Git carries deliberation.**
-> The GitHub surface — issues, PRs, comments — holds only the terminal signals a human acts on. Every
-> spec, status transition, review round, and audit record lives in a git ledger off to the side. The
-> overall GitHub presence is **quiet.**
+> The GitHub surface — issues, PRs, comments — holds only the terminal signals a role acts on — the PR
+> Lander's merge, the Coordinator's issue and PR curation. Every spec, status transition, review round, and
+> audit record lives in a git ledger off to the side. The overall GitHub presence is **quiet.**
 
 Octoshift is never a gate and never an author of judgment. Models are the workers and reviewers; octoshift
 only *reflects* their verdicts and GitHub's reality. It fixes no code, resolves no conflict, and writes no
@@ -156,12 +156,13 @@ can break `op2`'s branch, which was cut from pre-land `main`.** Octoshift must h
 
 ### 4.3 Closed-unmerged, and fan-out issue closing
 
-- A PR **closed without merging** → **default: escalate to a human.** A close is a deliberate out-of-band
-  act, not a mechanical failure like a conflict or red CI (§4.2, which route to `rework`); bouncing it straight
-  back to `rework` would fight the person who just closed it, and returning it to the pool would let another
-  agent silently reopen a decision a human made. So the order is **parked and surfaced** for a human, their
-  intent left intact. The other two routes are opt-in: **rework** when the close carries a rework
-  directive/label (an explicit "redo this"), and **return to the pool** when the order is explicitly abandoned
+- A PR **closed without merging** → **default: escalate to the Planner or Product Manager.** A close is a
+  deliberate out-of-band act, not a mechanical failure like a conflict or red CI (§4.2, which route to
+  `rework`); bouncing it straight back to `rework` would fight the PR Lander who just closed it, and returning
+  it to the pool would let another agent silently reopen a deliberate decision. So the order is **parked and
+  surfaced** for the Planner or Product Manager, that intent left intact. The other two routes are opt-in:
+  **rework** when the close carries a rework directive/label (an explicit "redo this"), and **return to the
+  pool** when the order is explicitly abandoned
   or superseded. (Resolved default — §9.5; governed in §6.)
 - **Fan-out issue close** is ledger-and-bridge-only value: since an issue can split into several orders, no
   single PR's `Fixes:` closes it. Octoshift holds the cross-order view and closes `#1234` when its **last**
@@ -173,7 +174,7 @@ can break `op2`'s branch, which was cut from pre-land `main`.** Octoshift must h
 
 This is the spectrum, and it lives here, not in Nightshift:
 
-- **Local-dev (MVP):** octoshift reads merges only. Humans open and merge PRs.
+- **Local-dev (MVP):** octoshift reads merges only. The Coordinator opens PRs and the PR Lander merges them.
 - **Remote-dev:** on `release --status done`, octoshift **opens the PR** from the pushed branch (title/body
   from the spec; trailers already in the commits), applies labels/reviewers/milestone from plan metadata.
 - **Factory:** octoshift **auto-merges** when policy is satisfied. The single most dangerous capability — so it
@@ -193,7 +194,7 @@ Instead:
   > ✅ **Adversarial review clear** — all-clear from Opus 4.8, GPT-5.5, Gemini 3.1 Pro.
   > Full record: `orders/2585/op1/review.md`.
 
-- Not clear → no clearance note; the order bounces to `rework` (§4.2). The human sees "safe to merge / not
+- Not clear → no clearance note; the order bounces to `rework` (§4.2). The PR Lander sees "safe to merge / not
   yet," never the deliberation.
 
 The template is open, but the shape is fixed: **verdict + which models signed off + a pointer to the ledger.**
@@ -204,7 +205,7 @@ The template is open, but the shape is fixed: **verdict + which models signed of
 
 Octoshift is the choke point where GitHub authority lives. That is the entire reason Nightshift stays
 GitHub-unaware. Everything in this section is declared in **octoshift's config file**, read at startup — one
-place a human edits and audits, never a value an agent supplies. A compact illustration of the surface:
+place the Coordinator edits and audits, never a value a running order supplies. A compact illustration of the surface:
 
 ```
 # octoshift config (illustrative keys, not a schema)
@@ -264,21 +265,21 @@ order's claim; **if the diff reaches outside the claim, octoshift refuses to mer
 becomes a checked precondition at the membrane — the claim you registered is the claim you are held to.
 
 None of these knobs are octoshift *judging the code*. A cleared order (§5.1) is one the reviewers already
-passed; the knobs decide only whether an **already-cleared** order may merge *without a human hand on the
-button*. Octoshift still reflects a verdict it did not form (§7).
+passed; the knobs decide only whether an **already-cleared** order may merge *without the PR Lander's hand on
+the button*. Octoshift still reflects a verdict it did not form (§7).
 
 ### 6.3 Blast-radius caps
 
 Autonomy is bounded by rate, not only by policy:
 
 - **Caps per interval** — `lands-per-hour`, `merges-per-hour`. A ceiling on how fast the membrane can move, so
-  a mis-registered plan or a runaway loop cannot drain a whole backlog before a human looks.
+  a mis-registered plan or a runaway loop cannot drain a whole backlog before the Coordinator looks.
 - **Global pause** — the existing `/control/halt` flag. When set, octoshift performs **no outbound mutation**:
   it opens no PR, posts no note, merges nothing. (Inbound `land` also stops; halt is a full stop.) Any actor
   may set it; octoshift itself sets it when an anomaly trips.
 
 **Hitting a cap pauses; it never drops.** A capped order is not rejected or returned to the pool — it waits for
-the next interval (or a human clearing `/control/halt`) and resumes where it left off. The distinction matters:
+the next interval (or the Coordinator clearing `/control/halt`) and resumes where it left off. The distinction matters:
 a cap is a rate limit, not a verdict. Octoshift records the pause (§6.4) so the backlog stays visible. When
 octoshift trips the global pause itself, it is choosing "stop and be looked at" over "keep going" — the
 conservative failure mode.
@@ -376,9 +377,9 @@ dependents, which unblocks some worker's `next`. **No live spawner required.**
    durably in the ledger. *Resolved:* branches are registered, PRs are derived.
 4. **Rework routing** — a distinct `rework` state that the reconciler re-readies (preferred, visibly
    different from an untouched `declined`), vs. reusing `declined` → pool with a directive.
-5. **Closed-unmerged policy default** — `rework` / pool / escalate. *Resolved:* **escalate to a human** is the
-   default (§4.3) — a close is a deliberate out-of-band act, not a mechanical failure; `rework` and pool are
-   opt-in via directive/label.
+5. **Closed-unmerged policy default** — `rework` / pool / escalate. *Resolved:* **escalate to the Planner or
+   Product Manager** is the default (§4.3) — a close is a deliberate out-of-band act, not a mechanical failure;
+   `rework` and pool are opt-in via directive/label.
 6. **Ledger sharding** — one branch, per-plan, or per-order. Start with one.
 7. **Bot identity** — introduced at first auto-merge, or from the first outbound PR. *Resolved:* from the
    **first outbound PR** (§6.1) — authorship, not only merge, must be attributable; the identity is
