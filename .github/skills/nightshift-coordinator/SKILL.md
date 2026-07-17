@@ -198,6 +198,15 @@ A worker's `release --status done` means **"submitted, awaiting merge"** — it 
 dependents. The worker has already **built and reviewed** the order to two clean and hands you a
 **review attestation** (the models that signed off and their rounds). You keep the merge loop:
 
+> **Stay on the loop — an idle coordinator with unlanded work is the stall.** The coordinator is a
+> *continuously running* driver, not a passive monitor. As long as the plan has an order that is
+> `done` (awaiting push/PR), merged (awaiting `land`), escalated, or still in flight, you have work —
+> do not stop and wait to be pinged. Block on `nightshift watch` (§6) so each state change wakes you,
+> then act on it the moment it appears: a `done` order gets pushed + PR'd + its clearance note; a
+> merged PR gets `land`ed; an escalation gets a call (§5). An order sitting in `done` with no PR, or
+> landed orders whose dependents never opened, is **your** stall — not the workers'. Workers finish
+> and leave; the merge loop is yours to pump until every order is `landed` or the shift is drained.
+
 1. **Push the worker's branch to origin, then open/update the PR** from it. The worker committed
    locally but never pushed; you carry it to GitHub.
 2. **Post the one clearance note** that the worker's attestation earns — a sidecar comment naming the
@@ -311,6 +320,28 @@ Today it aids inspection and review; a future merge→land bridge will use it (w
 `Fixes:` / `Nightshift-Order:` trailers) to map a merged PR back to the order it lands.
 
 Orders with `state.status == escalated` need your judgment — see §5.
+
+### Run continuously — the coordinator is a loop, not a glance
+
+`nightshift where` is a snapshot; the shift needs you to keep *acting* on it. Do not fall into
+"monitor mode" and go idle — block on the stream so board changes wake you, the same way a worker
+blocks on `next`:
+
+```
+nightshift watch            # stream order state transitions until Ctrl-C
+```
+
+Treat every transition as a cue and act on it immediately:
+
+- an order reaches **`done`** → push its branch, open/update the PR, post the clearance note (§4);
+- a PR **merges** → `nightshift land` it, opening its dependents;
+- an order **escalates** → make the call (§5);
+- the **ready set has orders but the roster is empty** → tell the operator to start workers (§3).
+
+You are finished watching only when every order is `landed` (or the shift is drained/stopped, §7).
+While any order is `done`-awaiting-push, merged-awaiting-land, escalated, or in flight, the loop is
+still yours to pump — going quiet with unlanded work is the stall, not a rest state. Workers drain the
+ready set and clock out; **you** carry every finished order the rest of the way to `landed`.
 
 ## 7. Drain and stop
 
