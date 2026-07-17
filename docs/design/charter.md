@@ -75,5 +75,6 @@ A charter is short and operational. It should answer, for its repository:
 
 Because this repository is at once the **design**, the **implementation**, and the **first dogfooding
 environment** for Nightshift, it carries both artifacts: this concept doc, and the operational charter
-it describes. When you want to see a charter, read [`NIGHTSHIFT.md`](../../NIGHTSHIFT.md) — this repo
+it describes. When you want to see a charter, read [`NIGHTSHIFT.md`](../../NIGHTSHIFT.md) (at the repo
+root) — this repo
 plans its own work through it.
