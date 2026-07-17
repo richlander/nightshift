@@ -17,7 +17,7 @@ internal static class ExitCode
     /// <summary>No active claim: <c>check</c>/<c>release</c> were called with no order in hand.</summary>
     public const int NoClaim = 3;
 
-    /// <summary><c>next</c>: no claimable order appeared before the timeout — wait and ask again.</summary>
+    /// <summary><c>next</c>: one-shot probe found no claimable order, or a bounded wait timed out.</summary>
     public const int NoWork = 10;
 
     /// <summary><c>next</c>: the shift is draining — stop asking for work and wind down.</summary>
