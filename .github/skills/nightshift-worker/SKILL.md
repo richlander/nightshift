@@ -256,17 +256,11 @@ scope yourself).
 
 ## Waiting without stalling
 
-Sometimes you must wait — polling `check` for the coordinator's `QUERY` answer after an
-escalation, or (where `next` blocks for work) waiting for an order. Don't poll in a tight
-loop, and don't end a turn "waiting to be notified" with nothing running to wake you:
-
-- **If you are headless** (`-p`, no next turn once you yield): you cannot go idle — a
-  backgrounded shell is reaped the moment you yield. **Block in-turn** on the call and read
-  its return, or exit and be relaunched. `NOWORK` / `DRAINING` mean *exit*, not *idle*.
-- **If your session can go idle and be woken** (interactive, with a persistent loop): run
-  the wait as a **background shell command**, end your turn, and let its completion
-  notification wake you with the result — then act and relaunch. Bound a blocking stream so
-  it returns on the signal you care about (e.g. the first `QUERY`).
+You wait on `next` (for work) and on `check` (for the coordinator's `QUERY` answer after an
+escalation). Don't poll in a tight loop, and don't end a turn "waiting to be notified" with
+nothing running to wake you: headless, **block in-turn or exit** (`NOWORK`/`DRAINING` mean
+*exit*); interactive, background the wait and let its completion wake you. Full technique:
+**Waiting without stalling** in [`AGENTS.md`](../../../AGENTS.md).
 
 ## Recovery — after a context reset or a reboot
 

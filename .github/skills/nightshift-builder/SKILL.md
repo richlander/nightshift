@@ -77,16 +77,10 @@ nightshift check
 ## Waiting on a long build or a directive
 
 A full build or test run can take minutes, and after a directive you may be polling `check`
-for a `QUERY`. Don't sit in a poll loop, and don't end your turn with nothing running to
-wake you:
-
-- **If your session can go idle and be woken** (interactive, with a persistent loop): run
-  the long command — or the wait — as a **background shell command**, end your turn, and let
-  its completion notification wake you with the result (full stdout + exit code); then
-  continue.
-- **If you are headless** (`-p`, no next turn once you yield): a backgrounded shell is reaped
-  when you yield — **block in-turn** on the command and read its result, or exit and be
-  relaunched.
+for a `QUERY`. Don't poll or stall: interactive, run the long command (or the wait) as a
+**background shell command** and let its completion wake you with the result (full stdout +
+exit code); headless, **block in-turn** and read its result. Full technique: **Waiting
+without stalling** in [`AGENTS.md`](../../../AGENTS.md).
 
 ## Integrating main — merge, don't rebase a public branch
 

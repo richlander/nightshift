@@ -353,27 +353,17 @@ While any order is `done`-awaiting-push, merged-awaiting-land, escalated, or in 
 still yours to pump — going quiet with unlanded work is the stall, not a rest state. Workers drain the
 ready set and clock out; **you** carry every finished order the rest of the way to `landed`.
 
-### How to wait on `watch` — background it, don't stall or poll
+### Waiting on `watch` — background it, don't stall or poll
 
-`nightshift watch` blocks — that is the point; its *return* is the signal. How you wait on it decides
-whether the loop keeps running:
+`nightshift watch` blocks; its *return* is the signal. Don't end a turn "still watching" with
+nothing running to wake you (the classic coordinator stall), and don't poll — background the wait
+if your session can go idle, or block in-turn if you're headless. See **Waiting without stalling**
+in [`AGENTS.md`](../../../AGENTS.md) for the full technique.
 
-- **Don't stall.** Ending your turn with a bare "I'll keep watching" leaves nothing running to wake you;
-  the wait never resumes and finished orders pile up unpushed. That is the classic coordinator stall.
-- **Don't poll.** Sitting in a check-sleep-check loop burns turns for no reason.
-- **If your session can go idle and be woken** (an interactive session with a persistent loop): issue the
-  wait as a **background shell command**, then **end your turn**. It keeps running while you are idle, and
-  its completion wakes you with the result — read it, act (push / `land` / decide), and relaunch the wait.
-  Bound a stream so it returns on the first thing you care about (e.g. pipe `nightshift watch` to stop
-  after the first `done` / `landed` / `escalated` line).
-- **If you are headless** (`-p`, no next turn once you yield): a backgrounded shell is reaped when you
-  yield, so **block in-turn** on `watch` and act on its return.
-
-One gap to cover: Nightshift is not GitHub-aware, so `nightshift watch` wakes you on **worker**
-transitions (`done` / `escalated`) directly, and on **merges** only once Octoshift is running (it turns a
-merged PR into a `land`, which is a `landed` transition). Until Octoshift is wired in, background a second
-waiter that polls `gh` for the merges of the PRs you have cleared, so a merge wakes you to `land` just
-like a transition does.
+One gap is yours to cover: Nightshift is not GitHub-aware, so `watch` wakes you on **worker**
+transitions (`done` / `escalated`) directly, but on **merges** only once Octoshift turns a merged
+PR into a `land` (a `landed` transition). Until Octoshift is wired in, background a second waiter
+that polls `gh` for the merges of the PRs you have cleared, so a merge wakes you to `land` too.
 
 ## 7. Drain and stop
 
