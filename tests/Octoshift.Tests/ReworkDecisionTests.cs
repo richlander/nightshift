@@ -203,6 +203,37 @@ public class ReworkDecisionTests
     }
 
     [Fact]
+    public void Decide_PrefersOpenPrOverClosedForSameOrder_RegardlessOfListOrder()
+    {
+        // An order branch carrying both a live OPEN PR and a historical CLOSED-unmerged PR must route on
+        // the OPEN PR (here: conflicting -> rebase bounce), never escalate on the stale closed one — and the
+        // outcome must not depend on the order gh lists them in.
+        var board = Board(("/plan/2/order/op-a", "done"));
+        OpenPr openPr = Open(60, "nightshift/2/op-a", Mergeability.Conflicting);
+        OpenPr closedPr = Closed(50, "nightshift/2/op-a");
+
+        foreach (OpenPr[] batch in new[] { new[] { closedPr, openPr }, new[] { openPr, closedPr } })
+        {
+            ReworkAction action = Assert.Single(ReworkDecision.Decide(batch, board));
+            Assert.Equal(ReworkKind.Rework, action.Kind);
+            Assert.Equal("rebase onto main", action.Directive);
+            Assert.Equal(60, action.PrNumber);
+        }
+    }
+
+    [Fact]
+    public void Decide_EscalatesClosedOnlyWhenOrderHasNoOpenPr()
+    {
+        // With no live OPEN PR, a lone CLOSED-unmerged PR still escalates (§4.3 default).
+        ReworkAction action = Assert.Single(ReworkDecision.Decide(
+            [Closed(50, "nightshift/2/op-a")],
+            Board(("/plan/2/order/op-a", "done"))));
+
+        Assert.Equal(ReworkKind.Escalate, action.Kind);
+        Assert.Equal(50, action.PrNumber);
+    }
+
+    [Fact]
     public void Decide_MixedBatch_BouncesOnlyEligible()
     {
         IReadOnlyList<ReworkAction> actions = ReworkDecision.Decide(

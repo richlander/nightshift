@@ -59,21 +59,35 @@ internal static class ReworkDecision
     /// </summary>
     public static IReadOnlyList<ReworkAction> Decide(IEnumerable<OpenPr> open, BoardState board)
     {
-        var actions = new List<ReworkAction>();
-        var seen = new HashSet<string>(StringComparer.Ordinal);
+        // Collapse to one authoritative PR per order before routing, preferring a live OPEN PR over a
+        // historical CLOSED one. gh returns both open and closed-unmerged PRs, and a single order branch
+        // can carry both (e.g. a fresh PR opened after an earlier one was closed unmerged). The OPEN PR
+        // governs conflict/CI routing; a CLOSED PR should escalate only when the order has no open PR. This
+        // makes routing independent of the order gh happens to list PRs in, so the outcome is deterministic.
+        var order = new List<string>();
+        var chosen = new Dictionary<string, OpenPr>(StringComparer.Ordinal);
         foreach (OpenPr pr in open)
         {
-            if (OrderRef.FromBranch(pr.HeadBranch) is not { } order)
+            if (OrderRef.FromBranch(pr.HeadBranch) is not { } orderRef)
             {
                 continue; // not a nightshift branch — never invent an order
             }
 
-            string orderBase = order.Base;
-            if (seen.Contains(orderBase))
+            string orderBase = orderRef.Base;
+            if (!chosen.TryGetValue(orderBase, out OpenPr current))
             {
-                continue; // one action per order per sweep
+                order.Add(orderBase);
+                chosen[orderBase] = pr;
             }
+            else if (current.State != PrLifecycle.Open && pr.State == PrLifecycle.Open)
+            {
+                chosen[orderBase] = pr; // a live open PR supersedes a historical closed one
+            }
+        }
 
+        var actions = new List<ReworkAction>();
+        foreach (string orderBase in order)
+        {
             // Idempotency + safety gate: only an order still 'done' (submitted, awaiting merge) is eligible.
             // An order already 'changes-requested' (a rework is in flight) or 'landed' (merged) is never
             // re-bounced, and an unknown/foreign order is never invented.
@@ -82,10 +96,9 @@ internal static class ReworkDecision
                 continue;
             }
 
-            if (Classify(orderBase, pr) is { } action)
+            if (Classify(orderBase, chosen[orderBase]) is { } action)
             {
                 actions.Add(action);
-                seen.Add(orderBase);
             }
         }
 
