@@ -18,6 +18,9 @@ coordinates branches and state over a local Unix socket.
 
 Your responsibilities:
 
+- **Prepare and activate the shift.** The planner *registers* a plan; **you** clear the deck (retire the
+  prior plan, remove leftover worktrees, stale sessions, and phantom roster entries) and only then
+  *activate* it and open a worker round (§3). Never start a round on top of the last one's debris.
 - **Push and open/update the PR** from a worker's branch, and **post the one clearance note** — from
   the **attestation the worker hands you** (the models that signed off and their rounds). Workers and
   their build/review subagents never push; **you** are the only role that pushes to origin or writes
@@ -36,7 +39,8 @@ session**. You do **not** claim orders, build, or review — and you do **not** 
 are independent agent sessions that clock in (`join`) and pull work (`next`) on their own; you only see
 them through board state (roster, branches, `state`, escalations). If no worker is running, an order
 just sits ready until one claims it — that is correct, not a stall for you to fix by doing the work.
-But it **is** something to surface: if orders are ready and the roster shows no active worker, **tell
+But it **is** something to surface — **once the shift is prepared and the board is verified clean (§3)**:
+if orders are ready and the roster shows no active worker, **tell
 the operator** — they may not realize a worker is a *separate* session they have to start, or know what
 to type. Instruct them to open a new terminal/session and tell that agent:
 
@@ -124,9 +128,57 @@ Field reference (per order):
 both `after: [op1]` = they open in parallel the moment `op1` **lands** (merges), not when its
 worker reports done. Multiple plans can be live at once.
 
-## 3. Register it
+## 3. Prepare the shift, then activate
 
-Two forms, same projection:
+Authoring a plan (§2) is **registration** — the planner's job, and it does **not** put work on the
+board. **Activation** — making orders claimable and starting a worker round — is **yours**, and you do
+it **only after the shift is clean**. Keep the two separate: the planner registers, the coordinator
+prepares and activates. A plan that is registered but not activated is inert; nothing dispatches until
+you say go. (A first-class `activate`/`retire` verb is planned; until then, "register" = the plan file
+exists and is anchored to a commit, and "activate" = you start the controller below.)
+
+### Prepare — clear footguns before you activate
+
+Stale state from a prior round is the coordinator's classic footgun: a superseded plan still dispatches
+its orders, a leftover worktree hijacks a fresh worker's identity, a phantom roster entry hides a dead
+agent. **Never start a new worker round on top of the last one.** Before activating, clear the deck:
+
+- **Retire the prior plan.** Stop its live `plan` controller and remove its ready + claim keys, so no
+  stale order is dispatchable. `next` scans **all** of `/ready/` in key order, so a single leftover
+  ready row from an old plan is claimed **before** your new one — that is how a whole round can drain
+  the wrong plan.
+
+  ```
+  # stop the process you started for the old plan's controller, then, per stale order:
+  turnstile delete /ready/<oldplan>/<order> --unconditional               # each stale ready row
+  turnstile delete /plan/<oldplan>/order/<order>/claim --unconditional    # and any stale claim
+  ```
+
+- **Clear leftover worktrees.** A worker's identity is the hash of its worktree path, so a leftover
+  `nightshift-worker-*` (or `review-*`) directory is an **identity trap**: the next worker that lands in
+  it inherits its session, lease, and claim. Remove them (the branches survive):
+
+  ```
+  git worktree list
+  git worktree remove --force ../nightshift-worker-<stale>   # repeat per leftover, then:
+  git worktree prune
+  ```
+
+- **Clear stale sessions and phantom roster entries.** Delete leftover session/presence files and any
+  `/agent/<id>` roster row whose worker is gone, so the roster reflects reality:
+
+  ```
+  rm -f ~/.nightshift/run/session-*.json ~/.nightshift/run/presence-*.json   # of dead workers
+  turnstile delete /agent/<stale-id> --unconditional
+  ```
+
+- **A released order that is `declined` returns to the pool and stays ready.** If that work is stale or
+  now belongs to a different plan, retire it (delete its ready/claim keys) rather than letting it be
+  handed out again.
+
+### Activate
+
+Bring the prepared plan live:
 
 ```
 nightshift add orders.json          # one-shot: seed specs + ready set once, then exit. Safe to re-run.
@@ -136,7 +188,9 @@ nightshift plan --plan orders.json  # LIVE controller: seed, then watch and re-r
 Run `plan` for a live shift — as orders land, it opens their dependents automatically. `add` is the
 bootstrap/idempotent form. Either prints how many specs/ready rows it created.
 
-Only ready orders are claimable; a worker's `next` hands out exactly one, exclusively.
+Only ready orders are claimable; a worker's `next` hands out exactly one, exclusively. **Then verify the
+board** (`nightshift where` / `roster`, §6) shows **exactly** the ready set you intend — no stale
+orders, no duplicates, no phantom agents — *before* you surface to the operator that workers can start.
 
 ## 4. Land merges — the only thing that advances the DAG
 
@@ -287,3 +341,7 @@ nightshift stop --resume                             # lift the halt
    (§5) and is never silently reassigned.
 4. **`paths` overlaps serialize, they don't conflict.** If two orders touch the same files, give
    the second an `after` on the first so a merge conflict becomes a scheduling wait.
+5. **A clean deck before every round.** Registration is inert; **you** activate. Retire the prior plan
+   and clear leftover worktrees, session/presence files, and phantom roster rows before activating a new
+   plan — a stale ready row dispatches *before* your new orders, and a leftover worktree hijacks a fresh
+   worker's identity (§3).
