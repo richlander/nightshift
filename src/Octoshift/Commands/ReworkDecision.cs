@@ -9,7 +9,7 @@ internal enum ReworkKind
     /// <summary>Bounce back to the pool as <c>changes-requested</c> via <c>nightshift rework</c>, carrying a directive.</summary>
     Rework,
 
-    /// <summary>Surface to a human (§4.3 closed-unmerged default); octoshift takes no coordination action.</summary>
+    /// <summary>Surface to the Planner or Product Manager (§4.3 closed-unmerged default); octoshift takes no coordination action.</summary>
     Escalate,
 }
 
@@ -94,11 +94,11 @@ internal static class ReworkDecision
 
     private static ReworkAction? Classify(string orderBase, OpenPr pr)
     {
-        // Closed-unmerged (§4.3). §9.5 leaves this an OPEN decision (rework / pool / escalate). We default to
-        // ESCALATE-to-human: a human closing a PR without merging is a deliberate act, and auto-bouncing it
-        // straight to rework would just re-ready it into a loop. Octoshift has no in-scope 'escalate'
-        // subprocess, so the escalation leaves the order untouched and only surfaces it for judgment
-        // (see ApplyReworkAsync). (docs/design/octoshift.md §9.5)
+        // Closed-unmerged (§4.3). §9.5 resolved this to the ESCALATE default: a PR closed without merging is
+        // a deliberate out-of-band act, and auto-bouncing it straight to rework would just re-ready it into a
+        // loop. Octoshift has no in-scope 'escalate' subprocess, so the escalation leaves the order untouched
+        // and only surfaces it for the Planner or Product Manager to judge
+        // (see ApplyReworkAsync). (docs/design/octoshift.md §4.3, §9.5)
         if (pr.State == PrLifecycle.Closed)
         {
             return new ReworkAction(orderBase, ReworkKind.Escalate, ClosedUnmergedDirective, pr.Number);

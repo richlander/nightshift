@@ -121,8 +121,8 @@ internal static class ReconcileCommand
             {
                 if (escalated.Add(action.PrNumber))
                 {
-                    // Not a routed action — surfaced for a human, never as success-shaped stdout (§4.3, §9.5).
-                    Console.Error.WriteLine($"ESCALATE {action.OrderBase} (PR #{action.PrNumber} {action.Directive}: needs a human)");
+                    // Not a routed action — surfaced for the Planner or Product Manager, never as success-shaped stdout (§4.3, §9.5).
+                    Console.Error.WriteLine($"ESCALATE {action.OrderBase} (PR #{action.PrNumber} {action.Directive}: needs the Planner or Product Manager)");
                 }
 
                 continue;

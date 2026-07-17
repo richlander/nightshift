@@ -251,7 +251,7 @@ public class ReworkDecisionTests
     [Fact]
     public async Task Sweep_ClosedUnmergedDoesNotInvokeRework()
     {
-        // The escalate default takes no coordination action — the order is left untouched for a human.
+        // The escalate default takes no coordination action — the order is left untouched for the Planner or Product Manager.
         var nightshift = new FakeNightshiftClient(Board(("/plan/2/order/op-a", "done")));
         var source = new FakeOpenPrSource(Closed(1, "nightshift/2/op-a"));
 

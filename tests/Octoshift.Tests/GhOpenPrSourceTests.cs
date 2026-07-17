@@ -75,7 +75,7 @@ public class GhOpenPrSourceTests
     }
 
     [Fact]
-    public async Task FetchOpenAsync_PassesStateAllAndJsonFields()
+    public async Task FetchOpenAsync_PassesStateAllSearchAndJsonFields()
     {
         IReadOnlyList<string>? captured = null;
         var source = new GhOpenPrSource("owner/repo", 200, (args, _) =>
@@ -89,6 +89,8 @@ public class GhOpenPrSourceTests
         Assert.NotNull(captured);
         Assert.Contains("--state", captured!);
         Assert.Contains("all", captured!);
+        Assert.Contains("--search", captured!);
+        Assert.Contains("head:nightshift/ -is:merged", captured!);
         Assert.Contains("number,headRefName,state,mergeable,statusCheckRollup", captured!);
     }
 }

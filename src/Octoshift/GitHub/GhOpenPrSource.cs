@@ -8,8 +8,10 @@ using System.Text.Json.Serialization;
 
 /// <summary>
 /// The live <see cref="IOpenPrSource"/>: open (and closed-unmerged) nightshift order-PRs sourced from GitHub
-/// via <c>gh pr list --state all --json number,headRefName,state,mergeable,statusCheckRollup</c>. It filters
-/// to nightshift branches, drops merged PRs (the merge→land reconciler owns those), and normalizes the two
+/// via <c>gh pr list --state all --search "head:nightshift/ -is:merged" --json number,headRefName,state,mergeable,statusCheckRollup</c>.
+/// The server-side search scopes the query to the nightshift branch namespace and drops merged PRs (the
+/// merge→land reconciler owns those), so growing merge history can't crowd an open order-PR past the cap.
+/// It still filters to nightshift branches client-side, drops any residual merged PRs, and normalizes the two
 /// <c>statusCheckRollup</c> shapes (<c>CheckRun</c>/<c>StatusContext</c>) into <see cref="PrCheck"/>. JSON is
 /// parsed with System.Text.Json source generation (no reflection) to stay NativeAOT-safe. I/O only; all
 /// decisions live in the pure <see cref="Octoshift.Commands.ReworkDecision"/>.
@@ -40,6 +42,11 @@ internal sealed class GhOpenPrSource : IOpenPrSource
             "pr", "list",
             "--repo", _repo,
             "--state", "all",
+
+            // Narrow server-side to the nightshift branch namespace and exclude merged PRs, so the
+            // ever-growing pile of merged history never crowds a long-lived open order-PR past the
+            // client-side cap (which would leave it stuck, never bounced).
+            "--search", $"head:{BranchPrefix} -is:merged",
             "--limit", _limit.ToString(System.Globalization.CultureInfo.InvariantCulture),
             "--json", "number,headRefName,state,mergeable,statusCheckRollup",
         };

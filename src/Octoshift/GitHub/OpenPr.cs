@@ -19,7 +19,7 @@ internal enum PrLifecycle
     /// <summary>Open and awaiting merge — the axis on which conflict/CI rework decisions are made.</summary>
     Open,
 
-    /// <summary>Closed without merging — a deliberate human act routed by the §4.3 closed-unmerged policy.</summary>
+    /// <summary>Closed without merging — a deliberate out-of-band act routed by the §4.3 closed-unmerged policy.</summary>
     Closed,
 }
 
