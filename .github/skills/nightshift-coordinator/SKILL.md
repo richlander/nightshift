@@ -336,7 +336,17 @@ Treat every transition as a cue and act on it immediately:
 - an order reaches **`done`** → push its branch, open/update the PR, post the clearance note (§4);
 - a PR **merges** → `nightshift land` it, opening its dependents;
 - an order **escalates** → make the call (§5);
+- a **worker leaves** (drops off the roster, or its order returns to the pool) → clear the worktree,
+  session/presence, and any phantom `/agent` row it left behind, so the next round starts clean (§3);
 - the **ready set has orders but the roster is empty** → tell the operator to start workers (§3).
+
+**Cleaning stale worktrees is a standing duty, not just a Prepare-time one.** Leftover
+`nightshift-worker-*` / `review-*` directories and dead session/presence files accumulate *during* a
+shift as workers finish and die, and a stale worktree is an identity trap for the next worker (§3). Sweep
+them as you watch — but **verify before you remove**: a worker's identity is the SHA-256 of its worktree
+path, so hash each `nightshift-worker-*` root and keep any that matches an **active** roster agent. Only a
+worktree whose identity is absent from the roster (and whose branch has no unlanded work you still need)
+is stale. Never remove a live worker's worktree.
 
 You are finished watching only when every order is `landed` (or the shift is drained/stopped, §7).
 While any order is `done`-awaiting-push, merged-awaiting-land, escalated, or in flight, the loop is
