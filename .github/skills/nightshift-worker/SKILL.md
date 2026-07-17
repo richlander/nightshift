@@ -45,24 +45,29 @@ is what keeps your identity (and therefore your claim and lease) attached to you
 
 ```
 git fetch origin
-git worktree add ../nightshift-worker-<you> --detach origin/main
-cd ../nightshift-worker-<you>
+worktree="../nightshift-worker-$(openssl rand -hex 3)"   # random, unique suffix
+git worktree add "$worktree" --detach origin/main
+cd "$worktree"
 nightshift join
 ```
 
-`<you>` is any stable name for this worker (e.g. `a`, `b`). `join` registers you on the
-roster (`active`). Stay in this directory: every gate call (`next`, `check`, `recover`,
-`release`) is keyed to it. Do NOT create a new worktree per order — switching
-directories changes your identity and orphans your claim.
+The suffix is a **random, unique token** (`openssl rand -hex 3`) generated once — not a
+name you pick. Identity is the hash of the worktree path, so the name only has to be
+unique and stable for the session; a random suffix guarantees that, so a fresh worker
+never lands on an occupied name and never has to decide whether to adopt someone else's.
+`join` registers you on the roster (`active`). Stay in this directory: every gate call
+(`next`, `check`, `recover`, `release`) is keyed to it. Do NOT create a new worktree per
+order — switching directories changes your identity and orphans your claim.
 
 > **Never adopt a worktree you didn't create.** Your identity is the hash of your worktree
 > path, so a pre-existing `nightshift-worker-*` (or `review-*`) directory is **someone
 > else's** identity — a live peer's, or a dead worker's the coordinator hasn't cleared yet.
 > Stepping into it makes you inherit their session, lease, and claim: `nightshift show`/
 > `check` will report an order you never claimed, and `check` may even return `OK` on it.
-> **That order is not yours.** If your chosen `<you>` name already has a worktree, pick a
-> different name and make your own. The only time you resume an existing worktree/branch is
-> genuine **recovery** (below): standing on **your own** order branch after a context reset.
+> **That order is not yours.** Because your suffix is random, your own worktree name is
+> effectively always free — you never have to weigh adopting an existing one. The only time
+> you resume an existing worktree/branch is genuine **recovery** (below): standing on **your
+> own** order branch after a context reset.
 >
 > **Don't do archaeology.** Other workers' worktrees, sessions, roster entries, and fence
 > numbers are the **coordinator's** view, not yours. Orient with exactly three steps —
@@ -273,7 +278,7 @@ git won't remove the worktree you're standing in, so step back into the main clo
 
 ```
 cd "$(git rev-parse --path-format=absolute --git-common-dir)/.."   # into the main clone
-git worktree remove ../nightshift-worker-<you>
+git worktree remove ../nightshift-worker-<suffix>   # the random suffix you minted at setup
 ```
 
 Do NOT remove it between orders — it is your home for the whole shift. While you are
