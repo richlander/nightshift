@@ -4,7 +4,7 @@ How one unit of work travels from an idea to a merged, landed commit — and whi
 role owns each step. This is the operational spine the tools (`turnstile`,
 `nightshift`, `octoshift`) and the skills (`nightshift-coordinator`,
 `nightshift-worker`, `nightshift-builder`, `nightshift-reviewer`) serve. Read
-[`nightshift.md`](nightshift.md) for the architecture, [`octoshift.md`](octoshift.md)
+[`nightshift-spec.md`](nightshift-spec.md) for the architecture, [`octoshift.md`](octoshift.md)
 for the GitHub membrane, and the `nightshift-reviewer` skill for the review gate;
 this note is the thread that ties them together.
 
@@ -242,7 +242,7 @@ DAG the scheduler:
 `paths` is each order's file scope and the conflict-avoidance contract: if two orders
 would touch the same files, give the second an `after` on the first so a merge
 conflict becomes a scheduling wait instead of a race. See
-[`nightshift.md`](nightshift.md) §5 for the DAG-as-scheduler details.
+[`nightshift-spec.md`](nightshift-spec.md) §5 for the DAG-as-scheduler details.
 
 ## Escalation — the Coordinator's call
 

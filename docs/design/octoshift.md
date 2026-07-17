@@ -1,10 +1,10 @@
 # Octoshift
 
-**The GitHub membrane for [Nightshift](nightshift.md).**
+**The GitHub membrane for [Nightshift](nightshift-spec.md).**
 *Nightshift coordinates. Octoshift translates. GitHub stays quiet.*
 
 *Draft spec v0.1 — Rich Lander, July 2026*
-*Built on [Nightshift](nightshift.md) and [Turnstile](turnstile.md). Not yet built — this is the map.*
+*Built on [Nightshift](nightshift-spec.md) and [Turnstile](turnstile.md). Not yet built — this is the map.*
 
 ---
 

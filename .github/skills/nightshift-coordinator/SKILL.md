@@ -57,6 +57,13 @@ Work out the design first — the Product Manager shapes it, the Planner turns i
 commit it (the `standard` notes and the plan file live in the repo; that commit is the authorization
 root). Then write the plan:
 
+> **Map issues by the charter, not by assumption.** How issues become orders — which are in scope, how
+> finely to slice, how `paths` stay disjoint, how `after` edges are inferred — is repository policy, not
+> something you improvise. Read this repo's charter, [`NIGHTSHIFT.md`](../../../NIGHTSHIFT.md), together
+> with whatever the operator told you this session; your authority is the charter **plus** those
+> instructions. Where both are silent, do not guess — post on the issue (the release valve below). The
+> charter concept is described in [`docs/design/charter.md`](../../../docs/design/charter.md).
+
 > **Readiness is a gate, not a formality — the planner's release valve.** Not every issue is ready to
 > scale through this pipeline. An order needs a design solid enough to slice into `paths`-bounded
 > pieces against a concrete `standard`; an issue that is still a sketch — unsettled scope, no agreed
