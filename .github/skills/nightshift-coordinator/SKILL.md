@@ -353,6 +353,18 @@ While any order is `done`-awaiting-push, merged-awaiting-land, escalated, or in 
 still yours to pump — going quiet with unlanded work is the stall, not a rest state. Workers drain the
 ready set and clock out; **you** carry every finished order the rest of the way to `landed`.
 
+### Waiting on `watch` — background it, don't stall or poll
+
+`nightshift watch` blocks; its *return* is the signal. Don't end a turn "still watching" with
+nothing running to wake you (the classic coordinator stall), and don't poll — background the wait
+if your session can go idle, or block in-turn if you're headless. See **Waiting without stalling**
+in [`AGENTS.md`](../../../AGENTS.md) for the full technique.
+
+One gap is yours to cover: Nightshift is not GitHub-aware, so `watch` wakes you on **worker**
+transitions (`done` / `escalated`) directly, but on **merges** only once Octoshift turns a merged
+PR into a `land` (a `landed` transition). Until Octoshift is wired in, background a second waiter
+that polls `gh` for the merges of the PRs you have cleared, so a merge wakes you to `land` too.
+
 ## 7. Drain and stop
 
 Two different gestures, each a first-class verb (the raw control keys they wrap are shown for reference):

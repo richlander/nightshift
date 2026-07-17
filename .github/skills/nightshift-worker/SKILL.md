@@ -254,6 +254,14 @@ spec, a design that looks wrong as you build it, a path collision you can't reso
 builder that needs files outside its `paths` (the coordinator owns `paths` — don't widen
 scope yourself).
 
+## Waiting without stalling
+
+You wait on `next` (for work) and on `check` (for the coordinator's `QUERY` answer after an
+escalation). Don't poll in a tight loop, and don't end a turn "waiting to be notified" with
+nothing running to wake you: headless, **block in-turn or exit** (`NOWORK`/`DRAINING` mean
+*exit*); interactive, background the wait and let its completion wake you. Full technique:
+**Waiting without stalling** in [`AGENTS.md`](../../../AGENTS.md).
+
 ## Recovery — after a context reset or a reboot
 
 Your task lives in Turnstile and in your git branch, never in your memory. Two ways back:
@@ -293,8 +301,10 @@ standing on an order branch, `nightshift recover` re-attaches you from that bran
 2. **You orchestrate build *and* review.** Prefer subagents (context preservation, model
    diversity); a builder subagent + a different-model reviewer subagent let you build and
    review one order. Without subagents you cannot review your own build.
-3. **You cannot sleep.** Headless, you have no next turn after you yield. Never "wait to
-   be notified" — block in-line or exit. `NOWORK`/`DRAINING` mean *exit*, not *idle*.
+3. **Don't stall while waiting.** Headless, you cannot go idle — block in-turn or exit
+   (`NOWORK`/`DRAINING` mean *exit*). Interactive, you may background a blocking wait and be
+   woken by its completion, but never end a turn waiting with nothing backgrounded to wake
+   you (see **Waiting without stalling**).
 4. **Never remember a lease or token.** The CLI owns it. Recover with `nightshift show`
    (session intact) or `nightshift recover` (session gone — from your branch).
 5. **Stay inside `paths`.** They are the conflict-avoidance contract with other workers.
