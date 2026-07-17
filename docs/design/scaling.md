@@ -121,12 +121,14 @@ Today's rule is a step function: `N = 0 ∧ R > 0` → tell the operator to star
 ([coordinator skill, the ready-set discussion](../../.github/skills/nightshift-coordinator/SKILL.md)).
 This generalizes it to the **staffing deficit**:
 
-> **`D = W − N = (Rᵉ + I) − N`**
+> **`D = W − N`**  (with `W = min(Rᵉ + I, C)`)
 
-Because `N` counts busy *and* idle workers and `I` counts the busy ones, this is equivalently
-**`D = Rᵉ − (N − I)`** — the ready work minus the **idle** (available) capacity. The deficit measures
-ready orders against workers free to claim them, **not** against the total roster; a busy worker on an
-in-flight order is neither idle nor unstaffed demand, so it cancels out of both sides.
+When the cap is not binding (`Rᵉ + I ≤ C`, the common case), `W = Rᵉ + I`, so the deficit expands to
+**`D = (Rᵉ + I) − N = Rᵉ − (N − I)`** — ready work minus **idle** (available) capacity. (When `C`
+binds, `W = C` and `D = C − N`.) The deficit measures ready orders against workers free to claim them,
+**not** against the total roster; because `N` counts busy *and* idle workers and `I` counts the busy
+ones, a busy worker on an in-flight order is neither idle nor unstaffed demand and cancels out of both
+sides.
 
 | Condition | Surface says |
 |---|---|
@@ -134,10 +136,11 @@ in-flight order is neither idle nor unstaffed demand, so it cancels out of both 
 | `D = 0` | quiet — the frontier is matched |
 | `D < 0` | **over-staffed** — "`|D|` sessions idle" (the existing board line) |
 
-The zero-worker flag is just the special case `N = 0, I = 0`, where `D = min(Rᵉ, C)` — today's flag,
-now graded with a number. The fully-busy case reduces correctly too: `R = 0, I = 3, N = 3` gives
-`W = 3` and `D = 0` — quiet, with no false "3 idle" while all three are actively building. Nothing
-about the current behavior changes; the flag becomes the bottom rung of a graded ladder, and the
+Both reductions sit in the cap's non-binding regime, so `D = W − N` evaluates directly. The
+zero-worker flag is the special case `N = 0, I = 0`, where `D = W = min(Rᵉ, C)` — today's flag, now
+graded with a number. The fully-busy case reduces correctly too: `R = 0, I = 3, N = 3` (with `C ≥ 3`)
+gives `W = 3` and `D = 0` — quiet, with no false "3 idle" while all three are actively building.
+Nothing about the current behavior changes; the flag becomes the bottom rung of a graded ladder, and the
 message gains a **number**.
 
 ### Where the signal lives
