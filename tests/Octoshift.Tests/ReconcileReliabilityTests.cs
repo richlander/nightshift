@@ -19,7 +19,7 @@ public class ReconcileReliabilityTests
         => BoardState.FromRows(rows.Select(r => new BoardRow { OrderBase = r.OrderBase, Status = r.Status }));
 
     [Fact]
-    public async Task PollOnce_LandFailureDoesNotAdvanceWatermark_AndBoardDoneRetries()
+    public async Task PollOnce_LandFailureDoesNotAdvanceWatermark_AndMergedPrRetries()
     {
         var state = new ReconcileCommand.ReconcileState { IntervalSeconds = 60 };
         var nightshift = new FakeNightshiftClient(
@@ -27,16 +27,28 @@ public class ReconcileReliabilityTests
             landResults: [false, true]);
         var source = new FakeMergedPrSource(
             new MergedPrPage { MergedPrs = [Pr(1, "op-a", T0)] },
-            new MergedPrPage { MergedPrs = [] });
+            new MergedPrPage { MergedPrs = [Pr(1, "op-a", T0)] });
 
         await ReconcileCommand.PollOnceAsync(nightshift, source, state, Poller, PollingTuning.Default, TestContext.Current.CancellationToken);
         await ReconcileCommand.PollOnceAsync(nightshift, source, state, Poller, PollingTuning.Default, TestContext.Current.CancellationToken);
 
-        Assert.Null(state.Since);
+        Assert.Equal(T0, state.Since);
         Assert.Equal([null, null], source.SinceArgs);
         Assert.Equal(
-            [("/plan/2/order/op-a", "merged #1"), ("/plan/2/order/op-a", "board done")],
+            [("/plan/2/order/op-a", "merged #1"), ("/plan/2/order/op-a", "merged #1")],
             nightshift.Lands);
+    }
+
+    [Fact]
+    public async Task PollOnce_DoneOnBoardWithoutMergedPrs_DoesNotLand()
+    {
+        var state = new ReconcileCommand.ReconcileState { IntervalSeconds = 60 };
+        var nightshift = new FakeNightshiftClient(Board(("/plan/2/order/op-a", "done")));
+        var source = new FakeMergedPrSource(new MergedPrPage { MergedPrs = [] });
+
+        await ReconcileCommand.PollOnceAsync(nightshift, source, state, Poller, PollingTuning.Default, TestContext.Current.CancellationToken);
+
+        Assert.Empty(nightshift.Lands);
     }
 
     [Fact]
