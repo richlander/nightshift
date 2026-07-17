@@ -29,6 +29,12 @@ Your responsibilities:
   spec, a design that looks wrong), you make the call — continue, abandon, or requeue (§5).
 - **Issue curation.** File new issues when a design needs re-shaping, and retire stale ones.
 - **Land** each order after it merges, so its dependents open.
+- **Targeted updates go through a worktree.** You generally make no code changes — the shift's
+  work lands through orders. But you *do* own targeted updates to the skills, governance docs, and
+  the tooling (e.g. `install.sh`). Make any such change in a **separate git worktree** on its own
+  branch, never in the main checkout you run the shift from — switching branches or dirtying that
+  tree disturbs the live shift. These changes still go through a PR and the two-clean review gate
+  like any other.
 
 The **PR Lander** — not you — holds merge authority and performs the merge; `land` is how you report
 that merge back to Nightshift.
@@ -427,3 +433,6 @@ nightshift stop --resume                             # lift the halt
    and clear leftover worktrees, session/presence files, and phantom roster rows before activating a new
    plan — a stale ready row dispatches *before* your new orders, and a leftover worktree hijacks a fresh
    worker's identity (§3).
+6. **Your own edits never touch the main checkout.** Skill, doc, and tooling changes you make go in a
+   separate worktree on their own branch — the checkout you run the shift from stays on its branch and
+   clean, so watching, landing, and roster work are never disturbed by a stray `git switch` or dirty tree.
