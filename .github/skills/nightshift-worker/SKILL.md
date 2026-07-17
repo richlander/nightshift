@@ -41,7 +41,7 @@ for running `check` before each one. If your context resets, recover with **`nig
 
 Everything you do this shift runs from ONE dedicated worktree — that stable directory
 is what keeps your identity (and therefore your claim and lease) attached to you.
-Create it off `origin/main` and work inside it for the whole shift:
+**Mint a fresh one of your own** off `origin/main` and work inside it for the whole shift:
 
 ```
 git fetch origin
@@ -54,6 +54,20 @@ nightshift join
 roster (`active`). Stay in this directory: every gate call (`next`, `check`, `recover`,
 `release`) is keyed to it. Do NOT create a new worktree per order — switching
 directories changes your identity and orphans your claim.
+
+> **Never adopt a worktree you didn't create.** Your identity is the hash of your worktree
+> path, so a pre-existing `nightshift-worker-*` (or `review-*`) directory is **someone
+> else's** identity — a live peer's, or a dead worker's the coordinator hasn't cleared yet.
+> Stepping into it makes you inherit their session, lease, and claim: `nightshift show`/
+> `check` will report an order you never claimed, and `check` may even return `OK` on it.
+> **That order is not yours.** If your chosen `<you>` name already has a worktree, pick a
+> different name and make your own. The only time you resume an existing worktree/branch is
+> genuine **recovery** (below): standing on **your own** order branch after a context reset.
+>
+> **Don't do archaeology.** Other workers' worktrees, sessions, roster entries, and fence
+> numbers are the **coordinator's** view, not yours. Orient with exactly three steps —
+> `join`, `next`, read the packet. A fresh worker starts clean; it does not go hunting for
+> state to adopt.
 
 ## The loop
 
@@ -285,3 +299,6 @@ standing on an order branch, `nightshift recover` re-attaches you from that bran
    one clearance note; the PR Lander merges.
 8. **Read the return value, not your assumptions.** `HALT`, `FENCE_STALE`, `DRAINING`
    override whatever you were doing.
+9. **Start clean; never adopt another worker's worktree, identity, or claim.** Mint your
+   own worktree; a pre-existing one is someone else's (or a dead worker's uncleared) state.
+   The only exception is genuine `recover` while standing on **your own** order branch.
