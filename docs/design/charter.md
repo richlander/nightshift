@@ -48,7 +48,7 @@ Both are repository-level policy, but they serve different readers:
 | Loaded | Ambient orientation any agent reads first | Consulted when someone is invoked to plan |
 | Content | Repo-wide engineering constraints, the role map, build/test commands | The issue→order **mapping policy** and the engineering bar orders are planned against |
 
-`AGENTS.md` orients anyone who lands in the repo. The charter answers a planner's *specific* question —
+`AGENTS.md` orients any agent who lands in the repo. The charter answers a planner's *specific* question —
 "given the open issues, what work do I create, and to what standard?" — and most sessions (workers)
 never need it.
 
