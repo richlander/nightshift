@@ -157,6 +157,12 @@ the models from:
 - GPT-5.x-Codex (e.g. `gpt-5.3-codex`)
 - Gemini Pro (e.g. Gemini 3.1 Pro) — add as a third for high-blast-radius orders
 
+This list is the single source of truth for the reviewer roster; the skills and
+`docs/design/workflow.md` reference this section rather than restating the models.
+**Do not review with your own model** — a reviewer subagent runs on a model
+different from the builder's, and a single-model worker cannot review its own
+build (see below).
+
 **Who does what — the responsibilities do not overlap:**
 
 - **The builder builds; it never reviews its own work.** Building an order — as
