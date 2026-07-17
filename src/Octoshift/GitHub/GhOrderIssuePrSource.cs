@@ -8,50 +8,53 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 
 /// <summary>
-/// The live <see cref="IOrderIssuePrSource"/>: all nightshift order PRs, across OPEN/CLOSED/MERGED, with
-/// GitHub's machine-readable issue bindings from <c>closingIssuesReferences</c>. This is the cross-order
-/// view octoshift needs for §4.3 fan-out issue closing.
+/// The live <see cref="IOrderIssuePrSource"/> for §4.3 fan-out closing. It fetches unmerged and merged
+/// nightshift order PRs separately so the ever-growing merged history can never crowd out the unmerged set
+/// (the premature-close hazard). The decision layer then collapses per-order state.
 /// </summary>
 internal sealed class GhOrderIssuePrSource : IOrderIssuePrSource
 {
     private const string BranchPrefix = "nightshift/";
     private readonly string _repo;
-    private readonly int _limit;
+    private readonly int _unmergedLimit;
+    private readonly int _mergedLimit;
     private readonly Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> _runGhAsync;
 
     public GhOrderIssuePrSource(string repo, int limit = 1000)
-        : this(repo, limit, RunGhAsync)
+        : this(repo, limit, limit, RunGhAsync)
     {
     }
 
     internal GhOrderIssuePrSource(string repo, int limit, Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> runGhAsync)
+        : this(repo, limit, limit, runGhAsync)
+    {
+    }
+
+    internal GhOrderIssuePrSource(string repo, int unmergedLimit, int mergedLimit, Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> runGhAsync)
     {
         _repo = repo;
-        _limit = Math.Max(1, limit);
+        _unmergedLimit = Math.Max(1, unmergedLimit);
+        _mergedLimit = Math.Max(1, mergedLimit);
         _runGhAsync = runGhAsync;
     }
 
     public async Task<IReadOnlyList<OrderIssuePr>> FetchOrderIssuePrsAsync(CancellationToken ct)
     {
-        var args = new List<string>
+        // Safety-critical set: if this fetch fails, return no actions (never close on partial evidence).
+        FetchOutcome unmerged = await FetchBySearchAsync($"head:{BranchPrefix} -is:merged", _unmergedLimit, "unmerged issue bindings", ct);
+        if (!unmerged.Success)
         {
-            "pr", "list",
-            "--repo", _repo,
-            "--state", "all",
-            "--search", $"head:{BranchPrefix}",
-            "--limit", _limit.ToString(CultureInfo.InvariantCulture),
-            "--json", "number,headRefName,state,closingIssuesReferences",
-        };
-
-        GhResult gh = await _runGhAsync(args, ct);
-        if (gh.ExitCode != 0)
-        {
-            string detail = gh.Stderr.Trim();
-            Console.Error.WriteLine($"octoshift: gh pr list (issue bindings) failed (exit {gh.ExitCode}){(detail.Length > 0 ? $": {detail}" : string.Empty)}");
             return [];
         }
 
-        return ParseOrderIssuePrs(gh.Stdout);
+        // Opportunistic set: missing merged evidence only delays close, never causes a premature close.
+        FetchOutcome merged = await FetchBySearchAsync($"head:{BranchPrefix} is:merged", _mergedLimit, "merged issue bindings", ct);
+        if (!merged.Success)
+        {
+            return unmerged.OrderPrs;
+        }
+
+        return [.. unmerged.OrderPrs, .. merged.OrderPrs];
     }
 
     /// <summary>Parses order PRs with issue bindings, dropping foreign/invalid branches and unrecognized states.</summary>
@@ -118,6 +121,29 @@ internal sealed class GhOrderIssuePrSource : IOrderIssuePrSource
         _ => null,
     };
 
+    private async Task<FetchOutcome> FetchBySearchAsync(string search, int limit, string label, CancellationToken ct)
+    {
+        var args = new List<string>
+        {
+            "pr", "list",
+            "--repo", _repo,
+            "--state", "all",
+            "--search", search,
+            "--limit", limit.ToString(CultureInfo.InvariantCulture),
+            "--json", "number,headRefName,state,closingIssuesReferences",
+        };
+
+        GhResult gh = await _runGhAsync(args, ct);
+        if (gh.ExitCode != 0)
+        {
+            string detail = gh.Stderr.Trim();
+            Console.Error.WriteLine($"octoshift: gh pr list ({label}) failed (exit {gh.ExitCode}){(detail.Length > 0 ? $": {detail}" : string.Empty)}");
+            return new FetchOutcome(false, []);
+        }
+
+        return new FetchOutcome(true, ParseOrderIssuePrs(gh.Stdout));
+    }
+
     private static async Task<GhResult> RunGhAsync(IReadOnlyList<string> args, CancellationToken ct)
     {
         var psi = new ProcessStartInfo("gh")
@@ -179,3 +205,5 @@ internal sealed record ClosingIssueRefDto
 internal partial class GhOrderIssueJsonContext : JsonSerializerContext
 {
 }
+
+internal readonly record struct FetchOutcome(bool Success, IReadOnlyList<OrderIssuePr> OrderPrs);

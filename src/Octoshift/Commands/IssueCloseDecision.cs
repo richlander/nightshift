@@ -18,7 +18,7 @@ internal static class IssueCloseDecision
 {
     public static IReadOnlyList<IssueCloseAction> Decide(IEnumerable<OrderIssuePr> orderPrs)
     {
-        var byIssue = new Dictionary<int, Aggregate>();
+        var chosen = new Dictionary<string, CollapsedOrder>(StringComparer.Ordinal);
         foreach (OrderIssuePr pr in orderPrs)
         {
             if (OrderRef.FromBranch(pr.HeadBranch) is not { } orderRef)
@@ -26,7 +26,31 @@ internal static class IssueCloseDecision
                 continue; // never invent an order from a foreign/unparseable branch
             }
 
-            foreach (int issueNumber in pr.ClosingIssueNumbers.Distinct())
+            string orderBase = orderRef.Base;
+            if (!chosen.TryGetValue(orderBase, out CollapsedOrder? current))
+            {
+                chosen[orderBase] = new CollapsedOrder(orderBase, pr.State, pr.ClosingIssueNumbers);
+                continue;
+            }
+
+            int incomingRank = Rank(pr.State);
+            int currentRank = Rank(current.State);
+            if (incomingRank > currentRank)
+            {
+                chosen[orderBase] = new CollapsedOrder(orderBase, pr.State, pr.ClosingIssueNumbers);
+                continue;
+            }
+
+            if (incomingRank == currentRank)
+            {
+                current.IssueNumbers.UnionWith(pr.ClosingIssueNumbers);
+            }
+        }
+
+        var byIssue = new Dictionary<int, Aggregate>();
+        foreach (CollapsedOrder order in chosen.Values)
+        {
+            foreach (int issueNumber in order.IssueNumbers)
             {
                 if (issueNumber <= 0)
                 {
@@ -39,10 +63,10 @@ internal static class IssueCloseDecision
                     byIssue.Add(issueNumber, aggregate);
                 }
 
-                if (pr.State == OrderPrState.Merged)
+                if (order.State == OrderPrState.Merged)
                 {
                     aggregate.HasMerged = true;
-                    aggregate.MergedOrders.Add(orderRef.Base);
+                    aggregate.MergedOrders.Add(order.OrderBase);
                 }
                 else
                 {
@@ -66,6 +90,13 @@ internal static class IssueCloseDecision
         return actions;
     }
 
+    private static int Rank(OrderPrState state) => state switch
+    {
+        OrderPrState.Merged => 2,
+        OrderPrState.Open => 1,
+        _ => 0,
+    };
+
     private sealed class Aggregate
     {
         public bool HasMerged { get; set; }
@@ -73,5 +104,21 @@ internal static class IssueCloseDecision
         public bool HasUnmerged { get; set; }
 
         public HashSet<string> MergedOrders { get; } = new(StringComparer.Ordinal);
+    }
+
+    private sealed class CollapsedOrder
+    {
+        public CollapsedOrder(string orderBase, OrderPrState state, IEnumerable<int> issueNumbers)
+        {
+            OrderBase = orderBase;
+            State = state;
+            IssueNumbers = new HashSet<int>(issueNumbers.Where(static number => number > 0));
+        }
+
+        public string OrderBase { get; }
+
+        public OrderPrState State { get; set; }
+
+        public HashSet<int> IssueNumbers { get; }
     }
 }

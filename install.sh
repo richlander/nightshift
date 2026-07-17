@@ -53,21 +53,11 @@ for entry in "${TOOLS[@]}"; do
   out="artifacts/publish/$name"
 
   echo ">> publishing $name  ($proj)"
-  log="$out.publish.log"
-  mkdir -p "$out"
-  # dotnet writes build/compiler errors to stdout, so we can't just drop stdout:
-  # under `set -e` a failed publish would abort with no diagnostics. Capture to a
-  # log at minimal verbosity and surface it only when the publish fails.
-  if ! dotnet publish "$proj" \
-      -c "$CONFIG" \
-      -p:PublishAot=true \
-      -v minimal \
-      -o "$out" \
-      >"$log" 2>&1; then
-    echo "install.sh: publish failed for $name — output follows:" >&2
-    cat "$log" >&2
-    exit 1
-  fi
+  dotnet publish "$proj" \
+    -c "$CONFIG" \
+    -p:PublishAot=true \
+    -o "$out" \
+    >/dev/null
 
   bin="$out/$name"
   if [[ ! -x "$bin" ]]; then
@@ -79,19 +69,6 @@ for entry in "${TOOLS[@]}"; do
   # currently-running process (it keeps its old inode until it exits).
   install -m 0755 "$bin" "$PREFIX/$name"
   echo "   deployed -> $PREFIX/$name  ($(du -h "$PREFIX/$name" | cut -f1))"
-
-  # NativeAOT does not statically link native runtime dependencies (e.g.
-  # turnstile's libe_sqlite3.dylib) — they publish as sidecar shared libraries
-  # the executable dlopen()s from its own directory at startup. Deploy them next
-  # to the binary, or the tool fails with DllNotFoundException on a machine that
-  # doesn't already have them.
-  shopt -s nullglob
-  for lib in "$out"/*.dylib "$out"/*.so; do
-    libname="$(basename "$lib")"
-    install -m 0755 "$lib" "$PREFIX/$libname"
-    echo "   sidecar  -> $PREFIX/$libname"
-  done
-  shopt -u nullglob
 done
 
 echo
