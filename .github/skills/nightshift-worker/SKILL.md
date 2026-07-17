@@ -45,24 +45,31 @@ is what keeps your identity (and therefore your claim and lease) attached to you
 
 ```
 git fetch origin
-git worktree add ../nightshift-worker-<you> --detach origin/main
-cd ../nightshift-worker-<you>
+# <NN> = a random number you pick yourself (say, 0–99). No tool or command runs it — just choose one.
+git worktree add ../nightshift-worker-<NN> --detach origin/main
+cd ../nightshift-worker-<NN>
 nightshift join
 ```
 
-`<you>` is any stable name for this worker (e.g. `a`, `b`). `join` registers you on the
-roster (`active`). Stay in this directory: every gate call (`next`, `check`, `recover`,
-`release`) is keyed to it. Do NOT create a new worktree per order — switching
-directories changes your identity and orphans your claim.
+The suffix `<NN>` is a **random number you choose yourself** (say, 0–99) — you pick it; no
+tool or command generates it for you. Identity is the hash of the worktree path, so the name
+only has to be unique and stable for the session; picking a random number makes a collision
+unlikely, so a fresh worker almost never lands on an occupied name and rarely has to decide
+whether to adopt someone else's. `join` registers you on the roster (`active`). Stay in this
+directory: every gate call (`next`, `check`, `recover`, `release`) is keyed to it. Do NOT
+create a new worktree per order — switching directories changes your identity and orphans
+your claim.
 
 > **Never adopt a worktree you didn't create.** Your identity is the hash of your worktree
 > path, so a pre-existing `nightshift-worker-*` (or `review-*`) directory is **someone
 > else's** identity — a live peer's, or a dead worker's the coordinator hasn't cleared yet.
 > Stepping into it makes you inherit their session, lease, and claim: `nightshift show`/
 > `check` will report an order you never claimed, and `check` may even return `OK` on it.
-> **That order is not yours.** If your chosen `<you>` name already has a worktree, pick a
-> different name and make your own. The only time you resume an existing worktree/branch is
-> genuine **recovery** (below): standing on **your own** order branch after a context reset.
+> **That order is not yours.** Because you pick your own random suffix, your worktree name is
+> almost always free — and if the number you picked already has a worktree, just choose another
+> one. You never have to weigh adopting an existing one. The only time you resume an existing
+> worktree/branch is genuine **recovery** (below): standing on **your own** order branch after a
+> context reset.
 >
 > **Don't do archaeology.** Other workers' worktrees, sessions, roster entries, and fence
 > numbers are the **coordinator's** view, not yours. Orient with exactly three steps —
@@ -247,6 +254,14 @@ spec, a design that looks wrong as you build it, a path collision you can't reso
 builder that needs files outside its `paths` (the coordinator owns `paths` — don't widen
 scope yourself).
 
+## Waiting without stalling
+
+You wait on `next` (for work) and on `check` (for the coordinator's `QUERY` answer after an
+escalation). Don't poll in a tight loop, and don't end a turn "waiting to be notified" with
+nothing running to wake you: headless, **block in-turn or exit** (`NOWORK`/`DRAINING` mean
+*exit*); interactive, background the wait and let its completion wake you. Full technique:
+**Waiting without stalling** in [`AGENTS.md`](../../../AGENTS.md).
+
 ## Recovery — after a context reset or a reboot
 
 Your task lives in Turnstile and in your git branch, never in your memory. Two ways back:
@@ -273,7 +288,7 @@ git won't remove the worktree you're standing in, so step back into the main clo
 
 ```
 cd "$(git rev-parse --path-format=absolute --git-common-dir)/.."   # into the main clone
-git worktree remove ../nightshift-worker-<you>
+git worktree remove ../nightshift-worker-<NN>   # the random suffix you minted at setup
 ```
 
 Do NOT remove it between orders — it is your home for the whole shift. While you are
@@ -286,8 +301,10 @@ standing on an order branch, `nightshift recover` re-attaches you from that bran
 2. **You orchestrate build *and* review.** Prefer subagents (context preservation, model
    diversity); a builder subagent + a different-model reviewer subagent let you build and
    review one order. Without subagents you cannot review your own build.
-3. **You cannot sleep.** Headless, you have no next turn after you yield. Never "wait to
-   be notified" — block in-line or exit. `NOWORK`/`DRAINING` mean *exit*, not *idle*.
+3. **Don't stall while waiting.** Headless, you cannot go idle — block in-turn or exit
+   (`NOWORK`/`DRAINING` mean *exit*). Interactive, you may background a blocking wait and be
+   woken by its completion, but never end a turn waiting with nothing backgrounded to wake
+   you (see **Waiting without stalling**).
 4. **Never remember a lease or token.** The CLI owns it. Recover with `nightshift show`
    (session intact) or `nightshift recover` (session gone — from your branch).
 5. **Stay inside `paths`.** They are the conflict-avoidance contract with other workers.

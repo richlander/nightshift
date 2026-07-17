@@ -105,6 +105,29 @@ then your role's skill (above). Reference the rest by topic:
 - Keep failure visible. A lost claim, an ineligible order, or a coordination
   error must surface as its token/exit code, never as success-shaped output.
 
+## Waiting without stalling
+
+Every role waits on a **blocking** call — the coordinator on `nightshift watch`,
+a worker on `next`/`check`, a builder on a long `dotnet build`/`test` or a `check`
+directive, a reviewer on a build or probe. Its *return* is the signal; how you
+wait on it decides whether the loop keeps running:
+
+- **Don't stall.** Ending a turn with a bare "I'll keep waiting" leaves nothing
+  running to wake you — the wait never resumes and finished work piles up. That
+  is the classic stall.
+- **Don't poll.** A tight check-sleep-check loop burns turns for nothing.
+- **Interactive** (a session that can go idle and be woken): issue the wait as a
+  **background shell command**, end your turn, and let its completion
+  notification wake you with the result — then act and relaunch. Bound a blocking
+  stream so it returns on the signal you care about (the first
+  `done`/`landed`/`escalated`, a `QUERY`, a build exit).
+- **Headless** (`-p`, no next turn once you yield): a backgrounded shell is
+  reaped the moment you yield, so **block in-turn** on the call and read its
+  return, or exit and be relaunched. `NOWORK`/`DRAINING` mean *exit*, not *idle*.
+
+Each skill names the specific call its role waits on and points here for the
+shared technique.
+
 ## Building and testing
 
 Build the whole graph:

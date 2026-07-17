@@ -268,21 +268,6 @@ internal static class ReconcileCommand
             }
         }
 
-        foreach (string orderBase in board.OutstandingDoneOrders)
-        {
-            if (attemptedOrders.Contains(orderBase) || landedOrders.Contains(orderBase))
-            {
-                continue;
-            }
-
-            const string reason = "board done";
-            if (await nightshift.LandAsync(orderBase, reason, ct))
-            {
-                Console.WriteLine($"LANDED {orderBase} ({reason})");
-                landedSomething = true;
-            }
-        }
-
         return new ApplyResult(actions, landedSomething);
     }
 

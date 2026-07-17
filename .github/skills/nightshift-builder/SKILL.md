@@ -74,6 +74,14 @@ nightshift check
 | `HALT` | Global stop | Stop now. Do not commit. Exit |
 | `FENCE_STALE` | The claim was lost (expired/reassigned) | Abandon this order. Do not hand it back. Exit |
 
+## Waiting on a long build or a directive
+
+A full build or test run can take minutes, and after a directive you may be polling `check`
+for a `QUERY`. Don't poll or stall: interactive, run the long command (or the wait) as a
+**background shell command** and let its completion wake you with the result (full stdout +
+exit code); headless, **block in-turn** and read its result. Full technique: **Waiting
+without stalling** in [`AGENTS.md`](../../../AGENTS.md).
+
 ## Integrating main — merge, don't rebase a public branch
 
 Sometimes you must pull `origin/main` into your branch mid-build: new guidance landed,

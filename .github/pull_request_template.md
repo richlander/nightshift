@@ -1,5 +1,7 @@
 <!--
 Title: describe the change in plain language (what it does), NOT the order id.
+Name the substance, not volatile references like doc section numbers (e.g. avoid
+"§5/§6/§9" — sections renumber and rot; say what the change actually does).
 The order↔PR mapping is carried by the branch name (nightshift/<plan>/<order>)
 and the Nightshift-Order: commit trailer — don't repeat it in the title.
 
@@ -25,6 +27,9 @@ body — the review clearance lives in a sidecar comment.
 <!-- The substance, grouped by area, as bullets. Flag behavior changes vs. refactoring.
      Enough that a reviewer can navigate the diff from this section alone. -->
 
-## Order
+## Resolves
 
-Closes #<!-- issue number -->
+Fixes #<!-- issue number -->
+
+<!-- The order↔PR mapping is the branch name plus the Nightshift-Order: commit trailer.
+     Do NOT add a separate "Order:" line here — it only duplicates the trailer. -->

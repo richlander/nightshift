@@ -8,7 +8,7 @@ using System.Text.Json.Serialization;
 /// <c>nightshift where --output json</c>. Octoshift reads status this way (a subprocess call), never by
 /// touching Turnstile, so it links nothing. Used for two things: the idempotent check-before-land (an order
 /// already <c>landed</c> is a no-op) and the board-aware fast path (an order at <c>done</c> means a merge is
-/// imminent, so the poller pins to the floor).
+/// imminent, so the poller pins to the floor while awaiting merge proof from the PR feed).
 /// </summary>
 internal sealed class BoardState
 {
@@ -68,12 +68,10 @@ internal sealed class BoardState
     public bool IsDone(string orderBase)
         => _statuses.TryGetValue(orderBase, out string? status) && status == DoneStatus;
 
-    /// <summary>True when some order is at <c>done</c> (a worker submitted a PR, awaiting land): a land is imminent.</summary>
+    /// <summary>
+    /// True when some order is at <c>done</c> (a worker submitted a PR, awaiting merge): this only tightens poll cadence.
+    /// </summary>
     public bool HasOutstandingDone => _statuses.Values.Any(status => status == DoneStatus);
-
-    /// <summary>The orders at <c>done</c>, which octoshift retries via <c>nightshift land</c> independent of the PR feed.</summary>
-    public IReadOnlyList<string> OutstandingDoneOrders
-        => _statuses.Where(kvp => kvp.Value == DoneStatus).Select(kvp => kvp.Key).ToArray();
 }
 
 /// <summary>One row of the <c>where</c> board: the order base, its status, and its branch (snake_case JSON).</summary>

@@ -41,6 +41,7 @@ public class WatchCommandTests
             OutputFormat.Jsonl,
             writer,
             _ => throw new InvalidOperationException("jsonl mode must not snapshot the board"),
+            showAll: false,
             TestContext.Current.CancellationToken);
 
         Assert.Equal(
@@ -71,6 +72,7 @@ public class WatchCommandTests
             OutputFormat.Table,
             writer,
             _ => Task.FromResult(snapshot),
+            showAll: false,
             TestContext.Current.CancellationToken);
 
         string output = writer.ToString();
@@ -81,6 +83,51 @@ public class WatchCommandTests
     }
 
     [Fact]
+    public async Task RunLoopWithRecovery_Table_OnCompaction_ReRangesAndResumes()
+    {
+        var watchedFrom = new List<long>();
+        int snapshots = 0;
+        using var writer = new StringWriter();
+
+        await WatchCommand.RunLoopWithRecoveryAsync(
+            fromRevision: 10,
+            watch: (from, _) =>
+            {
+                watchedFrom.Add(from);
+                if (watchedFrom.Count == 1)
+                {
+                    throw new WatchCompactedException("/plan/", from, compactRevision: 99);
+                }
+
+                return Replay(
+                [
+                    new WatchSignal("/plan/1/order/op-b/state", Deleted: false, 101),
+                ]);
+            },
+            output: OutputFormat.Table,
+            writer,
+            snapshot: _ =>
+            {
+                snapshots++;
+                return Task.FromResult<IReadOnlyList<KvItem>>(
+                    snapshots == 1
+                        ? [Item("/plan/1/order/op-a/state", "{\"status\":\"done\"}")]
+                        : [Item("/plan/1/order/op-b/state", "{\"status\":\"blocked\"}")]);
+            },
+            currentRevision: _ => Task.FromResult(100L),
+            showAll: false,
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal([10L, 100L], watchedFrom);
+        Assert.Equal(2, snapshots);
+
+        string output = writer.ToString();
+        Assert.Contains("/plan/1/order/op-a", output);
+        Assert.Contains("/plan/1/order/op-b", output);
+        Assert.Contains("blocked", output);
+    }
+
+    [Fact]
     public void Redraw_EmptyBoard_ClearsAndPrintsNoOrders()
     {
         using var writer = new StringWriter();
@@ -88,6 +135,87 @@ public class WatchCommandTests
 
         Assert.StartsWith("\u001b[2J\u001b[H", writer.ToString(), StringComparison.Ordinal);
         Assert.Contains("(no orders)", writer.ToString());
+    }
+
+    [Fact]
+    public void Redraw_Default_HidesLandedOrders()
+    {
+        IReadOnlyList<KvItem> items =
+        [
+            Item("/plan/1/order/op-a/branch", "nightshift/1/op-a"),
+            Item("/plan/1/order/op-a/state", "{\"status\":\"landed\"}"),
+            Item("/plan/1/order/op-b/branch", "nightshift/1/op-b"),
+            Item("/plan/1/order/op-b/state", "{\"status\":\"done\"}"),
+        ];
+
+        using var writer = new StringWriter();
+        WatchCommand.Redraw(items, writer, showAll: false);
+
+        string output = writer.ToString();
+        Assert.DoesNotContain("/plan/1/order/op-a", output);
+        Assert.DoesNotContain("landed", output);
+        Assert.Contains("/plan/1/order/op-b", output);
+        Assert.Contains("done", output);
+    }
+
+    [Fact]
+    public void Redraw_ShowAll_IncludesLandedOrders()
+    {
+        IReadOnlyList<KvItem> items =
+        [
+            Item("/plan/1/order/op-a/branch", "nightshift/1/op-a"),
+            Item("/plan/1/order/op-a/state", "{\"status\":\"landed\"}"),
+            Item("/plan/1/order/op-b/branch", "nightshift/1/op-b"),
+            Item("/plan/1/order/op-b/state", "{\"status\":\"done\"}"),
+        ];
+
+        using var writer = new StringWriter();
+        WatchCommand.Redraw(items, writer, showAll: true);
+
+        string output = writer.ToString();
+        Assert.Contains("/plan/1/order/op-a", output);
+        Assert.Contains("landed", output);
+        Assert.Contains("/plan/1/order/op-b", output);
+        Assert.Contains("done", output);
+    }
+
+    [Fact]
+    public void Redraw_Default_OnlyLandedOrders_RendersEmptyBoard()
+    {
+        IReadOnlyList<KvItem> items =
+        [
+            Item("/plan/1/order/op-a/branch", "nightshift/1/op-a"),
+            Item("/plan/1/order/op-a/state", "{\"status\":\"landed\"}"),
+            Item("/plan/1/order/op-b/branch", "nightshift/1/op-b"),
+            Item("/plan/1/order/op-b/state", "{\"status\":\"landed\"}"),
+        ];
+
+        using var writer = new StringWriter();
+        WatchCommand.Redraw(items, writer, showAll: false);
+
+        Assert.Contains("(no orders)", writer.ToString());
+    }
+
+    [Theory]
+    [InlineData("claimed")]
+    [InlineData("done")]
+    [InlineData("blocked")]
+    [InlineData("escalated")]
+    [InlineData("refused")]
+    public void Redraw_Default_NonLandedStatusesAlwaysVisible(string status)
+    {
+        IReadOnlyList<KvItem> items =
+        [
+            Item("/plan/1/order/op-a/branch", "nightshift/1/op-a"),
+            Item("/plan/1/order/op-a/state", $"{{\"status\":\"{status}\"}}"),
+        ];
+
+        using var writer = new StringWriter();
+        WatchCommand.Redraw(items, writer, showAll: false);
+
+        string output = writer.ToString();
+        Assert.Contains("/plan/1/order/op-a", output);
+        Assert.Contains(status, output);
     }
 
     private static async IAsyncEnumerable<WatchSignal> Replay(WatchSignal[] events)

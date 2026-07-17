@@ -266,10 +266,12 @@ public static class Cli
     {
         var command = new Command("watch", "Follow the coordinator board live.");
         Option<OutputFormat> output = OutputFormatter.CreateWatchOutputOption();
+        var all = new Option<bool>("--all", "-a") { Description = "Show all orders including landed (default hides landed)." };
 
         command.Options.Add(output);
+        command.Options.Add(all);
         command.SetAction(async (parseResult, cancellationToken)
-            => await WatchCommand.RunAsync(parseResult.GetValue(output)));
+            => await WatchCommand.RunAsync(parseResult.GetValue(output), parseResult.GetValue(all)));
         return command;
     }
 }

@@ -29,6 +29,12 @@ probes or test tools **in a scratch/temp location outside it** to actually exerc
 API and confirm a suspicion. Keep experiments out of the review worktree so the head
 stays exactly the thing you are judging.
 
+**Waiting on a long build or probe.** Exercising a suspicion can mean a full build or a
+multi-second probe. Don't poll or stall — background the wait if your session can go idle,
+or block in-turn if headless (full technique: **Waiting without stalling** in
+[`AGENTS.md`](../../../AGENTS.md)) — and keep the command and any scratch files outside the
+review worktree.
+
 Review against:
 - **What changed** and why — a paragraph and the file list, from your dispatch.
 - **Conventions**, to spot mismatches with the rest of the system — but **ignore
