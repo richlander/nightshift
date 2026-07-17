@@ -12,9 +12,8 @@ charter. The charter for *this* repository — the live, dogfooded instantiation
 ## Why a charter exists
 
 Nightshift's planner turns issues into **orders** (landable PRs) and registers them as a plan. But
-"which issues become work, and how they slice into orders" is not universal — it is a property of the
-*repository*: its issue conventions, its module boundaries, its taste for how finely to cut a change,
-its engineering standard. Left unstated, the planner would have to **assume** that policy. Assumptions
+*which* issues become work, and *how* they slice into orders, is not universal — it is a property of the
+individual repository. Left unstated, the planner would have to **assume** that policy. Assumptions
 are exactly what we do not want a planner making — a wrong guess scales churn across many workers before
 anyone notices.
 
@@ -70,11 +69,3 @@ A charter is short and operational. It should answer, for its repository:
   planner applies before creating orders, and what to post when it fails.
 - **Ask-on-gap.** The explicit instruction to post on the issue rather than assume when the charter is
   silent.
-
-## Instantiation
-
-Because this repository is at once the **design**, the **implementation**, and the **first dogfooding
-environment** for Nightshift, it carries both artifacts: this concept doc, and the operational charter
-it describes. When you want to see a charter, read [`NIGHTSHIFT.md`](../../NIGHTSHIFT.md) (at the repo
-root) — this repo
-plans its own work through it.
