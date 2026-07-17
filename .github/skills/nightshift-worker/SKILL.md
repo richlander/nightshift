@@ -254,6 +254,20 @@ spec, a design that looks wrong as you build it, a path collision you can't reso
 builder that needs files outside its `paths` (the coordinator owns `paths` — don't widen
 scope yourself).
 
+## Waiting without stalling
+
+Sometimes you must wait — polling `check` for the coordinator's `QUERY` answer after an
+escalation, or (where `next` blocks for work) waiting for an order. Don't poll in a tight
+loop, and don't end a turn "waiting to be notified" with nothing running to wake you:
+
+- **If you are headless** (`-p`, no next turn once you yield): you cannot go idle — a
+  backgrounded shell is reaped the moment you yield. **Block in-turn** on the call and read
+  its return, or exit and be relaunched. `NOWORK` / `DRAINING` mean *exit*, not *idle*.
+- **If your session can go idle and be woken** (interactive, with a persistent loop): run
+  the wait as a **background shell command**, end your turn, and let its completion
+  notification wake you with the result — then act and relaunch. Bound a blocking stream so
+  it returns on the signal you care about (e.g. the first `QUERY`).
+
 ## Recovery — after a context reset or a reboot
 
 Your task lives in Turnstile and in your git branch, never in your memory. Two ways back:
@@ -293,8 +307,10 @@ standing on an order branch, `nightshift recover` re-attaches you from that bran
 2. **You orchestrate build *and* review.** Prefer subagents (context preservation, model
    diversity); a builder subagent + a different-model reviewer subagent let you build and
    review one order. Without subagents you cannot review your own build.
-3. **You cannot sleep.** Headless, you have no next turn after you yield. Never "wait to
-   be notified" — block in-line or exit. `NOWORK`/`DRAINING` mean *exit*, not *idle*.
+3. **Don't stall while waiting.** Headless, you cannot go idle — block in-turn or exit
+   (`NOWORK`/`DRAINING` mean *exit*). Interactive, you may background a blocking wait and be
+   woken by its completion, but never end a turn waiting with nothing backgrounded to wake
+   you (see **Waiting without stalling**).
 4. **Never remember a lease or token.** The CLI owns it. Recover with `nightshift show`
    (session intact) or `nightshift recover` (session gone — from your branch).
 5. **Stay inside `paths`.** They are the conflict-avoidance contract with other workers.

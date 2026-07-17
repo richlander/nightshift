@@ -29,6 +29,13 @@ probes or test tools **in a scratch/temp location outside it** to actually exerc
 API and confirm a suspicion. Keep experiments out of the review worktree so the head
 stays exactly the thing you are judging.
 
+**Waiting on a long build or probe.** Exercising a suspicion can mean a full build or a
+multi-second probe run. Don't poll and don't stall: **if your session can go idle and be
+woken** (interactive), run the command as a **background shell command**, end your turn,
+and let its completion notification wake you with the output; **if you are headless**
+(`-p`), block in-turn on it and read the result. Either way keep the command and any
+scratch files outside the review worktree.
+
 Review against:
 - **What changed** and why — a paragraph and the file list, from your dispatch.
 - **Conventions**, to spot mismatches with the rest of the system — but **ignore
