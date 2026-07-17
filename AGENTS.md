@@ -44,7 +44,10 @@ Nightshift has **five roles**, each a set of responsibilities fillable by a
 person or an agent (the full model is in
 [`docs/design/workflow.md`](docs/design/workflow.md)). You are playing one; read
 its guidance first. Roles can collapse into one session — Planner and Coordinator
-commonly do — and most sessions on a machine are workers.
+commonly do — but a **Worker is always a separate instance** (never the
+Coordinator/Planner session); most sessions on a machine are workers. The
+coordinator never claims, builds, reviews, or spawns workers — workers `join` and
+`next` on their own.
 
 | Role | Owns | Read first |
 | --- | --- | --- |

@@ -28,8 +28,14 @@ Your responsibilities:
 - **Land** each order after it merges, so its dependents open.
 
 The **PR Lander** — not you — holds merge authority and performs the merge; `land` is how you report
-that merge back to Nightshift. (Coordinator and Planner are commonly the same session; most sessions
-on the machine are workers.)
+that merge back to Nightshift.
+
+**Workers are always separate instances — you never become one and never spawn one.** Planner and
+Coordinator are commonly the **same** session (this skill covers both); a **Worker is never that
+session**. You do **not** claim orders, build, or review — and you do **not** launch workers. Workers
+are independent agent sessions that clock in (`join`) and pull work (`next`) on their own; you only see
+them through board state (roster, branches, `state`, escalations). If no worker is running, an order
+just sits ready until one claims it — that is correct, not a stall for you to fix by doing the work.
 
 Roles are **responsibilities, not people** — any of them can be filled by a person or an agent. See
 [`docs/design/workflow.md`](../../../docs/design/workflow.md) for the full role model.
@@ -151,8 +157,9 @@ open the PR and post the note from the worker's attestation.
 finally converged, or every round ran the *same* two paired models — you may commission **one more
 review from a third model that was not one of the final two** before you post the note. It is a
 deliberate spend of time to avoid shipping a bad PR: a fresh model on a much-revised change sometimes
-catches something genuinely new. Direct the worker (or dispatch a reviewer yourself) to run the extra
-pass, and clear only if it too is clean.
+catches something genuinely new. Commission it the way every review runs — through a worker/reviewer
+session, not by reviewing it yourself: send the order back with `rework` (below) carrying a
+"third-model review" note, and clear only once that pass too comes back clean.
 
 **Not clean? Send it back with `rework` — the sibling of `land`.** If a coordinator-side check rejects
 a `done` order (the triple-check caught something), or `main` moved under it and broke the branch, do
