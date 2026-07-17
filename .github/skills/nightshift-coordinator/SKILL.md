@@ -37,8 +37,9 @@ are independent agent sessions that clock in (`join`) and pull work (`next`) on 
 them through board state (roster, branches, `state`, escalations). If no worker is running, an order
 just sits ready until one claims it — that is correct, not a stall for you to fix by doing the work.
 
-Roles are **responsibilities, not people** — any of them can be filled by a person or an agent. See
-[`docs/design/workflow.md`](../../../docs/design/workflow.md) for the full role model.
+Roles are **responsibilities, not people** — any of them can be filled by a person or an agent. The
+worker/coordinator/planner boundaries above are what you need to act; the roster and board state are
+your only view into the others.
 
 Vocabulary: an **order** = one **landable PR** (atomic claim + merge unit), bound to ≤1 issue.
 A **plan** (`orders.json`) = the set of orders for a feature, with an order→order dependency DAG.
@@ -65,11 +66,10 @@ root). Then write the plan:
 
 > **Map issues by the charter, not by assumption.** How issues become orders — which are in scope, how
 > finely to slice, how `paths` stay disjoint, how `after` edges are inferred — is repository policy, not
-> something you improvise. Read this repo's charter, [`NIGHTSHIFT.md`](../../../NIGHTSHIFT.md) (at the repo
-> root), together
-> with whatever the operator told you this session; your authority is the charter **plus** those
-> instructions. Where both are silent, do not guess — post on the issue (the release valve below). The
-> charter concept is described in [`docs/design/charter.md`](../../../docs/design/charter.md).
+> something you improvise. Read this repo's charter, [`NIGHTSHIFT.md`](../../../NIGHTSHIFT.md) (at the
+> repo root), together with whatever the operator told you this session; your authority is the charter
+> **plus** those instructions. Where both are silent, do not guess — post on the issue (the release
+> valve below).
 
 > **Readiness is a gate, not a formality — the planner's release valve.** Not every issue is ready to
 > scale through this pipeline. An order needs a design solid enough to slice into `paths`-bounded
