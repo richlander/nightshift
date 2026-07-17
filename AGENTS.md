@@ -27,12 +27,16 @@ Read, in order:
 
 1. `docs/design/nightshift-vision.md` — why this exists and the shape of the
    solution.
-2. `docs/design/nightshift.md` — the Nightshift mechanics (plans, orders, ready
-   set, landing).
+2. `docs/design/nightshift-spec.md` — the Nightshift mechanics (plans, orders,
+   ready set, landing).
 3. `docs/design/workflow.md` — the end-to-end workflow: how an order travels from
    idea to merge, and which role owns each step.
 4. `docs/design/turnstile.md` — the coordination kernel underneath.
 5. The skill for the role you are playing (below) before you act.
+
+If you are invoked to **plan** (turn issues into orders), also read this
+repository's charter, [`NIGHTSHIFT.md`](NIGHTSHIFT.md) — the issue→order mapping
+policy — and the concept behind it in `docs/design/charter.md`.
 
 Keep this file to repository-wide engineering and workflow rules. Role
 mechanics live in the skills; subsystem design lives in `docs/design/`. When the
@@ -69,7 +73,8 @@ responsibilities each have their own skill the worker points a subagent at:
 | Area | Read first |
 | --- | --- |
 | End-to-end workflow and role ownership | `docs/design/workflow.md` |
-| Nightshift plans, orders, landing | `docs/design/nightshift.md` |
+| Issue → order mapping policy (planning) | `NIGHTSHIFT.md` (concept: `docs/design/charter.md`) |
+| Nightshift plans, orders, landing | `docs/design/nightshift-spec.md` |
 | Turnstile kernel (kv/lease/watch, socket) | `docs/design/turnstile.md` |
 | Octoshift GitHub→land bridge | `docs/design/octoshift.md` |
 | Product intent and direction | `docs/design/nightshift-vision.md` |
