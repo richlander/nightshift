@@ -11,9 +11,9 @@
 ## Summary
 
 A shift with ready orders and too few workers leaves throughput on the table, and today the
-[Coordinator](workflow.md) has only a binary way to say so: it flags the **zero-worker** case
-("orders are ready and nobody is on") and nothing finer. It has no notion of *how many* workers a
-given ready set warrants, and no way to say "start two more."
+[Coordinator](workflow.md) has only a binary way to say so: it flags the **zero-worker** case — orders
+are ready and nobody is on — and nothing finer. It has no notion of *how many* workers a given ready
+set warrants, and no way to say "start two more."
 
 This note resolves both halves of [issue #30](https://github.com/richlander/nightshift/issues/30):
 
@@ -40,13 +40,16 @@ Three numbers, all already present in the system, drive everything below:
 | Symbol | Name | Where it comes from |
 |---|---|---|
 | `R` | **ready width** — orders ready to claim *right now* (deps done, unclaimed) | Turnstile state; the `ready:` line of `nightshift board` (`3 wide`) |
+| `I` | **in-flight width** — orders currently claimed and being built (= busy workers, since a worker holds ≤1 order) | the `in flight:` line of `nightshift board` / `roster` |
 | `A` | **antichain width** — the widest the plan's DAG ever gets | the plan's order→order DAG, computed once at registration |
-| `N` | **active roster** — workers currently on, holding or renewing a lease | `nightshift roster` |
+| `N` | **active roster** — workers currently on, holding or renewing a lease (busy *and* idle) | `nightshift roster` |
 
-`R` is the **instantaneous frontier**; `A` is the **shift-level ceiling**. At any instant the ready
-set is an antichain of the DAG, so `R ≤ A` always. The distinction matters: `A` tells the operator
-how many sessions the shift could *ever* keep busy, while `R` tells them how many would find work *in
-the next minute*. Backpressure is computed from `R`; long-horizon staffing is bounded by `A`.
+`R` is the **instantaneous frontier not yet claimed**; `A` is the **shift-level ceiling**. The active
+antichain being worked is the ready orders **plus** the ones already in flight, so at any instant
+`R + I ≤ A`. The distinction matters: `A` tells the operator how many sessions the shift could *ever*
+keep busy, while `R + I` tells them how wide the frontier is *right now* — `I` already claimed, `R`
+still waiting for a worker. Backpressure is computed from the current frontier; long-horizon staffing
+is bounded by `A`.
 
 A worker that claims an order past the frontier does not exist — there is nothing to claim. So the
 warranted count is a property of the frontier, never of the backlog. **A 40-order plan that is one
@@ -58,19 +61,24 @@ order wide warrants one worker.**
 
 The warranted worker count at any moment is:
 
-> **`W = min(Rᵉ, C)`**
+> **`W = min(Rᵉ + I, C)`**
+
+The warranted count covers the whole active frontier — the ready orders **plus** the ones already in
+flight — because both are members of the current antichain that need a worker on them.
 
 - **`Rᵉ` — effective ready width.** The ready count `R`, after collapsing orders that cannot truly
   run in parallel because they share a coarse `paths` scope. Two ready orders scoped to the same
   broad glob will serialize on the conflict graph even though the DAG calls them independent, so they
   warrant **one** worker between them, not two. `Rᵉ ≤ R`.
+- **`I` — in-flight width.** Orders already claimed and being built. Each is held by exactly one busy
+  worker, so `I` is both a slice of the frontier and a count of busy capacity.
 - **`C` — a sane per-machine cap.** Workers contend for RAM, I/O, tokens/min, and CI budget; past a
   point another session buys tokens, not throughput. `C` is an operator-set ceiling (a small default,
   e.g. 4–6, tunable per machine), not a Nightshift-computed value.
 
-For sizing the roster across the whole shift rather than for this instant, replace `Rᵉ` with `A`: the
-roster never usefully exceeds **`min(A, C)`**, because `A` is the most parallelism the plan can ever
-offer.
+For sizing the roster across the whole shift rather than for this instant, replace `Rᵉ + I` with `A`:
+the roster never usefully exceeds **`min(A, C)`**, because `A` is the most parallelism the plan can
+ever offer.
 
 ### Diminishing returns are the whole point
 
@@ -94,12 +102,16 @@ ready:      op-6, op-8, op-9          (3 wide)
 in flight:  op-5 (dev-b, 22m)
 blocked:    op-10, op-11  →  op-5
 roster:     1 session
-→ ready 3, warranted 3, active 1 — start 2 more workers.
+→ ready 3, in flight 1, warranted 4, active 1 — start 3 more workers.
 ```
 
-`R = 3`, no shared scopes so `Rᵉ = 3`, `C` not binding, so `W = 3`. One worker is on, so the deficit
-is `2`. Contrast the spec's existing over-staffed board — five sessions on a three-wide frontier — where
-the same arithmetic yields "2 sessions idle." Same formula, opposite sign.
+`R = 3`, no shared scopes so `Rᵉ = 3`; one order is in flight so `I = 1`; `C` not binding, so
+`W = min(3 + 1, C) = 4`. One worker is on (busy with op-5), so the deficit is `D = 4 − 1 = 3` — the
+three ready orders each need a worker that isn't there yet. For the opposite sign, take a clean
+over-staffed frontier of your own: `R = 3`, nothing in flight (`I = 0`), five sessions on. Then
+`W = min(3, C) = 3` and `D = 3 − 5 = −2` → "2 idle" — matching the spec's observation that
+"Adding a sixth agent to a three-wide frontier buys nothing but tokens"
+([spec §5](nightshift-spec.md)). Same formula, opposite sign.
 
 ---
 
@@ -109,7 +121,12 @@ Today's rule is a step function: `N = 0 ∧ R > 0` → tell the operator to star
 ([coordinator skill, the ready-set discussion](../../.github/skills/nightshift-coordinator/SKILL.md)).
 This generalizes it to the **staffing deficit**:
 
-> **`D = W − N`**
+> **`D = W − N = (Rᵉ + I) − N`**
+
+Because `N` counts busy *and* idle workers and `I` counts the busy ones, this is equivalently
+**`D = Rᵉ − (N − I)`** — the ready work minus the **idle** (available) capacity. The deficit measures
+ready orders against workers free to claim them, **not** against the total roster; a busy worker on an
+in-flight order is neither idle nor unstaffed demand, so it cancels out of both sides.
 
 | Condition | Surface says |
 |---|---|
@@ -117,14 +134,18 @@ This generalizes it to the **staffing deficit**:
 | `D = 0` | quiet — the frontier is matched |
 | `D < 0` | **over-staffed** — "`|D|` sessions idle" (the existing board line) |
 
-The zero-worker flag is just the special case `N = 0`. Nothing about the current behavior changes; it
-becomes the bottom rung of a graded ladder, and the message gains a **number**.
+The zero-worker flag is just the special case `N = 0, I = 0`, where `D = min(Rᵉ, C)` — today's flag,
+now graded with a number. The fully-busy case reduces correctly too: `R = 0, I = 3, N = 3` gives
+`W = 3` and `D = 0` — quiet, with no false "3 idle" while all three are actively building. Nothing
+about the current behavior changes; the flag becomes the bottom rung of a graded ladder, and the
+message gains a **number**.
 
 ### Where the signal lives
 
 **In the coordinator surface, computed from Turnstile state — not in the kernel.** Turnstile knows
-the ready set and the roster; `A` is a static property of the registered plan; `Rᵉ`, `W`, and `D` are
-pure functions of those. So the signal is a **derived view line on `nightshift board`**, alongside the
+the ready set, the in-flight set, and the roster; `A` is a static property of the registered plan;
+`Rᵉ`, `I`, `W`, and `D` are pure functions of those. So the signal is a **derived view line on
+`nightshift board`**, alongside the
 "idle / bottleneck" line the board already prints. `board` is where the operator already looks to
 decide whether to intervene; the deficit belongs next to the frontier it describes.
 
@@ -159,9 +180,9 @@ work on its own. The Coordinator does **not** open the session, does **not** `jo
 out the order.
 
 This is not a limitation to route around; it is the same boundary stated everywhere else in the
-system. The Coordinator *"never becomes a worker and never spawns one"*
-([coordinator skill](../../.github/skills/nightshift-coordinator/SKILL.md)); a Worker is *always a
-separate instance* ([workflow](workflow.md)). A scaling signal that spawned workers would collapse
+system. The coordinator skill puts it directly to the Coordinator — *"you never become one and never
+spawn one"* ([coordinator skill](../../.github/skills/nightshift-coordinator/SKILL.md)); a Worker is
+*always a separate instance* ([workflow](workflow.md)). A scaling signal that spawned workers would collapse
 exactly the day-shift/night-shift and coordinator/worker partitions Nightshift exists to keep. The
 number tells the operator how many sessions to start; starting them stays a deliberate act on the
 human's side of the line.
