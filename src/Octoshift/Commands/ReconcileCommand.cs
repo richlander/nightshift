@@ -44,6 +44,8 @@ internal static class ReconcileCommand
         var nightshift = new NightshiftCli(socket);
         var source = new GhMergedPrSource(scope);
         var openSource = new GhOpenPrSource(scope);
+        var orderIssueSource = new GhOrderIssuePrSource(scope);
+        var issueClient = new GhIssueClient(scope);
         var poller = new AdaptivePoller(tuning);
 
         if (once)
@@ -52,6 +54,7 @@ internal static class ReconcileCommand
             try
             {
                 await SweepReworkOnceAsync(nightshift, openSource, ct);
+                await SweepIssueCloseOnceAsync(orderIssueSource, issueClient, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -60,7 +63,7 @@ internal static class ReconcileCommand
             return mergedCode;
         }
 
-        await RunLoopAsync(nightshift, source, openSource, poller, tuning, ct);
+        await RunLoopAsync(nightshift, source, openSource, orderIssueSource, issueClient, poller, tuning, ct);
         return ExitCode.Ok;
     }
 
@@ -100,6 +103,34 @@ internal static class ReconcileCommand
         IReadOnlyList<OpenPr> open = await source.FetchOpenAsync(ct);
         IReadOnlyList<ReworkAction> actions = ReworkDecision.Decide(open, board);
         await ApplyReworkAsync(nightshift, actions, state.EscalatedPrs, ct);
+        return actions;
+    }
+
+    /// <summary>
+    /// A single fan-out issue-close sweep (§4.3): compute closable issues from bound order-PRs and close
+    /// each still-open issue once with a short pointer to the merged orders that fulfilled it.
+    /// </summary>
+    internal static async Task<IReadOnlyList<IssueCloseAction>> SweepIssueCloseOnceAsync(
+        IOrderIssuePrSource source,
+        IIssueClient issueClient,
+        CancellationToken ct)
+    {
+        IReadOnlyList<OrderIssuePr> orderPrs = await source.FetchOrderIssuePrsAsync(ct);
+        IReadOnlyList<IssueCloseAction> actions = IssueCloseDecision.Decide(orderPrs);
+        await ApplyIssueClosuresAsync(issueClient, actions, new HashSet<int>(), ct);
+        return actions;
+    }
+
+    /// <summary>The resident-loop issue-close pass, deduped across polls via <see cref="ReconcileState.HandledIssues"/>.</summary>
+    internal static async Task<IReadOnlyList<IssueCloseAction>> IssueClosePassAsync(
+        IOrderIssuePrSource source,
+        IIssueClient issueClient,
+        ReconcileState state,
+        CancellationToken ct)
+    {
+        IReadOnlyList<OrderIssuePr> orderPrs = await source.FetchOrderIssuePrsAsync(ct);
+        IReadOnlyList<IssueCloseAction> actions = IssueCloseDecision.Decide(orderPrs);
+        await ApplyIssueClosuresAsync(issueClient, actions, state.HandledIssues, ct);
         return actions;
     }
 
@@ -156,6 +187,8 @@ internal static class ReconcileCommand
         INightshiftClient nightshift,
         IMergedPrSource source,
         IOpenPrSource openSource,
+        IOrderIssuePrSource orderIssueSource,
+        IIssueClient issueClient,
         AdaptivePoller poller,
         PollingTuning tuning,
         CancellationToken ct)
@@ -163,7 +196,7 @@ internal static class ReconcileCommand
         var state = new ReconcileState { IntervalSeconds = tuning.MinIntervalSeconds };
         string? lastMode = null;
 
-        Console.WriteLine("octoshift: reconciling merged PRs -> nightshift land, open PRs -> nightshift rework (Ctrl-C to stop)");
+        Console.WriteLine("octoshift: reconciling merged PRs -> nightshift land, open PRs -> nightshift rework, fan-out issues -> close (Ctrl-C to stop)");
 
         try
         {
@@ -171,6 +204,7 @@ internal static class ReconcileCommand
             {
                 PollerState pollerState = await PollOnceAsync(nightshift, source, state, poller, tuning, ct);
                 await ReworkPassAsync(nightshift, openSource, state, ct);
+                await IssueClosePassAsync(orderIssueSource, issueClient, state, ct);
 
                 state.IntervalSeconds = poller.NextIntervalSeconds(pollerState, Random.Shared.NextDouble());
                 lastMode = NoteTransition(pollerState, state.IntervalSeconds, lastMode);
@@ -270,6 +304,48 @@ internal static class ReconcileCommand
 
         return new ApplyResult(actions, landedSomething);
     }
+
+    private static async Task ApplyIssueClosuresAsync(
+        IIssueClient issueClient,
+        IReadOnlyList<IssueCloseAction> actions,
+        HashSet<int> handledIssues,
+        CancellationToken ct)
+    {
+        foreach (IssueCloseAction action in actions)
+        {
+            if (handledIssues.Contains(action.IssueNumber))
+            {
+                continue;
+            }
+
+            IssueState state = await issueClient.GetIssueStateAsync(action.IssueNumber, ct);
+            if (state == IssueState.Closed)
+            {
+                handledIssues.Add(action.IssueNumber);
+                continue;
+            }
+
+            if (state != IssueState.Open)
+            {
+                continue;
+            }
+
+            IssueCloseOutcome outcome = await issueClient.CloseIssueAsync(action.IssueNumber, BuildIssueCloseComment(action), ct);
+            switch (outcome)
+            {
+                case IssueCloseOutcome.Closed:
+                    Console.WriteLine($"CLOSED #{action.IssueNumber} ({string.Join(", ", action.Orders)})");
+                    handledIssues.Add(action.IssueNumber);
+                    break;
+                case IssueCloseOutcome.AlreadyClosed:
+                    handledIssues.Add(action.IssueNumber);
+                    break;
+            }
+        }
+    }
+
+    private static string BuildIssueCloseComment(IssueCloseAction action)
+        => $"Closing after all bound Nightshift orders merged: {string.Join(", ", action.Orders)}.";
 
     internal static DateTimeOffset? AdvanceWatermark(
         DateTimeOffset? current,
@@ -393,6 +469,7 @@ internal static class ReconcileCommand
         public Dictionary<int, DateTimeOffset> HandledPrs { get; } = [];
         public List<MergedPr> RecentMerges { get; } = [];
         public HashSet<int> EscalatedPrs { get; } = [];
+        public HashSet<int> HandledIssues { get; } = [];
     }
 
     private sealed record ApplyResult(IReadOnlyList<LandAction> Actions, bool LandedSomething);
