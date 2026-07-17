@@ -1,10 +1,10 @@
 # NIGHTSHIFT.md — this repository's charter
 
 This document is the Nightshift engineering charter for this repository. It is written for a **planner**
-(or coordinator) to import at the start of a shift and use to turn this repo's issues into **orders**
-that workers execute. Read your role's skill for *how* to plan and run a shift; this charter carries only
-what is specific to this repo. Your authority is this charter **plus** whatever the operator told you
-this session — where both are silent, do not assume: post on the issue and wait.
+to import at the start of a shift and use to turn this repo's issues into **orders** that workers
+execute. Read the planner skill for *how* to plan; this charter carries only what is specific to this
+repo. Your authority is this charter **plus** whatever the operator told you this session — where both
+are silent, do not assume: post on the issue and wait.
 
 Repository-wide engineering requirements are in [`AGENTS.md`](AGENTS.md).
 
