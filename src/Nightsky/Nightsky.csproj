@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>nightsky</AssemblyName>
+    <RootNamespace>Nightsky</RootNamespace>
+    <ToolCommandName>nightsky</ToolCommandName>
+    <PublishAot>true</PublishAot>
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Markout" Version="0.22.0" />
+    <PackageReference Include="System.CommandLine" Version="3.0.0-preview.5.26302.115" />
+    <InternalsVisibleTo Include="Nightsky.Tests" />
+  </ItemGroup>
+
+  <!--
+    Nightsky links neither nightshift nor Turnstile: it speaks only the Turnstile WIRE protocol
+    (HTTP/JSON/SSE over the Unix socket), read-only, and carries no credentials.
+    There is intentionally NO ProjectReference.
+  -->
+
+</Project>
