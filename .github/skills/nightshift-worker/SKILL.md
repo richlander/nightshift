@@ -88,8 +88,14 @@ token):
 | `next` prints | Meaning | Do |
 |---|---|---|
 | `WORK <base>` + fields | You claimed an order | Take it to a reviewed branch (below) |
-| `NOWORK` | Nothing claimable right now | You cannot sleep — exit cleanly; you'll be relaunched |
-| `DRAINING` | Shift is winding down | Stop asking; exit |
+| `NOWORK` | Nothing claimable right now | Returned only by `next --once` (script/CI probe); in worker mode you normally do not use `--once` |
+| `DRAINING` | Shift is winding down | Exit — no new work will be dispatched |
+| `HALT` | Global stop is in force | Stop immediately and exit |
+
+Worker doctrine: the normal worker call is plain `nightshift next` (no `--once`). It **parks inside
+that running process** until one of three terminal outcomes happens: `WORK`, `DRAINING`, or `HALT`.
+The process is alive and blocked on I/O, not yielded/asleep. Start workers once; as `land`/`rework`
+open dependents, parked workers wake and drain the DAG.
 
 A `WORK` packet looks like:
 
@@ -258,8 +264,10 @@ scope yourself).
 
 You wait on `next` (for work) and on `check` (for the coordinator's `QUERY` answer after an
 escalation). Don't poll in a tight loop, and don't end a turn "waiting to be notified" with
-nothing running to wake you: headless, **block in-turn or exit** (`NOWORK`/`DRAINING` mean
-*exit*); interactive, background the wait and let its completion wake you. Full technique:
+nothing running to wake you. The default worker wait is to stay inside a running `nightshift next`
+process; that is the parked state. Exit only on `DRAINING` or `HALT` (or after deliberate one-shot
+`next --once`, which is for probes/scripts). Interactive sessions may still background other long
+waits and wake on completion. Full technique:
 **Waiting without stalling** in [`AGENTS.md`](../../../AGENTS.md).
 
 ## Recovery — after a context reset or a reboot
@@ -301,10 +309,10 @@ standing on an order branch, `nightshift recover` re-attaches you from that bran
 2. **You orchestrate build *and* review.** Prefer subagents (context preservation, model
    diversity); a builder subagent + a different-model reviewer subagent let you build and
    review one order. Without subagents you cannot review your own build.
-3. **Don't stall while waiting.** Headless, you cannot go idle — block in-turn or exit
-   (`NOWORK`/`DRAINING` mean *exit*). Interactive, you may background a blocking wait and be
-   woken by its completion, but never end a turn waiting with nothing backgrounded to wake
-   you (see **Waiting without stalling**).
+3. **Don't stall while waiting.** The worker parks by staying inside a running `next`; do not
+   exit on an empty ready set unless you intentionally used `next --once`. In normal worker mode,
+   exit on `DRAINING` or `HALT`. Interactive sessions may background blocking waits, but never end
+   a turn waiting with nothing backgrounded to wake you (see **Waiting without stalling**).
 4. **Never remember a lease or token.** The CLI owns it. Recover with `nightshift show`
    (session intact) or `nightshift recover` (session gone — from your branch).
 5. **Stay inside `paths`.** They are the conflict-avoidance contract with other workers.

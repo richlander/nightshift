@@ -177,13 +177,14 @@ public static class Cli
             Description = "Ready-set scope to scan.",
             Arity = ArgumentArity.ZeroOrOne,
         };
-        var timeout = new Option<int>("--timeout") { Description = "Seconds to wait for work." };
-        timeout.DefaultValueFactory = _ => 60;
+        var once = new Option<bool>("--once") { Description = "Scan once without waiting; print NOWORK when nothing is claimable." };
+        var timeout = new Option<int?>("--timeout") { Description = "Positive seconds to wait before returning NOWORK; omitted = wait indefinitely." };
 
         command.Arguments.Add(scope);
+        command.Options.Add(once);
         command.Options.Add(timeout);
         command.SetAction(async (parseResult, cancellationToken)
-            => await NextCommand.RunAsync(parseResult.GetValue(scope), parseResult.GetValue(timeout)));
+            => await NextCommand.RunAsync(parseResult.GetValue(scope), parseResult.GetValue(timeout), parseResult.GetValue(once)));
         return command;
     }
 
