@@ -61,6 +61,14 @@ internal sealed class BoardState
         => _statuses.TryGetValue(orderBase, out string? status) && status == LandedStatus;
 
     /// <summary>
+    /// True when the order is at <c>done</c> — submitted and awaiting merge. The rework sweep's idempotency
+    /// gate: only a <c>done</c> order is eligible to bounce, so an already-<c>changes-requested</c> or
+    /// <c>landed</c> order is never re-bounced.
+    /// </summary>
+    public bool IsDone(string orderBase)
+        => _statuses.TryGetValue(orderBase, out string? status) && status == DoneStatus;
+
+    /// <summary>
     /// True when some order is at <c>done</c> (a worker submitted a PR, awaiting merge): this only tightens poll cadence.
     /// </summary>
     public bool HasOutstandingDone => _statuses.Values.Any(status => status == DoneStatus);

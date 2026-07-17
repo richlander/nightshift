@@ -28,6 +28,27 @@ internal sealed class FakeMergedPrSource : IMergedPrSource
     }
 }
 
+/// <summary>A canned <see cref="IOpenPrSource"/> that returns fixed pages of open PRs — no network.</summary>
+internal sealed class FakeOpenPrSource : IOpenPrSource
+{
+    private readonly Queue<IReadOnlyList<OpenPr>> _pages;
+
+    public FakeOpenPrSource(params OpenPr[] open)
+        => _pages = new Queue<IReadOnlyList<OpenPr>>([open]);
+
+    public FakeOpenPrSource(params IReadOnlyList<OpenPr>[] pages)
+        => _pages = new Queue<IReadOnlyList<OpenPr>>(pages);
+
+    public int FetchCount { get; private set; }
+
+    public Task<IReadOnlyList<OpenPr>> FetchOpenAsync(CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        FetchCount++;
+        return Task.FromResult(_pages.Count > 1 ? _pages.Dequeue() : _pages.Count == 1 ? _pages.Peek() : (IReadOnlyList<OpenPr>)[]);
+    }
+}
+
 /// <summary>A recording <see cref="INightshiftClient"/> fake: a fixed board plus a log of land calls.</summary>
 internal sealed class FakeNightshiftClient : INightshiftClient
 {
@@ -47,6 +68,8 @@ internal sealed class FakeNightshiftClient : INightshiftClient
 
     public List<(string OrderBase, string Reason)> Lands { get; } = [];
 
+    public List<(string OrderBase, string Directive)> Reworks { get; } = [];
+
     public Task<BoardState> GetBoardAsync(CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
@@ -58,5 +81,12 @@ internal sealed class FakeNightshiftClient : INightshiftClient
         ct.ThrowIfCancellationRequested();
         Lands.Add((orderBase, reason));
         return Task.FromResult(_landResults.Count > 0 ? _landResults.Dequeue() : true);
+    }
+
+    public Task<bool> ReworkAsync(string orderBase, string directive, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        Reworks.Add((orderBase, directive));
+        return Task.FromResult(true);
     }
 }

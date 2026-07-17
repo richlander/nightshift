@@ -356,6 +356,7 @@ internal sealed record HeadDto
 
 [JsonSourceGenerationOptions(PropertyNameCaseInsensitive = true)]
 [JsonSerializable(typeof(PullDto[]))]
+[JsonSerializable(typeof(PrListDto[]))]
 internal partial class GhJsonContext : JsonSerializerContext
 {
 }
