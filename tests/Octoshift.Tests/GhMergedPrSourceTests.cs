@@ -99,6 +99,16 @@ public class GhMergedPrSourceTests
     }
 
     [Fact]
+    public void ParseMerged_ExactScopeMatchesOneBranch()
+    {
+        string body = $"[{PrJson(10, "nightshift/2/op-a", T0)},{PrJson(11, "nightshift/2/op-ab", T0)}]";
+
+        IReadOnlyList<MergedPr> merged = GhMergedPrSource.ParseMerged(body, null, "nightshift/2/op-a", exactBranch: true);
+
+        Assert.Equal([10], merged.Select(static pr => pr.Number).ToArray());
+    }
+
+    [Fact]
     public async Task FetchMergedAsync_NonZeroGhExitIsRateLimitedFailure()
     {
         var source = new GhMergedPrSource("owner/repo", perPage: 10, (_, _) =>

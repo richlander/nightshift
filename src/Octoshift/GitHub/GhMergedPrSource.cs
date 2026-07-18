@@ -17,27 +17,46 @@ using System.Text.Json.Serialization;
 /// </summary>
 internal sealed class GhMergedPrSource : IMergedPrSource
 {
-    private const string BranchPrefix = "nightshift/";
+    private const string DefaultBranchPrefix = "nightshift/";
     private readonly string _repo;
     private readonly int _perPage;
     private readonly int _maxPages;
+    private readonly string _branchPrefix;
+    private readonly bool _exactBranch;
     private readonly Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> _runGhAsync;
 
     public GhMergedPrSource(string repo, int perPage = 50)
-        : this(repo, perPage, 20, RunGhAsync)
+        : this(repo, perPage, 20, RunGhAsync, DefaultBranchPrefix, exactBranch: false)
+    {
+    }
+
+    /// <summary>
+    /// Creates a scoped source for one plan prefix (e.g. <c>nightshift/3/</c>) or one order branch
+    /// (e.g. <c>nightshift/3/op1</c> with <paramref name="exactBranch"/> true).
+    /// </summary>
+    public GhMergedPrSource(string repo, string branchPrefix, bool exactBranch, int perPage = 50)
+        : this(repo, perPage, 20, RunGhAsync, branchPrefix, exactBranch)
     {
     }
 
     internal GhMergedPrSource(string repo, int perPage, Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> runGhAsync)
-        : this(repo, perPage, 20, runGhAsync)
+        : this(repo, perPage, 20, runGhAsync, DefaultBranchPrefix, exactBranch: false)
     {
     }
 
-    internal GhMergedPrSource(string repo, int perPage, int maxPages, Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> runGhAsync)
+    internal GhMergedPrSource(
+        string repo,
+        int perPage,
+        int maxPages,
+        Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> runGhAsync,
+        string branchPrefix = DefaultBranchPrefix,
+        bool exactBranch = false)
     {
         _repo = repo;
         _perPage = Math.Max(1, perPage);
         _maxPages = Math.Max(1, maxPages);
+        _branchPrefix = branchPrefix;
+        _exactBranch = exactBranch;
         _runGhAsync = runGhAsync;
     }
 
@@ -85,7 +104,7 @@ internal sealed class GhMergedPrSource : IMergedPrSource
                 return ErrorPage(responseEtag, pollInterval, headerBlock);
             }
 
-            IReadOnlyList<MergedPr> seenOnPage = ParseMerged(body, null);
+            IReadOnlyList<MergedPr> seenOnPage = ParseMerged(body, null, _branchPrefix, _exactBranch);
             foreach (MergedPr pr in seenOnPage)
             {
                 oldestSeenMergedAt = oldestSeenMergedAt is null || pr.MergedAt < oldestSeenMergedAt.Value
@@ -124,7 +143,11 @@ internal sealed class GhMergedPrSource : IMergedPrSource
     }
 
     /// <summary>Filters the pulls payload to merged nightshift branches not older than the watermark, newest first.</summary>
-    internal static IReadOnlyList<MergedPr> ParseMerged(string body, DateTimeOffset? since)
+    internal static IReadOnlyList<MergedPr> ParseMerged(
+        string body,
+        DateTimeOffset? since,
+        string branchPrefix = DefaultBranchPrefix,
+        bool exactBranch = false)
     {
         if (string.IsNullOrWhiteSpace(body))
         {
@@ -151,7 +174,7 @@ internal sealed class GhMergedPrSource : IMergedPrSource
         {
             if (pull.MergedAt is not { } mergedAtRaw
                 || pull.Head?.Ref is not { Length: > 0 } headRef
-                || !headRef.StartsWith(BranchPrefix, StringComparison.Ordinal))
+                || !MatchesScope(headRef, branchPrefix, exactBranch))
             {
                 continue;
             }
@@ -172,6 +195,11 @@ internal sealed class GhMergedPrSource : IMergedPrSource
         merged.Sort((a, b) => b.MergedAt.CompareTo(a.MergedAt));
         return merged;
     }
+
+    private static bool MatchesScope(string branch, string branchPrefix, bool exactBranch)
+        => exactBranch
+            ? string.Equals(branch, branchPrefix, StringComparison.Ordinal)
+            : branch.StartsWith(branchPrefix, StringComparison.Ordinal);
 
     private static MergedPrPage ErrorPage(string? etag, int pollInterval, string headerBlock) => new()
     {
