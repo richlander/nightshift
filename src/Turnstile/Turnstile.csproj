@@ -23,4 +23,7 @@
     <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.3" />
   </ItemGroup>
 
+  <!-- Statically link SQLite so Native AOT publishes a genuine single file. -->
+  <Import Project="e_sqlite3-static.targets" />
+
 </Project>

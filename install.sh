@@ -80,11 +80,13 @@ for entry in "${TOOLS[@]}"; do
   install -m 0755 "$bin" "$PREFIX/$name"
   echo "   deployed -> $PREFIX/$name  ($(du -h "$PREFIX/$name" | cut -f1))"
 
-  # NativeAOT does not statically link native runtime dependencies (e.g.
-  # turnstile's libe_sqlite3.dylib) — they publish as sidecar shared libraries
-  # the executable dlopen()s from its own directory at startup. Deploy them next
-  # to the binary, or the tool fails with DllNotFoundException on a machine that
-  # doesn't already have them.
+  # Most tools publish as a genuine single file. NativeAOT does not statically
+  # link the native dependencies of NuGet packages, so a tool that pulls one in
+  # would otherwise emit a sidecar shared library the executable dlopen()s from
+  # its own directory at startup. (turnstile used to ship libe_sqlite3.dylib this
+  # way; it now statically links SQLite — see src/Turnstile/e_sqlite3-static.targets.)
+  # Deploy any remaining sidecars next to the binary so such a tool doesn't fail
+  # with DllNotFoundException on a machine that lacks them.
   shopt -s nullglob
   for lib in "$out"/*.dylib "$out"/*.so; do
     libname="$(basename "$lib")"
