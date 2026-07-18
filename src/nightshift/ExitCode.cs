@@ -32,6 +32,12 @@ internal static class ExitCode
     /// <summary><c>check</c>: the claim was lost or expired — abandon this order and re-acquire.</summary>
     public const int FenceStale = 14;
 
+    /// <summary><c>coordinate</c>: returned one coordinator-actionable transition (token: <c>COORD</c>).</summary>
+    public const int Coordinate = 20;
+
+    /// <summary><c>coordinate</c>: one-shot probe found no actionable transition, or a bounded wait timed out.</summary>
+    public const int NoCoordinate = 21;
+
     /// <summary>Interrupted by Ctrl-C (128 + SIGINT), the conventional signal exit code.</summary>
     public const int Interrupted = 130;
 }

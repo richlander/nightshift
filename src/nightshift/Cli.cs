@@ -8,7 +8,7 @@ using Nightshift.Output;
 /// <summary>Entry dispatch for the <c>nightshift</c> agent/operator CLI.</summary>
 public static class Cli
 {
-    private const string Usage = "usage: nightshift <add|plan|land|rework|join|standby|leave|next|show|recover|check|escalate|release|drain|stop|roster|where|watch> ...";
+    private const string Usage = "usage: nightshift <add|plan|land|rework|join|standby|leave|next|coordinate|show|recover|check|escalate|release|drain|stop|roster|where|watch> ...";
 
     /// <summary>
     /// The global <c>--socket</c> override, inherited by every verb. Parsed once at dispatch and pinned via
@@ -24,7 +24,7 @@ public static class Cli
     private static readonly HashSet<string> KnownVerbs =
     [
         "add", "plan", "land", "rework", "join", "standby", "leave", "next", "show",
-        "recover", "check", "escalate", "release", "drain", "stop", "roster", "where", "watch",
+        "coordinate", "recover", "check", "escalate", "release", "drain", "stop", "roster", "where", "watch",
     ];
 
     /// <summary>Parses and invokes the command line, preserving Nightshift's exit-code contract.</summary>
@@ -70,6 +70,7 @@ public static class Cli
         rootCommand.Subcommands.Add(CreateNoArgsCommand("standby", "Stay on the roster but stop taking new work.", StandbyCommand.RunAsync));
         rootCommand.Subcommands.Add(CreateNoArgsCommand("leave", "Clock out and release roster presence.", LeaveCommand.RunAsync));
         rootCommand.Subcommands.Add(CreateNextCommand());
+        rootCommand.Subcommands.Add(CreateCoordinateCommand());
         rootCommand.Subcommands.Add(CreateShowCommand());
         rootCommand.Subcommands.Add(CreateNoArgsCommand("recover", "Re-attach to the order encoded by the current git branch.", RecoverCommand.RunAsync));
         rootCommand.Subcommands.Add(CreateNoArgsCommand("check", "Renew the active claim lease and read directives.", CheckCommand.RunAsync));
@@ -196,6 +197,25 @@ public static class Cli
         command.Options.Add(reason);
         command.SetAction(async (parseResult, cancellationToken)
             => await EscalateCommand.RunAsync(parseResult.GetValue(reason)));
+        return command;
+    }
+
+    private static Command CreateCoordinateCommand()
+    {
+        var command = new Command("coordinate", "Wait for the next coordinator-actionable transition.");
+        var scope = new Argument<string?>("scope")
+        {
+            Description = "Optional plan scope (plan id) to watch.",
+            Arity = ArgumentArity.ZeroOrOne,
+        };
+        var once = new Option<bool>("--once") { Description = "Probe once without waiting; print NOCOORD when nothing is actionable." };
+        var timeout = new Option<int?>("--timeout") { Description = "Positive seconds to wait before returning NOCOORD; omitted = wait indefinitely." };
+
+        command.Arguments.Add(scope);
+        command.Options.Add(once);
+        command.Options.Add(timeout);
+        command.SetAction(async (parseResult, cancellationToken)
+            => await CoordinateCommand.RunAsync(parseResult.GetValue(scope), parseResult.GetValue(timeout), parseResult.GetValue(once)));
         return command;
     }
 
