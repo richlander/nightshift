@@ -20,7 +20,7 @@ public class GhOpenPrSourceTests
 
         IReadOnlyList<OpenPr> open = GhOpenPrSource.ParseOpenPrs(json);
 
-        Assert.Equal(new[] { 1, 4 }, open.Select(pr => pr.Number).ToArray());
+        Assert.Equal(new[] { 1, 4 }, open.Select(static pr => pr.Number).ToArray());
         Assert.Equal(Mergeability.Conflicting, open[0].Mergeable);
         Assert.Equal(PrLifecycle.Open, open[0].State);
         Assert.Equal(PrLifecycle.Closed, open[1].State);
@@ -53,6 +53,21 @@ public class GhOpenPrSourceTests
         Assert.Equal("legacy", pr.Checks[1].Name);
         Assert.Equal("ERROR", pr.Checks[1].State);
         Assert.Equal("https://ci/2", pr.Checks[1].Link);
+    }
+
+    [Fact]
+    public void ParseOpenPrs_ExactScopeMatchesOneBranch()
+    {
+        const string json = """
+        [
+          { "number": 1, "headRefName": "nightshift/2/op-a", "state": "OPEN", "mergeable": "MERGEABLE", "statusCheckRollup": [] },
+          { "number": 2, "headRefName": "nightshift/2/op-ab", "state": "OPEN", "mergeable": "MERGEABLE", "statusCheckRollup": [] }
+        ]
+        """;
+
+        IReadOnlyList<OpenPr> open = GhOpenPrSource.ParseOpenPrs(json, "nightshift/2/op-a", exactBranch: true);
+
+        Assert.Equal([1], open.Select(static pr => pr.Number).ToArray());
     }
 
     [Fact]
@@ -92,5 +107,21 @@ public class GhOpenPrSourceTests
         Assert.Contains("--search", captured!);
         Assert.Contains("head:nightshift/ -is:merged", captured!);
         Assert.Contains("number,headRefName,state,mergeable,statusCheckRollup", captured!);
+    }
+
+    [Fact]
+    public async Task FetchOpenAsync_UsesScopedSearchPrefix()
+    {
+        IReadOnlyList<string>? captured = null;
+        var source = new GhOpenPrSource("owner/repo", 200, (args, _) =>
+        {
+            captured = args;
+            return Task.FromResult(new GhResult(0, "[]", string.Empty));
+        }, "nightshift/3/op-a", exactBranch: true);
+
+        await source.FetchOpenAsync(TestContext.Current.CancellationToken);
+
+        Assert.NotNull(captured);
+        Assert.Contains("head:nightshift/3/op-a -is:merged", captured!);
     }
 }

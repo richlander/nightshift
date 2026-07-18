@@ -18,20 +18,38 @@ using System.Text.Json.Serialization;
 /// </summary>
 internal sealed class GhOpenPrSource : IOpenPrSource
 {
-    private const string BranchPrefix = "nightshift/";
+    private const string DefaultBranchPrefix = "nightshift/";
     private readonly string _repo;
     private readonly int _limit;
+    private readonly string _branchPrefix;
+    private readonly bool _exactBranch;
     private readonly Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> _runGhAsync;
 
     public GhOpenPrSource(string repo, int limit = 200)
-        : this(repo, limit, RunGhAsync)
+        : this(repo, limit, RunGhAsync, DefaultBranchPrefix, exactBranch: false)
     {
     }
 
-    internal GhOpenPrSource(string repo, int limit, Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> runGhAsync)
+    /// <summary>
+    /// Creates a scoped source for one plan prefix (e.g. <c>nightshift/3/</c>) or one order branch
+    /// (e.g. <c>nightshift/3/op1</c> with <paramref name="exactBranch"/> true).
+    /// </summary>
+    public GhOpenPrSource(string repo, string branchPrefix, bool exactBranch, int limit = 200)
+        : this(repo, limit, RunGhAsync, branchPrefix, exactBranch)
+    {
+    }
+
+    internal GhOpenPrSource(
+        string repo,
+        int limit,
+        Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> runGhAsync,
+        string branchPrefix = DefaultBranchPrefix,
+        bool exactBranch = false)
     {
         _repo = repo;
         _limit = Math.Max(1, limit);
+        _branchPrefix = branchPrefix;
+        _exactBranch = exactBranch;
         _runGhAsync = runGhAsync;
     }
 
@@ -46,7 +64,7 @@ internal sealed class GhOpenPrSource : IOpenPrSource
             // Narrow server-side to the nightshift branch namespace and exclude merged PRs, so the
             // ever-growing pile of merged history never crowds a long-lived open order-PR past the
             // client-side cap (which would leave it stuck, never bounced).
-            "--search", $"head:{BranchPrefix} -is:merged",
+            "--search", $"head:{_branchPrefix} -is:merged",
             "--limit", _limit.ToString(System.Globalization.CultureInfo.InvariantCulture),
             "--json", "number,headRefName,state,mergeable,statusCheckRollup",
         };
@@ -59,11 +77,11 @@ internal sealed class GhOpenPrSource : IOpenPrSource
             return [];
         }
 
-        return ParseOpenPrs(gh.Stdout);
+        return ParseOpenPrs(gh.Stdout, _branchPrefix, _exactBranch);
     }
 
     /// <summary>Parses the <c>gh pr list</c> payload into nightshift open/closed-unmerged PRs, dropping merged and foreign branches.</summary>
-    internal static IReadOnlyList<OpenPr> ParseOpenPrs(string body)
+    internal static IReadOnlyList<OpenPr> ParseOpenPrs(string body, string branchPrefix = DefaultBranchPrefix, bool exactBranch = false)
     {
         if (string.IsNullOrWhiteSpace(body))
         {
@@ -89,7 +107,7 @@ internal sealed class GhOpenPrSource : IOpenPrSource
         foreach (PrListDto pull in pulls)
         {
             if (pull.HeadRefName is not { Length: > 0 } headRef
-                || !headRef.StartsWith(BranchPrefix, StringComparison.Ordinal))
+                || !MatchesScope(headRef, branchPrefix, exactBranch))
             {
                 continue; // not a nightshift branch — never invent an order
             }
@@ -105,6 +123,11 @@ internal sealed class GhOpenPrSource : IOpenPrSource
 
         return open;
     }
+
+    private static bool MatchesScope(string branch, string branchPrefix, bool exactBranch)
+        => exactBranch
+            ? string.Equals(branch, branchPrefix, StringComparison.Ordinal)
+            : branch.StartsWith(branchPrefix, StringComparison.Ordinal);
 
     private static PrLifecycle? LifecycleOf(string? state) => state?.ToUpperInvariant() switch
     {
