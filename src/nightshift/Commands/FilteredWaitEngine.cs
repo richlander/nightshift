@@ -9,6 +9,7 @@ using Nightshift.Turnstile;
 internal static class FilteredWaitEngine
 {
     internal static TimeSpan KeepAliveCadence { get; set; } = TimeSpan.FromMinutes(5);
+    internal static TimeSpan NoneRearmDelay { get; set; } = TimeSpan.FromMilliseconds(100);
 
     internal sealed record WatchScope(string Name, Func<long, CancellationToken, IAsyncEnumerable<WatchSignal>> Watch);
 
@@ -43,11 +44,14 @@ internal static class FilteredWaitEngine
             }
 
             TimeSpan budget = NextCommand.ComputeWaitBudget(now, deadline, nextKeepAliveAt);
+            long previousFloor = MaxFloor(floors);
             ScopedWaitResult wake = await WaitForScopedSignalCoreAsync(scopes, floors, currentRevision, budget, ct);
             if (wake.Scope is { } scope)
             {
                 floors[scope] = wake.Revision;
             }
+
+            bool advanced = MaxFloor(floors) > previousFloor;
 
             if (wake.Source == ScopedWakeSource.Signal
                 && wake.Edge is { } edge
@@ -62,7 +66,23 @@ internal static class FilteredWaitEngine
                 return WaitResult<T>.Matched(MaxFloor(floors), snapshotMatch);
             }
 
-            if (wake.Source != ScopedWakeSource.Timeout || DateTime.UtcNow >= nextKeepAliveAt)
+            if (wake.Source == ScopedWakeSource.None)
+            {
+                TimeSpan rearmDelay = ComputeNoneRearmDelay(DateTime.UtcNow, deadline);
+                if (rearmDelay > TimeSpan.Zero)
+                {
+                    await Task.Delay(rearmDelay, ct);
+                }
+            }
+
+            bool shouldKeepAlive = wake.Source switch
+            {
+                ScopedWakeSource.Signal => true,
+                ScopedWakeSource.Compacted => true,
+                _ => DateTime.UtcNow >= nextKeepAliveAt,
+            };
+
+            if (shouldKeepAlive)
             {
                 await keepAliveAsync(ct);
                 nextKeepAliveAt = DateTime.UtcNow.Add(KeepAliveCadence);
@@ -159,6 +179,27 @@ internal static class FilteredWaitEngine
 
     private static long MaxFloor(IReadOnlyDictionary<string, long> floors)
         => floors.Count == 0 ? 0 : floors.Values.Max();
+
+    private static TimeSpan ComputeNoneRearmDelay(DateTime now, DateTime? deadline)
+    {
+        if (NoneRearmDelay <= TimeSpan.Zero)
+        {
+            return TimeSpan.Zero;
+        }
+
+        if (deadline is not { } d)
+        {
+            return NoneRearmDelay;
+        }
+
+        TimeSpan remaining = d - now;
+        if (remaining <= TimeSpan.Zero)
+        {
+            return TimeSpan.Zero;
+        }
+
+        return remaining < NoneRearmDelay ? remaining : NoneRearmDelay;
+    }
 
     internal sealed record ScopedWaitResult(long Revision, ScopedWakeSource Source, string? Scope, WatchEdge? Edge);
 

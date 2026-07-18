@@ -255,6 +255,49 @@ public class CoordinateCommandTests
             result.Match!.Render());
     }
 
+    [Fact]
+    public async Task FilteredWaitEngine_RepeatedNoneWake_PacesRearmsAndAvoidsKeepAliveHammer()
+    {
+        TimeSpan originalDelay = FilteredWaitEngine.NoneRearmDelay;
+        FilteredWaitEngine.NoneRearmDelay = TimeSpan.FromMilliseconds(40);
+        try
+        {
+            int watchCalls = 0;
+            int keepAliveCalls = 0;
+
+            FilteredWaitEngine.WaitResult<CoordinateCommand.CoordinateOutcome> result = await FilteredWaitEngine.WaitForMatchAsync(
+                scopes:
+                [
+                    new FilteredWaitEngine.WatchScope(
+                        "plan",
+                        (_, _) =>
+                        {
+                            watchCalls++;
+                            return Replay([]);
+                        }),
+                ],
+                currentRevision: _ => Task.FromResult(100L),
+                fromRevision: 100,
+                deadline: DateTime.UtcNow.AddMilliseconds(220),
+                keepAliveAsync: _ =>
+                {
+                    keepAliveCalls++;
+                    return Task.CompletedTask;
+                },
+                reconcileAsync: (_, _) => Task.FromResult<CoordinateCommand.CoordinateOutcome?>(null),
+                reconcileSnapshotAsync: _ => Task.FromResult<CoordinateCommand.CoordinateOutcome?>(null),
+                TestContext.Current.CancellationToken);
+
+            Assert.True(result.TimedOut);
+            Assert.InRange(watchCalls, 1, 12);
+            Assert.Equal(0, keepAliveCalls);
+        }
+        finally
+        {
+            FilteredWaitEngine.NoneRearmDelay = originalDelay;
+        }
+    }
+
     private static Func<string, CancellationToken, Task<KvItem?>> BuildGetter(Dictionary<string, string> values)
         => (key, _) => Task.FromResult(values.TryGetValue(key, out string? value) ? Item(key, value) : null);
 
