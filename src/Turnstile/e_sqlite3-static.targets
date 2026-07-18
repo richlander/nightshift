@@ -1,0 +1,124 @@
+<Project>
+
+  <!--
+    Static SQLite for Native AOT single-file distribution.
+
+    NativeAOT does not statically link the native dependencies of NuGet packages,
+    so a normal `PublishAot` of turnstile emits the managed single file PLUS a
+    sidecar `libe_sqlite3.dylib` / `.so` next to it (see install.sh). That makes
+    turnstile a multi-file tool, which `dotnet-install` refuses.
+
+    This file compiles the SQLite amalgamation into a static `e_sqlite3` archive
+    and links it directly into the AOT binary via DirectPInvoke + NativeLibrary,
+    then drops the now-redundant shared library from the publish output. The
+    result is a genuine single-file executable.
+
+    Enabled only for Native AOT publishes targeting osx-* / linux-* RIDs. Windows
+    keeps the existing dynamic-sidecar behavior (a `.lib`/clang-cl build can be
+    added later). A C toolchain (clang + ar) must be on PATH.
+  -->
+
+  <PropertyGroup Condition="'$(ESqlite3StaticLink)' == ''">
+    <ESqlite3StaticLink>false</ESqlite3StaticLink>
+    <ESqlite3StaticLink Condition="'$(PublishAot)' == 'true' and ($(RuntimeIdentifier.StartsWith('osx')) or $(RuntimeIdentifier.StartsWith('linux')))">true</ESqlite3StaticLink>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(ESqlite3StaticLink)' == 'true'">
+    <!-- SQLite amalgamation 3.50.4, matching the e_sqlite3 3.0.3 bundle line. -->
+    <ESqlite3AmalgamationName>sqlite-amalgamation-3500400</ESqlite3AmalgamationName>
+    <ESqlite3AmalgamationUrl>https://www.sqlite.org/2025/$(ESqlite3AmalgamationName).zip</ESqlite3AmalgamationUrl>
+    <ESqlite3AmalgamationSha256>1d3049dd0f830a025a53105fc79fd2ab9431aea99e137809d064d8ee8356b032</ESqlite3AmalgamationSha256>
+
+    <ESqlite3Compiler Condition="'$(ESqlite3Compiler)' == ''">clang</ESqlite3Compiler>
+    <ESqlite3Ar Condition="'$(ESqlite3Ar)' == ''">ar</ESqlite3Ar>
+
+    <!-- Cross-arch flag only needed on macOS (host is arm64, may target x64).
+         Match the AOT deployment target to avoid an object-version link warning. -->
+    <ESqlite3ArchFlag Condition="$(RuntimeIdentifier.StartsWith('osx')) and $(RuntimeIdentifier.EndsWith('arm64'))">-arch arm64 -mmacosx-version-min=12.0</ESqlite3ArchFlag>
+    <ESqlite3ArchFlag Condition="$(RuntimeIdentifier.StartsWith('osx')) and $(RuntimeIdentifier.EndsWith('x64'))">-arch x86_64 -mmacosx-version-min=12.0</ESqlite3ArchFlag>
+
+    <!-- Feature set aligned with the e_sqlite3 build; turnstile itself only needs
+         plain tables + WAL, but these keep behavior consistent with the bundle. -->
+    <ESqlite3Defines>-DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_RTREE -DSQLITE_ENABLE_COLUMN_METADATA -DSQLITE_ENABLE_MATH_FUNCTIONS -DSQLITE_ENABLE_DBSTAT_VTAB -DSQLITE_ENABLE_API_ARMOR -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_USE_URI=1</ESqlite3Defines>
+  </PropertyGroup>
+
+  <!--
+    DirectPInvoke rewrites the SQLitePCLRaw `[DllImport("e_sqlite3")]` calls into
+    direct references to the sqlite3_* symbols our static archive exports. It only
+    needs the module name, so it is safe to declare up front (before IlcCompile).
+  -->
+  <ItemGroup Condition="'$(ESqlite3StaticLink)' == 'true'">
+    <DirectPInvoke Include="e_sqlite3" />
+  </ItemGroup>
+
+  <!--
+    Path properties depend on $(IntermediateOutputPath), which the SDK does not
+    finalize until after this file is imported, so they must be resolved inside a
+    target (execution phase). This target also registers the NativeLibrary input;
+    it has no Inputs/Outputs so it always runs, even when the archive is cached.
+  -->
+  <Target Name="_ResolveESqlite3StaticLib"
+          Condition="'$(ESqlite3StaticLink)' == 'true'"
+          BeforeTargets="SetupOSSpecificProps;IlcCompile;LinkNative">
+    <PropertyGroup>
+      <!-- Source (amalgamation) is arch-independent: cache once under obj/. -->
+      <ESqlite3SrcDir>$(BaseIntermediateOutputPath)e_sqlite3-src</ESqlite3SrcDir>
+      <ESqlite3ZipPath>$(ESqlite3SrcDir)/$(ESqlite3AmalgamationName).zip</ESqlite3ZipPath>
+      <ESqlite3SourceFile>$(ESqlite3SrcDir)/$(ESqlite3AmalgamationName)/sqlite3.c</ESqlite3SourceFile>
+      <!-- Compiled object + archive are per-RID: keep under IntermediateOutputPath. -->
+      <ESqlite3ObjDir>$(IntermediateOutputPath)e_sqlite3</ESqlite3ObjDir>
+      <ESqlite3ObjPath>$(ESqlite3ObjDir)/sqlite3.o</ESqlite3ObjPath>
+      <ESqlite3StaticLib>$(MSBuildProjectDirectory)/$(ESqlite3ObjDir)/libe_sqlite3.a</ESqlite3StaticLib>
+    </PropertyGroup>
+    <ItemGroup>
+      <NativeLibrary Include="$(ESqlite3StaticLib)" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="_BuildStaticESqlite3"
+          Condition="'$(ESqlite3StaticLink)' == 'true'"
+          DependsOnTargets="_ResolveESqlite3StaticLib"
+          BeforeTargets="LinkNative"
+          Inputs="$(MSBuildThisFileFullPath)"
+          Outputs="$(ESqlite3StaticLib)">
+
+    <MakeDir Directories="$(ESqlite3SrcDir);$(ESqlite3ObjDir)" />
+
+    <!-- Download + verify the amalgamation (cached across builds). -->
+    <DownloadFile Condition="!Exists('$(ESqlite3ZipPath)')"
+                  SourceUrl="$(ESqlite3AmalgamationUrl)"
+                  DestinationFolder="$(ESqlite3SrcDir)"
+                  DestinationFileName="$(ESqlite3AmalgamationName).zip"
+                  Retries="3" />
+
+    <GetFileHash Files="$(ESqlite3ZipPath)" Algorithm="SHA256">
+      <Output TaskParameter="Hash" PropertyName="_ESqlite3ActualSha256" />
+    </GetFileHash>
+    <Error Condition="'$(_ESqlite3ActualSha256.ToLowerInvariant())' != '$(ESqlite3AmalgamationSha256)'"
+           Text="SQLite amalgamation SHA256 mismatch. Expected $(ESqlite3AmalgamationSha256), got $(_ESqlite3ActualSha256). Delete '$(ESqlite3ZipPath)' and retry." />
+
+    <Unzip Condition="!Exists('$(ESqlite3SourceFile)')"
+           SourceFiles="$(ESqlite3ZipPath)"
+           DestinationFolder="$(ESqlite3SrcDir)" />
+
+    <!-- Compile the amalgamation into a static e_sqlite3 archive. -->
+    <Message Importance="high" Text="Compiling static e_sqlite3 for $(RuntimeIdentifier) -> $(ESqlite3StaticLib)" />
+    <Exec Command="&quot;$(ESqlite3Compiler)&quot; -c -O2 -fPIC $(ESqlite3ArchFlag) $(ESqlite3Defines) -o &quot;$(ESqlite3ObjPath)&quot; &quot;$(ESqlite3SourceFile)&quot;" />
+    <Delete Files="$(ESqlite3StaticLib)" Condition="Exists('$(ESqlite3StaticLib)')" />
+    <Exec Command="&quot;$(ESqlite3Ar)&quot; rcs &quot;$(ESqlite3StaticLib)&quot; &quot;$(ESqlite3ObjPath)&quot;" />
+  </Target>
+
+  <!--
+    With SQLite statically linked, the sidecar shared library is dead weight and
+    would make the tool multi-file. Drop it from the publish output.
+  -->
+  <Target Name="_RemoveESqlite3Sidecar"
+          Condition="'$(ESqlite3StaticLink)' == 'true'"
+          AfterTargets="ComputeResolvedFilesToPublishList">
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
+                             Condition="'%(Filename)' == 'libe_sqlite3' or '%(Filename)' == 'e_sqlite3'" />
+    </ItemGroup>
+  </Target>
+
+</Project>
