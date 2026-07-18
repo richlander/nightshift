@@ -62,32 +62,28 @@ internal sealed class FileGitHubAppCredentialsSource : IGitHubAppCredentialsSour
     public const string CredentialsPathEnvironmentVariable = "OCTOSHIFT_GITHUB_APP_CREDENTIALS_PATH";
 
     private readonly Func<string, string?> _getEnvironmentVariable;
-    private readonly Func<string, string> _readAllText;
     private readonly Func<string> _getWorkingDirectory;
-    private readonly Func<string, UnixFileMode?> _getUnixFileMode;
+    private readonly IProtectedFileReader _protectedFileReader;
     private readonly bool _enforceOutsideWorkingTree;
 
     public FileGitHubAppCredentialsSource()
         : this(
             Environment.GetEnvironmentVariable,
-            File.ReadAllText,
             Directory.GetCurrentDirectory,
-            TryGetUnixFileMode,
+            OpenOnceProtectedFileReader.Instance,
             enforceOutsideWorkingTree: true)
     {
     }
 
     internal FileGitHubAppCredentialsSource(
         Func<string, string?> getEnvironmentVariable,
-        Func<string, string> readAllText,
         Func<string> getWorkingDirectory,
-        Func<string, UnixFileMode?> getUnixFileMode,
+        IProtectedFileReader protectedFileReader,
         bool enforceOutsideWorkingTree)
     {
         _getEnvironmentVariable = getEnvironmentVariable;
-        _readAllText = readAllText;
         _getWorkingDirectory = getWorkingDirectory;
-        _getUnixFileMode = getUnixFileMode;
+        _protectedFileReader = protectedFileReader;
         _enforceOutsideWorkingTree = enforceOutsideWorkingTree;
     }
 
@@ -100,27 +96,18 @@ internal sealed class FileGitHubAppCredentialsSource : IGitHubAppCredentialsSour
         }
 
         string credentialsPath = Path.GetFullPath(configuredPath);
-        EnsureReadableFile(credentialsPath, "credentials");
-        EnsureRestrictedPermissions(credentialsPath, "credentials");
         if (_enforceOutsideWorkingTree)
         {
             EnsureOutsideWorkingTree(credentialsPath, "credentials");
         }
 
-        string json;
-        try
-        {
-            json = _readAllText(credentialsPath);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            throw new InvalidOperationException($"octoshift: unable to read credentials file '{credentialsPath}'.", ex);
-        }
+        ProtectedFileData credentialsFile = _protectedFileReader.Read(credentialsPath, "credentials");
+        EnsureRestrictedPermissions(credentialsFile.Mode, credentialsPath, "credentials");
 
         GitHubAppCredentialFileDto? dto;
         try
         {
-            dto = JsonSerializer.Deserialize(json, GitHubAppCredentialsJsonContext.Default.GitHubAppCredentialFileDto);
+            dto = JsonSerializer.Deserialize(credentialsFile.Content, GitHubAppCredentialsJsonContext.Default.GitHubAppCredentialFileDto);
         }
         catch (JsonException ex)
         {
@@ -154,24 +141,14 @@ internal sealed class FileGitHubAppCredentialsSource : IGitHubAppCredentialsSour
 
         string baseDirectory = Path.GetDirectoryName(credentialsPath) ?? _getWorkingDirectory();
         string privateKeyPath = Path.GetFullPath(dto.PrivateKeyPath, baseDirectory);
-        EnsureReadableFile(privateKeyPath, "private-key");
-        EnsureRestrictedPermissions(privateKeyPath, "private-key");
         if (_enforceOutsideWorkingTree)
         {
             EnsureOutsideWorkingTree(privateKeyPath, "private-key");
         }
 
-        string privateKeyPem;
-        try
-        {
-            privateKeyPem = _readAllText(privateKeyPath);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            throw new InvalidOperationException($"octoshift: unable to read private key file '{privateKeyPath}'.", ex);
-        }
-
-        if (string.IsNullOrWhiteSpace(privateKeyPem))
+        ProtectedFileData privateKeyFile = _protectedFileReader.Read(privateKeyPath, "private-key");
+        EnsureRestrictedPermissions(privateKeyFile.Mode, privateKeyPath, "private-key");
+        if (string.IsNullOrWhiteSpace(privateKeyFile.Content))
         {
             throw new InvalidOperationException($"octoshift: private key file '{privateKeyPath}' was empty.");
         }
@@ -179,49 +156,12 @@ internal sealed class FileGitHubAppCredentialsSource : IGitHubAppCredentialsSour
         return new GitHubAppCredentials(
             dto.AppId.Value.ToString(CultureInfo.InvariantCulture),
             dto.InstallationId.Value,
-            privateKeyPem,
+            privateKeyFile.Content,
             new GitHubActorIdentity(dto.Actor));
     }
 
-    private static void EnsureReadableFile(string path, string label)
+    private static void EnsureRestrictedPermissions(UnixFileMode? mode, string path, string label)
     {
-        if (!File.Exists(path))
-        {
-            throw new InvalidOperationException($"octoshift: {label} file '{path}' does not exist.");
-        }
-
-        try
-        {
-            using FileStream _ = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            throw new InvalidOperationException($"octoshift: {label} file '{path}' is not readable.", ex);
-        }
-    }
-
-    private static UnixFileMode? TryGetUnixFileMode(string path)
-    {
-        if (OperatingSystem.IsWindows())
-        {
-            return null;
-        }
-
-        return File.GetUnixFileMode(path);
-    }
-
-    private void EnsureRestrictedPermissions(string path, string label)
-    {
-        UnixFileMode? mode;
-        try
-        {
-            mode = _getUnixFileMode(path);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
-        {
-            throw new InvalidOperationException($"octoshift: unable to read permissions for {label} file '{path}'.", ex);
-        }
-
         if (mode is null)
         {
             return;
@@ -267,6 +207,86 @@ internal sealed class FileGitHubAppCredentialsSource : IGitHubAppCredentialsSour
         string prefix = normalizedDirectory + Path.DirectorySeparatorChar;
         return normalizedPath.StartsWith(prefix, comparison);
     }
+}
+
+/// <summary>The mode and content read from one protected file handle.</summary>
+internal readonly record struct ProtectedFileData(UnixFileMode? Mode, string Content);
+
+/// <summary>
+/// Injectable seam that opens one protected file once and returns both its permissions and content.
+/// </summary>
+internal interface IProtectedFileReader
+{
+    /// <summary>Reads the file identified by <paramref name="path"/> with a single open handle.</summary>
+    ProtectedFileData Read(string path, string label);
+}
+
+/// <summary>
+/// Production protected-file reader: opens exactly once, checks Unix mode from that handle, then reads from it.
+/// </summary>
+internal sealed class OpenOnceProtectedFileReader : IProtectedFileReader
+{
+    public static OpenOnceProtectedFileReader Instance { get; } = new();
+
+    private OpenOnceProtectedFileReader()
+    {
+    }
+
+    public ProtectedFileData Read(string path, string label)
+    {
+        try
+        {
+            using var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            UnixFileMode? mode = ReadMode(stream, path, label);
+            string content = ReadContent(stream, path, label);
+            return new ProtectedFileData(mode, content);
+        }
+        catch (FileNotFoundException)
+        {
+            throw new InvalidOperationException($"octoshift: {label} file '{path}' does not exist.");
+        }
+        catch (DirectoryNotFoundException)
+        {
+            throw new InvalidOperationException($"octoshift: {label} file '{path}' does not exist.");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new InvalidOperationException($"octoshift: {label} file '{path}' is not readable.", ex);
+        }
+    }
+
+    private static UnixFileMode? ReadMode(FileStream stream, string path, string label)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return null;
+        }
+
+        try
+        {
+            return File.GetUnixFileMode(stream.SafeFileHandle);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            throw new InvalidOperationException($"octoshift: unable to read permissions for {label} file '{path}'.", ex);
+        }
+    }
+
+    private static string ReadContent(FileStream stream, string path, string label)
+    {
+        try
+        {
+            using var reader = new StreamReader(stream, detectEncodingFromByteOrderMarks: true);
+            return reader.ReadToEnd();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new InvalidOperationException($"octoshift: unable to read {ReadableLabel(label)} file '{path}'.", ex);
+        }
+    }
+
+    private static string ReadableLabel(string label)
+        => string.Equals(label, "private-key", StringComparison.Ordinal) ? "private key" : label;
 }
 
 internal sealed record GitHubAppCredentialFileDto
