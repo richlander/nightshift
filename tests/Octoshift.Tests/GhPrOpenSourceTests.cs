@@ -126,11 +126,39 @@ public class GhPrOpenSourceTests
     }
 
     [Fact]
+    public async Task OpenAsync_TransientRunnerFailure_ReturnsFailedWithoutThrowing()
+    {
+        var source = new GhPrOpenSource(
+            "owner/repo",
+            new GitHubActorIdentity("nightshift-bot[app]"),
+            (_, _) => throw new InvalidOperationException("token exchange failed"));
+
+        PrOpenOutcome outcome = await source.OpenAsync("/plan/2/order/op-a", "nightshift/2/op-a", TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrOpenOutcomeKind.Failed, outcome.Kind);
+    }
+
+    [Fact]
     public async Task CreatePrOpenSource_UnconfiguredIdentity_FailsClosed()
     {
         IPrOpenSource source = ReconcileCommand.CreatePrOpenSource(
             "owner/repo",
             new ThrowingCredentialsSource(),
+            NullPrOpenMetadataProvider.Instance,
+            NullPrOpenAuditSink.Instance,
+            out GitHubAppInstallationTokenProvider? tokenProvider);
+
+        Assert.Null(tokenProvider);
+        PrOpenOutcome outcome = await source.OpenAsync("/plan/2/order/op-a", "nightshift/2/op-a", TestContext.Current.CancellationToken);
+        Assert.Equal(PrOpenOutcomeKind.Unavailable, outcome.Kind);
+    }
+
+    [Fact]
+    public async Task CreatePrOpenSource_NonArgumentIdentityFailure_FailsClosed()
+    {
+        IPrOpenSource source = ReconcileCommand.CreatePrOpenSource(
+            "owner/repo",
+            new NotSupportedCredentialsSource(),
             NullPrOpenMetadataProvider.Instance,
             NullPrOpenAuditSink.Instance,
             out GitHubAppInstallationTokenProvider? tokenProvider);
@@ -168,5 +196,11 @@ public class GhPrOpenSourceTests
     {
         public GitHubAppCredentials Load()
             => throw new InvalidOperationException("set OCTOSHIFT_GITHUB_APP_CREDENTIALS_PATH to the GitHub App credentials file path.");
+    }
+
+    private sealed class NotSupportedCredentialsSource : IGitHubAppCredentialsSource
+    {
+        public GitHubAppCredentials Load()
+            => throw new NotSupportedException("path format unsupported");
     }
 }

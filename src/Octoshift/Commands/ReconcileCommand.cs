@@ -591,7 +591,7 @@ internal static class ReconcileCommand
             Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> runGhAsync = GhAuthenticatedRunner.Create(tokenProvider);
             return new GhPrOpenSource(repo, credentials.Actor, metadataProvider, auditSink, runGhAsync, () => DateTimeOffset.UtcNow);
         }
-        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return new DisabledPrOpenSource(ex.Message);
         }

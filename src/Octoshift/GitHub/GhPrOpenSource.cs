@@ -46,34 +46,42 @@ internal sealed class GhPrOpenSource : IPrOpenSource
 
     public async Task<PrOpenOutcome> OpenAsync(string orderBase, string headBranch, CancellationToken ct)
     {
-        PrOpenMetadata metadata = await _metadataProvider.GetMetadataAsync(orderBase, ct);
-        IReadOnlyList<string> args = BuildCreateArgs(headBranch, metadata);
-
-        GhResult gh = await _runGhAsync(args, ct);
-        if (gh.ExitCode != 0)
+        try
         {
-            if (LooksLikeAlreadyExists(gh.Stdout, gh.Stderr))
+            PrOpenMetadata metadata = await _metadataProvider.GetMetadataAsync(orderBase, ct);
+            IReadOnlyList<string> args = BuildCreateArgs(headBranch, metadata);
+
+            GhResult gh = await _runGhAsync(args, ct);
+            if (gh.ExitCode != 0)
             {
-                return new PrOpenOutcome(PrOpenOutcomeKind.AlreadyExists);
+                if (LooksLikeAlreadyExists(gh.Stdout, gh.Stderr))
+                {
+                    return new PrOpenOutcome(PrOpenOutcomeKind.AlreadyExists);
+                }
+
+                string detail = gh.Stderr.Trim();
+                Console.Error.WriteLine($"octoshift: gh pr create failed for {orderBase} ({headBranch}) (exit {gh.ExitCode}){(detail.Length > 0 ? $": {detail}" : string.Empty)}");
+                return new PrOpenOutcome(PrOpenOutcomeKind.Failed);
             }
 
-            string detail = gh.Stderr.Trim();
-            Console.Error.WriteLine($"octoshift: gh pr create failed for {orderBase} ({headBranch}) (exit {gh.ExitCode}){(detail.Length > 0 ? $": {detail}" : string.Empty)}");
-            return new PrOpenOutcome(PrOpenOutcomeKind.Failed);
-        }
+            int? prNumber = ParsePrNumber(gh.Stdout)
+                ?? await LookupPrNumberAsync(headBranch, ct);
+            if (prNumber is not { } number)
+            {
+                Console.Error.WriteLine($"octoshift: gh pr create succeeded for {orderBase} ({headBranch}) but PR number was not discoverable.");
+                return new PrOpenOutcome(PrOpenOutcomeKind.Failed);
+            }
 
-        int? prNumber = ParsePrNumber(gh.Stdout)
-            ?? await LookupPrNumberAsync(headBranch, ct);
-        if (prNumber is not { } number)
+            var auditRecord = new PrOpenedAuditRecord(_actor, orderBase, headBranch, number, _clock());
+            await _auditSink.RecordPrOpenedAsync(auditRecord, ct);
+
+            return new PrOpenOutcome(PrOpenOutcomeKind.Opened, number);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            Console.Error.WriteLine($"octoshift: gh pr create succeeded for {orderBase} ({headBranch}) but PR number was not discoverable.");
+            Console.Error.WriteLine($"octoshift: outbound PR open failed for {orderBase} ({headBranch}): {ex.Message}");
             return new PrOpenOutcome(PrOpenOutcomeKind.Failed);
         }
-
-        var auditRecord = new PrOpenedAuditRecord(_actor, orderBase, headBranch, number, _clock());
-        await _auditSink.RecordPrOpenedAsync(auditRecord, ct);
-
-        return new PrOpenOutcome(PrOpenOutcomeKind.Opened, number);
     }
 
     /// <summary>
