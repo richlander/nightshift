@@ -27,6 +27,7 @@ public class BoardStateTests
         Assert.False(board.IsLanded("/plan/2/order/op-b"));
         Assert.False(board.IsLanded("/plan/2/order/unknown"));
         Assert.True(board.HasOutstandingDone); // op-b is done
+        Assert.Equal(["/plan/2/order/op-b"], board.GetDoneOrderBases());
     }
 
     [Fact]

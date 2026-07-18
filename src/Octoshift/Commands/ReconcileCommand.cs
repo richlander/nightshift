@@ -5,14 +5,12 @@ using Octoshift.GitHub;
 using Octoshift.Polling;
 
 /// <summary>
-/// <c>octoshift reconcile</c> — the inbound merge→land membrane (design doc §4.1, §8). It reconciles
-/// GitHub's <b>merge</b> truth against Turnstile's <b>dispatch</b> truth: poll GitHub for merged nightshift
-/// PRs and, for each one whose order is not already landed, run <c>nightshift land &lt;base&gt;</c> — a pure
-/// Turnstile write that wakes the running <c>plan</c> controller, which promotes dependents. Octoshift links
-/// nothing: it reads the board via <c>nightshift where --output json</c> and lands via <c>nightshift land</c>,
-/// both as subprocesses, and it is the only gh-aware component. It never touches git or code. Long-running
-/// with a clean Ctrl-C exit (0); <c>--once</c> does a single sweep and exits (cron/testing). Poll cadence is
-/// adaptive (see <see cref="AdaptivePoller"/>).
+/// <c>octoshift reconcile</c> — the membrane controller (design doc §4, §5, §8): inbound merge→land plus
+/// outbound done→PR-open, conflict/CI→rework, and fan-out issue closing. Octoshift links nothing: it reads
+/// the board via <c>nightshift where --output json</c> and mutates coordination via subprocess calls, while
+/// GitHub reads/writes stay behind gh-backed interfaces. Long-running with a clean Ctrl-C exit (0);
+/// <c>--once</c> does one sweep and exits (cron/testing). Poll cadence is adaptive (see
+/// <see cref="AdaptivePoller"/>).
 /// </summary>
 internal static class ReconcileCommand
 {
@@ -43,28 +41,38 @@ internal static class ReconcileCommand
 
         var nightshift = new NightshiftCli(socket);
         var source = new GhMergedPrSource(scope);
+        var existingPrSource = new GhExistingOrderPrSource(scope);
         var openSource = new GhOpenPrSource(scope);
         var orderIssueSource = new GhOrderIssuePrSource(scope);
         var issueClient = new GhIssueClient(scope);
         var poller = new AdaptivePoller(tuning);
+        IPrOpenSource prOpenSource = CreatePrOpenSource(scope, out GitHubAppInstallationTokenProvider? tokenProvider);
 
-        if (once)
+        try
         {
-            int mergedCode = await RunOnceAsync(nightshift, source, ct);
-            try
+            if (once)
             {
-                await SweepReworkOnceAsync(nightshift, openSource, ct);
-                await SweepIssueCloseOnceAsync(orderIssueSource, issueClient, ct);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
+                int mergedCode = await RunOnceAsync(nightshift, source, ct);
+                try
+                {
+                    await SweepOpenPrOnceAsync(nightshift, existingPrSource, prOpenSource, ct);
+                    await SweepReworkOnceAsync(nightshift, openSource, ct);
+                    await SweepIssueCloseOnceAsync(orderIssueSource, issueClient, ct);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                }
+
+                return mergedCode;
             }
 
-            return mergedCode;
+            await RunLoopAsync(nightshift, source, existingPrSource, prOpenSource, openSource, orderIssueSource, issueClient, poller, tuning, ct);
+            return ExitCode.Ok;
         }
-
-        await RunLoopAsync(nightshift, source, openSource, orderIssueSource, issueClient, poller, tuning, ct);
-        return ExitCode.Ok;
+        finally
+        {
+            tokenProvider?.Dispose();
+        }
     }
 
     /// <summary>A single sweep: read the board, fetch all recent merges, land everything merged-but-unlanded.</summary>
@@ -89,6 +97,51 @@ internal static class ReconcileCommand
         IReadOnlyList<OpenPr> open = await source.FetchOpenAsync(ct);
         IReadOnlyList<ReworkAction> actions = ReworkDecision.Decide(open, board);
         await ApplyReworkAsync(nightshift, actions, new HashSet<int>(), ct);
+        return actions;
+    }
+
+    /// <summary>
+    /// A single outbound PR-open sweep (§5 remote-dev): read the board, compute done orders with no existing
+    /// OPEN/MERGED PR, and open each branch idempotently.
+    /// </summary>
+    internal static async Task<IReadOnlyList<OpenPrAction>> SweepOpenPrOnceAsync(
+        INightshiftClient nightshift,
+        IExistingOrderPrSource existingPrSource,
+        IPrOpenSource prOpenSource,
+        CancellationToken ct)
+    {
+        BoardState board = await nightshift.GetBoardAsync(ct);
+        ExistingOrderPrsSnapshot existing = await existingPrSource.FetchOpenOrMergedAsync(ct);
+        if (!existing.Success)
+        {
+            return [];
+        }
+
+        IReadOnlyList<OpenPrAction> actions = OpenPrDecision.Decide(board, existing.OpenOrMergedHeadBranches);
+        await ApplyPrOpenAsync(prOpenSource, actions, new HashSet<string>(StringComparer.Ordinal), ct);
+        return actions;
+    }
+
+    /// <summary>
+    /// Resident-loop outbound PR-open pass, deduped across polls via
+    /// <see cref="ReconcileState.OpenedOrders"/> so eventual-consistency windows cannot duplicate opens.
+    /// </summary>
+    internal static async Task<IReadOnlyList<OpenPrAction>> OpenPrPassAsync(
+        INightshiftClient nightshift,
+        IExistingOrderPrSource existingPrSource,
+        IPrOpenSource prOpenSource,
+        ReconcileState state,
+        CancellationToken ct)
+    {
+        BoardState board = await nightshift.GetBoardAsync(ct);
+        ExistingOrderPrsSnapshot existing = await existingPrSource.FetchOpenOrMergedAsync(ct);
+        if (!existing.Success)
+        {
+            return [];
+        }
+
+        IReadOnlyList<OpenPrAction> actions = OpenPrDecision.Decide(board, existing.OpenOrMergedHeadBranches);
+        await ApplyPrOpenAsync(prOpenSource, actions, state.OpenedOrders, ct);
         return actions;
     }
 
@@ -186,6 +239,8 @@ internal static class ReconcileCommand
     private static async Task RunLoopAsync(
         INightshiftClient nightshift,
         IMergedPrSource source,
+        IExistingOrderPrSource existingPrSource,
+        IPrOpenSource prOpenSource,
         IOpenPrSource openSource,
         IOrderIssuePrSource orderIssueSource,
         IIssueClient issueClient,
@@ -196,13 +251,14 @@ internal static class ReconcileCommand
         var state = new ReconcileState { IntervalSeconds = tuning.MinIntervalSeconds };
         string? lastMode = null;
 
-        Console.WriteLine("octoshift: reconciling merged PRs -> nightshift land, open PRs -> nightshift rework, fan-out issues -> close (Ctrl-C to stop)");
+        Console.WriteLine("octoshift: reconciling merged PRs -> nightshift land, done orders -> gh pr create, open PRs -> nightshift rework, fan-out issues -> close (Ctrl-C to stop)");
 
         try
         {
             while (!ct.IsCancellationRequested)
             {
                 PollerState pollerState = await PollOnceAsync(nightshift, source, state, poller, tuning, ct);
+                await OpenPrPassAsync(nightshift, existingPrSource, prOpenSource, state, ct);
                 await ReworkPassAsync(nightshift, openSource, state, ct);
                 await IssueClosePassAsync(orderIssueSource, issueClient, state, ct);
 
@@ -215,6 +271,37 @@ internal static class ReconcileCommand
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             Console.WriteLine("octoshift: stopped");
+        }
+    }
+
+    /// <summary>
+    /// Applies outbound PR-open actions and emits one additive token line on success:
+    /// <c>OPENED /plan/&lt;plan&gt;/order/&lt;order&gt; (PR #&lt;n&gt;)</c>.
+    /// </summary>
+    private static async Task ApplyPrOpenAsync(
+        IPrOpenSource prOpenSource,
+        IReadOnlyList<OpenPrAction> actions,
+        HashSet<string> openedOrders,
+        CancellationToken ct)
+    {
+        foreach (OpenPrAction action in actions)
+        {
+            if (openedOrders.Contains(action.OrderBase))
+            {
+                continue;
+            }
+
+            PrOpenOutcome outcome = await prOpenSource.OpenAsync(action.OrderBase, action.HeadBranch, ct);
+            switch (outcome.Kind)
+            {
+                case PrOpenOutcomeKind.Opened:
+                    Console.WriteLine($"OPENED {action.OrderBase} (PR #{outcome.PrNumber})");
+                    openedOrders.Add(action.OrderBase);
+                    break;
+                case PrOpenOutcomeKind.AlreadyExists:
+                    openedOrders.Add(action.OrderBase);
+                    break;
+            }
         }
     }
 
@@ -470,7 +557,43 @@ internal static class ReconcileCommand
         public List<MergedPr> RecentMerges { get; } = [];
         public HashSet<int> EscalatedPrs { get; } = [];
         public HashSet<int> HandledIssues { get; } = [];
+        public HashSet<string> OpenedOrders { get; } = new(StringComparer.Ordinal);
     }
 
     private sealed record ApplyResult(IReadOnlyList<LandAction> Actions, bool LandedSomething);
+
+    internal static IPrOpenSource CreatePrOpenSource(
+        string repo,
+        out GitHubAppInstallationTokenProvider? tokenProvider)
+        => CreatePrOpenSource(
+            repo,
+            new FileGitHubAppCredentialsSource(),
+            NullPrOpenMetadataProvider.Instance,
+            NullPrOpenAuditSink.Instance,
+            out tokenProvider);
+
+    internal static IPrOpenSource CreatePrOpenSource(
+        string repo,
+        IGitHubAppCredentialsSource credentialsSource,
+        IPrOpenMetadataProvider metadataProvider,
+        IPrOpenAuditSink auditSink,
+        out GitHubAppInstallationTokenProvider? tokenProvider)
+    {
+        ArgumentNullException.ThrowIfNull(credentialsSource);
+        ArgumentNullException.ThrowIfNull(metadataProvider);
+        ArgumentNullException.ThrowIfNull(auditSink);
+
+        tokenProvider = null;
+        try
+        {
+            GitHubAppCredentials credentials = credentialsSource.Load();
+            tokenProvider = new GitHubAppInstallationTokenProvider(credentials);
+            Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> runGhAsync = GhAuthenticatedRunner.Create(tokenProvider);
+            return new GhPrOpenSource(repo, credentials.Actor, metadataProvider, auditSink, runGhAsync, () => DateTimeOffset.UtcNow);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+        {
+            return new DisabledPrOpenSource(ex.Message);
+        }
+    }
 }
