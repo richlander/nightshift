@@ -28,9 +28,10 @@ internal static class FilteredWaitEngine
         DateTime? deadline,
         Func<CancellationToken, Task> keepAliveAsync,
         Func<WatchEdge, CancellationToken, Task<T?>> reconcileAsync,
+        Func<CancellationToken, Task<T?>> reconcileSnapshotAsync,
         CancellationToken ct) where T : class
     {
-        long revision = fromRevision;
+        var floors = scopes.ToDictionary(s => s.Name, _ => fromRevision, StringComparer.Ordinal);
         DateTime nextKeepAliveAt = DateTime.UtcNow.Add(KeepAliveCadence);
 
         while (true)
@@ -38,16 +39,27 @@ internal static class FilteredWaitEngine
             DateTime now = DateTime.UtcNow;
             if (deadline is { } d && now >= d)
             {
-                return WaitResult<T>.Timeout(revision);
+                return WaitResult<T>.Timeout(MaxFloor(floors));
             }
 
             TimeSpan budget = NextCommand.ComputeWaitBudget(now, deadline, nextKeepAliveAt);
-            ScopedWaitResult wake = await WaitForScopedSignalCoreAsync(scopes, currentRevision, revision, budget, ct);
-            revision = wake.Revision;
-
-            if (wake.Edge is { } edge && await reconcileAsync(edge, ct) is { } match)
+            ScopedWaitResult wake = await WaitForScopedSignalCoreAsync(scopes, floors, currentRevision, budget, ct);
+            if (wake.Scope is { } scope)
             {
-                return WaitResult<T>.Matched(revision, match);
+                floors[scope] = wake.Revision;
+            }
+
+            if (wake.Source == ScopedWakeSource.Signal
+                && wake.Edge is { } edge
+                && await reconcileAsync(edge, ct) is { } match)
+            {
+                return WaitResult<T>.Matched(MaxFloor(floors), match);
+            }
+
+            if (wake.Source == ScopedWakeSource.Compacted
+                && await reconcileSnapshotAsync(ct) is { } snapshotMatch)
+            {
+                return WaitResult<T>.Matched(MaxFloor(floors), snapshotMatch);
             }
 
             if (wake.Source != ScopedWakeSource.Timeout || DateTime.UtcNow >= nextKeepAliveAt)
@@ -60,8 +72,8 @@ internal static class FilteredWaitEngine
 
     internal static async Task<ScopedWaitResult> WaitForScopedSignalCoreAsync(
         IReadOnlyList<WatchScope> scopes,
+        IReadOnlyDictionary<string, long> floors,
         Func<CancellationToken, Task<long>> currentRevision,
-        long fromRevision,
         TimeSpan budget,
         CancellationToken ct)
     {
@@ -72,7 +84,7 @@ internal static class FilteredWaitEngine
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
         ScopedWatcher[] watchers = scopes
-            .Select(scope => new ScopedWatcher(scope.Name, WaitForPrefixChangeCoreAsync(scope.Watch, currentRevision, fromRevision, linked.Token)))
+            .Select(scope => new ScopedWatcher(scope.Name, WaitForPrefixChangeCoreAsync(scope.Watch, currentRevision, floors[scope.Name], linked.Token)))
             .ToArray();
 
         Task timeoutTask = budget == Timeout.InfiniteTimeSpan
@@ -84,15 +96,32 @@ internal static class FilteredWaitEngine
         {
             linked.Cancel();
             await ObserveCanceledWatchersAsync(watchers.Select(w => w.Task), ct);
-            return new ScopedWaitResult(fromRevision, ScopedWakeSource.Timeout, Edge: null);
+            return new ScopedWaitResult(MaxFloor(floors), ScopedWakeSource.Timeout, Scope: null, Edge: null);
         }
 
         int index = Array.FindIndex(watchers, w => ReferenceEquals(w.Task, winner));
         WatchOutcome outcome = await watchers[index].Task;
         linked.Cancel();
         await ObserveCanceledWatchersAsync(watchers.Select(w => w.Task), ct);
-        WatchEdge? edge = outcome.Signal is null ? null : new WatchEdge(watchers[index].Name, outcome.Signal);
-        return new ScopedWaitResult(outcome.Revision, ScopedWakeSource.Signal, edge);
+
+        return outcome.Kind switch
+        {
+            WatchOutcomeKind.Signal => new ScopedWaitResult(
+                outcome.Revision,
+                ScopedWakeSource.Signal,
+                watchers[index].Name,
+                new WatchEdge(watchers[index].Name, outcome.Signal!)),
+            WatchOutcomeKind.Compacted => new ScopedWaitResult(
+                outcome.Revision,
+                ScopedWakeSource.Compacted,
+                watchers[index].Name,
+                Edge: null),
+            _ => new ScopedWaitResult(
+                outcome.Revision,
+                ScopedWakeSource.None,
+                watchers[index].Name,
+                Edge: null),
+        };
     }
 
     private static async Task ObserveCanceledWatchersAsync(IEnumerable<Task<WatchOutcome>> tasks, CancellationToken ct)
@@ -117,26 +146,38 @@ internal static class FilteredWaitEngine
         {
             await foreach (WatchSignal signal in watch(fromRevision, ct))
             {
-                return new WatchOutcome(signal.Revision, signal);
+                return new WatchOutcome(signal.Revision, WatchOutcomeKind.Signal, signal);
             }
         }
         catch (WatchCompactedException)
         {
-            return new WatchOutcome(await currentRevision(ct), Signal: null);
+            return new WatchOutcome(await currentRevision(ct), WatchOutcomeKind.Compacted, Signal: null);
         }
 
-        return new WatchOutcome(fromRevision, Signal: null);
+        return new WatchOutcome(fromRevision, WatchOutcomeKind.None, Signal: null);
     }
 
-    internal sealed record ScopedWaitResult(long Revision, ScopedWakeSource Source, WatchEdge? Edge);
+    private static long MaxFloor(IReadOnlyDictionary<string, long> floors)
+        => floors.Count == 0 ? 0 : floors.Values.Max();
+
+    internal sealed record ScopedWaitResult(long Revision, ScopedWakeSource Source, string? Scope, WatchEdge? Edge);
 
     internal enum ScopedWakeSource
     {
         Timeout,
         Signal,
+        Compacted,
+        None,
     }
 
-    private sealed record WatchOutcome(long Revision, WatchSignal? Signal);
+    private sealed record WatchOutcome(long Revision, WatchOutcomeKind Kind, WatchSignal? Signal);
+
+    private enum WatchOutcomeKind
+    {
+        Signal,
+        Compacted,
+        None,
+    }
 
     private sealed record ScopedWatcher(string Name, Task<WatchOutcome> Task);
 }

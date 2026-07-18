@@ -18,6 +18,17 @@ internal static class CoordinateCommand
 
     private const string StateSuffix = "/state";
     private const string ClaimSuffix = "/claim";
+    private const string BranchSuffix = "/branch";
+
+    private static readonly HashSet<string> RequeueIneligibleStatuses =
+    [
+        "done",
+        "landed",
+        "blocked",
+        "escalated",
+        "refused",
+        "declined",
+    ];
 
     internal static TimeSpan KeepAliveCadence
     {
@@ -45,6 +56,8 @@ internal static class CoordinateCommand
 
         try
         {
+            // Blocking coordinate treats DRAINING as a transition signal (return when drain STARTS while
+            // parked), not as a standing startup terminal. --once includes standing draining by design.
             if (await TryReadTerminalSignalAsync(client, includeDraining: once, ct) is { } terminal)
             {
                 Console.WriteLine(terminal.Token);
@@ -54,15 +67,15 @@ internal static class CoordinateCommand
             CoordinateOutcome? outcome = await WaitForActionCoreAsync(
                 once,
                 timeoutSecs,
-                token => ProbeActionableStatesAsync(client, planPrefix, token),
+                token => ProbeActionableStatesAsync(client, planPrefix, readyPrefix, token),
                 client.CurrentRevisionAsync,
                 [
                     new FilteredWaitEngine.WatchScope("plan", (from, token) => client.WatchAsync(planPrefix, from, token)),
-                    new FilteredWaitEngine.WatchScope("ready", (from, token) => client.WatchAsync(readyPrefix, from, token)),
                     new FilteredWaitEngine.WatchScope("control", (from, token) => client.WatchAsync(ControlRoot, from, token)),
                 ],
                 token => KeepPresenceAliveAsync(client, token),
                 (edge, token) => predicate.TryMatchAsync(edge, client.GetAsync, token),
+                token => ProbeActionableStatesAsync(client, planPrefix, readyPrefix, token),
                 ct);
 
             if (outcome is null)
@@ -89,20 +102,18 @@ internal static class CoordinateCommand
         IReadOnlyList<FilteredWaitEngine.WatchScope> scopes,
         Func<CancellationToken, Task> keepAliveAsync,
         Func<FilteredWaitEngine.WatchEdge, CancellationToken, Task<CoordinateOutcome?>> reconcileAsync,
+        Func<CancellationToken, Task<CoordinateOutcome?>> reconcileSnapshotAsync,
         CancellationToken ct)
     {
-        if (await probeActionableAsync(ct) is { } existing)
-        {
-            return existing;
-        }
-
         if (once)
         {
-            return null;
+            return await probeActionableAsync(ct);
         }
 
-        DateTime? deadline = timeoutSecs is { } secs ? DateTime.UtcNow.AddSeconds(secs) : null;
+        // Capture the revision floor BEFORE waiting. In blocking mode coordinate is edge-triggered, so we
+        // do not probe standing states here; callers reconcile snapshots outside the wait loop.
         long fromRevision = await currentRevision(ct);
+        DateTime? deadline = timeoutSecs is { } secs ? DateTime.UtcNow.AddSeconds(secs) : null;
         FilteredWaitEngine.WaitResult<CoordinateOutcome> result = await FilteredWaitEngine.WaitForMatchAsync(
             scopes,
             currentRevision,
@@ -110,12 +121,17 @@ internal static class CoordinateCommand
             deadline,
             keepAliveAsync,
             reconcileAsync,
+            reconcileSnapshotAsync,
             ct);
 
         return result.TimedOut ? null : result.Match;
     }
 
-    private static async Task<CoordinateOutcome?> ProbeActionableStatesAsync(TurnstileClient client, string planPrefix, CancellationToken ct)
+    private static async Task<CoordinateOutcome?> ProbeActionableStatesAsync(
+        TurnstileClient client,
+        string planPrefix,
+        string readyPrefix,
+        CancellationToken ct)
     {
         foreach (KvItem item in await client.RangeAsync(planPrefix, ct))
         {
@@ -129,6 +145,33 @@ internal static class CoordinateCommand
             {
                 return outcome;
             }
+        }
+
+        foreach (KvItem ready in await client.RangeAsync(readyPrefix, ct))
+        {
+            string orderBase = ready.Text.Trim();
+            if (OrderRef.FromBase(orderBase) is not { } order)
+            {
+                continue;
+            }
+
+            if (await client.GetAsync(order.ClaimKey, ct) is not null)
+            {
+                continue;
+            }
+
+            if (await client.GetAsync($"{orderBase}{BranchSuffix}", ct) is null)
+            {
+                continue; // Never claimed: not a requeue.
+            }
+
+            string? status = StatusOf((await client.GetAsync($"{orderBase}{StateSuffix}", ct))?.Text);
+            if (status is not null && RequeueIneligibleStatuses.Contains(status))
+            {
+                continue;
+            }
+
+            return CoordinateOutcome.Action(orderBase, transition: "requeued", status: "ready");
         }
 
         return null;
@@ -187,18 +230,6 @@ internal static class CoordinateCommand
 
     internal sealed class CoordinatePredicate
     {
-        private static readonly HashSet<string> RequeueIneligibleStatuses =
-        [
-            "done",
-            "landed",
-            "blocked",
-            "escalated",
-            "refused",
-            "declined",
-        ];
-
-        private readonly HashSet<string> _pendingClaimDeletes = new(StringComparer.Ordinal);
-
         internal async Task<CoordinateOutcome?> TryMatchAsync(
             FilteredWaitEngine.WatchEdge edge,
             Func<string, CancellationToken, Task<KvItem?>> getAsync,
@@ -233,31 +264,17 @@ internal static class CoordinateCommand
                     string orderBase = edge.Signal.Key[..^ClaimSuffix.Length];
                     if (!edge.Signal.Deleted)
                     {
-                        _pendingClaimDeletes.Remove(orderBase);
                         return null;
                     }
 
-                    _pendingClaimDeletes.Add(orderBase);
-                    return await TryBuildRequeueOutcomeAsync(orderBase, getAsync, ct);
+                    return await TryBuildRequeueFromClaimDeleteAsync(orderBase, getAsync, ct);
                 }
-            }
-
-            if (edge.Scope == "ready" && !edge.Signal.Deleted)
-            {
-                KvItem? ready = await getAsync(edge.Signal.Key, ct);
-                string orderBase = ready?.Text.Trim() ?? string.Empty;
-                if (OrderRef.FromBase(orderBase) is null || !_pendingClaimDeletes.Contains(orderBase))
-                {
-                    return null;
-                }
-
-                return await TryBuildRequeueOutcomeAsync(orderBase, getAsync, ct);
             }
 
             return null;
         }
 
-        private async Task<CoordinateOutcome?> TryBuildRequeueOutcomeAsync(
+        private static async Task<CoordinateOutcome?> TryBuildRequeueFromClaimDeleteAsync(
             string orderBase,
             Func<string, CancellationToken, Task<KvItem?>> getAsync,
             CancellationToken ct)
@@ -267,24 +284,17 @@ internal static class CoordinateCommand
                 return null;
             }
 
-            if (await getAsync(order.ReadyKey, ct) is null)
-            {
-                return null;
-            }
-
             if (await getAsync(order.ClaimKey, ct) is not null)
             {
                 return null;
             }
 
-            string? status = StatusOf((await getAsync($"{orderBase}/state", ct))?.Text);
+            string? status = StatusOf((await getAsync($"{orderBase}{StateSuffix}", ct))?.Text);
             if (status is not null && RequeueIneligibleStatuses.Contains(status))
             {
-                _pendingClaimDeletes.Remove(orderBase);
                 return null;
             }
 
-            _pendingClaimDeletes.Remove(orderBase);
             return CoordinateOutcome.Action(orderBase, transition: "requeued", status: "ready");
         }
     }

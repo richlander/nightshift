@@ -379,6 +379,10 @@ Control signals remain first-line tokens too (`HALT`, `DRAINING`). On timeout/em
 NOCOORD
 ```
 
+Blocking `coordinate` is edge-triggered: it wakes on new transitions, not by replaying standing states
+you already acted on. Keep reconciling the board as you loop (`nightshift where`) and use `--once` only
+when you intentionally want a standing-state probe.
+
 Act on each wake:
 
 - an order reaches **`done`** → push its branch, open/update the PR, post the clearance note (§4);
@@ -397,7 +401,7 @@ worktree whose identity is absent from the roster (and whose branch has no unlan
 is stale. Never remove a live worker's worktree.
 
 You are finished watching only when every order is `landed` (or the shift is drained/stopped, §7).
-while any order is `done`-awaiting-push, merged-awaiting-land, escalated, or in flight, the loop is
+While any order is `done`-awaiting-push, merged-awaiting-land, escalated, or in flight, the loop is
 still yours to pump — going quiet with unlanded work is the stall, not a rest state. Workers drain the
 ready set and clock out; **you** carry every finished order the rest of the way to `landed`.
 

@@ -360,6 +360,9 @@ All three share one contract:
 2. **Return one token + minimal payload.** The first line stays machine-legible and includes enough payload (plan, order base, transition/new status) for immediate action without a second query.
 3. **One-shot semantics.** The verb returns on the first actionable match; callers re-invoke to re-arm.
 4. **Presence heartbeat while parked.** While blocked, the role renews presence on cadence so liveness remains externally observable.
+5. **Blocking mode is edge-triggered.** Standing states are surfaced by explicit board reconcile (or a deliberate `--once` probe), not replayed on every blocking re-arm.
+
+For the coordinator, `DRAINING` is a transition signal: blocking `coordinate` returns it when drain begins while parked, but a pre-existing draining flag does not short-circuit startup (drain still requires coordinating land/escalation completion).
 
 This also resolves the `plan` name collision: the wait **absorbs** the existing plan-controller reconcile loop. `plan` already watches and reconciles; adding planner-actionable projection to that same loop is the natural extension.
 
