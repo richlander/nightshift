@@ -49,6 +49,46 @@ internal sealed class FakeOpenPrSource : IOpenPrSource
     }
 }
 
+/// <summary>A canned <see cref="IExistingOrderPrSource"/> returning fixed branch snapshots.</summary>
+internal sealed class FakeExistingOrderPrSource : IExistingOrderPrSource
+{
+    private readonly Queue<ExistingOrderPrsSnapshot> _snapshots;
+
+    public FakeExistingOrderPrSource(params ExistingOrderPrsSnapshot[] snapshots)
+        => _snapshots = new Queue<ExistingOrderPrsSnapshot>(snapshots);
+
+    public int FetchCount { get; private set; }
+
+    public Task<ExistingOrderPrsSnapshot> FetchOpenOrMergedAsync(CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        FetchCount++;
+        return Task.FromResult(_snapshots.Count > 1
+            ? _snapshots.Dequeue()
+            : _snapshots.Count == 1
+                ? _snapshots.Peek()
+                : new ExistingOrderPrsSnapshot(Success: true, OpenOrMergedHeadBranches: new HashSet<string>(StringComparer.Ordinal)));
+    }
+}
+
+/// <summary>A recording <see cref="IPrOpenSource"/> fake with programmable outcomes.</summary>
+internal sealed class FakePrOpenSource : IPrOpenSource
+{
+    private readonly Queue<PrOpenOutcome> _outcomes;
+
+    public FakePrOpenSource(params PrOpenOutcome[] outcomes)
+        => _outcomes = new Queue<PrOpenOutcome>(outcomes);
+
+    public List<(string OrderBase, string HeadBranch)> Opens { get; } = [];
+
+    public Task<PrOpenOutcome> OpenAsync(string orderBase, string headBranch, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        Opens.Add((orderBase, headBranch));
+        return Task.FromResult(_outcomes.Count > 0 ? _outcomes.Dequeue() : new PrOpenOutcome(PrOpenOutcomeKind.Opened, 1));
+    }
+}
+
 /// <summary>A recording <see cref="INightshiftClient"/> fake: a fixed board plus a log of land calls.</summary>
 internal sealed class FakeNightshiftClient : INightshiftClient
 {

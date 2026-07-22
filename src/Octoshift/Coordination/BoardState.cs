@@ -72,6 +72,24 @@ internal sealed class BoardState
     /// True when some order is at <c>done</c> (a worker submitted a PR, awaiting merge): this only tightens poll cadence.
     /// </summary>
     public bool HasOutstandingDone => _statuses.Values.Any(status => status == DoneStatus);
+
+    /// <summary>
+    /// The order bases currently at <c>done</c>, sorted ordinally for deterministic routing.
+    /// </summary>
+    public IReadOnlyList<string> GetDoneOrderBases()
+    {
+        var done = new List<string>();
+        foreach ((string orderBase, string status) in _statuses)
+        {
+            if (status == DoneStatus)
+            {
+                done.Add(orderBase);
+            }
+        }
+
+        done.Sort(StringComparer.Ordinal);
+        return done;
+    }
 }
 
 /// <summary>One row of the <c>where</c> board: the order base, its status, and its branch (snake_case JSON).</summary>
