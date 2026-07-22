@@ -359,22 +359,31 @@ Orders with `state.status == escalated` need your judgment — see §5.
 ### Run continuously — the coordinator is a loop, not a glance
 
 `nightshift where` is a snapshot; the shift needs you to keep *acting* on it. Do not fall into
-"monitor mode" and go idle — block on the stream so board changes wake you, the same way a worker
-blocks on `next`:
+"monitor mode" and go idle — block on the coordinator wait verb so actionable changes wake you, the
+same way a worker blocks on `next`:
 
 ```
-nightshift watch            # redraw the board on every change until Ctrl-C (table mode)
+nightshift coordinate
 ```
 
-**`watch` is an edge trigger, not a status feed — this distinction is what keeps the loop honest.**
-Unlike a worker's `next`/`check`, which *return the actionable token itself* (`WORK`, `QUERY`, …),
-`watch --output Jsonl` emits one row per change carrying only `{"revision":…,"key":…,"op":"put|delete"}`
-— **never the status value.** A `done` transition writes `.../state`, so the row you see is
-`{"key":".../octoshift-issue-close/state","op":"put"}`; the word `done` is in the *value*, which the
-stream does not carry. So you cannot wait *on* `done` by grepping the stream for it — that never fires
-(the bug that leaves finished orders sitting unpushed). The stream tells you *that* something changed;
-**you then reconcile** — read `nightshift where` (or `turnstile get .../state`) to see *what* changed —
-and act:
+`coordinate` is one-shot: it returns on the **first** coordinator-actionable event, so you act and
+re-invoke to re-arm. The first line is the machine signal:
+
+```
+COORD plan=/plan/<id> order=/plan/<id>/order/<op> transition=<done|landed|escalated|requeued> status=<...>
+```
+
+Control signals remain first-line tokens too (`HALT`, `DRAINING`). On timeout/empty one-shot probes:
+
+```
+NOCOORD
+```
+
+Blocking `coordinate` is edge-triggered: it wakes on new transitions, not by replaying standing states
+you already acted on. Keep reconciling the board as you loop (`nightshift where`) and use `--once` only
+when you intentionally want a standing-state probe.
+
+Act on each wake:
 
 - an order reaches **`done`** → push its branch, open/update the PR, post the clearance note (§4);
 - a PR **merges** → `nightshift land` it, opening its dependents;
@@ -396,32 +405,24 @@ While any order is `done`-awaiting-push, merged-awaiting-land, escalated, or in 
 still yours to pump — going quiet with unlanded work is the stall, not a rest state. Workers drain the
 ready set and clock out; **you** carry every finished order the rest of the way to `landed`.
 
-### Waiting on `watch` — background it, don't stall or poll
+### Waiting on `coordinate` — background it, don't stall or poll
 
-`nightshift watch` blocks; its *return* is the signal. Don't end a turn "still watching" with
-nothing running to wake you (the classic coordinator stall), and don't poll — background the wait
-if your session can go idle, or block in-turn if you're headless. See **Waiting without stalling**
-in [`AGENTS.md`](../../../AGENTS.md) for the full technique.
+`nightshift coordinate` blocks; its *return* is the signal. Don't end a turn with a bare "still
+waiting" (nothing running to wake you), and don't poll. Run the blocking wait in background if your
+session can go idle, or block in-turn if you're headless. See **Waiting without stalling** in
+[`AGENTS.md`](../../../AGENTS.md) for the full technique.
 
-Bound the wait on a **key path**, not a status word — the stream carries keys, not statuses (above).
-Wake on the first order-state change, then reconcile and act:
+Re-arm immediately after every actionable return:
 
 ```
-# wakes on the first /state transition of ANY order, then returns:
-nightshift watch --output Jsonl | grep -m1 '/order/[^/]*/state'
-nightshift where            # reconcile: which order is now done / escalated / mergeable? act on it (§4/§5)
+nightshift coordinate
+# COORD plan=/plan/9001 order=/plan/9001/order/op4 transition=done status=done
+# ...act (push/open PR, land, judge escalation, etc)...
+nightshift coordinate
 ```
 
-You wake on *every* state write this way — a fresh `claimed`, a `changes-requested`, a `landed` — not
-just the ones you act on; that is correct for an edge trigger. Re-read the board each wake, act on what
-is actionable, and re-arm. **This edge-trigger-then-reconcile dance is a stopgap, not the intended
-interface** — the real fix is a role-scoped filtered wait (a coordinator's own `next` that blocks and
-returns *only* your actionable events — `done` / `escalated` / mergeable — with the order and transition
-in the payload, so you never grep a valueless stream). That command is tracked as
-[issue #76](https://github.com/richlander/nightshift/issues/76); until it lands, use the recipe above.
-
-One gap is yours to cover: Nightshift is not GitHub-aware, so a `watch` wake surfaces **worker**
-transitions (`done` / `escalated`) once you reconcile, but a **merge** only becomes visible once
+One gap is yours to cover: Nightshift is not GitHub-aware, so `coordinate` surfaces Nightshift-side
+transitions (`done` / `escalated` / `landed` / `requeued`), but a **merge** only becomes visible once
 Octoshift turns a merged PR into a `land` (a `landed` transition). Until Octoshift is wired in, background
 a second waiter that polls `gh` for the merges of the PRs you have cleared, so a merge wakes you to
 `land` too.

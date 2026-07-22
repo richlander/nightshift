@@ -346,6 +346,26 @@ nightshift refusals            per-glob content-filter map
 
 `drain` and `stop` are two genuinely different behaviors and two plain words. There is no third.
 
+### Role waits are first-class verbs
+
+Each role's core loop verb is its **filtered blocking wait**:
+
+- `work` (worker) waits for a claimable order, control signals, fence loss, or directive answers.
+- `coordinate` (coordinator) waits for coordinator-actionable transitions: `done`, `landed`, `escalated`, or worker-death requeue.
+- `plan` (planner) waits for planner-actionable shaping work.
+
+All three share one contract:
+
+1. **Wake on raw edge, reconcile internally.** Turnstile watch is key+op+revision only. The verb wakes on a scoped edge, reads the relevant key values, applies the role predicate, and returns **only** on a predicate match. Non-matching edges re-arm internally.
+2. **Return one token + minimal payload.** The first line stays machine-legible and includes enough payload (plan, order base, transition/new status) for immediate action without a second query.
+3. **One-shot semantics.** The verb returns on the first actionable match; callers re-invoke to re-arm.
+4. **Presence heartbeat while parked.** While blocked, the role renews presence on cadence so liveness remains externally observable.
+5. **Blocking mode is edge-triggered.** Standing states are surfaced by explicit board reconcile (or a deliberate `--once` probe), not replayed on every blocking re-arm.
+
+For the coordinator, `DRAINING` is a transition signal: blocking `coordinate` returns it when drain begins while parked, but a pre-existing draining flag does not short-circuit startup (drain still requires coordinating land/escalation completion).
+
+This also resolves the `plan` name collision: the wait **absorbs** the existing plan-controller reconcile loop. `plan` already watches and reconciles; adding planner-actionable projection to that same loop is the natural extension.
+
 ### The lease belongs to the process, not the model
 
 An LLM has no durable state. It ceases and resumes; it resets, compacts, forgets. **Any design where the model must remember a token is broken by construction** — it is the phantom wait wearing a different hat.

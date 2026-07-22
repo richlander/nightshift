@@ -197,6 +197,15 @@ public sealed class DispatchTests : IClassFixture<TurnstileFixture>
         Assert.Empty(result.Errors);
     }
 
+    [Fact]
+    public void CoordinateVerb_ParsesScopeOnceAndTimeout()
+    {
+        var result = Cli.CreateRootCommand().Parse(
+            ["coordinate", "1234", "--once", "--timeout", "5"]);
+
+        Assert.Empty(result.Errors);
+    }
+
     private static Task<InvocationResult> InvokeAsync(params string[] args)
         => InvokeAsync(socket: null, args);
 

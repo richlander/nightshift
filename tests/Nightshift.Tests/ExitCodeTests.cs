@@ -12,7 +12,8 @@ public class ExitCodeTests
         int[] codes =
         [
             ExitCode.Ok, ExitCode.Usage, ExitCode.NoClaim, ExitCode.NoWork,
-            ExitCode.Draining, ExitCode.Query, ExitCode.Halt, ExitCode.FenceStale, ExitCode.Interrupted,
+            ExitCode.Draining, ExitCode.Query, ExitCode.Halt, ExitCode.FenceStale,
+            ExitCode.Coordinate, ExitCode.NoCoordinate, ExitCode.Interrupted,
         ];
 
         Assert.Equal(codes.Length, codes.Distinct().Count());
@@ -26,6 +27,8 @@ public class ExitCodeTests
         Assert.Equal(12, ExitCode.Query);
         Assert.Equal(13, ExitCode.Halt);
         Assert.Equal(14, ExitCode.FenceStale);
+        Assert.Equal(20, ExitCode.Coordinate);
+        Assert.Equal(21, ExitCode.NoCoordinate);
         Assert.Equal(130, ExitCode.Interrupted);
     }
 }
