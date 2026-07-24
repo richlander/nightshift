@@ -1,0 +1,8 @@
+{
+  "name": "nightshift",
+  "bundle": [
+    { "project": "src/nightshift/nightshift.csproj" },
+    { "project": "src/Turnstile/Turnstile.csproj" },
+    { "project": "src/Octoshift/Octoshift.csproj" }
+  ]
+}
