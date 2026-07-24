@@ -6,7 +6,6 @@
     <RootNamespace>Octoshift</RootNamespace>
     <ToolCommandName>octoshift</ToolCommandName>
     <PublishAot>true</PublishAot>
-    <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
 
   <ItemGroup>

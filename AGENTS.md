@@ -88,9 +88,10 @@ then your role's skill (above). Reference the rest by topic:
   `InvariantGlobalization`, and **`TreatWarningsAsErrors`** (see
   `Directory.Build.props`). A warning is a build break — fix it, don't suppress
   it blindly.
-- Product paths must stay **NativeAOT-friendly**. `nightshift` sets
-  `PublishAot=true` in its csproj so it is published AOT; `Octoshift` sets
-  `PublishAot=true` too. Both
+- Product paths must stay **NativeAOT-friendly**. Every product tool —
+  `nightshift`, `turnstile`, `octoshift`, and `nightsky` — sets `PublishAot=true`
+  in its csproj so it is published AOT (which implies `IsAotCompatible`, so the
+  apps don't set that too). Both
   `System.CommandLine` and `Markout` are AOT-safe; don't introduce
   reflection-heavy or trim-unsafe dependencies on product paths.
 - **The CLI contract is load-bearing. Preserve it.** Agent shell loops depend on
