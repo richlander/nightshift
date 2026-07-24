@@ -22,6 +22,7 @@ public sealed class SkillCommandTests
     }
 
     [Theory]
+    [InlineData("planner", "# Nightshift coordinator")]
     [InlineData("worker", "# Nightshift worker")]
     [InlineData("coordinator", "# Nightshift coordinator")]
     [InlineData("builder", "# Nightshift builder")]
@@ -56,7 +57,7 @@ public sealed class SkillCommandTests
         Assert.Equal(ExitCode.Usage, result.ExitCode);
         Assert.Empty(result.Stdout);
         Assert.Contains("unknown role 'bogus'", result.Stderr, StringComparison.Ordinal);
-        Assert.Contains("worker, coordinator, builder, reviewer", result.Stderr, StringComparison.Ordinal);
+        Assert.Contains("planner, coordinator, worker, builder, reviewer", result.Stderr, StringComparison.Ordinal);
     }
 
     [Theory]

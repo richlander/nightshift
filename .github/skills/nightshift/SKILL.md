@@ -11,20 +11,22 @@ description: >-
 
 # Nightshift
 
-Nightshift drives many units of work to completion in parallel without anyone
-spending attention on mechanics. Work is built and reviewed to a clean bar on a
-**night shift**, while direction-setting and the merge decision stay deliberate
-acts on the **day shift**. It is a **loose harness**: it sits above many coding-agent
-harnesses and coordinates them through shared state — leases, orders, directives —
-never their inner loops. **Loosely overlaid; strictly gated.**
+Nightshift drives many units of work to completion in parallel by shifting the
+mechanical oversight onto the night-shift coordinator — so the people who set
+direction don't spend their attention on it. Work is built and reviewed to a clean
+bar on a **night shift**, while direction-setting and the merge decision stay
+deliberate acts on the **day shift**. It is a **loose harness**: it sits above many
+coding-agent harnesses and coordinates them through shared state — leases, orders,
+directives — never their inner loops. **Loosely overlaid; strictly gated.**
 
 You are reading the orientation. When you know your role, get its operating skill:
 
 ```bash
-nightshift skill <role>   # worker | coordinator | builder | reviewer
+nightshift skill <role>   # planner | coordinator | worker | builder | reviewer
 ```
 
-Run `nightshift skill` with no argument to reprint this orientation.
+Run `nightshift skill` with no argument to reprint this orientation. (`planner` and
+`coordinator` share one skill; a Planner is a Coordinator scoped to registering work.)
 
 ## The three layers
 
@@ -54,7 +56,7 @@ one session can fill several. Most sessions on a machine are workers.
 | Role | Owns | Skill |
 |---|---|---|
 | **Product Manager** | The expanding shape of the product: new issues, taste, where features must be re-shaped or composed. Sets direction. | — |
-| **Planner** | Turns intent (often issues) into orders and registers them with nightshift. | `nightshift skill coordinator` |
+| **Planner** | Turns intent (often issues) into orders and registers them with nightshift. | `nightshift skill planner` |
 | **Coordinator** | Runs the shift: registers plans, keeps the ready set live, owns the GitHub surface (push, PRs, the one clearance note), first-level escalation, lands merged orders. | `nightshift skill coordinator` |
 | **Worker** | Claims one order and takes it to a reviewed branch (handed back for the coordinator to push) — building it *and* reviewing it, usually via subagents. | `nightshift skill worker` |
 | **PR Lander** | Holds merge authority; keeps sequenced PRs flowing. | — |
@@ -110,7 +112,7 @@ stalling or polling.
 
 ## Where to go next
 
-- Your role's operating skill: `nightshift skill worker` (or `coordinator`,
-  `builder`, `reviewer`).
+- Your role's operating skill: `nightshift skill worker` (or `planner`,
+  `coordinator`, `builder`, `reviewer`).
 - Design docs live under `docs/design/` — `nightshift-vision.md`, `nightshift-spec.md`,
   `workflow.md`, `turnstile.md`, `octoshift.md`.

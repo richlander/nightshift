@@ -5,7 +5,8 @@
 Three things to hold at once — they are easy to conflate because all three are true here:
 
 - **(A) What Nightshift is.** Nightshift is a coordination system that drives many units of work to
-  completion in parallel without anyone spending attention on mechanics. Work happens on a **night
+  completion in parallel by shifting the mechanical oversight onto the night-shift coordinator, so the
+  people setting direction don't have to spend attention on it. Work happens on a **night
   shift** — orders built and reviewed to a clean bar — while direction-setting and the merge decision
   stay deliberate acts on the **day shift**.
 - **(B) What you are.** You are an agent contributing features **to** Nightshift — this repository is

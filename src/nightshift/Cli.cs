@@ -302,7 +302,7 @@ public static class Cli
         var command = new Command("skill", "Print a packaged Nightshift skill: the general orientation, or a role's operating skill.");
         var role = new Argument<string?>("role")
         {
-            Description = "Role skill to print: worker, coordinator, builder, or reviewer. Omit for the general orientation.",
+            Description = "Role skill to print: planner, coordinator, worker, builder, or reviewer. Omit for the general orientation.",
             Arity = ArgumentArity.ZeroOrOne,
         };
 

@@ -22,14 +22,16 @@ internal static class SkillCommand
     private static readonly IReadOnlyDictionary<string, string> Skills = new Dictionary<string, string>(StringComparer.Ordinal)
     {
         [GeneralKey] = "nightshift.skill.nightshift.md",
-        ["worker"] = "nightshift.skill.worker.md",
+        // A Planner is a Coordinator scoped to registering work, so it shares the coordinator skill.
+        ["planner"] = "nightshift.skill.coordinator.md",
         ["coordinator"] = "nightshift.skill.coordinator.md",
+        ["worker"] = "nightshift.skill.worker.md",
         ["builder"] = "nightshift.skill.builder.md",
         ["reviewer"] = "nightshift.skill.reviewer.md",
     };
 
     /// <summary>The role skills a caller can request by name (the general orientation is the no-arg default).</summary>
-    internal static readonly IReadOnlyList<string> Roles = ["worker", "coordinator", "builder", "reviewer"];
+    internal static readonly IReadOnlyList<string> Roles = ["planner", "coordinator", "worker", "builder", "reviewer"];
 
     public static Task<int> RunAsync(string? role)
     {
