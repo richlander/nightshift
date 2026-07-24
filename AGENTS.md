@@ -62,6 +62,11 @@ responsibilities each have their own skill the worker points a subagent at:
 - **Builder** — build one order into commits on its branch: `.github/skills/nightshift-builder/SKILL.md`
 - **Reviewer** — review one order's diff read-only and report inward: `.github/skills/nightshift-reviewer/SKILL.md`
 
+The `nightshift` tool also packages these skills: `nightshift skill` prints the
+general orientation (roles and how they fit together), and `nightshift skill
+<role>` (`worker`, `coordinator`, `builder`, `reviewer`) prints that role's skill
+— the same bytes as the files above, served from the binary.
+
 ## Where to read more
 
 New here? Read `docs/design/nightshift-vision.md`, then `docs/design/nightshift-spec.md`,

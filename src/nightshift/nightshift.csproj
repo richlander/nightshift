@@ -15,6 +15,20 @@
   </ItemGroup>
 
   <!--
+    Package the role skills into the tool so `nightshift skill [role]` serves them from
+    the binary itself (the same bytes the marketplace ships). The .github/skills SKILL.md
+    files are the single source of truth; they are embedded here under stable logical
+    names that SkillCommand resolves. Keep this list in sync with SkillCommand.Skills.
+  -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\.github\skills\nightshift\SKILL.md" LogicalName="nightshift.skill.nightshift.md" />
+    <EmbeddedResource Include="..\..\.github\skills\nightshift-worker\SKILL.md" LogicalName="nightshift.skill.worker.md" />
+    <EmbeddedResource Include="..\..\.github\skills\nightshift-coordinator\SKILL.md" LogicalName="nightshift.skill.coordinator.md" />
+    <EmbeddedResource Include="..\..\.github\skills\nightshift-builder\SKILL.md" LogicalName="nightshift.skill.builder.md" />
+    <EmbeddedResource Include="..\..\.github\skills\nightshift-reviewer\SKILL.md" LogicalName="nightshift.skill.reviewer.md" />
+  </ItemGroup>
+
+  <!--
     Nightshift depends on Turnstile only through its WIRE PROTOCOL (HTTP/JSON/SSE over the socket),
     never the Turnstile assembly. This is deliberate: it keeps controllers language-agnostic,
     process/credential-isolated, and cross-machine capable. There is intentionally no ProjectReference.
