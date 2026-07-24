@@ -83,8 +83,8 @@ then your role's skill (above). Reference the rest by topic:
   `Directory.Build.props`). A warning is a build break — fix it, don't suppress
   it blindly.
 - Product paths must stay **NativeAOT-friendly**. `nightshift` sets
-  `IsAotCompatible=true` (analyzer-enforced) and is published AOT with
-  `-p:PublishAot=true`; `Octoshift` sets `PublishAot=true` in its csproj. Both
+  `PublishAot=true` in its csproj so it is published AOT; `Octoshift` sets
+  `PublishAot=true` too. Both
   `System.CommandLine` and `Markout` are AOT-safe; don't introduce
   reflection-heavy or trim-unsafe dependencies on product paths.
 - **The CLI contract is load-bearing. Preserve it.** Agent shell loops depend on
