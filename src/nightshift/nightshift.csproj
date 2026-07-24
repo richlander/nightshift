@@ -5,7 +5,7 @@
     <AssemblyName>nightshift</AssemblyName>
     <RootNamespace>Nightshift</RootNamespace>
     <ToolCommandName>nightshift</ToolCommandName>
-    <IsAotCompatible>true</IsAotCompatible>
+    <PublishAot>true</PublishAot>
   </PropertyGroup>
 
   <ItemGroup>
