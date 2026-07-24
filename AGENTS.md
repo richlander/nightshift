@@ -5,7 +5,8 @@
 Three things to hold at once — they are easy to conflate because all three are true here:
 
 - **(A) What Nightshift is.** Nightshift is a coordination system that drives many units of work to
-  completion in parallel without anyone spending attention on mechanics. Work happens on a **night
+  completion in parallel by shifting the mechanical oversight onto the night-shift coordinator, so the
+  people setting direction don't have to spend attention on it. Work happens on a **night
   shift** — orders built and reviewed to a clean bar — while direction-setting and the merge decision
   stay deliberate acts on the **day shift**.
 - **(B) What you are.** You are an agent contributing features **to** Nightshift — this repository is
@@ -61,6 +62,11 @@ responsibilities each have their own skill the worker points a subagent at:
 
 - **Builder** — build one order into commits on its branch: `.github/skills/nightshift-builder/SKILL.md`
 - **Reviewer** — review one order's diff read-only and report inward: `.github/skills/nightshift-reviewer/SKILL.md`
+
+The `nightshift` tool also packages these skills: `nightshift skill` prints the
+general orientation (roles and how they fit together), and `nightshift skill
+<role>` (`worker`, `coordinator`, `builder`, `reviewer`) prints that role's skill
+— the same bytes as the files above, served from the binary.
 
 ## Where to read more
 
