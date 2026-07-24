@@ -6,7 +6,6 @@
     <RootNamespace>Nightsky</RootNamespace>
     <ToolCommandName>nightsky</ToolCommandName>
     <PublishAot>true</PublishAot>
-    <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
 
   <ItemGroup>

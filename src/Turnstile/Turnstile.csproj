@@ -5,7 +5,7 @@
     <AssemblyName>turnstile</AssemblyName>
     <RootNamespace>Turnstile</RootNamespace>
     <ToolCommandName>turnstile</ToolCommandName>
-    <IsAotCompatible>true</IsAotCompatible>
+    <PublishAot>true</PublishAot>
     <EnableRequestDelegateGenerator>true</EnableRequestDelegateGenerator>
   </PropertyGroup>
 
