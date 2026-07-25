@@ -117,9 +117,10 @@ export TURNSTILE_SOCKET=~/.turnstile/turnstile.sock
 
 ## 2. Author the plan — `orders.json`
 
-Work out the design first — the Product Manager shapes it, the Planner turns it into orders — and
-commit it (the `standard` notes and the plan file live in the repo; that commit is the authorization
-root). Then write the plan:
+Work out the design first — the Product Manager shapes it, the Planner turns it into orders. The
+`standard` notes live in `main` like any design doc, but **the plan file itself is coordination data,
+not mainline code — it lives on the orphan order-ledger branch, not `main`** (see *Where the plan
+lives* below; that ledger commit is the authorization root). Then write the plan:
 
 > **Map issues by the charter, not by assumption.** How issues become orders — which are in scope, how
 > finely to slice, how `paths` stay disjoint, how `after` edges are inferred — is repository policy, not
@@ -135,6 +136,32 @@ root). Then write the plan:
 > When an issue is **not design-ready, do not plan it.** Post on the issue naming the specific design
 > it still needs (the decisions to make, the `standard` to write), and leave it for the product manager
 > to shape. Only well-formed issues become orders.
+
+### Where the plan lives — the orphan order-ledger branch
+
+The order domain is **not** mainline code, so the plan does **not** go on `main` and does **not** go
+through the code-review gate. It lives in a git **ledger**: a single **orphan branch**
+(`nightshift-orders` — a parallel root with no shared history with `main`) holding a directory per
+plan, `orders/<plan>/orders.json`. Committing the plan there is **registration**, and that ledger
+commit is the **authorization root** the shift anchors to. Design:
+[`docs/design/octoshift.md`](../../../docs/design/octoshift.md) §3 (start with one branch; shard by
+plan only if it gets hot).
+
+Author it in a **separate worktree** so the checkout you run the shift from is never disturbed:
+
+```
+git worktree add --orphan ../nightshift-orders          # first time only; creates the orphan branch
+mkdir -p ../nightshift-orders/orders/<plan>
+$EDITOR ../nightshift-orders/orders/<plan>/orders.json
+git -C ../nightshift-orders add orders/<plan>/orders.json
+git -C ../nightshift-orders commit -m 'Register plan <plan>'
+git -C ../nightshift-orders push -u origin nightshift-orders   # durable, portable system of record
+```
+
+Then seed Turnstile from that file (§3) — the plan's SHA anchor is the ledger commit, resolved from
+that worktree's `HEAD`. Contrast this with your **code / skill / tooling** changes, which *do* go on a
+`main`-based branch through a PR and the two-clean gate: the ledger is coordination data, not code, so
+it takes neither.
 
 ```json
 {
@@ -178,7 +205,8 @@ board. **Activation** — making orders claimable and starting a worker round �
 it **only after the shift is clean**. Keep the two separate: the planner registers, the coordinator
 prepares and activates. A plan that is registered but not activated is inert; nothing dispatches until
 you say go. (A first-class `activate`/`retire` verb is planned; until then, "register" = the plan file
-exists and is anchored to a commit, and "activate" = you start the controller below.)
+is committed on the orphan order-ledger branch (§2) and anchored to that commit, and "activate" = you
+start the controller below.)
 
 ### Prepare — clear footguns before you activate
 
@@ -235,6 +263,17 @@ Only ready orders are claimable; a worker's `next` hands out exactly one, exclus
 board** (`nightshift where` / `roster`, §6) shows **exactly** the ready set you intend — no stale
 orders, no duplicates, no phantom agents — *before* you surface to the operator that workers can start.
 
+### Coordinator owns local `main`
+
+Hold `main` in the coordinator's **primary** worktree. Workers never check out or move `main`; they
+only branch from a base in linked worktrees (`git switch -c <branch> <base>`). Git checkout exclusivity
+already enforces most of this: if you hold `main`, workers cannot check it out elsewhere.
+
+The remaining hole is a force-move of the shared ref (`git branch -f main ...`). Treat that as a
+coordination-integrity violation, not a coaching moment: reconcile `main` back to the coordinator's
+blessed snapshot, revoke the offender's claim/lease, and quarantine the offender head as a local forensic
+`refs/nightshift/corpse/...` ref. No warning loop and no rework loop — stealing `main` is cancellable.
+
 ## 4. Land merges — the only thing that advances the DAG
 
 A worker's `release --status done` means **"submitted, awaiting merge"** — it does NOT open
@@ -252,6 +291,15 @@ dependents. The worker has already **built and reviewed** the order to two clean
 
 1. **Push the worker's branch to origin, then open/update the PR** from it. The worker committed
    locally but never pushed; you carry it to GitHub.
+
+   **Title the PR like a human would** — one clear sentence in the repo's normal voice, describing
+   what the change *does* (e.g. *Statically link e_sqlite3 on RID-less AOT publish*). **Write a fresh
+   title; do not reuse the order's or issue's title** — that is an internal spec line, and copying it
+   dumps the order's plumbing into the PR (`WORK-packet`, `base-ref`, a comma-list of mechanics, a
+   trailing `(#N)`), which reads like a machine wrote it. **Nothing about the order machinery belongs
+   in the title.** The order↔PR binding lives in the **body**, as trailers at the very end, and only
+   there: `Fixes: #<issue>` (to close the issue) and `Nightshift-Order: <order base>` (the durable
+   binding). The body explains the change for a human reviewer; the trailers are the last lines.
 2. **Post the one clearance note** that the worker's attestation earns — a sidecar comment naming the
    models and rounds, nothing more (the deliberation never appears on the PR):
 
@@ -273,6 +321,8 @@ dependents. The worker has already **built and reviewed** the order to two clean
 `after: [op1]`. This is the deliberate-merge invariant: dispatch is autonomous, merging is a
 deliberate act the PR Lander owns. (A future gh-aware bridge will call `land` for you off merged PRs;
 today it's manual — and merge authority and the `land` signal can be different actors.)
+When run from the coordinator's primary `main` checkout, `land` also fast-forwards local `main` to the
+already-fetched `origin/main` tip (`--ff-only`) and refreshes the coordinator's blessed `main` snapshot.
 
 You do **not** run the review gate yourself — the worker does, via subagents on different models. You
 open the PR and post the note from the worker's attestation.

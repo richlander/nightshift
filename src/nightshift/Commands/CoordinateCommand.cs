@@ -15,6 +15,9 @@ internal static class CoordinateCommand
     private const string ControlRoot = "/control/";
     private const string HaltKey = "/control/halt";
     private const string DrainingKey = "/control/draining";
+    private const string BlessedMainHeadKey = "/coord/main-head";
+    private const string CorpseRefPrefix = "refs/nightshift/corpse";
+    private const string MainRef = "refs/heads/main";
 
     private const string StateSuffix = "/state";
     private const string ClaimSuffix = "/claim";
@@ -34,6 +37,43 @@ internal static class CoordinateCommand
     {
         get => FilteredWaitEngine.KeepAliveCadence;
         set => FilteredWaitEngine.KeepAliveCadence = value;
+    }
+
+    internal enum MainVerdict
+    {
+        Healthy,
+        Adopt,
+        Rebless,
+        Steal,
+    }
+
+    internal static MainVerdict ClassifyMain(
+        string? observed,
+        string? blessed,
+        bool blessedIsAncestorOfObserved,
+        bool observedMatchesClaimedBranch)
+    {
+        if (observed is null)
+        {
+            return MainVerdict.Healthy;
+        }
+
+        if (string.IsNullOrWhiteSpace(blessed))
+        {
+            return MainVerdict.Adopt;
+        }
+
+        if (observed == blessed)
+        {
+            return MainVerdict.Healthy;
+        }
+
+        if (blessedIsAncestorOfObserved)
+        {
+            return observedMatchesClaimedBranch ? MainVerdict.Steal : MainVerdict.Rebless;
+        }
+
+        return MainVerdict.Steal;
     }
 
     public static async Task<int> RunAsync(string? scope, int? timeoutSecs, bool once)
@@ -133,6 +173,11 @@ internal static class CoordinateCommand
         string readyPrefix,
         CancellationToken ct)
     {
+        if (await CheckMainIntegrityAsync(client, ct) is { } mainOutcome)
+        {
+            return mainOutcome;
+        }
+
         foreach (KvItem item in await client.RangeAsync(planPrefix, ct))
         {
             if (!item.Key.EndsWith(StateSuffix, StringComparison.Ordinal))
@@ -172,6 +217,150 @@ internal static class CoordinateCommand
             }
 
             return CoordinateOutcome.Action(orderBase, transition: "requeued", status: "ready");
+        }
+
+        return null;
+    }
+
+    private static async Task<CoordinateOutcome?> CheckMainIntegrityAsync(TurnstileClient client, CancellationToken ct)
+    {
+        try
+        {
+            string? observed = Git.RevParse("main");
+            if (observed is null)
+            {
+                return null;
+            }
+
+            string? blessed = (await client.GetAsync(BlessedMainHeadKey, ct))?.Text.Trim();
+            (string orderBase, KvItem claim)? offender = null;
+            bool observedMatchesClaimedBranch = false;
+            if (observed != blessed)
+            {
+                string? originMain = Git.RevParse("origin/main");
+                if (originMain is not null && observed == originMain)
+                {
+                    return await WriteBlessedMainHeadAsync(client, observed, ct);
+                }
+
+                offender = await FindMainStealOffenderAsync(client, observed, ct);
+                observedMatchesClaimedBranch = offender is not null;
+            }
+
+            bool blessedIsAncestorOfObserved = blessed is { Length: > 0 } && Git.IsAncestor(blessed, observed);
+            return ClassifyMain(observed, blessed, blessedIsAncestorOfObserved, observedMatchesClaimedBranch) switch
+            {
+                MainVerdict.Healthy => null,
+                MainVerdict.Adopt => await WriteBlessedMainHeadAsync(client, observed, ct),
+                MainVerdict.Rebless => await WriteBlessedMainHeadAsync(client, observed, ct),
+                MainVerdict.Steal => await HandleMainStealAsync(client, observed, blessed!, offender, ct),
+                _ => null,
+            };
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"nightshift coordinate: non-fatal main-integrity check error: {ex.Message}");
+            return null;
+        }
+    }
+
+    private static async Task<CoordinateOutcome?> WriteBlessedMainHeadAsync(
+        TurnstileClient client,
+        string observed,
+        CancellationToken ct)
+    {
+        await client.SetAsync(BlessedMainHeadKey, observed, ct);
+        return null;
+    }
+
+    private static async Task<CoordinateOutcome> HandleMainStealAsync(
+        TurnstileClient client,
+        string observed,
+        string blessed,
+        (string orderBase, KvItem claim)? offender,
+        CancellationToken ct)
+    {
+        ReconcileMainRef(blessed);
+        if (offender is null)
+        {
+            Console.Error.WriteLine("nightshift coordinate: local main moved unexpectedly; offender branch was not identified");
+            return CoordinateOutcome.Action("/plan/unknown/order/unknown", transition: "main-stolen", status: "cancelled");
+        }
+
+        if (OrderRef.FromBase(offender.Value.orderBase) is { } offenderRef)
+        {
+            string corpseRef = $"{CorpseRefPrefix}/{offenderRef.Plan}/{offenderRef.Order}/steal";
+            if (!Git.UpdateRef(corpseRef, observed))
+            {
+                Console.Error.WriteLine($"nightshift coordinate: failed to quarantine offender branch at {corpseRef}");
+            }
+        }
+        else
+        {
+            Console.Error.WriteLine($"nightshift coordinate: offender order base was invalid: {offender.Value.orderBase}");
+        }
+
+        await OrderState.WriteAsync(client, offender.Value.orderBase, "refused", "stole main: claim cancelled", "coordinator", ct);
+
+        if (offender.Value.claim.Lease is { Length: > 0 } leaseId)
+        {
+            await client.RevokeLeaseAsync(leaseId, ct);
+        }
+        else
+        {
+            await client.DeleteAsync($"{offender.Value.orderBase}{ClaimSuffix}", ct);
+        }
+
+        return CoordinateOutcome.Action(offender.Value.orderBase, transition: "main-stolen", status: "cancelled");
+    }
+
+    private static void ReconcileMainRef(string blessed)
+    {
+        if (string.Equals(Git.CurrentBranch(), "main", StringComparison.Ordinal))
+        {
+            if (!Git.ResetHardTo(blessed))
+            {
+                Console.Error.WriteLine($"nightshift coordinate: failed to reset local main to blessed head {blessed}");
+            }
+
+            return;
+        }
+
+        if (!Git.UpdateRef(MainRef, blessed))
+        {
+            Console.Error.WriteLine($"nightshift coordinate: failed to update {MainRef} to blessed head {blessed}");
+        }
+    }
+
+    private static async Task<(string orderBase, KvItem claim)?> FindMainStealOffenderAsync(
+        TurnstileClient client,
+        string observed,
+        CancellationToken ct)
+    {
+        foreach (KvItem item in await client.RangeAsync(PlanRoot, ct))
+        {
+            if (!item.Key.EndsWith(BranchSuffix, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            string orderBase = item.Key[..^BranchSuffix.Length];
+            KvItem? claim = await client.GetAsync($"{orderBase}{ClaimSuffix}", ct);
+            if (claim is null)
+            {
+                continue;
+            }
+
+            string branchName = item.Text.Trim();
+            if (branchName.Length == 0)
+            {
+                continue;
+            }
+
+            if (Git.RevParse(branchName) == observed)
+            {
+                return (orderBase, claim);
+            }
         }
 
         return null;
