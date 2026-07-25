@@ -31,7 +31,7 @@ Your responsibilities:
 - **Land** each order after it merges, so its dependents open.
 - **Targeted updates go through a worktree.** You generally make no code changes — the shift's
   work lands through orders. But you *do* own targeted updates to the skills, governance docs, and
-  the tooling (e.g. `install.sh`). Make any such change in a **separate git worktree** on its own
+  the tooling (e.g. the `.dotnet-install` bundle manifest). Make any such change in a **separate git worktree** on its own
   branch, never in the main checkout you run the shift from — switching branches or dirtying that
   tree disturbs the live shift. These changes still go through a PR and the two-clean review gate
   like any other.
@@ -67,30 +67,38 @@ A **plan** (`orders.json`) = the set of orders for a feature, with an order→or
 ## 0. Rebuild and redeploy the tools — every round
 
 Nightshift is self-hosted: the orders you land change the very tools the shift runs on
-(`nightshift`, `turnstile`, `octoshift`, `nightsky`). The daemon, the `nightshift plan`
+(`nightshift`, `turnstile`, `octoshift`). The daemon, the `nightshift plan`
 controller, and every CLI call use the **deployed** binaries on `PATH` — not `bin/`.
 A fresh `git pull` or `dotnet build` does **not** change what is running. Until you
 redeploy, the shift is coordinating itself with stale code and landed fixes are not in
 effect.
 
 So at the **start of every round** — after you refresh `main` and before you touch the
-board — rebuild and redeploy:
+board — rebuild and redeploy with [`dotnet-install`](https://www.nuget.org/packages/dotnet-install),
+run one-off via `dnx` (which fetches and runs a .NET tool from NuGet without a persistent
+global install, like `npx`), from the repo root:
 
 ```
-./install.sh
+dnx dotnet-install -y --
 ```
 
-This publishes each tool as a NativeAOT native binary and installs it into `~/.local/bin`
-(override with `PREFIX=…`). The RID is inferred automatically; there is nothing to pass.
+`dnx dotnet-install -y` fetches the tool (the `-y` auto-confirms the download); the `--` ends
+`dnx`'s own options so everything after it is forwarded to `dotnet-install` — here, nothing, so
+it runs with no arguments. With no arguments in the repo root it reads the
+`.dotnet-install/.dotnet-install.json` bundle manifest and publishes each tool as a NativeAOT
+single-file native binary, installing it into `~/.dotnet/bin` (on `PATH`). The RID is inferred
+automatically; there is nothing to pass. The same tool installs the bundle onto a fresh machine
+straight from GitHub — forward the flag past the `--`:
+`dnx dotnet-install -y -- --github richlander/nightshift`.
 
-Deploying a binary does **not** restart anything already running. After `install.sh`:
+Deploying a binary does **not** restart anything already running. After the redeploy:
 
 - **Always restart the `nightshift plan` controller** so it runs the new code (stop the old
   one, relaunch on the same plan file and `--sha` anchor — re-seeding is idempotent).
 - **Restart `turnstile serve` only if `src/Turnstile/**` changed this round.** Restarting the
   daemon drops every watcher and can disturb an in-flight worker, so don't do it gratuitously.
 
-Overwriting a running binary is safe: `install` replaces the file, and the running process
+Overwriting a running binary is safe: the install replaces the file, and the running process
 keeps its old inode until it exits.
 
 ## 1. Start the daemon

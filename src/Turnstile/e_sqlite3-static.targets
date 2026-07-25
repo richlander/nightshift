@@ -5,8 +5,8 @@
 
     NativeAOT does not statically link the native dependencies of NuGet packages,
     so a normal `PublishAot` of turnstile emits the managed single file PLUS a
-    sidecar `libe_sqlite3.dylib` / `.so` next to it (see install.sh). That makes
-    turnstile a multi-file tool, which `dotnet-install` refuses.
+    sidecar `libe_sqlite3.dylib` / `.so` next to it. That makes turnstile a
+    multi-file tool, which `dotnet-install` refuses.
 
     This file compiles the SQLite amalgamation into a static `e_sqlite3` archive
     and links it directly into the AOT binary via DirectPInvoke + NativeLibrary,
@@ -20,8 +20,8 @@
 
   <!--
     RID must be known BEFORE the ESqlite3StaticLink decision below reads it.
-    A `dotnet publish -p:PublishAot=true` WITHOUT an explicit `-r` (how install.sh
-    and dotnet-install invoke it) only infers the RID in the SDK's closing targets
+    A `dotnet publish -p:PublishAot=true` WITHOUT an explicit `-r` (how
+    `dotnet-install` invokes it) only infers the RID in the SDK's closing targets
     — after this file, imported from the csproj body, has already evaluated. That
     left RuntimeIdentifier empty here, so static linking silently did not happen
     and the sidecar shipped anyway. Pin the RID to the SDK's portable RID up front
