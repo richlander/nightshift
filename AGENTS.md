@@ -80,6 +80,7 @@ then your role's skill (above). Reference the rest by topic:
 | End-to-end workflow and role ownership | `docs/design/workflow.md` |
 | Turnstile kernel (kv/lease/watch, socket) | `docs/design/turnstile.md` |
 | Octoshift GitHub→land bridge | `docs/design/octoshift.md` |
+| Stacked orders — per-order base refs, dependent chains | `docs/design/stacked-orders.md` |
 | Issue → order mapping policy (planning) | `NIGHTSHIFT.md` (concept: `docs/design/charter.md`) |
 
 ## Repository-wide engineering constraints
