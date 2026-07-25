@@ -186,7 +186,7 @@ internal static class CoordinateCommand
             }
 
             string orderBase = item.Key[..^StateSuffix.Length];
-            if (TryBuildStateOutcome(orderBase, StatusOf(item.Text)) is { } outcome)
+            if (TryBuildStateOutcome(orderBase, StatusOf(item.Text), ReasonOf(item.Text)) is { } outcome)
             {
                 return outcome;
             }
@@ -390,16 +390,26 @@ internal static class CoordinateCommand
         return null;
     }
 
-    private static CoordinateOutcome? TryBuildStateOutcome(string orderBase, string? status)
+    private static CoordinateOutcome? TryBuildStateOutcome(string orderBase, string? status, string? reason)
         => status switch
         {
             "done" => CoordinateOutcome.Action(orderBase, transition: "done", status: "done"),
             "landed" => CoordinateOutcome.Action(orderBase, transition: "landed", status: "landed"),
-            "escalated" => CoordinateOutcome.Action(orderBase, transition: "escalated", status: "escalated"),
+
+            // Stacked orders §4: a prereq-unreachable escalation is a publish-the-base request, distinct from a
+            // judgment escalation. Surface it as transition=prereq so the coordinator publishes the base ref to
+            // origin (workers stay read-only w.r.t. origin), rather than adjudicating it.
+            "escalated" => EscalateCommand.IsPrereqUnreachableReason(reason)
+                ? CoordinateOutcome.Action(orderBase, transition: "prereq", status: "escalated")
+                : CoordinateOutcome.Action(orderBase, transition: "escalated", status: "escalated"),
             _ => null,
         };
 
-    private static string? StatusOf(string? stateJson)
+    private static string? StatusOf(string? stateJson) => FieldOf(stateJson, "status");
+
+    private static string? ReasonOf(string? stateJson) => FieldOf(stateJson, "reason");
+
+    private static string? FieldOf(string? stateJson, string field)
     {
         if (string.IsNullOrWhiteSpace(stateJson))
         {
@@ -409,7 +419,7 @@ internal static class CoordinateCommand
         try
         {
             using JsonDocument doc = JsonDocument.Parse(stateJson);
-            return doc.RootElement.TryGetProperty("status", out JsonElement status) ? status.GetString() : null;
+            return doc.RootElement.TryGetProperty(field, out JsonElement value) ? value.GetString() : null;
         }
         catch (JsonException)
         {
@@ -445,7 +455,7 @@ internal static class CoordinateCommand
                 {
                     string orderBase = edge.Signal.Key[..^StateSuffix.Length];
                     KvItem? state = await getAsync(edge.Signal.Key, ct);
-                    return TryBuildStateOutcome(orderBase, StatusOf(state?.Text));
+                    return TryBuildStateOutcome(orderBase, StatusOf(state?.Text), ReasonOf(state?.Text));
                 }
 
                 if (edge.Signal.Key.EndsWith(ClaimSuffix, StringComparison.Ordinal))

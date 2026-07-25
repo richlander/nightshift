@@ -12,6 +12,23 @@ using Nightshift.Turnstile;
 /// </summary>
 internal static class EscalateCommand
 {
+    /// <summary>
+    /// The escalation-reason prefix for a <b>prereq-unreachable</b> base ref (stacked orders §4). A worker
+    /// that cannot reach its <c>base-ref</c> in the local object database self-raises this on the existing
+    /// andon cord; the coordinator resolves it by publishing that base to origin. The prefix lets both
+    /// <c>check</c> (re-arm the parked worker once the base is reachable) and <c>coordinate</c> (surface a
+    /// publish-the-base transition apart from a judgment escalation) recognise it without a new mechanism.
+    /// </summary>
+    internal const string PrereqUnreachablePrefix = "prereq-unreachable:";
+
+    /// <summary>Formats the standing reason a worker records when its base ref is not reachable locally.</summary>
+    internal static string PrereqUnreachableReason(string baseRef, string branch)
+        => $"{PrereqUnreachablePrefix} base-ref '{baseRef}' for branch '{branch}' is not reachable in the local object database. Coordinator: publish it to origin so this worker can fetch it and proceed.";
+
+    /// <summary>True when <paramref name="reason"/> is a prereq-unreachable escalation (see <see cref="PrereqUnreachablePrefix"/>).</summary>
+    internal static bool IsPrereqUnreachableReason(string? reason)
+        => reason is not null && reason.TrimStart().StartsWith(PrereqUnreachablePrefix, StringComparison.Ordinal);
+
     public static async Task<int> RunAsync(string? reason)
     {
         if (string.IsNullOrWhiteSpace(reason))
