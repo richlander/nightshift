@@ -43,7 +43,7 @@ internal sealed class Plan
             string orderId = Scalar(orderElem, "order") ?? throw new InvalidDataException("order is missing `order`");
             string orderBase = $"/plan/{planId}/order/{orderId}";
             string[] after = Array(orderElem, "after")
-                .Select(d => d.ValueKind == JsonValueKind.Number ? d.GetRawText() : d.GetString() ?? string.Empty)
+                .Select(AfterId)
                 .Where(s => s.Length > 0)
                 .ToArray();
             string specJson = BuildSpec(planId, orderId, planSha, orderElem, planStandard);
@@ -77,7 +77,7 @@ internal sealed class Plan
 
             CopyStringArray(w, order, "paths");
             CopyStringArray(w, order, "supersedes");
-            CopyStringArray(w, order, "after");
+            CopyAfterIds(w, order);
             CopyStringArray(w, order, "related");
             CopyStringArray(w, order, "antipatterns");
             CopyScalar(w, order, "brief");
@@ -109,6 +109,49 @@ internal sealed class Plan
         }
 
         w.WriteEndArray();
+    }
+
+    /// <summary>
+    /// Normalizes the <c>after</c> edges to their order ids in the spec. An edge may be authored as a bare id
+    /// (string/number) or, under the settled stacked-orders model, as an object <c>{ "order", "kind" }</c>
+    /// declaring a dependency kind. The kind is intent for the <b>coordinator</b> to resolve into a base ref
+    /// (read from the plan file at registration); the spec — and the DAG — only need the ids.
+    /// </summary>
+    private static void CopyAfterIds(Utf8JsonWriter w, JsonElement order)
+    {
+        if (!order.TryGetProperty("after", out JsonElement arr) || arr.ValueKind != JsonValueKind.Array || arr.GetArrayLength() == 0)
+        {
+            return;
+        }
+
+        w.WriteStartArray("after");
+        foreach (JsonElement e in arr.EnumerateArray())
+        {
+            if (AfterId(e) is { Length: > 0 } id)
+            {
+                w.WriteStringValue(id);
+            }
+        }
+
+        w.WriteEndArray();
+    }
+
+    /// <summary>The order id of an <c>after</c> edge: a bare string/number, or the <c>order</c> field of an
+    /// object edge <c>{ "order", "kind" }</c>. Total and tolerant — any other shape (a missing or non-scalar
+    /// <c>order</c>, a boolean/object/array/null edge) yields an empty id that the caller skips, so a
+    /// malformed edge is ignored rather than throwing.</summary>
+    private static string AfterId(JsonElement edge)
+    {
+        JsonElement id = edge.ValueKind == JsonValueKind.Object && edge.TryGetProperty("order", out JsonElement o)
+            ? o
+            : edge;
+
+        return id.ValueKind switch
+        {
+            JsonValueKind.String => id.GetString() ?? string.Empty,
+            JsonValueKind.Number => id.GetRawText(),
+            _ => string.Empty,
+        };
     }
 
     private static string? Scalar(JsonElement parent, string name)

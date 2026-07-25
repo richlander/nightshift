@@ -64,6 +64,7 @@ internal static class ShowCommand
             fields.Add(new OrderField { Field = "branch", Value = order.Branch });
         }
 
+        AddText(fields, "base-ref", view.BaseRef);
         AddText(fields, "mode", view.Mode);
         AddText(fields, "title", view.Title);
         AddText(fields, "issue", view.Issue);

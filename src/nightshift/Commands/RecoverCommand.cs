@@ -82,8 +82,9 @@ internal static class RecoverCommand
 
     private static async Task ReprintAsync(TurnstileClient client, string orderBase, long fence, CancellationToken ct)
     {
-        KvItem? spec = await client.GetAsync($"{orderBase}/spec", ct);
-        OrderView view = spec is null ? OrderView.Empty : OrderView.Parse(spec.Text);
+        // Load through the shared claim loader (not raw spec Parse) so recover reprints the WORK packet
+        // byte-identically to `next`/`show` — base ref, and any rework mode/findings, included.
+        OrderView view = await OrderView.LoadAsync(client, orderBase, ct);
         view.PrintWork(Console.Out, orderBase, fence);
     }
 
