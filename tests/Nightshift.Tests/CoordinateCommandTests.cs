@@ -347,7 +347,7 @@ public class CoordinateCommandTests
                 TestContext.Current.CancellationToken);
 
             Assert.True(result.TimedOut);
-            Assert.InRange(watchCalls, 1, 120);
+            Assert.InRange(watchCalls, 1, 12);
             Assert.Equal(0, keepAliveCalls);
         }
         finally
