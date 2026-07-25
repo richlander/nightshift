@@ -22,6 +22,9 @@ internal sealed record OrderView(
     /// <summary>The non-terminal status that turns a claim into a rework continuation of its existing branch.</summary>
     internal const string ChangesRequested = "changes-requested";
 
+    /// <summary>The base ref an order builds on when the coordinator has written none — an independent order off <c>main</c>.</summary>
+    internal const string DefaultBaseRef = "main";
+
     /// <summary>
     /// Set to <c>rework</c> when the claimed order is at <see cref="ChangesRequested"/>: it tells the worker
     /// the <c>branch</c> already exists on origin with prior work — fetch and CONTINUE it, do not cut a fresh
@@ -32,6 +35,15 @@ internal sealed record OrderView(
 
     /// <summary>The review findings for a rework (from <c>{base}/rework</c>) — the brief the re-claiming worker acts on.</summary>
     public string? Findings { get; init; }
+
+    /// <summary>
+    /// The commit-ish this order branches from (<c>{base}/base-ref</c>), e.g. <c>main</c>, a branch, or a
+    /// pinned SHA for a stacked child. The <b>coordinator</b> writes it; the worker only reads it at claim.
+    /// <see cref="LoadAsync"/> resolves an absent key to <see cref="DefaultBaseRef"/>, so a WORK packet loaded
+    /// through it always carries a base ref. Left null by the spec-only <see cref="Parse"/> (the base ref is
+    /// per-order coordination state, never part of the immutable spec).
+    /// </summary>
+    public string? BaseRef { get; init; }
 
     public static OrderView Empty { get; } = new([], [], [], [], null, null, null, null, null);
 
@@ -52,8 +64,13 @@ internal sealed record OrderView(
             view = view with { Mode = "rework", Findings = rework?.Text };
         }
 
-        return view;
+        KvItem? baseRef = await client.GetAsync($"{orderBase}/base-ref", ct);
+        return view with { BaseRef = Resolve(baseRef?.Text) };
     }
+
+    /// <summary>The written base ref, trimmed, or <see cref="DefaultBaseRef"/> when the key is absent or blank.</summary>
+    private static string Resolve(string? baseRef)
+        => baseRef?.Trim() is { Length: > 0 } value ? value : DefaultBaseRef;
 
     public static OrderView Parse(string json)
     {
@@ -87,6 +104,7 @@ internal sealed record OrderView(
             Line(output, "branch", order.Branch);
         }
 
+        Line(output, "base-ref", BaseRef);
         Line(output, "mode", Mode);
         Line(output, "title", Title);
         Line(output, "issue", Issue);

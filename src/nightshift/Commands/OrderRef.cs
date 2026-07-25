@@ -2,11 +2,11 @@ namespace Nightshift.Commands;
 
 /// <summary>
 /// The bijection between an order and its git branch. An order lives at <c>/plan/{plan}/order/{order}</c>;
-/// the worker produces exactly one branch, <c>nightshift/{plan}/{order}</c>, off origin/main. Because the
-/// branch name encodes the order, it is a durable, on-disk breadcrumb: it survives a reboot or a wiped
-/// runtime dir when the session file does not, so <c>recover</c> can re-attach from the branch alone. This
-/// type is the single place that mapping is expressed, so <c>next</c>, <c>show</c>, and <c>recover</c>
-/// agree by construction.
+/// the worker produces exactly one branch, <c>nightshift/{plan}/{order}</c>, cut from the order's base ref
+/// (<c>{base}/base-ref</c>, default <c>main</c>). Because the branch name encodes the order, it is a durable,
+/// on-disk breadcrumb: it survives a reboot or a wiped runtime dir when the session file does not, so
+/// <c>recover</c> can re-attach from the branch alone. This type is the single place that mapping is
+/// expressed, so <c>next</c>, <c>show</c>, and <c>recover</c> agree by construction.
 /// </summary>
 internal readonly record struct OrderRef(string Plan, string Order)
 {

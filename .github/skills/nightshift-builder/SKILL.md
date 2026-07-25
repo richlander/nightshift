@@ -37,6 +37,9 @@ For the one order you are given:
 - `paths` — the only files you are cleared to touch.
 - `standard` — the design note your change must conform to. Read it.
 - `issue` — the issue this order fixes (may be absent).
+- `base-ref` — the commit-ish your branch is cut from (default `main`; a stacked child pins a
+  branch or SHA). The coordinator resolves and writes it; you just build on the branch already
+  checked out from it. See *Integrating the base*.
 - the order base `/plan/<plan>/order/<order>` — for the commit trailer.
 
 ## Build the order
@@ -82,29 +85,30 @@ for a `QUERY`. Don't poll or stall: interactive, run the long command (or the wa
 exit code); headless, **block in-turn** and read its result. Full technique: **Waiting
 without stalling** in [`AGENTS.md`](../../../AGENTS.md).
 
-## Integrating main — merge, don't rebase a public branch
+## Integrating the base — merge, don't rebase a public branch
 
-Sometimes you must pull `origin/main` into your branch mid-build: new guidance landed,
-an important repo test changed, or a related/breaking commit merged. A directive may
-tell you to; you may also judge it necessary. You have read access to origin, so
-`git fetch origin` / `git pull` is fine. **How** you integrate depends on whether the
-branch is **public** yet — i.e. whether the coordinator has already pushed it (a PR
-exists):
+Your branch is cut from its **`base-ref`** (default `main`; for a stacked child, a branch or a
+pinned SHA the coordinator chose). Most orders build straight on it and never touch it again — a
+branch, once cut, is frozen at its base, and the base moving underneath is fine. Sometimes you
+must pull the base into your branch mid-build: new guidance landed, an important repo test
+changed, or a related/breaking commit merged. A directive may tell you to; you may also judge it
+necessary. You have read access to origin, so `git fetch origin` / `git pull` is fine. A child
+pinned to a **SHA** never restacks — its base is immutable until the parent lands, at which point
+it rebases cleanly onto `main`. **How** you integrate a moving base depends on whether the branch
+is **public** yet — i.e. whether the coordinator has already pushed it (a PR exists):
 
-- **Never pushed (still private)** → **rebase** onto fresh `origin/main`. Nobody is
-  looking; clean history is free.
-- **Already pushed (public branch, maybe under review — e.g. a rework)** → **merge**
-  `origin/main` into your branch. **Do not rebase a public branch** — rebasing would
-  force a force-push, which rewrites history, kills diffability, and voids every review
-  already done on the old commits.
+- **Never pushed (still private)** → **rebase** onto the fresh base. Nobody is looking; clean
+  history is free.
+- **Already pushed (public branch, maybe under review — e.g. a rework)** → **merge** the base into
+  your branch. **Do not rebase a public branch** — rebasing would force a force-push, which
+  rewrites history, kills diffability, and voids every review already done on the old commits.
 
-**Never amend a pushed commit.** Once the branch is public, keep the commit graph
-append-only; the coordinator handles the push.
+**Never amend a pushed commit.** Once the branch is public, keep the commit graph append-only; the
+coordinator handles the push.
 
-This same rule covers **rework** — an order routed back to you because landing an earlier
-order broke your branch (a conflict or a red CI run): the branch is public, so merge
-`origin/main`, resolve, re-run build/test, and hand back a new commit. `check` before
-every commit still applies.
+This same rule covers **rework** — an order routed back to you because landing an earlier order
+broke your branch (a conflict or a red CI run): the branch is public, so merge the base,
+resolve, re-run build/test, and hand back a new commit. `check` before every commit still applies.
 
 ## Requesting more files
 
