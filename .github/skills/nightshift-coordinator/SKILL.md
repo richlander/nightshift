@@ -235,6 +235,17 @@ Only ready orders are claimable; a worker's `next` hands out exactly one, exclus
 board** (`nightshift where` / `roster`, §6) shows **exactly** the ready set you intend — no stale
 orders, no duplicates, no phantom agents — *before* you surface to the operator that workers can start.
 
+### Coordinator owns local `main`
+
+Hold `main` in the coordinator's **primary** worktree. Workers never check out or move `main`; they
+only branch from a base in linked worktrees (`git switch -c <branch> <base>`). Git checkout exclusivity
+already enforces most of this: if you hold `main`, workers cannot check it out elsewhere.
+
+The remaining hole is a force-move of the shared ref (`git branch -f main ...`). Treat that as a
+coordination-integrity violation, not a coaching moment: reconcile `main` back to the coordinator's
+blessed snapshot, revoke the offender's claim/lease, and quarantine the offender head as a local forensic
+`refs/nightshift/corpse/...` ref. No warning loop and no rework loop — stealing `main` is cancellable.
+
 ## 4. Land merges — the only thing that advances the DAG
 
 A worker's `release --status done` means **"submitted, awaiting merge"** — it does NOT open
@@ -273,6 +284,8 @@ dependents. The worker has already **built and reviewed** the order to two clean
 `after: [op1]`. This is the deliberate-merge invariant: dispatch is autonomous, merging is a
 deliberate act the PR Lander owns. (A future gh-aware bridge will call `land` for you off merged PRs;
 today it's manual — and merge authority and the `land` signal can be different actors.)
+When run from the coordinator's primary `main` checkout, `land` also fast-forwards local `main` to the
+already-fetched `origin/main` tip (`--ff-only`) and refreshes the coordinator's blessed `main` snapshot.
 
 You do **not** run the review gate yourself — the worker does, via subagents on different models. You
 open the PR and post the note from the worker's attestation.
