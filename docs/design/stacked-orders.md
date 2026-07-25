@@ -92,6 +92,18 @@ coordinator provides it.
   without checking it out. The coordinator watches for `main` moving unexpectedly
   and resets it. Discipline (workers branch, never touch `main`) plus git's
   exclusivity means this rarely fires.
+- **Stealing `main` is a cancellable offense — no second chances.** A worker that
+  force-moves or commandeers `main` has corrupted the shared base every concurrent
+  worker builds on. That is a coordination-integrity violation, not a coachable
+  mistake, and it is unambiguous — the coordinator either observed `main` move to a
+  commit it did not author or found a worker operating on the primary checkout.
+  The response is **immediate cancellation of that worker's claim**, not a warning
+  and not a rework loop: reconcile `main`, revoke the claim/lease, and quarantine
+  the worker's branch as forensic (the same corpse-quarantine the spec already
+  applies to a dead agent's WIP). No progressive discipline; the first offense is
+  the last. This keeps the base an invariant the swarm can trust rather than a
+  suggestion, and it costs an honest worker nothing — an honest worker never moves
+  `main`.
 - **Local `main` is a coordinator-blessed snapshot** of `origin/main`. It never
   diverges from origin (a land merges on GitHub, origin advances, the coordinator
   fast-forwards local `main`). Its value is a *consistent* base across all workers
