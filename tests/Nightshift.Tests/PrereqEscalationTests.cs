@@ -160,6 +160,28 @@ public class PrereqEscalationTests
         Assert.Equal("escalated", outcome!.Transition);
     }
 
+    [Fact]
+    public async Task Coordinate_NonObjectRootState_DoesNotThrowAndIsNotPrereq()
+    {
+        // A state payload whose JSON root is an array (not an object) must not throw when read —
+        // TryGetProperty throws InvalidOperationException on non-object kinds, which the JsonException
+        // catch would miss. The order is treated as having no readable status (a plain no-op edge).
+        string orderBase = "/plan/stacked/order/child";
+        string stateKey = $"{orderBase}/state";
+        var values = new Dictionary<string, string>
+        {
+            [stateKey] = "[]",
+        };
+        var predicate = new CoordinateCommand.CoordinatePredicate();
+
+        CoordinateCommand.CoordinateOutcome? outcome = await predicate.TryMatchAsync(
+            new FilteredWaitEngine.WatchEdge("plan", new WatchSignal(stateKey, Deleted: false, Revision: 63)),
+            BuildGetter(values),
+            TestContext.Current.CancellationToken);
+
+        Assert.Null(outcome);
+    }
+
     private static Func<string, CancellationToken, Task<KvItem?>> BuildGetter(Dictionary<string, string> values)
         => (key, _) => Task.FromResult(values.TryGetValue(key, out string? value)
             ? new KvItem(key, CreateRevision: 1, ModRevision: 1, Lease: null, Immutable: false, Encoding.UTF8.GetBytes(value))

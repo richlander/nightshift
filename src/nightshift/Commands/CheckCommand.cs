@@ -155,6 +155,11 @@ internal static class CheckCommand
         {
             using JsonDocument doc = JsonDocument.Parse(stateJson);
             JsonElement root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                return (null, null);
+            }
+
             string? status = root.TryGetProperty("status", out JsonElement s) && s.ValueKind == JsonValueKind.String ? s.GetString() : null;
             string? reason = root.TryGetProperty("reason", out JsonElement r) && r.ValueKind == JsonValueKind.String ? r.GetString() : null;
             return (status, reason);

@@ -419,7 +419,10 @@ internal static class CoordinateCommand
         try
         {
             using JsonDocument doc = JsonDocument.Parse(stateJson);
-            return doc.RootElement.TryGetProperty(field, out JsonElement value) && value.ValueKind == JsonValueKind.String
+            JsonElement root = doc.RootElement;
+            return root.ValueKind == JsonValueKind.Object
+                && root.TryGetProperty(field, out JsonElement value)
+                && value.ValueKind == JsonValueKind.String
                 ? value.GetString()
                 : null;
         }
