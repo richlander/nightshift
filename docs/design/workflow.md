@@ -125,9 +125,13 @@ The product manager defines the change as issues — a feature to add, or a
 taste/re-shape note where existing features must adapt to enable a UX or a composed
 scenario. The planner turns that intent into orders and registers them. The
 **standard** (a design note precise enough that a worker can check its own work
-against it) and the **`orders.json`** plan are committed to `main` — the
-*authorization root*; nothing is dispatchable that was not first approved into the
-repo. The planner files one issue per order; the order's `issue` field points at it.
+against it) is committed to `main` like any design doc. The **`orders.json`** plan,
+by contrast, is coordination data, not mainline code: it is committed to the orphan
+**order-ledger** branch (`nightshift-orders` — a parallel root with no shared history
+with `main`; design: [`octoshift.md`](octoshift.md) §3), *not* to `main`. That ledger
+commit is the *authorization root*; nothing is dispatchable that was not first
+registered there. The planner files one issue per order; the order's `issue` field
+points at it.
 *(Planner and Coordinator are commonly the same session — but never the same
 session as a Worker, which is always a separate instance.)*
 
