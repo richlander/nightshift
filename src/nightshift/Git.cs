@@ -19,6 +19,21 @@ internal static class Git
         return string.IsNullOrEmpty(branch) ? null : branch;
     }
 
+    /// <summary>Resolves <paramref name="rev"/> to a commit SHA, or null if it cannot be resolved.</summary>
+    public static string? RevParse(string rev) => Run($"rev-parse --verify {rev}^{{commit}}");
+
+    /// <summary>Returns true when <paramref name="ancestor"/> is an ancestor of <paramref name="descendant"/>.</summary>
+    public static bool IsAncestor(string ancestor, string descendant) => RunOk($"merge-base --is-ancestor {ancestor} {descendant}");
+
+    /// <summary>Fast-forwards the current branch to <paramref name="target"/> only.</summary>
+    public static bool MergeFastForwardOnly(string target) => RunOk($"merge --ff-only {target}");
+
+    /// <summary>Resets the current branch and working tree to <paramref name="target"/>.</summary>
+    public static bool ResetHardTo(string target) => RunOk($"reset --hard {target}");
+
+    /// <summary>Sets <paramref name="refName"/> to <paramref name="sha"/>.</summary>
+    public static bool UpdateRef(string refName, string sha) => RunOk($"update-ref {refName} {sha}");
+
     private static string? Run(string args)
     {
         try
@@ -43,6 +58,32 @@ internal static class Git
         {
             // git not installed or not runnable.
             return null;
+        }
+    }
+
+    private static bool RunOk(string args)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo("git", args)
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var proc = Process.Start(psi);
+            if (proc is null)
+            {
+                return false;
+            }
+
+            proc.WaitForExit();
+            return proc.ExitCode == 0;
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            // git not installed or not runnable.
+            return false;
         }
     }
 }
