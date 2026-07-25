@@ -280,6 +280,15 @@ dependents. The worker has already **built and reviewed** the order to two clean
 
 1. **Push the worker's branch to origin, then open/update the PR** from it. The worker committed
    locally but never pushed; you carry it to GitHub.
+
+   **Title the PR like a human would** — one clear sentence in the repo's normal voice, describing
+   what the change *does* (e.g. *Statically link e_sqlite3 on RID-less AOT publish*). **Write a fresh
+   title; do not reuse the order's or issue's title** — that is an internal spec line, and copying it
+   dumps the order's plumbing into the PR (`WORK-packet`, `base-ref`, a comma-list of mechanics, a
+   trailing `(#N)`), which reads like a machine wrote it. **Nothing about the order machinery belongs
+   in the title.** The order↔PR binding lives in the **body**, as trailers at the very end, and only
+   there: `Fixes: #<issue>` (to close the issue) and `Nightshift-Order: <order base>` (the durable
+   binding). The body explains the change for a human reviewer; the trailers are the last lines.
 2. **Post the one clearance note** that the worker's attestation earns — a sidecar comment naming the
    models and rounds, nothing more (the deliberation never appears on the PR):
 
