@@ -172,6 +172,58 @@ public class ReconcilerTests : IClassFixture<TurnstileFixture>
         await AssertReady(client, plan, "c", expected: false);
     }
 
+    [Fact]
+    public async Task StackedChild_ReleasesWhenBaseRefReachable_BeforeParentLands()
+    {
+        // A stacked child pinned to its parent's contract commit releases the instant that commit exists
+        // locally — ahead of the parent order landing — so siblings on a shared base build concurrently.
+        using TurnstileClient client = _fixture.Connect();
+        Plan plan = MakePlan(PlanId());
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        Order b = plan.Orders.Single(o => o.Id == "b");
+        await client.SetAsync($"{b.Base}/base-ref", "contract-sha", ct);
+
+        // Root a is NOT landed; only b's base ref is reachable.
+        await Reconciler.RunAsync(client, plan, r => r == "contract-sha", ct);
+
+        await AssertReady(client, plan, "a", expected: true);  // root, unchanged
+        await AssertReady(client, plan, "b", expected: true);  // stacked: released on reachable base ref
+        await AssertReady(client, plan, "c", expected: false); // still on main → waits for a to land
+    }
+
+    [Fact]
+    public async Task StackedChild_StaysBlockedWhenBaseRefUnreachable()
+    {
+        // A non-default base ref that is NOT yet in the local object db keeps the child out of the ready set:
+        // the parent's contract has not been committed anywhere the coordinator can see.
+        using TurnstileClient client = _fixture.Connect();
+        Plan plan = MakePlan(PlanId());
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        Order b = plan.Orders.Single(o => o.Id == "b");
+        await client.SetAsync($"{b.Base}/base-ref", "contract-sha", ct);
+
+        await Reconciler.RunAsync(client, plan, _ => false, ct);
+
+        await AssertReady(client, plan, "b", expected: false);
+    }
+
+    [Fact]
+    public async Task IndependentOrder_NotReleasedEarly_EvenWhenEverythingReachable()
+    {
+        // An order on the default base ref (`main`) never takes the stacked path: even a probe that would
+        // answer "reachable" for anything must not open a dependent whose parent has not landed.
+        using TurnstileClient client = _fixture.Connect();
+        Plan plan = MakePlan(PlanId());
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        // No base-ref keys written → all orders default to `main`.
+        await Reconciler.RunAsync(client, plan, _ => true, ct);
+
+        await AssertReady(client, plan, "a", expected: true);  // root
+        await AssertReady(client, plan, "b", expected: false); // main-based dependent, a not landed
+        await AssertReady(client, plan, "c", expected: false);
+    }
+
     private static async Task AssertReady(TurnstileClient client, Plan plan, string orderId, bool expected)
     {
         Order order = plan.Orders.Single(o => o.Id == orderId);

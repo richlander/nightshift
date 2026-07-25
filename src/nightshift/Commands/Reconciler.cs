@@ -5,10 +5,16 @@ using Nightshift.Turnstile;
 
 /// <summary>
 /// Projects a <see cref="Plan"/> into Turnstile and keeps <c>/ready/*</c> consistent with the DAG.
-/// An order (one landable PR) is dispatchable iff every order it depends on has <b>landed</b> (merged),
-/// it is not already claimed, and it has no in-flight/terminal outcome. `landed` — not the agent's
-/// self-declared `done` — is the signal that opens downstream work: the human stays in the merge loop,
-/// dispatch is autonomous.
+/// An order (one landable PR) is dispatchable iff its dependency edges are satisfied, it is not already
+/// claimed, and it has no in-flight/terminal outcome. An edge is satisfied one of two ways:
+/// <list type="bullet">
+/// <item>an <b>independent</b> order (base ref <c>main</c>) waits until every order it depends on has
+/// <b>landed</b> (merged) — <c>landed</c>, not the agent's self-declared <c>done</c>, is the signal that
+/// opens downstream work, so the human stays in the merge loop while dispatch is autonomous; or</item>
+/// <item>a <b>stacked</b> order (a non-default base ref — a parent's branch or a pinned SHA) releases as
+/// soon as that base-ref commit is <b>reachable in the local object database</b>, ahead of the parent's
+/// merge, so siblings on a shared base build concurrently (see <c>docs/design/stacked-orders.md</c> §3).</item>
+/// </list>
 /// </summary>
 internal static class Reconciler
 {
@@ -20,7 +26,14 @@ internal static class Reconciler
 
     public sealed record Result(int SpecsCreated, int Added, int Removed);
 
-    public static async Task<Result> RunAsync(TurnstileClient client, Plan plan, CancellationToken ct)
+    public static Task<Result> RunAsync(TurnstileClient client, Plan plan, CancellationToken ct)
+        => RunAsync(client, plan, Git.IsReachable, ct);
+
+    /// <param name="isReachable">
+    /// Tests whether a stacked order's base-ref commit-ish exists in the local object database. Injected so
+    /// the git dependency is isolated for tests; production passes <see cref="Git.IsReachable"/>.
+    /// </param>
+    public static async Task<Result> RunAsync(TurnstileClient client, Plan plan, Func<string, bool> isReachable, CancellationToken ct)
     {
         int specsCreated = 0;
         foreach (Order order in plan.Orders)
@@ -53,9 +66,11 @@ internal static class Reconciler
             bool present = presentReady.Contains(readyKey);
 
             bool depsLanded = order.After.All(landedOrders.Contains);
+            bool stackedReady = await StackedReadyAsync(client, order, isReachable, ct);
+            bool depsSatisfied = depsLanded || stackedReady;
             bool ineligibleState = status[order.Id] is { } st && Ineligible.Contains(st);
             bool claimed = await client.GetAsync($"{order.Base}/claim", ct) is not null;
-            bool eligible = depsLanded && !ineligibleState && !claimed;
+            bool eligible = depsSatisfied && !ineligibleState && !claimed;
 
             if (eligible && !present)
             {
@@ -70,6 +85,24 @@ internal static class Reconciler
         }
 
         return new Result(specsCreated, added, removed);
+    }
+
+    /// <summary>
+    /// A stacked order is released early — ahead of its parent's merge — once its base-ref commit is reachable
+    /// locally. Only a <b>non-default</b> base ref (something other than <c>main</c>, written by the coordinator
+    /// for a stacked child) takes this path; an independent order on <c>main</c> keeps today's deps-landed
+    /// semantics and never triggers a git probe here.
+    /// </summary>
+    private static async Task<bool> StackedReadyAsync(TurnstileClient client, Order order, Func<string, bool> isReachable, CancellationToken ct)
+    {
+        KvItem? baseRef = await client.GetAsync($"{order.Base}/base-ref", ct);
+        if (baseRef?.Text.Trim() is not { Length: > 0 } commitish
+            || string.Equals(commitish, OrderView.DefaultBaseRef, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return isReachable(commitish);
     }
 
     private static string? StatusOf(string stateJson)

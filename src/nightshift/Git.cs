@@ -19,6 +19,17 @@ internal static class Git
         return string.IsNullOrEmpty(branch) ? null : branch;
     }
 
+    /// <summary>
+    /// True when <paramref name="commitish"/> resolves to a commit in the local object database. All
+    /// worktrees of a repository share one object database, so the instant a stacked parent's worker
+    /// commits its contract in another worktree, that ref (a branch or a pinned SHA) is reachable here —
+    /// no fetch, push, or merge. This is the readiness signal the coordinator uses to release a stacked
+    /// child ahead of the parent's merge (see <c>docs/design/stacked-orders.md</c> §3).
+    /// </summary>
+    public static bool IsReachable(string commitish)
+        => !string.IsNullOrWhiteSpace(commitish)
+            && Run($"rev-parse --verify --quiet {commitish}^{{commit}}") is not null;
+
     private static string? Run(string args)
     {
         try
