@@ -74,21 +74,24 @@ redeploy, the shift is coordinating itself with stale code and landed fixes are 
 effect.
 
 So at the **start of every round** — after you refresh `main` and before you touch the
-board — rebuild and redeploy with [`dotnet-install`](https://www.nuget.org/packages/dotnet-install)
-(a .NET global tool; install once with `dotnet tool install --global dotnet-install`) from
-the repo root:
+board — rebuild and redeploy with [`dotnet-install`](https://www.nuget.org/packages/dotnet-install),
+run one-off via `dnx` (which fetches and runs a .NET tool from NuGet without a persistent
+global install, like `npx`), from the repo root:
 
 ```
-dotnet-install
+dnx dotnet-install -y --
 ```
 
-With no arguments in the repo root it reads the `.dotnet-install/.dotnet-install.json` bundle
-manifest and publishes each tool as a NativeAOT single-file native binary, installing it into
-`~/.dotnet/bin` (on `PATH`). The RID is inferred automatically; there is nothing to pass. The
-same tool installs the bundle onto a fresh machine straight from GitHub:
-`dotnet-install --github richlander/nightshift`.
+`dnx dotnet-install -y` fetches the tool (the `-y` auto-confirms the download); the `--` ends
+`dnx`'s own options so everything after it is forwarded to `dotnet-install` — here, nothing, so
+it runs with no arguments. With no arguments in the repo root it reads the
+`.dotnet-install/.dotnet-install.json` bundle manifest and publishes each tool as a NativeAOT
+single-file native binary, installing it into `~/.dotnet/bin` (on `PATH`). The RID is inferred
+automatically; there is nothing to pass. The same tool installs the bundle onto a fresh machine
+straight from GitHub — forward the flag past the `--`:
+`dnx dotnet-install -y -- --github richlander/nightshift`.
 
-Deploying a binary does **not** restart anything already running. After `dotnet-install`:
+Deploying a binary does **not** restart anything already running. After the redeploy:
 
 - **Always restart the `nightshift plan` controller** so it runs the new code (stop the old
   one, relaunch on the same plan file and `--sha` anchor — re-seeding is idempotent).
