@@ -172,6 +172,81 @@ public class ReconcilerTests : IClassFixture<TurnstileFixture>
         await AssertReady(client, plan, "c", expected: false);
     }
 
+    [Fact]
+    public async Task StackedChild_ReleasesWhenBaseRefReachable_BeforeParentLands()
+    {
+        // A stacked child pinned to its parent's contract commit releases the instant that commit exists
+        // locally — ahead of the parent order landing — so siblings on a shared base build concurrently.
+        using TurnstileClient client = _fixture.Connect();
+        Plan plan = MakePlan(PlanId());
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        Order b = plan.Orders.Single(o => o.Id == "b");
+        await client.SetAsync($"{b.Base}/base-ref", "contract-sha", ct);
+
+        // Root a is NOT landed; only b's base ref is reachable.
+        await Reconciler.RunAsync(client, plan, r => r == "contract-sha", ct);
+
+        await AssertReady(client, plan, "a", expected: true);  // root, unchanged
+        await AssertReady(client, plan, "b", expected: true);  // stacked: released on reachable base ref
+        await AssertReady(client, plan, "c", expected: false); // still on main → waits for a to land
+    }
+
+    [Fact]
+    public async Task StackedChild_StaysBlockedWhenBaseRefUnreachable()
+    {
+        // A non-default base ref that is NOT yet in the local object db keeps the child out of the ready set:
+        // the parent's contract has not been committed anywhere the coordinator can see.
+        using TurnstileClient client = _fixture.Connect();
+        Plan plan = MakePlan(PlanId());
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        Order b = plan.Orders.Single(o => o.Id == "b");
+        await client.SetAsync($"{b.Base}/base-ref", "contract-sha", ct);
+
+        await Reconciler.RunAsync(client, plan, _ => false, ct);
+
+        await AssertReady(client, plan, "b", expected: false);
+    }
+
+    [Fact]
+    public async Task IndependentOrder_NotReleasedEarly_EvenWhenEverythingReachable()
+    {
+        // An order on the default base ref (`main`) never takes the stacked path: even a probe that would
+        // answer "reachable" for anything must not open a dependent whose parent has not landed.
+        using TurnstileClient client = _fixture.Connect();
+        Plan plan = MakePlan(PlanId());
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        // No base-ref keys written → all orders default to `main`.
+        await Reconciler.RunAsync(client, plan, _ => true, ct);
+
+        await AssertReady(client, plan, "a", expected: true);  // root
+        await AssertReady(client, plan, "b", expected: false); // main-based dependent, a not landed
+        await AssertReady(client, plan, "c", expected: false);
+    }
+
+    [Fact]
+    public async Task StackedOrder_EmptyAfter_WaitsForBaseRefReachable_NotReleasedVacuously()
+    {
+        // A stacked order with an empty `after` list must NOT slip into the ready set on the vacuously-true
+        // deps-landed check: with a non-default base ref it is gated purely on that base being reachable.
+        using TurnstileClient client = _fixture.Connect();
+        string planId = PlanId();
+        Plan plan = Plan.Parse(
+            $$"""{ "plan": "{{planId}}", "orders": [ { "order": "root" } ] }""", "sha");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        Order root = plan.Orders.Single(o => o.Id == "root");
+        await client.SetAsync($"{root.Base}/base-ref", "contract-sha", ct);
+
+        // Base ref not yet reachable → the order stays out of ready despite having no dependencies.
+        await Reconciler.RunAsync(client, plan, _ => false, ct);
+        await AssertReady(client, plan, "root", expected: false);
+
+        // Once the base ref is reachable, it opens.
+        Reconciler.Result opened = await Reconciler.RunAsync(client, plan, r => r == "contract-sha", ct);
+        Assert.Equal(1, opened.Added);
+        await AssertReady(client, plan, "root", expected: true);
+    }
+
     private static async Task AssertReady(TurnstileClient client, Plan plan, string orderId, bool expected)
     {
         Order order = plan.Orders.Single(o => o.Id == orderId);
