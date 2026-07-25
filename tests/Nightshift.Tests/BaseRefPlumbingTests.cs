@@ -185,6 +185,24 @@ public class BaseRefPlumbingTests : IClassFixture<TurnstileFixture>
         Assert.Equal(["contract", "other"], specAfter);
     }
 
+    [Fact]
+    public void PlanSchema_AfterToleratesMalformedEdges_WithoutThrowing()
+    {
+        // A malformed dependency edge — a non-scalar `order`, or a boolean/object/array/null edge — must be
+        // ignored, not throw. AfterId is total; the empty id it yields is filtered out of the DAG.
+        Plan plan = Plan.Parse(
+            """
+            { "plan": "p", "orders": [
+                { "order": "x", "after": [
+                    { "order": true }, { "order": {} }, { "order": [] }, { "kind": "stacked" },
+                    true, null, { "order": "good" } ] } ] }
+            """,
+            "deadbeefcafe");
+
+        Order order = Assert.Single(plan.Orders);
+        Assert.Equal(["good"], order.After);
+    }
+
     private static string Render(OrderView view, string orderBase)
     {
         var sb = new StringBuilder();

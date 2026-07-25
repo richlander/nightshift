@@ -137,17 +137,22 @@ internal sealed class Plan
     }
 
     /// <summary>The order id of an <c>after</c> edge: a bare string/number, or the <c>order</c> field of an
-    /// object edge <c>{ "order", "kind" }</c>. Empty when the edge carries no usable id.</summary>
+    /// object edge <c>{ "order", "kind" }</c>. Total and tolerant — any other shape (a missing or non-scalar
+    /// <c>order</c>, a boolean/object/array/null edge) yields an empty id that the caller skips, so a
+    /// malformed edge is ignored rather than throwing.</summary>
     private static string AfterId(JsonElement edge)
-        => edge.ValueKind switch
+    {
+        JsonElement id = edge.ValueKind == JsonValueKind.Object && edge.TryGetProperty("order", out JsonElement o)
+            ? o
+            : edge;
+
+        return id.ValueKind switch
         {
-            JsonValueKind.String => edge.GetString() ?? string.Empty,
-            JsonValueKind.Number => edge.GetRawText(),
-            JsonValueKind.Object => edge.TryGetProperty("order", out JsonElement o)
-                ? o.ValueKind == JsonValueKind.Number ? o.GetRawText() : o.GetString() ?? string.Empty
-                : string.Empty,
+            JsonValueKind.String => id.GetString() ?? string.Empty,
+            JsonValueKind.Number => id.GetRawText(),
             _ => string.Empty,
         };
+    }
 
     private static string? Scalar(JsonElement parent, string name)
     {
