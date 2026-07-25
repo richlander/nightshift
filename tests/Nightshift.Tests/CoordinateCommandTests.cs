@@ -14,7 +14,8 @@ public class CoordinateCommandTests
         CoordinateCommand.MainVerdict verdict = CoordinateCommand.ClassifyMain(
             observed: null,
             blessed: "abc123",
-            blessedIsAncestorOfObserved: false);
+            blessedIsAncestorOfObserved: false,
+            observedMatchesClaimedBranch: false);
 
         Assert.Equal(CoordinateCommand.MainVerdict.Healthy, verdict);
     }
@@ -28,7 +29,8 @@ public class CoordinateCommandTests
         CoordinateCommand.MainVerdict verdict = CoordinateCommand.ClassifyMain(
             observed: "abc123",
             blessed: blessed,
-            blessedIsAncestorOfObserved: false);
+            blessedIsAncestorOfObserved: false,
+            observedMatchesClaimedBranch: false);
 
         Assert.Equal(CoordinateCommand.MainVerdict.Adopt, verdict);
     }
@@ -39,7 +41,8 @@ public class CoordinateCommandTests
         CoordinateCommand.MainVerdict verdict = CoordinateCommand.ClassifyMain(
             observed: "abc123",
             blessed: "abc123",
-            blessedIsAncestorOfObserved: false);
+            blessedIsAncestorOfObserved: false,
+            observedMatchesClaimedBranch: false);
 
         Assert.Equal(CoordinateCommand.MainVerdict.Healthy, verdict);
     }
@@ -50,9 +53,22 @@ public class CoordinateCommandTests
         CoordinateCommand.MainVerdict verdict = CoordinateCommand.ClassifyMain(
             observed: "def456",
             blessed: "abc123",
-            blessedIsAncestorOfObserved: true);
+            blessedIsAncestorOfObserved: true,
+            observedMatchesClaimedBranch: false);
 
         Assert.Equal(CoordinateCommand.MainVerdict.Rebless, verdict);
+    }
+
+    [Fact]
+    public void ClassifyMain_FastForward_ClaimedBranchMatch_IsSteal()
+    {
+        CoordinateCommand.MainVerdict verdict = CoordinateCommand.ClassifyMain(
+            observed: "def456",
+            blessed: "abc123",
+            blessedIsAncestorOfObserved: true,
+            observedMatchesClaimedBranch: true);
+
+        Assert.Equal(CoordinateCommand.MainVerdict.Steal, verdict);
     }
 
     [Fact]
@@ -61,7 +77,8 @@ public class CoordinateCommandTests
         CoordinateCommand.MainVerdict verdict = CoordinateCommand.ClassifyMain(
             observed: "def456",
             blessed: "abc123",
-            blessedIsAncestorOfObserved: false);
+            blessedIsAncestorOfObserved: false,
+            observedMatchesClaimedBranch: false);
 
         Assert.Equal(CoordinateCommand.MainVerdict.Steal, verdict);
     }
