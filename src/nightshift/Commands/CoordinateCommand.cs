@@ -237,6 +237,12 @@ internal static class CoordinateCommand
             bool observedMatchesClaimedBranch = false;
             if (observed != blessed)
             {
+                string? originMain = Git.RevParse("origin/main");
+                if (originMain is not null && observed == originMain)
+                {
+                    return await WriteBlessedMainHeadAsync(client, observed, ct);
+                }
+
                 offender = await FindMainStealOffenderAsync(client, observed, ct);
                 observedMatchesClaimedBranch = offender is not null;
             }
