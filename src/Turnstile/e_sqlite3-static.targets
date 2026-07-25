@@ -18,6 +18,20 @@
     added later). A C toolchain (clang + ar) must be on PATH.
   -->
 
+  <!--
+    RID must be known BEFORE the ESqlite3StaticLink decision below reads it.
+    A `dotnet publish -p:PublishAot=true` WITHOUT an explicit `-r` (how install.sh
+    and dotnet-install invoke it) only infers the RID in the SDK's closing targets
+    — after this file, imported from the csproj body, has already evaluated. That
+    left RuntimeIdentifier empty here, so static linking silently did not happen
+    and the sidecar shipped anyway. Pin the RID to the SDK's portable RID up front
+    during publish so the decision sees it. Gated on _IsPublishing (a global
+    property `dotnet publish` sets) so ordinary RID-agnostic builds are untouched.
+  -->
+  <PropertyGroup Condition="'$(_IsPublishing)' == 'true' and '$(PublishAot)' == 'true' and '$(RuntimeIdentifier)' == '' and '$(NETCoreSdkPortableRuntimeIdentifier)' != ''">
+    <RuntimeIdentifier>$(NETCoreSdkPortableRuntimeIdentifier)</RuntimeIdentifier>
+  </PropertyGroup>
+
   <PropertyGroup Condition="'$(ESqlite3StaticLink)' == ''">
     <ESqlite3StaticLink>false</ESqlite3StaticLink>
     <ESqlite3StaticLink Condition="'$(PublishAot)' == 'true' and ($(RuntimeIdentifier.StartsWith('osx')) or $(RuntimeIdentifier.StartsWith('linux')))">true</ESqlite3StaticLink>
