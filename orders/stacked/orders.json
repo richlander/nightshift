@@ -1,0 +1,57 @@
+{
+  "plan": "stacked",
+  "standard": "docs/design/stacked-orders.md",
+  "orders": [
+    { "order": "baseref", "issue": 120,
+      "title": "Base-ref plumbing: plan-schema, Turnstile key, WORK packet, branch-off-base",
+      "paths": [
+        "src/nightshift/Commands/PlanFile.cs",
+        "src/nightshift/Commands/Plan.cs",
+        "src/nightshift/Commands/OrderView.cs",
+        "src/nightshift/Commands/OrderRef.cs",
+        "src/nightshift/Commands/OrderState.cs",
+        "src/nightshift/Commands/NextCommand.cs",
+        "src/nightshift/Commands/ShowCommand.cs",
+        "src/nightshift/Commands/RecoverCommand.cs",
+        ".github/skills/nightshift-builder/**"
+      ],
+      "brief": "Per-order base ref (default main). Authoring model is SETTLED: the planner declares intent (after + dependency kind); the COORDINATOR resolves it to a concrete commit SHA — plans do NOT author base refs directly. Add {base}/base-ref key; add WORK body field base-ref: (never the first line; show/recover byte-identical); branch off the named base (default main)." },
+
+    { "order": "coord-main", "issue": 121,
+      "title": "Coordinator owns local main: ff-advance, steal-back, cancel-on-steal",
+      "paths": [
+        "src/nightshift/Git.cs",
+        "src/nightshift/Commands/CoordinateCommand.cs",
+        "src/nightshift/Commands/LandCommand.cs",
+        ".github/skills/nightshift-coordinator/**"
+      ],
+      "brief": "Coordinator holds main in the primary worktree and --ff-only advances after each land. Detect main force-moved by a non-coordinator and reconcile. Stealing main is cancellable, no second chances: revoke claim/lease, quarantine branch (§2)." },
+
+    { "order": "readiness", "issue": 122,
+      "title": "Readiness predicate: fire 'after' on base commit existing locally",
+      "paths": [ "src/nightshift/Commands/Reconciler.cs" ],
+      "after": ["baseref"],
+      "brief": "Release a stacked order when its base-ref commit is reachable locally (shared object DB) instead of when the parent PR merges — enabling sibling concurrency. Independent orders keep today's semantics." },
+
+    { "order": "escalate-base", "issue": 123,
+      "title": "Prereq resolution via escalation: publish base to origin",
+      "paths": [
+        "src/nightshift/Commands/EscalateCommand.cs",
+        "src/nightshift/Commands/CheckCommand.cs",
+        "src/nightshift/Commands/NextCommand.cs",
+        "src/nightshift/Commands/CoordinateCommand.cs",
+        ".github/skills/nightshift-worker/**"
+      ],
+      "after": ["baseref", "coord-main"],
+      "brief": "Worker checks base-ref reachable locally; if not, escalate (new reason on the existing andon-cord). Coordinator resolves by pushing that branch to origin, clears the escalation, worker fetches and proceeds. General prereq-unreachable path; workers stay read-only w.r.t. origin." },
+
+    { "order": "land-stack", "issue": 124,
+      "title": "Land a stack in topological order",
+      "paths": [
+        "src/nightshift/Commands/LandCommand.cs",
+        "src/nightshift/Commands/CoordinateCommand.cs"
+      ],
+      "after": ["baseref", "coord-main", "readiness", "escalate-base"],
+      "brief": "Land a stack topologically through the existing merge queue: contract first, then dependents. A child pinned to the parent's contract SHA rebases cleanly onto main once that SHA is an ancestor of main. Two-clean gate per order unchanged." }
+  ]
+}
