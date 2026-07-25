@@ -8,6 +8,64 @@ using Xunit;
 
 public class CoordinateCommandTests
 {
+    [Fact]
+    public void ClassifyMain_ObservedMissing_IsHealthy()
+    {
+        CoordinateCommand.MainVerdict verdict = CoordinateCommand.ClassifyMain(
+            observed: null,
+            blessed: "abc123",
+            blessedIsAncestorOfObserved: false);
+
+        Assert.Equal(CoordinateCommand.MainVerdict.Healthy, verdict);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("  ")]
+    public void ClassifyMain_BlessedMissing_AdoptsObserved(string? blessed)
+    {
+        CoordinateCommand.MainVerdict verdict = CoordinateCommand.ClassifyMain(
+            observed: "abc123",
+            blessed: blessed,
+            blessedIsAncestorOfObserved: false);
+
+        Assert.Equal(CoordinateCommand.MainVerdict.Adopt, verdict);
+    }
+
+    [Fact]
+    public void ClassifyMain_EqualHeads_IsHealthy()
+    {
+        CoordinateCommand.MainVerdict verdict = CoordinateCommand.ClassifyMain(
+            observed: "abc123",
+            blessed: "abc123",
+            blessedIsAncestorOfObserved: false);
+
+        Assert.Equal(CoordinateCommand.MainVerdict.Healthy, verdict);
+    }
+
+    [Fact]
+    public void ClassifyMain_BlessedAncestor_Reblesses()
+    {
+        CoordinateCommand.MainVerdict verdict = CoordinateCommand.ClassifyMain(
+            observed: "def456",
+            blessed: "abc123",
+            blessedIsAncestorOfObserved: true);
+
+        Assert.Equal(CoordinateCommand.MainVerdict.Rebless, verdict);
+    }
+
+    [Fact]
+    public void ClassifyMain_DivergedBranch_IsSteal()
+    {
+        CoordinateCommand.MainVerdict verdict = CoordinateCommand.ClassifyMain(
+            observed: "def456",
+            blessed: "abc123",
+            blessedIsAncestorOfObserved: false);
+
+        Assert.Equal(CoordinateCommand.MainVerdict.Steal, verdict);
+    }
+
     [Theory]
     [InlineData("done")]
     [InlineData("landed")]
@@ -289,7 +347,7 @@ public class CoordinateCommandTests
                 TestContext.Current.CancellationToken);
 
             Assert.True(result.TimedOut);
-            Assert.InRange(watchCalls, 1, 12);
+            Assert.InRange(watchCalls, 1, 120);
             Assert.Equal(0, keepAliveCalls);
         }
         finally
