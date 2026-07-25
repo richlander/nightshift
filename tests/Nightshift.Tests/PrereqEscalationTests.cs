@@ -129,6 +129,37 @@ public class PrereqEscalationTests
         Assert.Equal("escalated", outcome!.Transition);
     }
 
+    [Fact]
+    public void ResolutionFor_ReworkOrder_RestoresRework()
+        => Assert.Equal(CheckCommand.PrereqResolution.RestoreRework, CheckCommand.ResolutionFor(isRework: true));
+
+    [Fact]
+    public void ResolutionFor_FreshClaim_ClearsToFresh()
+        => Assert.Equal(CheckCommand.PrereqResolution.ClearToFresh, CheckCommand.ResolutionFor(isRework: false));
+
+    [Fact]
+    public async Task Coordinate_NonStringReason_DoesNotThrowAndIsNotPrereq()
+    {
+        // A `reason` whose JSON value is an object (not a string) must not throw when read —
+        // GetString() throws InvalidOperationException on non-string kinds, which the JsonException
+        // catch would miss. It is treated as a plain (non-prereq) escalation.
+        string orderBase = "/plan/stacked/order/child";
+        string stateKey = $"{orderBase}/state";
+        var values = new Dictionary<string, string>
+        {
+            [stateKey] = "{\"status\":\"escalated\",\"reason\":{\"nested\":true}}",
+        };
+        var predicate = new CoordinateCommand.CoordinatePredicate();
+
+        CoordinateCommand.CoordinateOutcome? outcome = await predicate.TryMatchAsync(
+            new FilteredWaitEngine.WatchEdge("plan", new WatchSignal(stateKey, Deleted: false, Revision: 62)),
+            BuildGetter(values),
+            TestContext.Current.CancellationToken);
+
+        Assert.NotNull(outcome);
+        Assert.Equal("escalated", outcome!.Transition);
+    }
+
     private static Func<string, CancellationToken, Task<KvItem?>> BuildGetter(Dictionary<string, string> values)
         => (key, _) => Task.FromResult(values.TryGetValue(key, out string? value)
             ? new KvItem(key, CreateRevision: 1, ModRevision: 1, Lease: null, Immutable: false, Encoding.UTF8.GetBytes(value))

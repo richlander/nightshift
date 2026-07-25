@@ -137,17 +137,25 @@ your machine's local object database — typically a parent branch built on anot
 never published — `next` **self-raises a prereq-unreachable escalation** on the andon cord
 and prints a `prereq:` line after the packet. **Do not build.** You keep the claim; the
 order is already `escalated` for you. Wait for the coordinator to publish the base to
-origin (only the coordinator pushes — you stay read-only w.r.t. origin), then:
+origin (only the coordinator pushes — you stay read-only w.r.t. origin), then fetch it
+into a form your `base-ref` resolves to and re-arm:
 
 ```
-git fetch origin            # pull the now-published base into your local object DB
+# a SHA base-ref: fetch brings the objects on the published branch
+git fetch origin
+# a branch base-ref: fetch it into the SAME local ref so `<base-ref>` resolves and you
+# can later `git switch -c <order-branch> <base-ref>` — a plain fetch only makes
+# origin/<base-ref>, which the reachability check and the branch-off both miss
+git fetch origin <base-ref>:<base-ref>
+
 nightshift check            # re-arms: QUERY (still parked) until the base is reachable, then OK
 ```
 
 `check` re-tests reachability every heartbeat: while the base is still unreachable it
 returns `QUERY` with the prereq reason (stay parked, lease renewed); once your fetch has
-made the base reachable it clears the escalation and returns `OK` — **then build**. This
-is the general "prereq not available → escalate → coordinator publishes → proceed" path;
+made the base reachable it clears the escalation and returns `OK` — **then build** (a
+rework order is returned to `changes-requested`, so its findings still render). This is
+the general "prereq not available → escalate → coordinator publishes → proceed" path;
 you never push a base yourself.
 
 ## Build and review the order

@@ -26,6 +26,20 @@ internal static class CheckCommand
         Parked,
     }
 
+    /// <summary>How <c>check</c> clears a resolved prereq escalation: restore rework, or clear to a fresh claim.</summary>
+    internal enum PrereqResolution
+    {
+        /// <summary>The order had no pre-escalation state (a fresh claim): delete <c>{base}/state</c>.</summary>
+        ClearToFresh,
+
+        /// <summary>The order was a rework: restore <c>changes-requested</c> so its findings keep rendering.</summary>
+        RestoreRework,
+    }
+
+    /// <summary>Resolves a satisfied prereq to the state to restore — rework when the order carried rework findings.</summary>
+    internal static PrereqResolution ResolutionFor(bool isRework)
+        => isRework ? PrereqResolution.RestoreRework : PrereqResolution.ClearToFresh;
+
     /// <summary>
     /// Classifies a standing order state for the prereq re-arm path: a prereq-unreachable escalation resolves
     /// once <paramref name="reachable"/>, stays parked until then, and anything else is not a prereq.
@@ -87,7 +101,26 @@ internal static class CheckCommand
             switch (ClassifyPrereq(status, reason, reachable))
             {
                 case PrereqOutcome.Resolved:
-                    await client.DeleteAsync($"{session.OrderBase}/state", ct);
+                    // The self-raised prereq is satisfied. Restore the pre-escalation state so we do not lose
+                    // rework semantics: an order that was `changes-requested` when claimed still carries its
+                    // findings in {base}/rework, so returning it to `changes-requested` keeps `show`/`recover`
+                    // rendering `mode: rework`. A fresh claim had no state — clear it back to none.
+                    bool isRework = await client.GetAsync($"{session.OrderBase}/rework", ct) is not null;
+                    if (ResolutionFor(isRework) == PrereqResolution.RestoreRework)
+                    {
+                        await OrderState.WriteAsync(
+                            client,
+                            session.OrderBase,
+                            OrderView.ChangesRequested,
+                            "prereq resolved: base-ref reachable — resuming rework",
+                            Session.Identity,
+                            ct);
+                    }
+                    else
+                    {
+                        await client.DeleteAsync($"{session.OrderBase}/state", ct);
+                    }
+
                     Console.WriteLine("OK");
                     Console.WriteLine("prereq resolved: base-ref is reachable locally — proceed to build");
                     return ExitCode.Ok;
@@ -122,8 +155,8 @@ internal static class CheckCommand
         {
             using JsonDocument doc = JsonDocument.Parse(stateJson);
             JsonElement root = doc.RootElement;
-            string? status = root.TryGetProperty("status", out JsonElement s) ? s.GetString() : null;
-            string? reason = root.TryGetProperty("reason", out JsonElement r) ? r.GetString() : null;
+            string? status = root.TryGetProperty("status", out JsonElement s) && s.ValueKind == JsonValueKind.String ? s.GetString() : null;
+            string? reason = root.TryGetProperty("reason", out JsonElement r) && r.ValueKind == JsonValueKind.String ? r.GetString() : null;
             return (status, reason);
         }
         catch (JsonException)
