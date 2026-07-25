@@ -26,20 +26,39 @@ internal static class Git
     /// no fetch, push, or merge. This is the readiness signal the coordinator uses to release a stacked
     /// child ahead of the parent's merge (see <c>docs/design/stacked-orders.md</c> §3).
     /// </summary>
+    /// <remarks>
+    /// The base ref is passed as a single contiguous argument after <c>--end-of-options</c>, so a value with
+    /// spaces or a leading dash can never be reinterpreted as git options — a malformed ref simply fails to
+    /// resolve and returns <c>false</c> rather than probing an unintended object.
+    /// </remarks>
     public static bool IsReachable(string commitish)
         => !string.IsNullOrWhiteSpace(commitish)
-            && Run($"rev-parse --verify --quiet {commitish}^{{commit}}") is not null;
+            && RunArgs("rev-parse", "--verify", "--quiet", "--end-of-options", $"{commitish}^{{commit}}") is not null;
 
     private static string? Run(string args)
     {
+        var psi = new ProcessStartInfo("git", args);
+        return Run(psi);
+    }
+
+    private static string? RunArgs(params string[] args)
+    {
+        var psi = new ProcessStartInfo("git");
+        foreach (string arg in args)
+        {
+            psi.ArgumentList.Add(arg);
+        }
+
+        return Run(psi);
+    }
+
+    private static string? Run(ProcessStartInfo psi)
+    {
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        psi.UseShellExecute = false;
         try
         {
-            var psi = new ProcessStartInfo("git", args)
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-            };
             using var proc = Process.Start(psi);
             if (proc is null)
             {

@@ -224,6 +224,29 @@ public class ReconcilerTests : IClassFixture<TurnstileFixture>
         await AssertReady(client, plan, "c", expected: false);
     }
 
+    [Fact]
+    public async Task StackedOrder_EmptyAfter_WaitsForBaseRefReachable_NotReleasedVacuously()
+    {
+        // A stacked order with an empty `after` list must NOT slip into the ready set on the vacuously-true
+        // deps-landed check: with a non-default base ref it is gated purely on that base being reachable.
+        using TurnstileClient client = _fixture.Connect();
+        string planId = PlanId();
+        Plan plan = Plan.Parse(
+            $$"""{ "plan": "{{planId}}", "orders": [ { "order": "root" } ] }""", "sha");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        Order root = plan.Orders.Single(o => o.Id == "root");
+        await client.SetAsync($"{root.Base}/base-ref", "contract-sha", ct);
+
+        // Base ref not yet reachable → the order stays out of ready despite having no dependencies.
+        await Reconciler.RunAsync(client, plan, _ => false, ct);
+        await AssertReady(client, plan, "root", expected: false);
+
+        // Once the base ref is reachable, it opens.
+        Reconciler.Result opened = await Reconciler.RunAsync(client, plan, r => r == "contract-sha", ct);
+        Assert.Equal(1, opened.Added);
+        await AssertReady(client, plan, "root", expected: true);
+    }
+
     private static async Task AssertReady(TurnstileClient client, Plan plan, string orderId, bool expected)
     {
         Order order = plan.Orders.Single(o => o.Id == orderId);

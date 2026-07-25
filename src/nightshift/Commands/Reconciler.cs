@@ -65,9 +65,7 @@ internal static class Reconciler
             string readyKey = plan.ReadyKey(order);
             bool present = presentReady.Contains(readyKey);
 
-            bool depsLanded = order.After.All(landedOrders.Contains);
-            bool stackedReady = await StackedReadyAsync(client, order, isReachable, ct);
-            bool depsSatisfied = depsLanded || stackedReady;
+            bool depsSatisfied = await DepsSatisfiedAsync(client, order, landedOrders, isReachable, ct);
             bool ineligibleState = status[order.Id] is { } st && Ineligible.Contains(st);
             bool claimed = await client.GetAsync($"{order.Base}/claim", ct) is not null;
             bool eligible = depsSatisfied && !ineligibleState && !claimed;
@@ -88,21 +86,33 @@ internal static class Reconciler
     }
 
     /// <summary>
-    /// A stacked order is released early — ahead of its parent's merge — once its base-ref commit is reachable
-    /// locally. Only a <b>non-default</b> base ref (something other than <c>main</c>, written by the coordinator
-    /// for a stacked child) takes this path; an independent order on <c>main</c> keeps today's deps-landed
-    /// semantics and never triggers a git probe here.
+    /// Whether an order's dependency edge is satisfied — the two readiness regimes are <b>exclusive</b>, chosen
+    /// by the order's base ref:
+    /// <list type="bullet">
+    /// <item><b>Independent</b> (base ref absent/blank/<c>main</c>): today's rule — every <c>after</c> order has
+    /// <b>landed</b>. An order with no dependencies is trivially satisfied.</item>
+    /// <item><b>Stacked</b> (a non-default base ref — a parent branch or a pinned SHA the coordinator resolved
+    /// for this order's edge): satisfied once that base-ref commit is <b>reachable locally</b>, ahead of the
+    /// parent's merge (<c>docs/design/stacked-orders.md</c> §3). This deliberately does <i>not</i> also require
+    /// the <c>after</c> orders to have landed — reachability of the resolved base <i>is</i> the edge — and it is
+    /// not OR-ed with the landed rule, so an order that merely has an empty <c>after</c> can never slip through
+    /// on the vacuously-true landed check while its base is still unreachable.</item>
+    /// </list>
+    /// The stacked-orders model has one base per order (variants depend only on their contract, §6); resolving a
+    /// child that depends on several distinct un-landed orders through one base ref is an open question (§8) and
+    /// is intentionally out of scope here.
     /// </summary>
-    private static async Task<bool> StackedReadyAsync(TurnstileClient client, Order order, Func<string, bool> isReachable, CancellationToken ct)
+    private static async Task<bool> DepsSatisfiedAsync(
+        TurnstileClient client, Order order, IReadOnlySet<string> landedOrders, Func<string, bool> isReachable, CancellationToken ct)
     {
         KvItem? baseRef = await client.GetAsync($"{order.Base}/base-ref", ct);
-        if (baseRef?.Text.Trim() is not { Length: > 0 } commitish
-            || string.Equals(commitish, OrderView.DefaultBaseRef, StringComparison.Ordinal))
+        if (baseRef?.Text.Trim() is { Length: > 0 } commitish
+            && !string.Equals(commitish, OrderView.DefaultBaseRef, StringComparison.Ordinal))
         {
-            return false;
+            return isReachable(commitish);
         }
 
-        return isReachable(commitish);
+        return order.After.All(landedOrders.Contains);
     }
 
     private static string? StatusOf(string stateJson)
