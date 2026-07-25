@@ -117,9 +117,10 @@ export TURNSTILE_SOCKET=~/.turnstile/turnstile.sock
 
 ## 2. Author the plan — `orders.json`
 
-Work out the design first — the Product Manager shapes it, the Planner turns it into orders — and
-commit it (the `standard` notes and the plan file live in the repo; that commit is the authorization
-root). Then write the plan:
+Work out the design first — the Product Manager shapes it, the Planner turns it into orders. The
+`standard` notes live in `main` like any design doc, but **the plan file itself is coordination data,
+not mainline code — it lives on the orphan order-ledger branch, not `main`** (see *Where the plan
+lives* below; that ledger commit is the authorization root). Then write the plan:
 
 > **Map issues by the charter, not by assumption.** How issues become orders — which are in scope, how
 > finely to slice, how `paths` stay disjoint, how `after` edges are inferred — is repository policy, not
@@ -135,6 +136,32 @@ root). Then write the plan:
 > When an issue is **not design-ready, do not plan it.** Post on the issue naming the specific design
 > it still needs (the decisions to make, the `standard` to write), and leave it for the product manager
 > to shape. Only well-formed issues become orders.
+
+### Where the plan lives — the orphan order-ledger branch
+
+The order domain is **not** mainline code, so the plan does **not** go on `main` and does **not** go
+through the code-review gate. It lives in a git **ledger**: a single **orphan branch**
+(`nightshift-orders` — a parallel root with no shared history with `main`) holding a directory per
+plan, `orders/<plan>/orders.json`. Committing the plan there is **registration**, and that ledger
+commit is the **authorization root** the shift anchors to. Design:
+[`docs/design/octoshift.md`](../../../docs/design/octoshift.md) §3 (start with one branch; shard by
+plan only if it gets hot).
+
+Author it in a **separate worktree** so the checkout you run the shift from is never disturbed:
+
+```
+git worktree add --orphan ../nightshift-orders          # first time only; creates the orphan branch
+mkdir -p ../nightshift-orders/orders/<plan>
+$EDITOR ../nightshift-orders/orders/<plan>/orders.json
+git -C ../nightshift-orders add orders/<plan>/orders.json
+git -C ../nightshift-orders commit -m 'Register plan <plan>'
+git -C ../nightshift-orders push -u origin nightshift-orders   # durable, portable system of record
+```
+
+Then seed Turnstile from that file (§3) — the plan's SHA anchor is the ledger commit, resolved from
+that worktree's `HEAD`. Contrast this with your **code / skill / tooling** changes, which *do* go on a
+`main`-based branch through a PR and the two-clean gate: the ledger is coordination data, not code, so
+it takes neither.
 
 ```json
 {
@@ -178,7 +205,8 @@ board. **Activation** — making orders claimable and starting a worker round �
 it **only after the shift is clean**. Keep the two separate: the planner registers, the coordinator
 prepares and activates. A plan that is registered but not activated is inert; nothing dispatches until
 you say go. (A first-class `activate`/`retire` verb is planned; until then, "register" = the plan file
-exists and is anchored to a commit, and "activate" = you start the controller below.)
+is committed on the orphan order-ledger branch (§2) and anchored to that commit, and "activate" = you
+start the controller below.)
 
 ### Prepare — clear footguns before you activate
 
