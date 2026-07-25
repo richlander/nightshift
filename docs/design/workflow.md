@@ -56,8 +56,10 @@ role; any role can be filled by a person or an agent, and one session can fill
 several — Planner and Coordinator commonly collapse, and a worker builds and
 reviews within its own session (via subagents). **One collapse never happens: a
 Worker is always a separate instance from the Coordinator/Planner.** The
-coordinator never claims, builds, reviews, or spawns workers — workers are
-independent sessions that `join` and `next` on their own. The invariants hold
+coordinator never claims, builds, or reviews, and does not spawn workers except
+as a last-resort fallback when no worker is on the payroll (see the coordinator
+skill) — normally workers are independent sessions that `join` and `next` on
+their own. The invariants hold
 regardless of the split: the builder never reviews its own work, the reviewer is a
 different model than the builder, and only the coordinator writes to GitHub.
 

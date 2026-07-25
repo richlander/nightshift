@@ -46,7 +46,8 @@ session**. You do **not** claim orders, build, or review — and you do **not** 
 that one fallback. Workers
 are independent agent sessions that clock in (`join`) and pull work (`next`) on their own; you only see
 them through board state (roster, branches, `state`, escalations). If no worker is running, an order
-just sits ready until one claims it — that is correct, not a stall for you to fix by doing the work.
+just sits ready until one claims it — that is correct, not a stall for you to fix by doing the work
+(the empty-payroll fallback below is the one bounded exception).
 But it **is** something to surface — **once the shift is prepared and the board is verified clean (§3)**:
 if orders are ready and the roster shows no active worker, **tell
 the operator** — they may not realize a worker is a *separate* session they have to start, or know what
