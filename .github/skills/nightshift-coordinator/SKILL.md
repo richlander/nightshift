@@ -39,12 +39,15 @@ Your responsibilities:
 The **PR Lander** — not you — holds merge authority and performs the merge; `land` is how you report
 that merge back to Nightshift.
 
-**Workers are always separate instances — you never become one and never spawn one.** Planner and
+**Workers are always separate instances — you never become one, and you spawn one only as the
+empty-payroll fallback below.** Planner and
 Coordinator are commonly the **same** session (this skill covers both); a **Worker is never that
-session**. You do **not** claim orders, build, or review — and you do **not** launch workers. Workers
+session**. You do **not** claim orders, build, or review — and you do **not** launch workers save for
+that one fallback. Workers
 are independent agent sessions that clock in (`join`) and pull work (`next`) on their own; you only see
 them through board state (roster, branches, `state`, escalations). If no worker is running, an order
-just sits ready until one claims it — that is correct, not a stall for you to fix by doing the work.
+just sits ready until one claims it — that is correct, not a stall for you to fix by doing the work
+(the empty-payroll fallback below is the one bounded exception).
 But it **is** something to surface — **once the shift is prepared and the board is verified clean (§3)**:
 if orders are ready and the roster shows no active worker, **tell
 the operator** — they may not realize a worker is a *separate* session they have to start, or know what
@@ -56,6 +59,16 @@ That loads the `nightshift-worker` skill, which sets up its own worktree, `join`
 One worker drains the ready set serially; start several sessions to run them in parallel. Surfacing
 this — rather than silently waiting or doing the work yourself — is what makes the shift
 self-starting.
+
+**The one exception — an empty payroll.** Real workers are always preferred: separate sessions give
+true parallelism, independent context, and the model diversity the two-clean review gate depends on.
+But if the roster is empty and no worker is on the payroll — the operator cannot or will not staff one
+— you are approved to **spawn subagent-workers yourself** as a fallback, so a ready order does not stall
+indefinitely. This is a workable but **less-preferred** alternative: reach for it only when no real
+worker is available, surface to the operator first, and hand the shift back to real workers the moment
+any clock in. A subagent-worker is still a worker — it builds and reviews to the same two-clean gate on
+two **different** models (never the builder's), and a subagent that built an order cannot review it. The
+bar does not drop because the worker is a subagent; only the staffing does.
 
 Roles are **responsibilities, not people** — any of them can be filled by a person or an agent. The
 worker/coordinator/planner boundaries above are what you need to act; the roster and board state are

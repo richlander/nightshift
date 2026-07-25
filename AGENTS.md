@@ -45,8 +45,9 @@ person or an agent (the full model is in
 its guidance first. Roles can collapse into one session — Planner and Coordinator
 commonly do — but a **Worker is always a separate instance** (never the
 Coordinator/Planner session); most sessions on a machine are workers. The
-coordinator never claims, builds, reviews, or spawns workers — workers `join` and
-`next` on their own.
+coordinator never claims, builds, or reviews, and does not spawn workers except
+as a last-resort fallback when no worker is on the payroll (see the coordinator
+skill) — normally workers `join` and `next` on their own.
 
 | Role | Owns | Read first |
 | --- | --- | --- |
