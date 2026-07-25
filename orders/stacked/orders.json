@@ -45,13 +45,22 @@
       "after": ["baseref", "coord-main"],
       "brief": "Worker checks base-ref reachable locally; if not, escalate (new reason on the existing andon-cord). Coordinator resolves by pushing that branch to origin, clears the escalation, worker fetches and proceeds. General prereq-unreachable path; workers stay read-only w.r.t. origin." },
 
+    { "order": "rename-advance", "issue": 138,
+      "title": "Rename the MainVerdict.Rebless coordinator verdict to Advance",
+      "paths": [
+        "src/nightshift/Commands/CoordinateCommand.cs",
+        "tests/Nightshift.Tests/CoordinateCommandTests.cs"
+      ],
+      "after": ["escalate-base"],
+      "brief": "Pure identifier rename MainVerdict.Rebless -> Advance (5 sites; `git grep Rebless` must return empty). KEEP the 'blessed' snapshot vocabulary (BlessedMainHeadKey, /coord/main-head, WriteBlessedMainHeadAsync, 'blessed head' logs) — only the verdict value changes. Lost from PR #130 which merged at its pre-rename head; the exact diff is on branch nightshift/stacked/coord-main @ 2853075 and saved as a patch — re-apply onto a fresh branch off current main. Serialized after escalate-base because both edit CoordinateCommand.cs." },
+
     { "order": "land-stack", "issue": 124,
       "title": "Land a stack in topological order",
       "paths": [
         "src/nightshift/Commands/LandCommand.cs",
         "src/nightshift/Commands/CoordinateCommand.cs"
       ],
-      "after": ["baseref", "coord-main", "readiness", "escalate-base"],
+      "after": ["baseref", "coord-main", "readiness", "escalate-base", "rename-advance"],
       "brief": "Land a stack topologically through the existing merge queue: contract first, then dependents. A child pinned to the parent's contract SHA rebases cleanly onto main once that SHA is an ancestor of main. Two-clean gate per order unchanged." }
   ]
 }
