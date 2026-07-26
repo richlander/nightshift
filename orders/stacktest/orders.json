@@ -1,0 +1,22 @@
+{
+  "plan": "stacktest",
+  "standard": "docs/design/stacked-orders.md",
+  "orders": [
+    { "order": "t-base",
+      "title": "stacktest contract: the base slice",
+      "paths": ["docs/scratch/stacktest/contract.md"],
+      "brief": "Create docs/scratch/stacktest/contract.md — the base 'contract' of a throwaway stacked-order test. Content: an H1 '# Stacktest contract', one sentence stating this is a disposable Nightshift stacked-order machinery test, and a '## Terms' section defining exactly two named terms the leaves will each reference: `alpha` = 'the first variant slot' and `beta` = 'the second variant slot'. Keep it under ~15 lines. Must pass markdownlint (the repo's config). Nothing else — this is the interface commit the two leaf orders stack on." },
+
+    { "order": "t-alpha",
+      "title": "stacktest leaf alpha (stacks on t-base)",
+      "paths": ["docs/scratch/stacktest/alpha.md"],
+      "after": [{ "order": "t-base", "kind": "stack" }],
+      "brief": "Create docs/scratch/stacktest/alpha.md, branched off the t-base contract (WORK packet base-ref = nightshift/stacktest/t-base — git switch -c your branch from it, do NOT branch off main). Content: an H1 '# Alpha', and a body that references the `alpha` term defined in contract.md (link to ./contract.md) and states what the alpha slot does in one sentence. Under ~12 lines; must pass markdownlint. Disjoint from beta.md — touch only alpha.md. This order becomes ready once t-base's branch commit is reachable locally, ahead of t-base merging (sibling of t-beta)." },
+
+    { "order": "t-beta",
+      "title": "stacktest leaf beta (stacks on t-base)",
+      "paths": ["docs/scratch/stacktest/beta.md"],
+      "after": [{ "order": "t-base", "kind": "stack" }],
+      "brief": "Create docs/scratch/stacktest/beta.md, branched off the t-base contract (WORK packet base-ref = nightshift/stacktest/t-base — git switch -c your branch from it, do NOT branch off main). Content: an H1 '# Beta', and a body that references the `beta` term defined in contract.md (link to ./contract.md) and states what the beta slot does in one sentence. Under ~12 lines; must pass markdownlint. Disjoint from alpha.md — touch only beta.md. Sibling of t-alpha: both open concurrently once t-base's contract commit is local." }
+  ]
+}
