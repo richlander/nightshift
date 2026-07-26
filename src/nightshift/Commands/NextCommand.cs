@@ -67,12 +67,29 @@ internal static class NextCommand
 
                     // Mint the branch↔order association at claim time: the branch is the durable recovery
                     // anchor and the future merge→land bridge's join key. Recorded before any work starts.
+                    string branch = packet.OrderBase;
                     if (OrderRef.FromBase(packet.OrderBase) is { } order)
                     {
-                        await client.SetAsync($"{packet.OrderBase}/branch", order.Branch, ct);
+                        branch = order.Branch;
+                        await client.SetAsync($"{packet.OrderBase}/branch", branch, ct);
                     }
 
                     packet.Spec.PrintWork(Console.Out, packet.OrderBase, packet.Fence);
+
+                    // Stacked orders §4: the base ref is a prerequisite the worker must be able to reach. If
+                    // it is not in the local object database (a parent branch built on another machine and
+                    // never published), self-raise a prereq-unreachable escalation on the existing andon cord
+                    // and keep the claim. The worker waits for the coordinator to publish the base to origin,
+                    // fetches it, then `check` re-arms it — the worker never pushes. A reachable base (every
+                    // default `main` order) prints a plain WORK packet and builds immediately.
+                    if (!BaseRefReachable(packet.Spec.BaseRef, Git.RevParse))
+                    {
+                        string reason = EscalateCommand.PrereqUnreachableReason(
+                            packet.Spec.BaseRef ?? OrderView.DefaultBaseRef, branch);
+                        await OrderState.WriteAsync(client, packet.OrderBase, "escalated", reason, Session.Identity, ct);
+                        Console.WriteLine($"prereq: {reason}");
+                    }
+
                     return ExitCode.Ok;
                 }
 
@@ -113,6 +130,24 @@ internal static class NextCommand
         DateTime wakeAt = deadline is { } d && d < keepAliveAt ? d : keepAliveAt;
         TimeSpan budget = wakeAt - now;
         return budget > TimeSpan.Zero ? budget : TimeSpan.Zero;
+    }
+
+    /// <summary>
+    /// True when an order's <paramref name="baseRef"/> is reachable enough to build on (stacked orders §4).
+    /// An independent order (absent/blank base ref, or the default <c>main</c>) always builds on the mainline
+    /// the worker already has, so it is never a publish-me prerequisite. Only a non-default base ref — a
+    /// stacked parent branch or a pinned SHA — can be missing from the local object database; that case is
+    /// resolved by <paramref name="revParse"/> (<see cref="Git.RevParse"/> in production, injected so the
+    /// decision is testable without a git repo).
+    /// </summary>
+    internal static bool BaseRefReachable(string? baseRef, Func<string, string?> revParse)
+    {
+        if (baseRef is not { Length: > 0 } value || value == OrderView.DefaultBaseRef)
+        {
+            return true;
+        }
+
+        return revParse(value) is not null;
     }
 
     private static async Task<WorkPacket?> TryClaimOneAsync(TurnstileClient client, string readyPrefix, string leaseId, CancellationToken ct)
