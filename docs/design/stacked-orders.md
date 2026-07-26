@@ -172,7 +172,10 @@ stack on one machine, or let the escalation publish the base on demand.
 
 ## 6. The shape to insist on
 
-Slice the stack at its **dependency edges**, not at feature boundaries.
+Slice the stack at its **dependency edges**, not at feature boundaries. A stack typically realizes
+**one multi-slice issue** whose slices are dependency-coupled; the planner's charter decides when
+coupled slices become a stack rather than independent path-partitioned orders (see
+[`NIGHTSHIFT.md`](../../NIGHTSHIFT.md)).
 
 - The pattern-recognition/lifting **contract** is the stable base slice (the
   "interface commit").

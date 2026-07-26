@@ -59,7 +59,9 @@ A charter is short and operational. It should answer, for its repository:
 - **Issue conventions.** How this repo's issues encode plannable work — labels, an embedded order
   block, a required shape — so the planner can tell a planning-ready issue from a sketch.
 - **Issue → order mapping.** How an issue becomes one or more orders (one order = one landable PR),
-  how finely to slice, and how `paths` are kept disjoint so orders don't collide.
+  how finely to slice — balancing review capacity against the per-order review/CI cost — **whether
+  coupled slices should be stacked** (each order based on the one below) rather than path-partitioned,
+  and how `paths` are kept disjoint so independent orders don't collide.
 - **Dependency inference.** How order→order `after` edges are determined (declared in the issue, or
   inferred from module/path dependencies).
 - **The engineering standard.** The bar an order is planned against — the `standard` a worker checks

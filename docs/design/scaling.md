@@ -76,7 +76,10 @@ flight — because both are members of the current antichain that need a worker 
 - **`I` — in-flight width.** Orders already claimed and being built. Each is held by exactly one busy
   worker, so `I` is both a slice of the frontier and a count of busy capacity.
 - **`C` — a sane per-machine cap.** Workers contend for RAM, I/O, tokens/min, and CI budget; past a
-  point another session buys tokens, not throughput. `C` is an operator-set ceiling (a small default,
+  point another session buys tokens, not throughput. The sharpest case is a **shared serial resource**:
+  when the frontier's orders each need the same heavy job — a corpus or benchmark sweep that saturates
+  CPU on one box — they do **not** run in parallel, they serialize with *worse* per-run timings, so
+  effective throughput can plateau **below** `C`. `C` is an operator-set ceiling (a small default,
   e.g. 4–6, tunable per machine), not a Nightshift-computed value.
 
 For sizing the roster across the whole shift rather than for this instant, replace `Rᵉ + I` with `A`:
@@ -96,6 +99,14 @@ spec already names:
 - **Coarse scopes serialize.** *"How coarse can path scopes be before serialization eats the
   parallelism?"* is an open question in the spec ([§20](nightshift-spec.md)); until it is answered,
   `Rᵉ` conservatively discounts ready orders that share a scope.
+
+### A shared machine also invalidates timing
+
+The resource ceiling has a measurement corollary. When several workers share a box, a run's wall-clock
+reflects contention, not the change under test — so **performance claims made under shared load are
+unreliable**. An order whose `standard` rests on a timing result should tell the worker **not to assert
+performance numbers while the machine is shared**: measure in isolation or on a quiet box, or defer the
+claim. Mismeasuring here is easy and silently corrupts the evidence a review relies on.
 
 ### Worked example
 
