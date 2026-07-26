@@ -25,6 +25,17 @@ theme into orders:
 - **Size each order to about an hour.** Break an issue into orders an agent can finish in **no more than
   an hour** and that are a reasonable size to **adversarially review at high quality**. In many cases a
   single issue already fits and needs no breakdown.
+- **Slice for review capacity, then stop — prefer fewer coherent PRs.** The ~hour cap is a *ceiling*,
+  not a target to subdivide beneath. It exists to keep an agent engaged over a real stretch, to bound
+  the loss when a design journey goes wrong, and to keep each diff **within a reviewer's capacity** so
+  findings stay stingingly on-point. But slicing has a countervailing cost: **each order costs two
+  adversarial reviews and a CI run**, so cutting an issue into the *most* possible orders multiplies
+  that overhead. Cut at coherent boundaries that keep each diff reviewable, then stop.
+- **Keep the design act in one order; farm the plumbing.** Where a slice carries a real design
+  decision — a contract other work is measured against — give it **one opinionated owner** and the
+  hardest review, and split only the mechanical work beneath it into separate orders. A contract
+  decided once and implemented in pieces holds; a design spread across many small parallel orders
+  drifts.
 - **Design-first for the hard ones.** If an issue is ambiguous, carries tradeoff decisions, has
   significant interactions with other systems, or is a new foundational capability other features will be
   built on, start with a **docs-only design PR** before any implementation.
@@ -33,6 +44,15 @@ theme into orders:
 - **Collapse strong overlap.** If two issues overlap heavily, consider merging them into a single order,
   or into a shared set of overlapping slices, rather than planning orders that will collide on the same
   files.
+- **Stack dependency-coupled slices; keep disjoint ones independent.** When an issue's slices are
+  *dependency- or same-file-coupled* — a contract others build on, variants that share a file — they
+  cannot be path-partitioned into independent orders without colliding. Chain them as a **stack**: each
+  order branches off the one below (its base ref), is reviewed as it is added, and the whole scenario
+  proves out at the tip before anything merges. This lets one larger issue run as a sequence of capped,
+  individually-reviewed orders — extending engaged work without growing any review block, and imposing
+  a forced design checkpoint at each slice boundary. Slices that are genuinely independent stay
+  separate path-partitioned orders; only coupled ones stack. See
+  [stacked orders](docs/design/stacked-orders.md).
 
 The mechanics of expressing an order and driving it to merge — the plan format, the two-clean review
 gate, landing — are standard Nightshift and belong to your skill.
