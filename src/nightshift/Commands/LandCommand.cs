@@ -33,6 +33,17 @@ internal static class LandCommand
             return 3;
         }
 
+        // Stacked orders §5: land in topological order — contract first, then dependents. Refuse to land an order
+        // whose `after` dependencies have not all reached `landed`, so a squash/rebase merge of a dependent can
+        // never advance main ahead of its contract. This gates on the dependency's landed STATE (not a git
+        // ancestor check), so it holds under any merge strategy.
+        if (!await CoordinateCommand.AreDependenciesLandedAsync(client.GetAsync, orderBase, ct))
+        {
+            Console.Error.WriteLine(
+                $"nightshift land: {orderBase} has unlanded dependencies; land its `after` orders first (stacked-orders \u00a75, topological order)");
+            return 4;
+        }
+
         await OrderState.WriteAsync(client, orderBase, "landed", reason, "operator", ct);
         await TryAdvanceAndBlessMainAsync(client, ct);
         Console.WriteLine($"LANDED {orderBase}");

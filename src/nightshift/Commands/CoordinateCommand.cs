@@ -22,6 +22,7 @@ internal static class CoordinateCommand
     private const string StateSuffix = "/state";
     private const string ClaimSuffix = "/claim";
     private const string BranchSuffix = "/branch";
+    private const string SpecSuffix = "/spec";
 
     private static readonly HashSet<string> RequeueIneligibleStatuses =
     [
@@ -408,6 +409,80 @@ internal static class CoordinateCommand
     private static string? StatusOf(string? stateJson) => FieldOf(stateJson, "status");
 
     private static string? ReasonOf(string? stateJson) => FieldOf(stateJson, "reason");
+
+    /// <summary>
+    /// Stacked orders §5 (land in topological order): an order is landable only once every order it depends
+    /// on — the order ids in its spec <c>after</c> — has itself reached <c>landed</c> (contract first, then its
+    /// dependents). This is the <b>landing</b> gate (enforced by <see cref="LandCommand"/>); it deliberately
+    /// does NOT gate coordinate's <c>done</c> surfacing, because §6–§7 want each dependent's PR opened and
+    /// adversarially reviewed <i>early</i> (stacked on the contract) — only the merge/land is ordered. Gating
+    /// on the dependency's <b>landed state</b> rather than a git-ancestor check keeps it correct under any merge
+    /// strategy: a squash merge never makes the contract's literal base SHA an ancestor of <c>main</c>, yet the
+    /// contract's order still transitions to <c>landed</c>. An order with no <c>after</c> deps (an independent
+    /// order or the contract itself) is trivially landable, so existing single-order plans are unaffected. A
+    /// dependency whose state is missing or unreadable is treated as not-yet-landed (fail closed — never land a
+    /// dependent on incomplete information).
+    /// </summary>
+    internal static async Task<bool> AreDependenciesLandedAsync(
+        Func<string, CancellationToken, Task<KvItem?>> getAsync,
+        string orderBase,
+        CancellationToken ct)
+    {
+        if (OrderRef.FromBase(orderBase) is not { } order)
+        {
+            return true;
+        }
+
+        string? specJson = (await getAsync($"{orderBase}{SpecSuffix}", ct))?.Text;
+        foreach (string depId in AfterIdsOf(specJson))
+        {
+            string depBase = $"/plan/{order.Plan}/order/{depId}";
+            string? depStatus = StatusOf((await getAsync($"{depBase}{StateSuffix}", ct))?.Text);
+            if (depStatus != "landed")
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>The order ids in a spec's <c>after</c> array. The spec normalizes every edge to a bare string id
+    /// (see <c>Plan.CopyAfterIds</c>), so this reads string entries only and tolerates a missing/other-shaped
+    /// <c>after</c> by yielding nothing.</summary>
+    private static IReadOnlyList<string> AfterIdsOf(string? specJson)
+    {
+        if (string.IsNullOrWhiteSpace(specJson))
+        {
+            return [];
+        }
+
+        try
+        {
+            using JsonDocument doc = JsonDocument.Parse(specJson);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object
+                || !doc.RootElement.TryGetProperty("after", out JsonElement after)
+                || after.ValueKind != JsonValueKind.Array)
+            {
+                return [];
+            }
+
+            var ids = new List<string>();
+            foreach (JsonElement edge in after.EnumerateArray())
+            {
+                if (edge.ValueKind == JsonValueKind.String && edge.GetString() is { Length: > 0 } id)
+                {
+                    ids.Add(id);
+                }
+            }
+
+            return ids;
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
+    }
 
     private static string? FieldOf(string? stateJson, string field)
     {
