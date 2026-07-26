@@ -187,13 +187,7 @@ internal static class CoordinateCommand
             }
 
             string orderBase = item.Key[..^StateSuffix.Length];
-            string? status = StatusOf(item.Text);
-            if (status == "done" && !await AreDependenciesLandedAsync(client.GetAsync, orderBase, ct))
-            {
-                continue; // Stacked orders §5: a dependent is not landable until its contract has landed.
-            }
-
-            if (TryBuildStateOutcome(orderBase, status, ReasonOf(item.Text)) is { } outcome)
+            if (TryBuildStateOutcome(orderBase, StatusOf(item.Text), ReasonOf(item.Text)) is { } outcome)
             {
                 return outcome;
             }
@@ -417,14 +411,17 @@ internal static class CoordinateCommand
     private static string? ReasonOf(string? stateJson) => FieldOf(stateJson, "reason");
 
     /// <summary>
-    /// Stacked orders §5 (land in topological order): a <c>done</c> order is landable only once every order it
-    /// depends on — the order ids in its spec <c>after</c> — has itself reached <c>landed</c> (contract first,
-    /// then its dependents). This gates on the dependency's <b>landed state</b>, not on a git-ancestor check, so
-    /// it holds under any merge strategy: a squash merge never makes the contract's literal base SHA an ancestor
-    /// of <c>main</c>, yet the contract's order still transitions to <c>landed</c>. An order with no <c>after</c>
-    /// deps (an independent order or the contract itself) is trivially landable, so existing single-order plans
-    /// are unaffected. A dependency whose state is missing or unreadable is treated as not-yet-landed
-    /// (fail closed — never surface a dependent for landing on incomplete information).
+    /// Stacked orders §5 (land in topological order): an order is landable only once every order it depends
+    /// on — the order ids in its spec <c>after</c> — has itself reached <c>landed</c> (contract first, then its
+    /// dependents). This is the <b>landing</b> gate (enforced by <see cref="LandCommand"/>); it deliberately
+    /// does NOT gate coordinate's <c>done</c> surfacing, because §6–§7 want each dependent's PR opened and
+    /// adversarially reviewed <i>early</i> (stacked on the contract) — only the merge/land is ordered. Gating
+    /// on the dependency's <b>landed state</b> rather than a git-ancestor check keeps it correct under any merge
+    /// strategy: a squash merge never makes the contract's literal base SHA an ancestor of <c>main</c>, yet the
+    /// contract's order still transitions to <c>landed</c>. An order with no <c>after</c> deps (an independent
+    /// order or the contract itself) is trivially landable, so existing single-order plans are unaffected. A
+    /// dependency whose state is missing or unreadable is treated as not-yet-landed (fail closed — never land a
+    /// dependent on incomplete information).
     /// </summary>
     internal static async Task<bool> AreDependenciesLandedAsync(
         Func<string, CancellationToken, Task<KvItem?>> getAsync,
@@ -538,13 +535,7 @@ internal static class CoordinateCommand
                 {
                     string orderBase = edge.Signal.Key[..^StateSuffix.Length];
                     KvItem? state = await getAsync(edge.Signal.Key, ct);
-                    string? status = StatusOf(state?.Text);
-                    if (status == "done" && !await AreDependenciesLandedAsync(getAsync, orderBase, ct))
-                    {
-                        return null; // Stacked orders §5: hold a dependent's done until its contract has landed.
-                    }
-
-                    return TryBuildStateOutcome(orderBase, status, ReasonOf(state?.Text));
+                    return TryBuildStateOutcome(orderBase, StatusOf(state?.Text), ReasonOf(state?.Text));
                 }
 
                 if (edge.Signal.Key.EndsWith(ClaimSuffix, StringComparison.Ordinal))

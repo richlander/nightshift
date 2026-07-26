@@ -6,10 +6,10 @@ using Nightshift.Config;
 using Nightshift.Turnstile;
 using Xunit;
 
-// Stacked orders §5 — land a stack in topological order: a dependent is landable only once every order in
-// its spec `after` has itself reached `landed`. These tests exercise the topological gate at each seam it
-// touches: the shared predicate (AreDependenciesLandedAsync), the edge-triggered coordinate predicate, the
-// standing once-probe, and the LandCommand refusal.
+// Stacked orders §5 — land a stack in topological order. An order is landable only once every order in its
+// spec `after` has itself reached `landed`. LandCommand is the sole topological enforcer (it refuses an
+// out-of-order land); coordinate's `done` surfacing is deliberately NOT gated, so each dependent's PR is
+// opened and reviewed early (§6–§7) and no watch edge is ever dropped.
 public class LandStackTests
 {
     [Fact]
@@ -80,33 +80,26 @@ public class LandStackTests
     }
 
     [Fact]
-    public async Task Predicate_DoneChild_WithUnlandedContract_IsGated()
+    public async Task AreDependenciesLanded_UnparseableOrderBase_IsLandable()
     {
-        string child = "/plan/12/order/child";
-        var getter = BuildGetter(new()
-        {
-            [$"{child}/state"] = "{\"status\":\"done\"}",
-            [$"{child}/spec"] = "{\"plan\":\"12\",\"order\":\"child\",\"after\":[\"contract\"]}",
-        });
-        var predicate = new CoordinateCommand.CoordinatePredicate();
+        var getter = BuildGetter(new());
 
-        CoordinateCommand.CoordinateOutcome? outcome = await predicate.TryMatchAsync(
-            new FilteredWaitEngine.WatchEdge("plan", new WatchSignal($"{child}/state", Deleted: false, Revision: 44)),
-            getter,
-            TestContext.Current.CancellationToken);
-
-        Assert.Null(outcome);
+        Assert.True(await CoordinateCommand.AreDependenciesLandedAsync(
+            getter, "not-an-order", TestContext.Current.CancellationToken));
     }
 
+    // Regression guard for the liveness trap the reviewers caught: coordinate must NOT gate a dependent's
+    // `done` edge on its deps having landed. Dropping the edge would strand the dependent, since the
+    // edge-triggered blocking `coordinate` never replays standing states. The dependent's `done` must
+    // surface immediately (so its PR opens early); topological order is enforced only at land time.
     [Fact]
-    public async Task Predicate_DoneChild_WithLandedContract_SurfacesDone()
+    public async Task Predicate_DoneChild_WithUnlandedContract_StillSurfaces()
     {
         string child = "/plan/12/order/child";
         var getter = BuildGetter(new()
         {
             [$"{child}/state"] = "{\"status\":\"done\"}",
             [$"{child}/spec"] = "{\"plan\":\"12\",\"order\":\"child\",\"after\":[\"contract\"]}",
-            ["/plan/12/order/contract/state"] = "{\"status\":\"landed\"}",
         });
         var predicate = new CoordinateCommand.CoordinatePredicate();
 
@@ -118,49 +111,6 @@ public class LandStackTests
         Assert.NotNull(outcome);
         Assert.Equal(
             $"COORD plan=/plan/12 order={child} transition=done status=done",
-            outcome!.Render());
-    }
-
-    [Fact]
-    public async Task Predicate_DoneOrder_NoDeps_SurfacesDone()
-    {
-        string solo = "/plan/12/order/solo";
-        var getter = BuildGetter(new()
-        {
-            [$"{solo}/state"] = "{\"status\":\"done\"}",
-            [$"{solo}/spec"] = "{\"plan\":\"12\",\"order\":\"solo\"}",
-        });
-        var predicate = new CoordinateCommand.CoordinatePredicate();
-
-        CoordinateCommand.CoordinateOutcome? outcome = await predicate.TryMatchAsync(
-            new FilteredWaitEngine.WatchEdge("plan", new WatchSignal($"{solo}/state", Deleted: false, Revision: 44)),
-            getter,
-            TestContext.Current.CancellationToken);
-
-        Assert.NotNull(outcome);
-        Assert.Equal(
-            $"COORD plan=/plan/12 order={solo} transition=done status=done",
-            outcome!.Render());
-    }
-
-    [Fact]
-    public async Task Predicate_LandedContract_StaysUngated()
-    {
-        string contract = "/plan/12/order/contract";
-        var getter = BuildGetter(new()
-        {
-            [$"{contract}/state"] = "{\"status\":\"landed\"}",
-        });
-        var predicate = new CoordinateCommand.CoordinatePredicate();
-
-        CoordinateCommand.CoordinateOutcome? outcome = await predicate.TryMatchAsync(
-            new FilteredWaitEngine.WatchEdge("plan", new WatchSignal($"{contract}/state", Deleted: false, Revision: 44)),
-            getter,
-            TestContext.Current.CancellationToken);
-
-        Assert.NotNull(outcome);
-        Assert.Equal(
-            $"COORD plan=/plan/12 order={contract} transition=landed status=landed",
             outcome!.Render());
     }
 
@@ -232,50 +182,26 @@ public sealed class LandStackIntegrationTests : IClassFixture<TurnstileFixture>
     }
 
     [Fact]
-    public async Task OnceProbe_DoneChild_WithUnlandedContract_NotSurfaced()
+    public async Task Land_IndependentOrder_Lands()
     {
         string scope = $"land-stack-{Guid.NewGuid():N}";
-        string child = $"/plan/{scope}/order/child";
+        string solo = $"/plan/{scope}/order/solo";
         CancellationToken ct = TestContext.Current.CancellationToken;
 
         using (TurnstileClient client = _fixture.Connect())
         {
-            await client.SetAsync($"{child}/spec", $"{{\"plan\":\"{scope}\",\"order\":\"child\",\"after\":[\"contract\"]}}", ct);
-            await client.SetAsync($"{child}/state", "{\"status\":\"done\"}", ct);
+            await client.SetAsync($"{solo}/spec", $"{{\"plan\":\"{scope}\",\"order\":\"solo\"}}", ct);
+            await client.SetAsync($"{solo}/state", "{\"status\":\"done\"}", ct);
         }
 
-        InvocationResult result = await InvokeCoordinateAsync(scope, timeoutSecs: null, once: true);
+        InvocationResult result = await InvokeLandAsync(solo, reason: null);
 
-        Assert.Equal(ExitCode.NoCoordinate, result.ExitCode);
-    }
-
-    [Fact]
-    public async Task OnceProbe_DoneChild_AfterContractLanded_SurfacesDone()
-    {
-        string scope = $"land-stack-{Guid.NewGuid():N}";
-        string child = $"/plan/{scope}/order/child";
-        CancellationToken ct = TestContext.Current.CancellationToken;
-
-        using (TurnstileClient client = _fixture.Connect())
-        {
-            await client.SetAsync($"{child}/spec", $"{{\"plan\":\"{scope}\",\"order\":\"child\",\"after\":[\"contract\"]}}", ct);
-            await client.SetAsync($"{child}/state", "{\"status\":\"done\"}", ct);
-            await client.SetAsync($"/plan/{scope}/order/contract/state", "{\"status\":\"landed\"}", ct);
-        }
-
-        InvocationResult result = await InvokeCoordinateAsync(scope, timeoutSecs: null, once: true);
-
-        Assert.Equal(ExitCode.Coordinate, result.ExitCode);
-        Assert.Equal(
-            $"COORD plan=/plan/{scope} order={child} transition=done status=done{Environment.NewLine}",
-            result.Stdout);
+        Assert.Equal(0, result.ExitCode);
+        Assert.Equal($"LANDED {solo}{Environment.NewLine}", result.Stdout);
     }
 
     private Task<InvocationResult> InvokeLandAsync(string orderBase, string? reason)
         => InvokeAsync(() => LandCommand.RunAsync(orderBase, reason));
-
-    private Task<InvocationResult> InvokeCoordinateAsync(string? scope, int? timeoutSecs, bool once)
-        => InvokeAsync(() => CoordinateCommand.RunAsync(scope, timeoutSecs, once));
 
     private async Task<InvocationResult> InvokeAsync(Func<Task<int>> run)
     {
