@@ -43,7 +43,7 @@ internal static class CoordinateCommand
     {
         Healthy,
         Adopt,
-        Rebless,
+        Advance,
         Steal,
     }
 
@@ -70,7 +70,7 @@ internal static class CoordinateCommand
 
         if (blessedIsAncestorOfObserved)
         {
-            return observedMatchesClaimedBranch ? MainVerdict.Steal : MainVerdict.Rebless;
+            return observedMatchesClaimedBranch ? MainVerdict.Steal : MainVerdict.Advance;
         }
 
         return MainVerdict.Steal;
@@ -252,7 +252,7 @@ internal static class CoordinateCommand
             {
                 MainVerdict.Healthy => null,
                 MainVerdict.Adopt => await WriteBlessedMainHeadAsync(client, observed, ct),
-                MainVerdict.Rebless => await WriteBlessedMainHeadAsync(client, observed, ct),
+                MainVerdict.Advance => await WriteBlessedMainHeadAsync(client, observed, ct),
                 MainVerdict.Steal => await HandleMainStealAsync(client, observed, blessed!, offender, ct),
                 _ => null,
             };
