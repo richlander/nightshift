@@ -48,7 +48,7 @@ public class CoordinateCommandTests
     }
 
     [Fact]
-    public void ClassifyMain_BlessedAncestor_Reblesses()
+    public void ClassifyMain_BlessedAncestor_Advances()
     {
         CoordinateCommand.MainVerdict verdict = CoordinateCommand.ClassifyMain(
             observed: "def456",
@@ -56,7 +56,7 @@ public class CoordinateCommandTests
             blessedIsAncestorOfObserved: true,
             observedMatchesClaimedBranch: false);
 
-        Assert.Equal(CoordinateCommand.MainVerdict.Rebless, verdict);
+        Assert.Equal(CoordinateCommand.MainVerdict.Advance, verdict);
     }
 
     [Fact]
