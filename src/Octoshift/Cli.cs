@@ -6,7 +6,7 @@ using Octoshift.Commands;
 /// <summary>Entry dispatch for the <c>octoshift</c> GitHub-membrane CLI.</summary>
 public static class Cli
 {
-    private const string Usage = "usage: octoshift <reconcile|wait|watch> ...";
+    private const string Usage = "usage: octoshift <reconcile|wait|watch|waiting> ...";
 
     /// <summary>
     /// The global <c>--socket</c> override, inherited by every verb and passed through to the
@@ -18,7 +18,7 @@ public static class Cli
         Recursive = true,
     };
 
-    private static readonly HashSet<string> KnownVerbs = ["reconcile", "wait", "watch"];
+    private static readonly HashSet<string> KnownVerbs = ["reconcile", "wait", "watch", "waiting"];
 
     /// <summary>Parses and invokes the command line, preserving the exit-code contract.</summary>
     public static async Task<int> RunAsync(string[] args)
@@ -52,6 +52,7 @@ public static class Cli
         rootCommand.Subcommands.Add(CreateReconcileCommand());
         rootCommand.Subcommands.Add(CreateWaitCommand());
         rootCommand.Subcommands.Add(CreateWatchCommand());
+        rootCommand.Subcommands.Add(CreateWaitingCommand());
         return rootCommand;
     }
 
@@ -135,6 +136,27 @@ public static class Cli
             parseResult.GetValue(poll.CadenceWindow),
             parseResult.GetValue(poll.CadenceDecay),
             parseResult.GetValue(poll.Backoff)));
+
+        return command;
+    }
+
+    private static Command CreateWaitingCommand()
+    {
+        var command = new Command("waiting", "Report stopped agent panes and what is actually blocking each one.");
+
+        var all = new Option<bool>("--all") { Description = "Include panes that are holding legitimately, and idle panes with no record." };
+        var json = new Option<bool>("--json") { Description = "Emit the rows as JSON instead of a table." };
+        Option<string?> repo = CreateRepoOption();
+
+        command.Options.Add(all);
+        command.Options.Add(json);
+        command.Options.Add(repo);
+
+        command.SetAction(async (parseResult, cancellationToken) => await WaitingCommand.RunAsync(
+            parseResult.GetValue(repo),
+            parseResult.GetValue(all),
+            parseResult.GetValue(json),
+            cancellationToken));
 
         return command;
     }
