@@ -93,7 +93,7 @@ internal static class WaitingCommand
                 continue;
             }
 
-            StatusRecord? record = StatusRecord.Parse(pane.Capture);
+            StatusRecord? record = StatusRecord.Parse(pane.Capture, pane.PaneWidth);
 
             if (pane.Activity == PaneActivity.Blocked)
             {

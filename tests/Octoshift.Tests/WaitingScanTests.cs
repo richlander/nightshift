@@ -17,13 +17,14 @@ public class WaitingScanTests
     public void ParseWindows_ReadsTargetAttachmentAndActivity()
     {
         IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseWindows(
-            "night:3|1|1755900000|pr4595\nnight:4|0|1755800000|i158\n");
+            "night:3|1|1755900000|213|pr4595\nnight:4|0|1755800000|80|i158\n");
 
         Assert.Equal(2, windows.Count);
         Assert.Equal("night:3", windows[0].Target);
         Assert.True(windows[0].SessionAttached);
         Assert.Equal("pr4595", windows[0].WindowName);
         Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(1755900000), windows[0].LastActivity);
+        Assert.Equal(213, windows[0].PaneWidth);
         Assert.False(windows[1].SessionAttached);
     }
 
@@ -31,7 +32,7 @@ public class WaitingScanTests
     public void ParseWindows_KeepsAPipeInTheWindowName()
     {
         // Window name is formatted last precisely so a separator inside it cannot shift earlier fields.
-        IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseWindows("night:3|1|1755900000|pr4595|round2");
+        IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseWindows("night:3|1|1755900000|80|pr4595|round2");
 
         TmuxPane window = Assert.Single(windows);
         Assert.Equal("night:3", window.Target);
@@ -41,7 +42,8 @@ public class WaitingScanTests
     [Theory]
     [InlineData("")]
     [InlineData("garbage\nmalformed row")]
-    [InlineData("|1|1755900000|name")]
+    [InlineData("|1|1755900000|80|name")]
+    [InlineData("night:3|1|1755900000|80")]
     public void ParseWindows_DropsMalformedRows(string stdout)
         => Assert.Empty(TmuxScanner.ParseWindows(stdout));
 

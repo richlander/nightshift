@@ -34,6 +34,9 @@ internal sealed record TmuxPane
     /// <summary>When the window last produced output — an observed stop time, not a claimed one.</summary>
     public DateTimeOffset? LastActivity { get; init; }
 
+    /// <summary>Column count of the pane, which is the column the terminal hard-wraps at.</summary>
+    public int PaneWidth { get; init; }
+
     public PaneActivity Activity { get; init; }
 
     public string Capture { get; init; } = string.Empty;
@@ -51,7 +54,7 @@ internal sealed class TmuxScanner
     /// <summary>
     /// Window name comes last so that a <c>|</c> inside it cannot shift the fields before it.
     /// </summary>
-    private const string ListFormat = "#{session_name}:#{window_index}|#{session_attached}|#{window_activity}|#{window_name}";
+    private const string ListFormat = "#{session_name}:#{window_index}|#{session_attached}|#{window_activity}|#{pane_width}|#{window_name}";
 
     private readonly Func<IReadOnlyList<string>, CancellationToken, Task<CommandResult>> _runAsync;
 
@@ -84,8 +87,8 @@ internal sealed class TmuxScanner
         var windows = new List<TmuxPane>();
         foreach (string line in stdout.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
         {
-            string[] parts = line.Split('|', 4);
-            if (parts.Length < 4 || parts[0].Length == 0)
+            string[] parts = line.Split('|', 5);
+            if (parts.Length < 5 || parts[0].Length == 0)
             {
                 continue;
             }
@@ -97,7 +100,8 @@ internal sealed class TmuxScanner
                 LastActivity = long.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out long epoch) && epoch > 0
                     ? DateTimeOffset.FromUnixTimeSeconds(epoch)
                     : null,
-                WindowName = parts[3].Trim(),
+                PaneWidth = int.TryParse(parts[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out int width) && width > 0 ? width : 0,
+                WindowName = parts[4].Trim(),
             });
         }
 
