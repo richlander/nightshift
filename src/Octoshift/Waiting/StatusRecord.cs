@@ -57,32 +57,42 @@ internal sealed partial record StatusRecord
     /// <summary>
     /// Parses the last record out of a captured pane. Returns null when no PR could be identified at all.
     /// </summary>
-    public static StatusRecord? Parse(string? paneText)
+    /// <param name="paneText">The captured pane.</param>
+    /// <param name="paneWidth">
+    /// The pane's column count, when known. A terminal hard-wraps at that column without regard for token
+    /// boundaries, so this is what distinguishes a split field from a new line of prose.
+    /// </param>
+    public static StatusRecord? Parse(string? paneText, int paneWidth = 0)
     {
         if (string.IsNullOrWhiteSpace(paneText))
         {
             return null;
         }
 
-        IReadOnlyList<string> lines = Normalize(paneText);
-        return ParseDeclared(lines) ?? Infer(lines);
+        IReadOnlyList<NormalizedLine> lines = Normalize(paneText);
+        return ParseDeclared(lines, paneWidth) ?? Infer(lines);
     }
+
+    /// <summary>A pane line with its framing removed, keeping the width it occupied on screen.</summary>
+    internal readonly record struct NormalizedLine(string Text, int RawWidth);
 
     /// <summary>
     /// Strips the TUI's box-drawing frame and trailing blank lines so the pane reads as plain text.
     /// Agent output arrives inside a bordered box, so most lines carry a rule character at one or both
     /// edges; leaving them in would corrupt the first and last token of every line.
     /// </summary>
-    internal static IReadOnlyList<string> Normalize(string paneText)
+    internal static IReadOnlyList<NormalizedLine> Normalize(string paneText)
     {
         string[] raw = paneText.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
-        var lines = new List<string>(raw.Length);
+        var lines = new List<NormalizedLine>(raw.Length);
         foreach (string line in raw)
         {
-            lines.Add(StripFrame(line));
+            // The on-screen width is measured before the frame comes off, because that is the width the
+            // terminal wrapped against.
+            lines.Add(new NormalizedLine(StripFrame(line), line.TrimEnd().Length));
         }
 
-        while (lines.Count > 0 && lines[^1].Length == 0)
+        while (lines.Count > 0 && lines[^1].Text.Length == 0)
         {
             lines.RemoveAt(lines.Count - 1);
         }
@@ -112,12 +122,12 @@ internal sealed partial record StatusRecord
     /// <summary>Box-drawing (U+2500–U+257F) and block-element (U+2580–U+259F) glyphs a TUI frames with.</summary>
     private static bool IsRule(char c) => c is >= '─' and <= '▟';
 
-    private static StatusRecord? ParseDeclared(IReadOnlyList<string> lines)
+    private static StatusRecord? ParseDeclared(IReadOnlyList<NormalizedLine> lines, int paneWidth)
     {
         int start = -1;
         for (int i = lines.Count - 1; i >= 0; i--)
         {
-            if (lines[i].Contains(Sentinel, StringComparison.Ordinal))
+            if (lines[i].Text.Contains(Sentinel, StringComparison.Ordinal))
             {
                 start = i;
                 break;
@@ -129,15 +139,9 @@ internal sealed partial record StatusRecord
             return null;
         }
 
-        var text = new StringBuilder(lines[start][(lines[start].IndexOf(Sentinel, StringComparison.Ordinal) + Sentinel.Length)..]);
-
-        // The record is one logical line, but the TUI word-wraps at the box width, so a long record can
-        // arrive split across rows. Keep absorbing rows made purely of key=value tokens; ordinary prose
-        // fails that test, which is what stops the join from swallowing whatever follows.
-        for (int i = start + 1; i < lines.Count && IsTokenRun(lines[i]); i++)
-        {
-            text.Append(' ').Append(lines[i]);
-        }
+        string first = lines[start].Text;
+        var text = new StringBuilder(first[(first.IndexOf(Sentinel, StringComparison.Ordinal) + Sentinel.Length)..]);
+        Continue(lines, start, paneWidth, text);
 
         Dictionary<string, string> fields = SplitFields(text.ToString());
         if (!fields.TryGetValue("pr", out string? prValue) || !TryParsePrNumber(prValue, out int pr))
@@ -164,23 +168,61 @@ internal sealed partial record StatusRecord
         };
     }
 
-    private static bool IsTokenRun(string line)
+    /// <summary>
+    /// Reassembles a record the terminal split across rows. Two different wraps have to be told apart:
+    /// a TUI word-wraps inside its box, so the next row opens with a whole <c>key=value</c>; a plain pane
+    /// hard-wraps at its last column, so the next row opens with the tail of a token and must be rejoined
+    /// with no space. Anything else ends the record, which is what stops prose being absorbed into it.
+    /// </summary>
+    private static void Continue(IReadOnlyList<NormalizedLine> lines, int start, int paneWidth, StringBuilder text)
     {
-        if (line.Length == 0)
-        {
-            return false;
-        }
+        int previousWidth = lines[start].RawWidth;
 
-        foreach (Range range in line.AsSpan().Split(' '))
+        for (int i = start + 1; i < lines.Count; i++)
         {
-            ReadOnlySpan<char> token = line.AsSpan()[range].Trim();
-            if (token.Length > 0 && !FieldToken().IsMatch(token))
+            string[] tokens = lines[i].Text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (tokens.Length == 0)
             {
-                return false;
+                return;
             }
-        }
 
-        return true;
+            bool opensWithFragment = !tokens[0].Contains('=', StringComparison.Ordinal);
+            bool tailAreFields = true;
+            for (int t = 1; t < tokens.Length; t++)
+            {
+                if (!FieldToken().IsMatch(tokens[t]))
+                {
+                    tailAreFields = false;
+                    break;
+                }
+            }
+
+            bool splitToken = false;
+            if (opensWithFragment)
+            {
+                // "tes" + "t next=round-2-review": a bare word trailed by nothing but fields is a shape
+                // prose does not take, so it is read as a split token even when the width is unknown. A
+                // fragment standing alone is ambiguous, and there the full row is the only evidence.
+                splitToken = tailAreFields
+                    && (tokens.Length > 1 || (paneWidth > 0 && previousWidth >= paneWidth));
+
+                if (!splitToken)
+                {
+                    return;
+                }
+            }
+            else if (!tailAreFields || !FieldToken().IsMatch(tokens[0]))
+            {
+                return;
+            }
+
+            for (int t = 0; t < tokens.Length; t++)
+            {
+                text.Append(t == 0 && splitToken ? string.Empty : " ").Append(tokens[t]);
+            }
+
+            previousWidth = lines[i].RawWidth;
+        }
     }
 
     private static Dictionary<string, string> SplitFields(string text)
@@ -201,13 +243,13 @@ internal sealed partial record StatusRecord
         return fields;
     }
 
-    private static StatusRecord? Infer(IReadOnlyList<string> lines)
+    private static StatusRecord? Infer(IReadOnlyList<NormalizedLine> lines)
     {
         // Last mention wins: a pane references many PRs over its life and the newest is the live one.
         int pr = -1;
         for (int i = lines.Count - 1; i >= 0 && pr < 0; i--)
         {
-            MatchCollection matches = PrMention().Matches(lines[i]);
+            MatchCollection matches = PrMention().Matches(lines[i].Text);
             if (matches.Count > 0 && TryParsePrNumber(matches[^1].Groups[1].Value, out int parsed))
             {
                 pr = parsed;
@@ -222,7 +264,7 @@ internal sealed partial record StatusRecord
         string? head = null;
         for (int i = lines.Count - 1; i >= 0 && head is null; i--)
         {
-            MatchCollection matches = ShaMention().Matches(lines[i]);
+            MatchCollection matches = ShaMention().Matches(lines[i].Text);
             for (int m = matches.Count - 1; m >= 0; m--)
             {
                 string candidate = matches[m].Groups[1].Value.ToLowerInvariant();

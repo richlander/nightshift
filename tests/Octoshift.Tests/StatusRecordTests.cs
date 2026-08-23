@@ -73,6 +73,77 @@ public class StatusRecordTests
         Assert.Equal("round-3", record.Next);
     }
 
+    /// <summary>Splits a line into fixed-width rows the way a terminal does — with no regard for tokens.</summary>
+    private static string HardWrap(string text, int width)
+        => string.Join('\n', Enumerable.Range(0, (text.Length + width - 1) / width)
+            .Select(i => text.Substring(i * width, Math.Min(width, text.Length - i * width))));
+
+    [Fact]
+    public void Parse_RejoinsARecordTheTerminalSplitMidToken()
+    {
+        // Observed 2026-08-23 in an 80-column pane: `waiting=check:test` arrived as `check:tes` + `t`,
+        // and the predicate silently degraded to "look at everything" — a wrong answer, not a missing one.
+        const string Record = "NIGHTSHIFT-STATUS pr=4610 head=0075e914f round=2 verdict=gated waiting=check:test next=round-2-review";
+
+        StatusRecord? record = StatusRecord.Parse(HardWrap(Record, 80), paneWidth: 80);
+
+        Assert.NotNull(record);
+        Assert.Equal(4610, record.PrNumber);
+        Assert.Equal("test", record.Waiting.CheckName);
+        Assert.Equal("round-2-review", record.Next);
+    }
+
+    [Fact]
+    public void Parse_RejoinsAcrossSeveralHardWraps()
+    {
+        const string Record = "NIGHTSHIFT-STATUS pr=4599 head=61aa225fe round=4 verdict=escalating waiting=operator next=escalate at=2026-08-23T04:12Z";
+
+        StatusRecord? record = StatusRecord.Parse(HardWrap(Record, 40), paneWidth: 40);
+
+        Assert.NotNull(record);
+        Assert.Equal(PredicateKind.Operator, record.Waiting.Kind);
+        Assert.Equal("escalate", record.Next);
+        Assert.Equal(4, record.Round);
+    }
+
+    [Fact]
+    public void Parse_RejoinsEvenWhenTheWidthIsUnknown()
+    {
+        // A bare word trailed by nothing but fields is a shape prose does not take, so the rejoin does not
+        // depend on knowing the pane width — which matters for any capture read from a file or a pipe.
+        const string Record = "NIGHTSHIFT-STATUS pr=4610 head=0075e914f round=2 verdict=gated waiting=check:test next=round-2-review";
+
+        StatusRecord? record = StatusRecord.Parse(HardWrap(Record, 80));
+
+        Assert.NotNull(record);
+        Assert.Equal("test", record.Waiting.CheckName);
+        Assert.Equal("round-2-review", record.Next);
+    }
+
+    [Fact]
+    public void Parse_ALoneFragmentNeedsTheWidthToBeBelieved()
+    {
+        // Nothing but a bare word follows, so only a full preceding row can distinguish a split token
+        // from a one-word sentence.
+        string pane = "NIGHTSHIFT-STATUS pr=4563 waiting=none next=round-thi".PadRight(53) + "\nrd";
+
+        Assert.Equal("round-thi", StatusRecord.Parse(pane)?.Next);
+        Assert.Equal("round-third", StatusRecord.Parse(pane, paneWidth: 53)?.Next);
+    }
+
+    [Fact]
+    public void Parse_AFullWidthRecordFollowedByProseStillStops()
+    {
+        // The rejoin rule keys off a full row, so prose after one must not be pulled in on its first word.
+        string pane = "NIGHTSHIFT-STATUS pr=4563 head=f5c2b3fac waiting=none next=round-3".PadRight(80)
+            + "\nDone. Handing back to the coordinator.";
+
+        StatusRecord? record = StatusRecord.Parse(pane, paneWidth: 80);
+
+        Assert.NotNull(record);
+        Assert.Equal("round-3", record.Next);
+    }
+
     [Fact]
     public void Parse_LastRecordWins()
     {
