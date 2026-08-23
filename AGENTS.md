@@ -142,6 +142,111 @@ wait on it decides whether the loop keeps running:
 Each skill names the specific call its role waits on and points here for the
 shared technique.
 
+## Stopping: the status record
+
+`Waiting without stalling` covers the waits a tool can hold for you. This section covers
+the other kind — the wait whose answer lives on GitHub: a CI run, a required check, a
+mergeability recompute. You cannot block on those without polling, and polling is what
+exhausted the GraphQL budget (see [#157](https://github.com/richlander/nightshift/issues/157)).
+
+So the rule is: **hand the wait off, then stop.**
+
+- **Do not poll GitHub for a state change.** Not on a timer, not "one more check before I
+  yield." If you have already learned the PR is on an unchanged head with a check still
+  pending, re-asking cannot help you — nothing will change until something outside you
+  changes it.
+- **Never end on a bare narration.** "Waiting for CI to finish" as your last output is a
+  stall with extra words: nothing is running to wake you, and the fact you just paid a
+  GitHub call to learn dies in the terminal pane where no tool can read it.
+- **End with a status record instead.** One line, machine-readable, as your final output.
+  It says where you stopped, what would unblock you, and what you would do next. A tool
+  scans for it, holds the wait on your behalf, and wakes you when the condition it names
+  actually flips.
+
+### The record
+
+The **last non-blank line** of your final output, when you stop and cannot proceed:
+
+```
+NIGHTSHIFT-STATUS pr=4595 head=722512e25 round=2 verdict=gated waiting=check:ci-required
+```
+
+Keep whatever prose you already write — the record is for tools; the prose is for the
+operator reading over your shoulder. Just put the record last.
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `pr` | yes | PR number, digits only. |
+| `head` | yes | The head sha your record describes. |
+| `round` | review only | Review round just completed. |
+| `verdict` | yes | Your own conclusion: `converging`, `clean`, `gated`, `escalating`, `blocked`. |
+| `waiting` | yes | The condition that would unblock you — see below. |
+| `next` | yes | What you would do the moment it unblocks, as a short slug. |
+| `at` | optional | UTC stamp, `2026-08-23T03:44Z`. Omit it in tmux — the pane's own activity time is observed rather than claimed, and cannot drift. |
+
+Values carry no spaces, so the record survives being scraped out of a wrapped terminal pane.
+
+**`head` is what makes the record falsifiable.** A record describes one sha. If GitHub's
+head has moved past it, you pushed after writing it and the record is stale — a reader
+discards it rather than acting on a claim about code that no longer exists. Never write a
+record for a head you have not actually produced.
+
+### `waiting` names a predicate, not a mood
+
+The whole value of the field is that a tool can *evaluate* it. `waiting=ci` is nearly
+useless — it means "something, somewhere, eventually." Name the specific thing:
+
+| Value | Evaluated as |
+| --- | --- |
+| `check:<name>` | Does check run `<name>` exist on `head`, and what did it conclude? |
+| `merge` | Is the PR mergeable, or is it `CONFLICTING`? |
+| `review` | A review round is outstanding; nothing on GitHub will change. |
+| `operator` | A human decision is required. **Tools must not wake you for this.** |
+| `none` | Nothing external blocks you; you stopped at a round boundary. |
+
+Prefer `check:<name>` over `ci` whenever you know the name — and by the time you are
+blocked on a check you almost always do, because you just looked. A named check is one
+cheap conditional REST call with an exact answer; `ci` forces a reader to guess which of
+several pending checks you meant.
+
+### `next` keeps the tool out of the judgment business
+
+A tool that reads your record decides **when** you resume. It never decides **what** you
+do — it releases the instruction *you* already declared in `next`. That boundary is the
+same one Octoshift holds: it detects, routes, and records, and it authors no judgment.
+
+Write `next` as the instruction you would want handed back to you, short and imperative:
+`round-3`, `rebase`, `fix-ci`, `merge`, `escalate`.
+
+### Worked examples
+
+A review round finished, nothing external pending — the tool confirms the PR is green and
+mergeable, then hands back `round-3`:
+
+```
+NIGHTSHIFT-STATUS pr=4563 head=f5c2b3fac round=2 verdict=converging waiting=none next=round-3
+```
+
+A rerun is outstanding and the required check has not reported yet. There is nothing to do
+and nothing to re-poll; the tool owns the wait until `ci-required` lands on that exact sha:
+
+```
+NIGHTSHIFT-STATUS pr=4595 head=722512e25 round=2 verdict=gated waiting=check:ci-required next=round-2-review
+```
+
+Four rounds without convergence — escalation is a human decision, so no tool wakes this one:
+
+```
+NIGHTSHIFT-STATUS pr=4470 head=91ab3c7de round=4 verdict=escalating waiting=operator next=escalate
+```
+
+### Why this earns its keep
+
+An idle pane carrying a record is **unambiguous**: the agent is stopped, the wait is
+declared, and ownership of it has transferred. An idle pane *without* one is equally
+unambiguous — it is stuck, and it should be looked at. Today both look identical, which is
+why a finished round can sit unnoticed for six hours.
+
 ## Building and testing
 
 Build the whole graph:
@@ -223,7 +328,10 @@ build (see below).
   coordinator**. Without subagents a worker is one model and cannot review its own
   build — the review goes to a different worker, and a worker offered review of an
   order it built declines as an invalid choice. The worker hands the coordinator
-  the **attestation** (models and rounds); it never posts to GitHub.
+  the **attestation** (models and rounds); it never posts to GitHub. A round boundary is a
+  stop, so the worker's final output at each one ends with a **status record**
+  ([above](#stopping-the-status-record)) — that is what lets a round that finished at 03:44
+  be picked up at 03:45 instead of whenever someone next looks.
 - **The coordinator owns the GitHub surface — and the push.** Only the coordinator
   pushes worker branches to origin, opens PRs, posts the single clearance note (from
   the worker's attestation), and lands merged orders. A verdict reaches GitHub through
