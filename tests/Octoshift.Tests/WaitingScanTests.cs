@@ -141,6 +141,7 @@ public class WaitingScanTests
                 Pane("night:3", "Working on PR 4600\n(esc to interrupt)", PaneActivity.Working),
             ],
             (pr, _) => { fetches.Add(pr); return Task.FromResult<PrFacts?>(null); },
+            (_, _) => Task.FromResult<PrFacts?>(null),
             DateTimeOffset.UtcNow,
             all: false,
             TestContext.Current.CancellationToken);
@@ -157,6 +158,7 @@ public class WaitingScanTests
         IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
             [Pane("night:1", "Do you want to proceed?\n(enter to confirm)", PaneActivity.Blocked)],
             (pr, _) => { fetches.Add(pr); return Task.FromResult<PrFacts?>(null); },
+            (_, _) => Task.FromResult<PrFacts?>(null),
             DateTimeOffset.UtcNow,
             all: false,
             TestContext.Current.CancellationToken);
@@ -179,8 +181,10 @@ public class WaitingScanTests
 
         TmuxPane[] panes = [Pane("night:1", "", PaneActivity.Idle, agentState: "pr=4595 head=722512e25 waiting=check:ci-required next=round-3")];
 
-        Assert.Empty(await WaitingCommand.BuildRowsAsync(panes, (_, _) => Task.FromResult<PrFacts?>(holding), DateTimeOffset.UtcNow, all: false, TestContext.Current.CancellationToken));
-        Assert.Single(await WaitingCommand.BuildRowsAsync(panes, (_, _) => Task.FromResult<PrFacts?>(holding), DateTimeOffset.UtcNow, all: true, TestContext.Current.CancellationToken));
+        Assert.Empty(await WaitingCommand.BuildRowsAsync(panes, (_, _) => Task.FromResult<PrFacts?>(holding),
+            (_, _) => Task.FromResult<PrFacts?>(null), DateTimeOffset.UtcNow, all: false, ct: TestContext.Current.CancellationToken));
+        Assert.Single(await WaitingCommand.BuildRowsAsync(panes, (_, _) => Task.FromResult<PrFacts?>(holding),
+            (_, _) => Task.FromResult<PrFacts?>(null), DateTimeOffset.UtcNow, all: true, ct: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -188,9 +192,11 @@ public class WaitingScanTests
     {
         TmuxPane[] panes = [Pane("night:1", "$ ", PaneActivity.Idle)];
 
-        Assert.Empty(await WaitingCommand.BuildRowsAsync(panes, (_, _) => Task.FromResult<PrFacts?>(null), DateTimeOffset.UtcNow, all: false, TestContext.Current.CancellationToken));
+        Assert.Empty(await WaitingCommand.BuildRowsAsync(panes, (_, _) => Task.FromResult<PrFacts?>(null),
+            (_, _) => Task.FromResult<PrFacts?>(null), DateTimeOffset.UtcNow, all: false, ct: TestContext.Current.CancellationToken));
 
-        WaitingRow row = Assert.Single(await WaitingCommand.BuildRowsAsync(panes, (_, _) => Task.FromResult<PrFacts?>(null), DateTimeOffset.UtcNow, all: true, TestContext.Current.CancellationToken));
+        WaitingRow row = Assert.Single(await WaitingCommand.BuildRowsAsync(panes, (_, _) => Task.FromResult<PrFacts?>(null),
+            (_, _) => Task.FromResult<PrFacts?>(null), DateTimeOffset.UtcNow, all: true, ct: TestContext.Current.CancellationToken));
         Assert.Null(row.Record);
         Assert.Contains("no published state", row.Verdict.Reason, StringComparison.Ordinal);
     }
@@ -205,6 +211,7 @@ public class WaitingScanTests
                 Pane("night:2", "", PaneActivity.Idle, now.AddHours(-6), agentState: "pr=2 waiting=none next=x"),
                 Pane("night:3", "", PaneActivity.Idle, now.AddMinutes(-90), agentState: "pr=3 waiting=none next=x"),
             ],
+            (_, _) => Task.FromResult<PrFacts?>(null),
             (_, _) => Task.FromResult<PrFacts?>(null),
             now,
             all: false,

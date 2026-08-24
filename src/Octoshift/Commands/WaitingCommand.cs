@@ -54,7 +54,8 @@ internal static class WaitingCommand
             repo,
             new FileConditionalCache(),
             (args, token) => GhAuthenticatedRunner.RunGhAsync(args, null, token));
-        IReadOnlyList<WaitingRow> rows = await BuildRowsAsync(panes, facts.FetchAsync, DateTimeOffset.UtcNow, all, ct);
+        IReadOnlyList<WaitingRow> rows = await BuildRowsAsync(
+            panes, facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, all, ct);
 
         if (json)
         {
@@ -75,11 +76,13 @@ internal static class WaitingCommand
     internal static async Task<IReadOnlyList<WaitingRow>> BuildRowsAsync(
         IReadOnlyList<TmuxPane> panes,
         Func<int, CancellationToken, Task<PrFacts?>> fetchAsync,
+        Func<int, CancellationToken, Task<PrFacts?>> refreshMergeabilityAsync,
         DateTimeOffset now,
         bool all,
         CancellationToken ct)
     {
         var rows = new List<WaitingRow>();
+        var pending = new List<(TmuxPane Pane, AgentState State)>();
 
         // One fetch per PR, not per pane: #159 measured PRs claimed by two windows at once, and the
         // second window's question has the same answer as the first's.
@@ -122,7 +125,23 @@ internal static class WaitingCommand
                 seen[record.PrNumber] = prFacts;
             }
 
-            rows.Add(Row(pane, record, WaitingVerdict.Resolve(record, prFacts), now));
+            pending.Add((pane, record));
+        }
+
+        // Second pass for mergeability GitHub had not finished computing. Deliberately after every other
+        // PR has been read: the calculation needs a moment, and the time spent on the rest of the fleet
+        // is that moment. Re-reading immediately just collects `unknown` a second time.
+        foreach (int prNumber in seen.Where(e => e.Value is { MergeabilityKnown: false, Merged: false }).Select(e => e.Key).ToArray())
+        {
+            if (await refreshMergeabilityAsync(prNumber, ct) is { } refreshed && refreshed.MergeabilityKnown)
+            {
+                seen[prNumber] = seen[prNumber]! with { MergeableState = refreshed.MergeableState };
+            }
+        }
+
+        foreach ((TmuxPane pane, AgentState state) in pending)
+        {
+            rows.Add(Row(pane, state, WaitingVerdict.Resolve(state, seen[state.PrNumber]), now));
         }
 
         // Longest wait first among the rows that need you: coming back after hours away, the thing that
@@ -132,6 +151,7 @@ internal static class WaitingCommand
         return rows
             .Where(r => all || r.Verdict.NeedsAttention || r.Record?.Defects.Count > 0)
             .OrderByDescending(r => r.Verdict.NeedsAttention)
+            .ThenBy(r => r.Verdict.Severity)
             .ThenByDescending(r => r.StoppedFor ?? TimeSpan.Zero)
             .ToArray();
     }

@@ -59,6 +59,31 @@ internal sealed class GhPrFactsSource
     /// <summary>True once a response reported the budget spent or GitHub pushed back.</summary>
     public bool RateLimited { get; private set; }
 
+    /// <summary>
+    /// Re-reads one PR unconditionally, for mergeability that was still being computed. Unconditional
+    /// because the ETag can be unchanged while the computed field is not, so a conditional request would
+    /// be answered 304 with the stale value.
+    /// </summary>
+    public async Task<PrFacts?> RefreshMergeabilityAsync(int prNumber, CancellationToken ct)
+    {
+        string? body = await GetAsync($"repos/{_repo}/pulls/{prNumber}", ct, bypassCache: true);
+        PullDetailDto? pull = body is null ? null : Deserialize(body, GhPrFactsJsonContext.Default.PullDetailDto);
+        if (pull?.Head?.Sha is not { Length: > 0 } headSha)
+        {
+            return null;
+        }
+
+        Recomputed++;
+        return new PrFacts
+        {
+            Number = pull.Number > 0 ? pull.Number : prNumber,
+            HeadSha = headSha,
+            State = pull.State ?? "open",
+            Merged = pull.Merged ?? false,
+            MergeableState = pull.MergeableState,
+        };
+    }
+
     /// <summary>Reads a PR's facts, or null when GitHub could not be read.</summary>
     public async Task<PrFacts?> FetchAsync(int prNumber, CancellationToken ct)
     {
@@ -72,21 +97,6 @@ internal sealed class GhPrFactsSource
         if (pull?.Head?.Sha is not { Length: > 0 } headSha)
         {
             return null;
-        }
-
-        // GitHub computes mergeability lazily: the first read after a change returns `unknown` and only
-        // starts the calculation. One re-read resolves it, and it has to be unconditional — the ETag can
-        // be unchanged while the computed field is not. Measured across the fleet, 18 of 32 open PRs
-        // answered `unknown` first and two of those were actually `dirty`, on PRs whose agents had just
-        // reported them mergeable. Skipping this is how a conflicted PR reads as ready.
-        if (IsUnknownMergeability(pull.MergeableState))
-        {
-            string? recheck = await GetAsync($"repos/{_repo}/pulls/{prNumber}", ct, bypassCache: true);
-            if (recheck is not null && Deserialize(recheck, GhPrFactsJsonContext.Default.PullDetailDto) is { } refreshed)
-            {
-                Recomputed++;
-                pull = refreshed;
-            }
         }
 
         // Checks are keyed by sha, so this read stays valid until the branch actually moves — which is
