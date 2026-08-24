@@ -101,26 +101,42 @@ internal sealed class GhPrFactsSource
 
         // Checks are keyed by sha, so this read stays valid until the branch actually moves — which is
         // what lets a rerun on an unchanged head be watched for the price of a 304.
-        string? checksBody = await GetAsync($"repos/{_repo}/commits/{headSha}/check-runs", ct);
+        string? checksBody = await GetAsync($"repos/{_repo}/commits/{headSha}/check-runs?per_page=100", ct);
         CheckRunsDto? checks = checksBody is null ? null : Deserialize(checksBody, GhPrFactsJsonContext.Default.CheckRunsDto);
+
+        // total_count above what one page returned means the rest were never seen, which is the same
+        // problem as a failed read: the evidence is incomplete, so it must not read as "nothing failing".
+        bool checksKnown = checks is not null
+            && (checks.TotalCount is null or 0 || checks.TotalCount <= (checks.CheckRuns?.Length ?? 0));
 
         return new PrFacts
         {
+            ChecksKnown = checksKnown,
             Number = pull.Number > 0 ? pull.Number : prNumber,
             HeadSha = headSha,
             State = pull.State ?? "open",
             Merged = pull.Merged ?? false,
             MergeableState = pull.MergeableState,
-            Checks = (checks?.CheckRuns ?? [])
+            Checks = PrFacts.LatestPerName((checks?.CheckRuns ?? [])
                 .Where(c => !string.IsNullOrWhiteSpace(c.Name))
-                .Select(c => new CheckRunFact(c.Name!, c.Status ?? "queued", c.Conclusion))
-                .ToArray(),
+                .Select(c => new CheckRunFact(
+                    c.Name!,
+                    c.Status ?? "queued",
+                    c.Conclusion,
+                    DateTimeOffset.TryParse(c.StartedAt, out DateTimeOffset started) ? started : null))),
         };
     }
 
     /// <summary>One conditional GET. Returns the body — from the response, or from cache on a 304.</summary>
     private async Task<string?> GetAsync(string path, CancellationToken ct, bool bypassCache = false)
     {
+        // Once GitHub has pushed back, further calls cannot succeed and only deepen the hole for every
+        // other agent drawing on the same budget.
+        if (RateLimited)
+        {
+            return null;
+        }
+
         (string? etag, string? cached) = bypassCache ? (null, null) : _cache.Get(path);
 
         var args = new List<string> { "api", path, "-i" };
@@ -270,6 +286,9 @@ internal sealed record PullHeadDto
 
 internal sealed record CheckRunsDto
 {
+    [JsonPropertyName("total_count")]
+    public int? TotalCount { get; init; }
+
     [JsonPropertyName("check_runs")]
     public CheckRunDto[]? CheckRuns { get; init; }
 }
@@ -284,6 +303,9 @@ internal sealed record CheckRunDto
 
     [JsonPropertyName("conclusion")]
     public string? Conclusion { get; init; }
+
+    [JsonPropertyName("started_at")]
+    public string? StartedAt { get; init; }
 }
 
 [JsonSourceGenerationOptions(PropertyNameCaseInsensitive = true)]

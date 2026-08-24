@@ -17,9 +17,10 @@ public class WaitingScanTests
     public void ParseWindows_ReadsTargetAttachmentAndActivity()
     {
         IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseWindows(
-            "night:3|1|1755900000|pr=4595 head=abc1234 reviews=2/2 rec=merge|pr4595\nnight:4|0|1755800000||i158\n");
+            "%1|night:3|1|1755900000|pr=4595 head=abc1234 reviews=2/2 rec=merge|pr4595\n%2|night:4|0|1755800000||i158\n");
 
         Assert.Equal(2, windows.Count);
+        Assert.Equal("%1", windows[0].PaneId);
         Assert.Equal("night:3", windows[0].Target);
         Assert.True(windows[0].SessionAttached);
         Assert.Equal("pr4595", windows[0].WindowName);
@@ -33,7 +34,7 @@ public class WaitingScanTests
     public void ParseWindows_KeepsAPipeInTheWindowName()
     {
         // Window name is formatted last precisely so a separator inside it cannot shift earlier fields.
-        IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseWindows("night:3|1|1755900000||pr4595|round2");
+        IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseWindows("%7|night:3|1|1755900000||pr4595|round2");
 
         TmuxPane window = Assert.Single(windows);
         Assert.Equal("night:3", window.Target);
@@ -43,8 +44,8 @@ public class WaitingScanTests
     [Theory]
     [InlineData("")]
     [InlineData("garbage\nmalformed row")]
-    [InlineData("|1|1755900000||name")]
-    [InlineData("night:3|1|1755900000")]
+    [InlineData("night:3|1|1755900000||name")]
+    [InlineData("%1|night:3|1|1755900000")]
     public void ParseWindows_DropsMalformedRows(string stdout)
         => Assert.Empty(TmuxScanner.ParseWindows(stdout));
 
@@ -73,7 +74,7 @@ public class WaitingScanTests
             [$"repos/o/r/pulls/4595"] = Response(200, """
                 {"number":4595,"state":"open","merged":false,"mergeable_state":"clean","head":{"sha":"722512e25f0c1d4a9b8e7360a1c2d3e4f5061728"}}
                 """),
-            [$"repos/o/r/commits/{Head}/check-runs"] = Response(200, """
+            [$"repos/o/r/commits/{Head}/check-runs?per_page=100"] = Response(200, """
                 {"check_runs":[{"name":"ci-required","status":"completed","conclusion":"success"}]}
                 """),
         };
@@ -96,12 +97,12 @@ public class WaitingScanTests
         cache.Put($"repos/o/r/pulls/4595", "\"etag-pull\"", """
             {"number":4595,"state":"open","mergeable_state":"clean","head":{"sha":"722512e25f0c1d4a9b8e7360a1c2d3e4f5061728"}}
             """);
-        cache.Put($"repos/o/r/commits/{Head}/check-runs", "\"etag-checks\"", """{"check_runs":[]}""");
+        cache.Put($"repos/o/r/commits/{Head}/check-runs?per_page=100", "\"etag-checks\"", """{"check_runs":[]}""");
 
         var gh = new FakeGh
         {
             [$"repos/o/r/pulls/4595"] = Response(304, string.Empty),
-            [$"repos/o/r/commits/{Head}/check-runs"] = Response(304, string.Empty),
+            [$"repos/o/r/commits/{Head}/check-runs?per_page=100"] = Response(304, string.Empty),
         };
 
         var source = new GhPrFactsSource("o/r", cache, gh.RunAsync);
@@ -221,9 +222,93 @@ public class WaitingScanTests
         Assert.Equal(TimeSpan.FromHours(6), rows[0].StoppedFor);
     }
 
+    [Fact]
+    public async Task ScanAsync_TreatsAnUnreachableTmuxAsAFailureNotAnEmptyFleet()
+    {
+        // Reporting QUIET for both is how a silent tool gets mistaken for a quiet one.
+        var scanner = new TmuxScanner((_, _) => Task.FromResult(new CommandResult(1, string.Empty, "no server running")));
+
+        TmuxUnavailableException ex = await Assert.ThrowsAsync<TmuxUnavailableException>(
+            () => scanner.ScanAsync(TestContext.Current.CancellationToken));
+
+        Assert.Contains("no server running", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ScanAsync_MarksAPaneUnreadableWhenTheCaptureFails()
+    {
+        var scanner = new TmuxScanner((args, _) => Task.FromResult(
+            args[0] == "list-windows"
+                ? new CommandResult(0, "%1|night:1|1|1755900000||pr4595\n", string.Empty)
+                : new CommandResult(1, string.Empty, "pane not found")));
+
+        TmuxPane pane = Assert.Single(await scanner.ScanAsync(TestContext.Current.CancellationToken));
+
+        Assert.Equal(PaneActivity.Unreadable, pane.Activity);
+    }
+
+    [Fact]
+    public async Task FetchAsync_StopsSpendingOnceGitHubHasPushedBack()
+    {
+        var gh = new FakeGh { ["repos/o/r/pulls/1"] = Response(403, string.Empty, "x-ratelimit-remaining: 0") };
+        var source = new GhPrFactsSource("o/r", new FakeCache(), gh.RunAsync);
+
+        Assert.Null(await source.FetchAsync(1, TestContext.Current.CancellationToken));
+        Assert.Null(await source.FetchAsync(2, TestContext.Current.CancellationToken));
+
+        // Only the first call reaches gh; further requests cannot succeed and deepen the hole for every
+        // other agent on the same budget.
+        Assert.Single(gh.Requests);
+    }
+
+    [Fact]
+    public async Task FetchAsync_TruncatedChecksAreNotAnEmptyCheckSet()
+    {
+        var gh = new FakeGh
+        {
+            ["repos/o/r/pulls/4595"] = Response(200, """
+                {"number":4595,"state":"open","mergeable_state":"clean","head":{"sha":"722512e25f0c1d4a9b8e7360a1c2d3e4f5061728"}}
+                """),
+            [$"repos/o/r/commits/{Head}/check-runs?per_page=100"] = Response(200, """
+                {"total_count":140,"check_runs":[{"name":"build","status":"completed","conclusion":"success"}]}
+                """),
+        };
+
+        PrFacts? facts = await new GhPrFactsSource("o/r", new FakeCache(), gh.RunAsync)
+            .FetchAsync(4595, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(facts);
+        Assert.False(facts.ChecksKnown);
+    }
+
+    [Fact]
+    public async Task FetchAsync_KeepsOnlyTheNewestAttemptPerCheckName()
+    {
+        var gh = new FakeGh
+        {
+            ["repos/o/r/pulls/4595"] = Response(200, """
+                {"number":4595,"state":"open","mergeable_state":"clean","head":{"sha":"722512e25f0c1d4a9b8e7360a1c2d3e4f5061728"}}
+                """),
+            [$"repos/o/r/commits/{Head}/check-runs?per_page=100"] = Response(200, """
+                {"total_count":2,"check_runs":[
+                  {"name":"ci-required","status":"completed","conclusion":"failure","started_at":"2026-08-24T01:00:00Z"},
+                  {"name":"ci-required","status":"completed","conclusion":"success","started_at":"2026-08-24T03:00:00Z"}]}
+                """),
+        };
+
+        PrFacts? facts = await new GhPrFactsSource("o/r", new FakeCache(), gh.RunAsync)
+            .FetchAsync(4595, TestContext.Current.CancellationToken);
+
+        // A rerun leaves the failed attempt in the response; reporting it is how an agent sits waiting on
+        // a check that has already gone green.
+        CheckRunFact check = Assert.Single(facts!.Checks);
+        Assert.False(check.IsFailure);
+    }
+
     private static TmuxPane Pane(string target, string capture, PaneActivity activity, DateTimeOffset? lastActivity = null, string? agentState = null, string windowName = "w")
         => new()
         {
+            PaneId = "%" + target.GetHashCode().ToString("x", System.Globalization.CultureInfo.InvariantCulture),
             Target = target,
             AgentStateOption = agentState,
             WindowName = windowName,

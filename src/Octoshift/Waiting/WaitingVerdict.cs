@@ -220,9 +220,11 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         // Reviews meet the bar and the branch merges. CI is reported but is deliberately not a gate: it
         // goes red for reasons unrelated to the change, and clearing it is the operator's call.
         CheckRunFact? failed = facts.Checks.FirstOrDefault(c => c.IsFailure);
-        string ci = failed is not null
-            ? $"; CI red ({failed.Name})"
-            : facts.Checks.Any(c => !c.IsComplete) ? "; CI still running" : string.Empty;
+        string ci = !facts.ChecksKnown
+            ? "; CI unreadable"
+            : failed is not null
+                ? $"; CI red ({failed.Name})"
+                : facts.Checks.Any(c => !c.IsComplete) ? "; CI still running" : string.Empty;
 
         return new(WaitingState.Ready, RowOwner.Operator, $"reviews {state.ReviewsClean}/{state.ReviewsRequired}, mergeable{ci}");
     }

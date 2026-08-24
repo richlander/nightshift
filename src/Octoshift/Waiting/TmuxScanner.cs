@@ -16,7 +16,13 @@ internal enum PaneActivity
 
     /// <summary>The agent is holding a prompt open and waiting for a keystroke.</summary>
     Blocked,
+
+    /// <summary>The pane could not be captured, so nothing about it is known.</summary>
+    Unreadable,
 }
+
+/// <summary>Raised when tmux itself could not be reached, as distinct from finding no windows.</summary>
+internal sealed class TmuxUnavailableException(string message) : Exception(message);
 
 /// <summary>The result of running a local command.</summary>
 internal readonly record struct CommandResult(int ExitCode, string Stdout, string Stderr);
@@ -24,6 +30,13 @@ internal readonly record struct CommandResult(int ExitCode, string Stdout, strin
 /// <summary>One tmux window and the visible contents of its active pane.</summary>
 internal sealed record TmuxPane
 {
+    /// <summary>
+    /// The tmux pane id (<c>%12</c>). Used for every follow-up call: it is unique, stable across renames
+    /// and reindexing, and cannot be confused by a delimiter inside a session or window name.
+    /// </summary>
+    public required string PaneId { get; init; }
+
+    /// <summary>Human-readable <c>session:window</c>, for display only.</summary>
     public required string Target { get; init; }
 
     public required string WindowName { get; init; }
@@ -56,28 +69,36 @@ internal sealed class TmuxScanner
     /// Window name comes last so that a <c>|</c> inside it cannot shift the fields before it.
     /// </summary>
     private const string ListFormat =
-        "#{session_name}:#{window_index}|#{session_attached}|#{window_activity}|#{@agent_state}|#{window_name}";
+        "#{pane_id}|#{session_name}:#{window_index}|#{session_attached}|#{window_activity}|#{@agent_state}|#{window_name}";
 
     private readonly Func<IReadOnlyList<string>, CancellationToken, Task<CommandResult>> _runAsync;
 
     public TmuxScanner(Func<IReadOnlyList<string>, CancellationToken, Task<CommandResult>>? runAsync = null)
         => _runAsync = runAsync ?? RunTmuxAsync;
 
-    /// <summary>Lists every window across every session, each with its active pane's visible text.</summary>
+    /// <summary>
+    /// Lists every window across every session, each with its active pane's visible text. Throws when
+    /// tmux itself could not be reached: no tmux and an idle fleet must not report the same thing.
+    /// </summary>
     public async Task<IReadOnlyList<TmuxPane>> ScanAsync(CancellationToken ct)
     {
         CommandResult list = await _runAsync(["list-windows", "-a", "-F", ListFormat], ct);
         if (list.ExitCode != 0)
         {
-            return [];
+            throw new TmuxUnavailableException(
+                list.Stderr.Trim() is { Length: > 0 } detail ? detail : $"tmux exited {list.ExitCode}");
         }
 
         var panes = new List<TmuxPane>();
         foreach (TmuxPane window in ParseWindows(list.Stdout))
         {
-            CommandResult capture = await _runAsync(["capture-pane", "-p", "-t", window.Target], ct);
-            string text = capture.ExitCode == 0 ? capture.Stdout : string.Empty;
-            panes.Add(window with { Capture = text, Activity = ClassifyActivity(text) });
+            CommandResult capture = await _runAsync(["capture-pane", "-p", "-t", window.PaneId], ct);
+
+            // A capture that failed is not a quiet pane. Leaving Activity unknown keeps a stopped agent
+            // from being reported as working, and a working one from being reported as stopped.
+            panes.Add(capture.ExitCode == 0
+                ? window with { Capture = capture.Stdout, Activity = ClassifyActivity(capture.Stdout) }
+                : window with { Capture = string.Empty, Activity = PaneActivity.Unreadable });
         }
 
         return panes;
@@ -89,21 +110,22 @@ internal sealed class TmuxScanner
         var windows = new List<TmuxPane>();
         foreach (string line in stdout.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
         {
-            string[] parts = line.Split('|', 5);
-            if (parts.Length < 5 || parts[0].Length == 0)
+            string[] parts = line.Split('|', 6);
+            if (parts.Length < 6 || !parts[0].StartsWith('%'))
             {
                 continue;
             }
 
             windows.Add(new TmuxPane
             {
-                Target = parts[0],
-                SessionAttached = parts[1].Trim() != "0" && parts[1].Trim().Length > 0,
-                LastActivity = long.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out long epoch) && epoch > 0
+                PaneId = parts[0],
+                Target = parts[1],
+                SessionAttached = parts[2].Trim() != "0" && parts[2].Trim().Length > 0,
+                LastActivity = long.TryParse(parts[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out long epoch) && epoch > 0
                     ? DateTimeOffset.FromUnixTimeSeconds(epoch)
                     : null,
-                AgentStateOption = parts[3].Trim() is { Length: > 0 } option ? option : null,
-                WindowName = parts[4].Trim(),
+                AgentStateOption = parts[4].Trim() is { Length: > 0 } option ? option : null,
+                WindowName = parts[5].Trim(),
             });
         }
 

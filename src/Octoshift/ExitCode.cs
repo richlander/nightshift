@@ -14,6 +14,9 @@ internal static class ExitCode
     /// <summary>Malformed invocation, or a repo scope that could not be resolved.</summary>
     public const int Usage = 2;
 
+    /// <summary>A dependency the command needs — tmux, a socket — could not be reached.</summary>
+    public const int Unavailable = 3;
+
     /// <summary>Interrupted by Ctrl-C (128 + SIGINT), the conventional signal exit code.</summary>
     public const int Interrupted = 130;
 }

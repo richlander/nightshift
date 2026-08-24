@@ -41,11 +41,25 @@ internal static class WaitingCommand
         }
 
         var scanner = new TmuxScanner();
-        IReadOnlyList<TmuxPane> panes = await scanner.ScanAsync(ct);
-        if (panes.Count == 0)
+        IReadOnlyList<TmuxPane> panes;
+        try
         {
-            Console.WriteLine("QUIET no tmux windows found");
-            return ExitCode.Ok;
+            panes = await scanner.ScanAsync(ct);
+        }
+        catch (TmuxUnavailableException ex)
+        {
+            // An unreachable tmux and an idle fleet are different answers; reporting QUIET for both is
+            // how a silent tool gets mistaken for a quiet one.
+            if (json)
+            {
+                WriteJsonError(ex.Message);
+            }
+            else
+            {
+                Console.Error.WriteLine($"octoshift: tmux unavailable: {ex.Message}");
+            }
+
+            return ExitCode.Unavailable;
         }
 
         // The operator's own gh auth, on purpose: this is a hand-run report, and the App installation
@@ -133,10 +147,18 @@ internal static class WaitingCommand
         // is that moment. Re-reading immediately just collects `unknown` a second time.
         foreach (int prNumber in seen.Where(e => e.Value is { MergeabilityKnown: false, Merged: false }).Select(e => e.Key).ToArray())
         {
-            if (await refreshMergeabilityAsync(prNumber, ct) is { } refreshed && refreshed.MergeabilityKnown)
+            if (await refreshMergeabilityAsync(prNumber, ct) is not { } refreshed || !refreshed.MergeabilityKnown)
             {
-                seen[prNumber] = seen[prNumber]! with { MergeableState = refreshed.MergeableState };
+                continue;
             }
+
+            // Only graft when the PR has not moved between the two reads. Otherwise the answer belongs to
+            // a different head, and pairing it with the old snapshot would report the agent's head as
+            // mergeable on the strength of a newer one.
+            PrFacts current = seen[prNumber]!;
+            seen[prNumber] = string.Equals(current.HeadSha, refreshed.HeadSha, StringComparison.OrdinalIgnoreCase)
+                ? current with { MergeableState = refreshed.MergeableState }
+                : refreshed with { ChecksKnown = false };
         }
 
         foreach ((TmuxPane pane, AgentState state) in pending)
@@ -263,12 +285,27 @@ internal static class WaitingCommand
         { } value => $"{(int)value.TotalDays}d{value.Hours:00}h",
     };
 
+    /// <summary>Emits a machine-readable failure so <c>--json</c> never returns non-JSON.</summary>
+    private static void WriteJsonError(string message)
+    {
+        using var writer = new Utf8JsonWriter(Console.OpenStandardOutput(), new JsonWriterOptions { Indented = true });
+        writer.WriteStartObject();
+        writer.WriteString("error", message);
+        writer.WriteStartArray("rows");
+        writer.WriteEndArray();
+        writer.WriteEndObject();
+        writer.Flush();
+        Console.WriteLine();
+    }
+
     private static void WriteJson(IReadOnlyList<WaitingRow> rows, GhPrFactsSource facts)
     {
         using var writer = new Utf8JsonWriter(Console.OpenStandardOutput(), new JsonWriterOptions { Indented = true });
         writer.WriteStartObject();
         writer.WriteNumber("calls", facts.Calls);
         writer.WriteNumber("notModified", facts.NotModified);
+        writer.WriteNumber("mergeabilityRereads", facts.Recomputed);
+        writer.WriteBoolean("rateLimited", facts.RateLimited);
         if (facts.RateLimitRemaining is { } remaining)
         {
             writer.WriteNumber("rateLimitRemaining", remaining);
