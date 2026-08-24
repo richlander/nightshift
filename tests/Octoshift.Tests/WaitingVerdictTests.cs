@@ -163,12 +163,76 @@ public class WaitingVerdictTests
     }
 
     [Fact]
-    public void Resolve_ReviewsCompleteCountsAsDoneEvenWithoutRecMerge()
+    public void Resolve_ReviewEvidenceIsWhatCountsNotTheRecommendation()
     {
         WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e25 reviews=2/2"), Facts());
 
         Assert.Equal(WaitingState.Ready, v.State);
         Assert.Equal(RowOwner.Operator, v.Owner);
+    }
+
+    [Fact]
+    public void Resolve_RecMergeAloneDoesNotMakeAPrReady()
+    {
+        // `rec=merge` is the agent's request, not its evidence. The evidence is the review count.
+        WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e25 reviews=0/2 rec=merge"), Facts());
+
+        Assert.NotEqual(WaitingState.Ready, v.State);
+        Assert.NotEqual(RowOwner.Operator, v.Owner);
+    }
+
+    [Fact]
+    public void Resolve_ASelfLoweredBarIsNotTheBar()
+    {
+        // reviews=1/1 satisfies "clean equals required" and still has not met the two-clean repository
+        // bar. A record does not get to choose what it is measured against.
+        WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e25 reviews=1/1"), Facts());
+
+        Assert.Equal(WaitingState.Holding, v.State);
+    }
+
+    [Fact]
+    public void Resolve_ADiscardedBlockerCannotFallThroughIntoTheMergeQueue()
+    {
+        // Observed live: `blocked=ci reviews=2/2 rec=wait`. "ci" is not citable so the blocker list is
+        // empty, the wait branch is skipped, and without this gate the row lands in the merge queue.
+        WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e25 reviews=2/2 blocked=ci rec=wait"), Facts());
+
+        Assert.Equal(WaitingState.Untrustworthy, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
+    }
+
+    [Fact]
+    public void Resolve_DoneWithoutAHeadCannotBeChecked()
+    {
+        WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 reviews=2/2 rec=merge"), Facts());
+
+        Assert.Equal(WaitingState.Untrustworthy, v.State);
+        Assert.Contains("without a head", v.Reason, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("behind")]
+    [InlineData("blocked")]
+    [InlineData("draft")]
+    [InlineData("some_state_github_added_later")]
+    public void Resolve_OnlyAffirmativeMergeabilityCounts(string mergeableState)
+    {
+        // Anything that does not positively say the branch can merge fails closed and is named.
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=2/2 rec=merge"), Facts(mergeableState: mergeableState));
+
+        Assert.Equal(WaitingState.NotMergeable, v.State);
+        Assert.Contains(mergeableState, v.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Resolve_UnstableIsStillMergeableBecauseCiIsNotTheBar()
+    {
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=2/2 rec=merge"), Facts(mergeableState: "unstable"));
+
+        Assert.Equal(WaitingState.Ready, v.State);
     }
 
     [Fact]

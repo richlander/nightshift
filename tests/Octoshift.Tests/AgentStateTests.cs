@@ -22,7 +22,7 @@ public class AgentStateTests
         Assert.Equal(1, state.Round);
         Assert.Equal(2, state.ReviewsClean);
         Assert.Equal(2, state.ReviewsRequired);
-        Assert.True(state.ReviewsComplete);
+        Assert.True(state.ReviewsMeetBar);
         Assert.Equal([4629], state.Blocked);
         Assert.Equal(Recommendation.Wait, state.Recommendation);
         Assert.Empty(state.Defects);
@@ -47,7 +47,7 @@ public class AgentStateTests
 
         Assert.NotNull(state);
         Assert.Equal(Recommendation.Merge, state.Recommendation);
-        Assert.False(state.ReviewsComplete);
+        Assert.False(state.ReviewsMeetBar);
         Assert.Contains(state.Defects, d => d.Contains("rec=merge with reviews=0/2", StringComparison.Ordinal));
     }
 

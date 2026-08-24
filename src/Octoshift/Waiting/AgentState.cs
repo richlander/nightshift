@@ -70,8 +70,21 @@ internal sealed partial record AgentState
     /// </summary>
     public IReadOnlyList<string> Defects { get; init; } = [];
 
-    /// <summary>True when the agent has declared the review bar met.</summary>
-    public bool ReviewsComplete => ReviewsRequired is > 0 && ReviewsClean == ReviewsRequired;
+    /// <summary>
+    /// The repository bar: two clean reviews from two different models. A record claiming <c>1/1</c> has
+    /// not met it, so the count is checked against this rather than against whatever the record says was
+    /// required of it.
+    /// </summary>
+    public const int RequiredCleanReviews = 2;
+
+    /// <summary>
+    /// True only when the declared count actually meets the repository bar. Deliberately not "clean
+    /// equals required": a record is not permitted to lower the bar it is measured against.
+    /// </summary>
+    public bool ReviewsMeetBar
+        => ReviewsClean >= RequiredCleanReviews
+            && ReviewsRequired >= RequiredCleanReviews
+            && ReviewsClean <= ReviewsRequired;
 
     /// <summary>
     /// Reads a window's state. <paramref name="agentState"/> is the <c>@agent_state</c> option and

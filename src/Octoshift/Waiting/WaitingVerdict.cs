@@ -20,6 +20,12 @@ internal enum WaitingState
     /// <summary>The branch cannot merge without integrating a later main.</summary>
     Conflicting,
 
+    /// <summary>GitHub does not affirmatively say the branch can merge, for some reason other than a conflict.</summary>
+    NotMergeable,
+
+    /// <summary>The declared state contradicts itself, so nothing in it can be relied on.</summary>
+    Untrustworthy,
+
     /// <summary>GitHub has not finished computing mergeability, so nothing can be claimed yet.</summary>
     MergeUnverified,
 
@@ -102,7 +108,26 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
             return new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to authorise more rounds");
         }
 
-        bool declaredDone = state.Recommendation == Recommendation.Merge || state.ReviewsComplete;
+        // Everything below decides whether a window is finished, so every one of these gates fails closed.
+        // A claim that cannot be checked is not a claim that passes.
+        //
+        // `rec=merge` alone is deliberately NOT enough. It is the agent's request, not its evidence, and
+        // the evidence is the review count measured against the repository bar.
+        bool declaredDone = state.ReviewsMeetBar;
+
+        // A record that contradicts itself cannot be trusted to say it is finished — and a discarded
+        // blocker is exactly how `blocked=ci rec=wait` would otherwise fall through into the merge queue.
+        if (declaredDone && state.Defects.Count > 0)
+        {
+            return new(WaitingState.Untrustworthy, RowOwner.Operator, "reported done, but the state contradicts itself");
+        }
+
+        // Falsifiability is the point of `head`. Without one there is nothing tying the claim to a
+        // revision, so it can be neither confirmed nor refuted.
+        if (declaredDone && state.Head is null)
+        {
+            return new(WaitingState.Untrustworthy, RowOwner.Operator, "reported done without a head to check it against");
+        }
 
         if (facts.IsConflicting)
         {
@@ -136,8 +161,16 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
                 : new(WaitingState.Holding, RowOwner.Nobody, "in progress");
         }
 
-        // Reviews are in and the branch merges. CI is reported but is deliberately not a gate: it goes
-        // red for reasons unrelated to the change, and clearing it is the operator's call.
+        // Known, and not conflicting, but still not a state that says the branch can merge: `behind`,
+        // `blocked`, `draft`, or something GitHub added since. Naming it beats guessing at it.
+        if (!facts.IsMergeable)
+        {
+            return new(WaitingState.NotMergeable, RowOwner.Operator,
+                $"reported done, but GitHub says {facts.MergeableState}");
+        }
+
+        // Reviews meet the bar and the branch merges. CI is reported but is deliberately not a gate: it
+        // goes red for reasons unrelated to the change, and clearing it is the operator's call.
         CheckRunFact? failed = facts.Checks.FirstOrDefault(c => c.IsFailure);
         string ci = failed is not null
             ? $"; CI red ({failed.Name})"
