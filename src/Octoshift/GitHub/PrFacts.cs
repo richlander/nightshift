@@ -39,8 +39,17 @@ internal sealed record PrFacts
     /// <summary>Check runs on <see cref="HeadSha"/>.</summary>
     public IReadOnlyList<CheckRunFact> Checks { get; init; } = [];
 
-    /// <summary>True when GitHub reports the branch cannot merge without a rebase.</summary>
+    /// <summary>True when GitHub reports the branch cannot merge without integrating a later main.</summary>
     public bool IsConflicting => string.Equals(MergeableState, "dirty", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// False while GitHub still answers <c>unknown</c>. Mergeability is computed lazily: the first read
+    /// after a change starts the calculation and returns <c>unknown</c>, and the answer arrives on a later
+    /// read. Treating <c>unknown</c> as "not conflicting" is how a conflicted PR reads as ready.
+    /// </summary>
+    public bool MergeabilityKnown
+        => !string.IsNullOrEmpty(MergeableState)
+            && !string.Equals(MergeableState, "unknown", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Finds a check run by name, case-insensitively.</summary>
     public CheckRunFact? FindCheck(string name)

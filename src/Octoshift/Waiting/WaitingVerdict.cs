@@ -2,7 +2,7 @@ namespace Octoshift.Waiting;
 
 using Octoshift.GitHub;
 
-/// <summary>What a stopped agent's declared wait resolves to once GitHub's side is known.</summary>
+/// <summary>What a window's self-reported state resolves to once GitHub's side is known.</summary>
 internal enum WaitingState
 {
     /// <summary>GitHub could not be read; nothing is asserted.</summary>
@@ -11,153 +11,140 @@ internal enum WaitingState
     /// <summary>The record describes a sha GitHub is no longer at. Its claims are void.</summary>
     Stale,
 
-    /// <summary>The declared condition has cleared. The agent's own <c>next</c> is ready to release.</summary>
+    /// <summary>Reviews are in and the branch merges. This is the merge queue.</summary>
     Ready,
 
-    /// <summary>Something needs doing that is not what the agent was waiting for.</summary>
-    Blocked,
+    /// <summary>The agent declared itself done and GitHub disagrees.</summary>
+    Contradicted,
 
-    /// <summary>The wait is legitimate and unresolved. Nothing to do but keep holding it.</summary>
-    Holding,
+    /// <summary>The branch cannot merge without integrating a later main.</summary>
+    Conflicting,
 
-    /// <summary>A human decision is required.</summary>
+    /// <summary>GitHub has not finished computing mergeability, so nothing can be claimed yet.</summary>
+    MergeUnverified,
+
+    /// <summary>A person has to decide before anything moves.</summary>
     NeedsOperator,
 
-    /// <summary>The PR merged. The wait is over by other means.</summary>
+    /// <summary>Legitimately parked or still working. Nothing to do.</summary>
+    Holding,
+
+    /// <summary>The PR merged.</summary>
     Merged,
 
     /// <summary>The PR closed without merging.</summary>
     Closed,
 }
 
-/// <summary>
-/// The join of what an agent declared with what GitHub reports — one record with a state, a human-readable
-/// reason, and where applicable the directive that would resume the agent.
-/// </summary>
-/// <param name="State">The resolved state of the wait.</param>
-/// <param name="Reason">One line naming the specific fact behind the state.</param>
-/// <param name="Directive">The instruction that would resume the agent, or null when there is none.</param>
-/// <param name="Releasable">
-/// Whether a tool may send <paramref name="Directive"/> unattended. True only when the blocker the agent
-/// itself named has cleared and the agent itself declared what comes next — so releasing repeats the
-/// agent's decision rather than substituting one. Everything else, including every <see
-/// cref="WaitingState.Blocked"/> verdict, carries a suggestion for a human to act on.
-/// </param>
-internal readonly record struct WaitingVerdict(WaitingState State, string Reason, string? Directive, bool Releasable)
+/// <summary>Whose attention a row belongs to.</summary>
+internal enum RowOwner
 {
-    /// <summary>True when the row deserves the operator's attention rather than being scrolled past.</summary>
-    public bool NeedsAttention => State is not WaitingState.Holding;
+    /// <summary>Nobody: the window is progressing or legitimately parked.</summary>
+    Nobody,
+
+    /// <summary>The operator. A person has to look.</summary>
+    Operator,
+
+    /// <summary>The agent, which is still working and has not handed anything over.</summary>
+    Agent,
+}
+
+/// <summary>
+/// The join of what a window declared with what GitHub reports.
+/// </summary>
+/// <param name="State">The resolved state.</param>
+/// <param name="Owner">Whose attention this row belongs to.</param>
+/// <param name="Reason">One line naming the specific fact behind the state.</param>
+internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owner, string Reason)
+{
+    public bool NeedsAttention => Owner == RowOwner.Operator;
 
     /// <summary>
-    /// Resolves a record against GitHub's account of the same PR. Pure: no I/O, so the whole decision
-    /// table is testable without a network or a live pane.
+    /// Resolves a window's state against GitHub's account of the same PR. Pure — the whole decision table
+    /// is testable without a pane or a network.
     /// </summary>
-    public static WaitingVerdict Resolve(StatusRecord record, PrFacts? facts)
+    public static WaitingVerdict Resolve(AgentState state, PrFacts? facts)
     {
-        ArgumentNullException.ThrowIfNull(record);
+        ArgumentNullException.ThrowIfNull(state);
 
         if (facts is null)
         {
-            return new WaitingVerdict(WaitingState.Unknown, $"could not read PR #{record.PrNumber} from GitHub", null, false);
+            return new(WaitingState.Unknown, RowOwner.Operator, $"could not read PR #{state.PrNumber} from GitHub");
         }
 
         if (facts.Merged)
         {
-            return new WaitingVerdict(WaitingState.Merged, $"PR #{facts.Number} merged", null, false);
+            return new(WaitingState.Merged, RowOwner.Operator, $"PR #{facts.Number} merged; the window is done");
         }
 
         if (string.Equals(facts.State, "closed", StringComparison.OrdinalIgnoreCase))
         {
-            return new WaitingVerdict(WaitingState.Closed, $"PR #{facts.Number} closed without merging", null, false);
+            return new(WaitingState.Closed, RowOwner.Operator, $"PR #{facts.Number} closed without merging");
         }
 
-        // Head divergence voids the record before any predicate is evaluated: every claim in it — the
-        // round, the verdict, the wait — was made about code GitHub is no longer serving. The checks
-        // fetched here belong to a different sha, so they cannot answer the question that was asked.
-        if (record.Head is not null && !ShaMatches(record.Head, facts.HeadSha))
+        // Head divergence voids the record before anything in it is evaluated: every claim was made about
+        // code GitHub is no longer serving.
+        if (state.Head is not null && !ShaMatches(state.Head, facts.HeadSha))
         {
-            return new WaitingVerdict(
-                WaitingState.Stale,
-                $"record describes {Short(record.Head)}, GitHub head is {Short(facts.HeadSha)}",
-                null,
-                false);
+            return new(WaitingState.Stale, RowOwner.Operator,
+                $"record describes {Short(state.Head)}, GitHub head is {Short(facts.HeadSha)}");
         }
 
-        if (record.Waiting.Kind == PredicateKind.Operator)
+        // Stop and Approve both need an answer before anything moves, and an escalation outranks whatever
+        // the branch looks like — a person is already required.
+        if (state.Recommendation == Recommendation.Stop)
         {
-            return new WaitingVerdict(WaitingState.NeedsOperator, "agent escalated; awaiting a human decision", null, false);
+            return new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to stop; grant or decline");
         }
 
-        // A conflict outranks whatever the agent was waiting for: a green check on an unmergeable branch
-        // still cannot land, so resuming the declared next would waste the round.
+        if (state.Recommendation == Recommendation.Approve)
+        {
+            return new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to authorise more rounds");
+        }
+
+        bool declaredDone = state.Recommendation == Recommendation.Merge || state.ReviewsComplete;
+
         if (facts.IsConflicting)
         {
-            return new WaitingVerdict(WaitingState.Blocked, "CONFLICTING — needs a rebase onto main", "rebase onto main and push", false);
+            // The agent believes it is finished and the branch does not merge. Do NOT send it back round:
+            // sequencing against a moving main is an operator call, and repeated conflict passes are the
+            // waste this tool exists to remove.
+            return declaredDone
+                ? new(WaitingState.Contradicted, RowOwner.Operator, "reported done, but the branch is CONFLICTING")
+                : new(WaitingState.Conflicting, RowOwner.Agent, "CONFLICTING; integrate a later main");
         }
 
-        return record.Waiting.Kind switch
+        if (!facts.MergeabilityKnown)
         {
-            PredicateKind.Check => ResolveCheck(record, facts),
-            PredicateKind.Merge => new WaitingVerdict(WaitingState.Ready, "mergeable", Release(record), IsReleasable(record)),
-            PredicateKind.Review => new WaitingVerdict(WaitingState.Holding, "review round outstanding; GitHub will not change this", null, false),
-            _ => ResolveOverall(record, facts),
-        };
-    }
-
-    private static WaitingVerdict ResolveCheck(StatusRecord record, PrFacts facts)
-    {
-        string name = record.Waiting.CheckName!;
-        CheckRunFact? check = facts.FindCheck(name);
-
-        if (check is null)
-        {
-            return new WaitingVerdict(WaitingState.Holding, $"{name} has not reported on {Short(facts.HeadSha)}", null, false);
+            return declaredDone
+                ? new(WaitingState.MergeUnverified, RowOwner.Operator, "reported done, but GitHub has not computed mergeability")
+                : new(WaitingState.MergeUnverified, RowOwner.Nobody, "mergeability not yet computed");
         }
 
-        if (!check.IsComplete)
+        // Wait is the one recommendation that needs no decision — the agent resumes itself when the
+        // numbers it named close. It stays quiet, and becomes interesting again exactly then.
+        if (state.Recommendation == Recommendation.Wait && state.Blocked.Count > 0)
         {
-            return new WaitingVerdict(WaitingState.Holding, $"{name} is {check.Status}", null, false);
+            return new(WaitingState.Holding, RowOwner.Nobody,
+                $"parked behind {string.Join(", ", state.Blocked.Select(b => "#" + b))}");
         }
 
-        if (check.IsFailure)
+        if (!declaredDone)
         {
-            return new WaitingVerdict(WaitingState.Blocked, $"{name} concluded {check.Conclusion}", $"fix {name} and push", false);
+            return state.ReviewsRequired is > 0
+                ? new(WaitingState.Holding, RowOwner.Nobody, $"reviews {state.ReviewsClean ?? 0}/{state.ReviewsRequired}")
+                : new(WaitingState.Holding, RowOwner.Nobody, "in progress");
         }
 
-        return new WaitingVerdict(WaitingState.Ready, $"{name} passed", Release(record), IsReleasable(record));
-    }
-
-    private static WaitingVerdict ResolveOverall(StatusRecord record, PrFacts facts)
-    {
+        // Reviews are in and the branch merges. CI is reported but is deliberately not a gate: it goes
+        // red for reasons unrelated to the change, and clearing it is the operator's call.
         CheckRunFact? failed = facts.Checks.FirstOrDefault(c => c.IsFailure);
-        if (failed is not null)
-        {
-            return new WaitingVerdict(WaitingState.Blocked, $"{failed.Name} concluded {failed.Conclusion}", $"fix {failed.Name} and push", false);
-        }
+        string ci = failed is not null
+            ? $"; CI red ({failed.Name})"
+            : facts.Checks.Any(c => !c.IsComplete) ? "; CI still running" : string.Empty;
 
-        int pending = facts.Checks.Count(c => !c.IsComplete);
-        if (pending > 0)
-        {
-            string names = string.Join(", ", facts.Checks.Where(c => !c.IsComplete).Take(3).Select(c => c.Name));
-            return new WaitingVerdict(WaitingState.Holding, $"{pending} check(s) pending: {names}", null, false);
-        }
-
-        if (facts.Checks.Count == 0)
-        {
-            return new WaitingVerdict(WaitingState.Holding, $"no checks reported on {Short(facts.HeadSha)}", null, false);
-        }
-
-        return new WaitingVerdict(WaitingState.Ready, "all checks green and mergeable", Release(record), IsReleasable(record));
+        return new(WaitingState.Ready, RowOwner.Operator, $"reviews {state.ReviewsClean}/{state.ReviewsRequired}, mergeable{ci}");
     }
-
-    private static string? Release(StatusRecord record) => record.Next;
-
-    /// <summary>
-    /// A directive may be sent unattended only when the agent wrote it down itself. An inferred record's
-    /// fields were scraped out of prose, so nothing in it is the agent's word.
-    /// </summary>
-    private static bool IsReleasable(StatusRecord record)
-        => record.Source == RecordSource.Declared && !string.IsNullOrWhiteSpace(record.Next);
 
     private static bool ShaMatches(string recorded, string actual)
     {

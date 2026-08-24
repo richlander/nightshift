@@ -5,27 +5,16 @@ using Octoshift.Waiting;
 using Xunit;
 
 /// <summary>
-/// The decision table that turns "what the agent said" plus "what GitHub says" into a state and, where it
-/// is safe, a directive. Pure input to pure output — no pane, no network.
+/// The decision table joining a window's declared state with GitHub's. Its two governing rules: ready is
+/// dual-clean and mergeable rather than green CI, and an agent that has declared itself done is never
+/// sent back round — that row belongs to the operator.
 /// </summary>
 public class WaitingVerdictTests
 {
     private const string Head = "722512e25f0c1d4a9b8e7360a1c2d3e4f5061728";
 
-    private static StatusRecord Declared(string waiting, string? next = "round-3", string? head = Head, int pr = 4595)
-        => new()
-        {
-            PrNumber = pr,
-            Head = head,
-            Round = 2,
-            Verdict = "gated",
-            Waiting = WaitingPredicate.Parse(waiting),
-            Next = next,
-            Source = RecordSource.Declared,
-        };
-
-    private static StatusRecord Inferred(string? head = Head, int pr = 4595)
-        => new() { PrNumber = pr, Head = head, Source = RecordSource.Inferred };
+    private static AgentState State(string record, string window = "pr4595")
+        => AgentState.Parse(record, window)!;
 
     private static PrFacts Facts(
         string mergeableState = "clean",
@@ -43,214 +32,152 @@ public class WaitingVerdictTests
             Checks = checks ?? [],
         };
 
-    private static CheckRunFact Check(string name, string status = "completed", string? conclusion = "success")
-        => new(name, status, conclusion);
-
     [Fact]
-    public void Resolve_UnreadablePrIsUnknown()
+    public void Resolve_UnreadablePrGoesToTheOperator()
     {
-        WaitingVerdict verdict = WaitingVerdict.Resolve(Declared("check:ci-required"), null);
-
-        Assert.Equal(WaitingState.Unknown, verdict.State);
-        Assert.False(verdict.Releasable);
+        WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e25 reviews=1/2"), null);
+        Assert.Equal(WaitingState.Unknown, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
     }
 
     [Fact]
-    public void Resolve_MergedPrEndsTheWait()
+    public void Resolve_MergedAndClosedAreReported()
     {
-        WaitingVerdict verdict = WaitingVerdict.Resolve(Declared("check:ci-required"), Facts(merged: true, state: "closed"));
-
-        Assert.Equal(WaitingState.Merged, verdict.State);
-        Assert.True(verdict.NeedsAttention);
+        Assert.Equal(WaitingState.Merged, WaitingVerdict.Resolve(State("pr=4595 head=722512e25"), Facts(merged: true, state: "closed")).State);
+        Assert.Equal(WaitingState.Closed, WaitingVerdict.Resolve(State("pr=4595 head=722512e25"), Facts(state: "closed")).State);
     }
-
-    [Fact]
-    public void Resolve_ClosedUnmergedPrIsReported()
-        => Assert.Equal(WaitingState.Closed, WaitingVerdict.Resolve(Declared("check:ci-required"), Facts(state: "closed")).State);
 
     [Fact]
     public void Resolve_HeadDivergenceVoidsTheRecord()
     {
-        // The agent pushed after writing the record, so the checks fetched here belong to a different sha
-        // than the one it asked about. Answering the question anyway would be answering a different one.
-        WaitingVerdict verdict = WaitingVerdict.Resolve(
-            Declared("check:ci-required", head: "aaaaaaa11"),
-            Facts(checks: [Check("ci-required")]));
+        WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=aaaaaaa11 reviews=2/2 rec=merge"), Facts());
 
-        Assert.Equal(WaitingState.Stale, verdict.State);
-        Assert.False(verdict.Releasable);
-        Assert.Contains("aaaaaaa11", verdict.Reason, StringComparison.Ordinal);
-        Assert.Contains("722512e25", verdict.Reason, StringComparison.Ordinal);
+        Assert.Equal(WaitingState.Stale, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
     }
 
     [Fact]
-    public void Resolve_ShortRecordedShaMatchesFullGitHubSha()
+    public void Resolve_StopAndApproveNeedAPerson()
     {
-        WaitingVerdict verdict = WaitingVerdict.Resolve(
-            Declared("check:ci-required", head: "722512e25"),
-            Facts(checks: [Check("ci-required")]));
-
-        Assert.Equal(WaitingState.Ready, verdict.State);
+        Assert.Equal(WaitingState.NeedsOperator, WaitingVerdict.Resolve(State("pr=4595 head=722512e25 rec=stop"), Facts()).State);
+        Assert.Equal(WaitingState.NeedsOperator, WaitingVerdict.Resolve(State("pr=4595 head=722512e25 rec=approve"), Facts()).State);
     }
 
     [Fact]
-    public void Resolve_OperatorWaitIsNeverReleased()
+    public void Resolve_DeclaredDoneAndConflictingGoesToTheOperatorNotBackToTheAgent()
     {
-        WaitingVerdict verdict = WaitingVerdict.Resolve(Declared("operator", next: "escalate"), Facts());
+        // The rule this tool exists for: repeated conflict passes on a PR the agent thinks is finished
+        // are the waste being removed. Sequencing against a moving main is an operator call.
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=2/2 rec=merge"),
+            Facts(mergeableState: "dirty"));
 
-        Assert.Equal(WaitingState.NeedsOperator, verdict.State);
-        Assert.False(verdict.Releasable);
-        Assert.Null(verdict.Directive);
+        Assert.Equal(WaitingState.Contradicted, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
     }
 
     [Fact]
-    public void Resolve_ConflictOutranksAPassingCheck()
+    public void Resolve_MidWorkAndConflictingIsTheAgentsToFix()
     {
-        // A green check on an unmergeable branch still cannot land, so resuming the declared next would
-        // burn a round that ends in the same place.
-        WaitingVerdict verdict = WaitingVerdict.Resolve(
-            Declared("check:ci-required"),
-            Facts(mergeableState: "dirty", checks: [Check("ci-required")]));
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=0/2"),
+            Facts(mergeableState: "dirty"));
 
-        Assert.Equal(WaitingState.Blocked, verdict.State);
-        Assert.Equal("rebase onto main and push", verdict.Directive);
-        Assert.False(verdict.Releasable);
-    }
-
-    [Fact]
-    public void Resolve_OperatorOutranksAConflict()
-    {
-        // Already escalated: a human is coming either way, and a nudge would race them.
-        WaitingVerdict verdict = WaitingVerdict.Resolve(Declared("operator"), Facts(mergeableState: "dirty"));
-
-        Assert.Equal(WaitingState.NeedsOperator, verdict.State);
-    }
-
-    [Fact]
-    public void Resolve_NamedCheckAbsentIsStillHolding()
-    {
-        // The 2026-08-22 case: a rerun was requested and the required check has not appeared on the head.
-        WaitingVerdict verdict = WaitingVerdict.Resolve(
-            Declared("check:ci-required"),
-            Facts(checks: [Check("build"), Check("test")]));
-
-        Assert.Equal(WaitingState.Holding, verdict.State);
-        Assert.False(verdict.NeedsAttention);
-        Assert.Contains("ci-required has not reported", verdict.Reason, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void Resolve_NamedCheckInProgressIsHolding()
-        => Assert.Equal(
-            WaitingState.Holding,
-            WaitingVerdict.Resolve(
-                Declared("check:ci-required"),
-                Facts(checks: [Check("ci-required", status: "in_progress", conclusion: null)])).State);
-
-    [Fact]
-    public void Resolve_NamedCheckFailureBlocksWithoutReleasing()
-    {
-        WaitingVerdict verdict = WaitingVerdict.Resolve(
-            Declared("check:ci-required"),
-            Facts(checks: [Check("ci-required", conclusion: "failure")]));
-
-        Assert.Equal(WaitingState.Blocked, verdict.State);
-        Assert.Equal("fix ci-required and push", verdict.Directive);
-        Assert.False(verdict.Releasable);
-    }
-
-    [Fact]
-    public void Resolve_NamedCheckPassReleasesTheAgentsOwnNext()
-    {
-        WaitingVerdict verdict = WaitingVerdict.Resolve(
-            Declared("check:ci-required", next: "round-2-review"),
-            Facts(checks: [Check("ci-required")]));
-
-        Assert.Equal(WaitingState.Ready, verdict.State);
-        Assert.Equal("round-2-review", verdict.Directive);
-        Assert.True(verdict.Releasable);
+        Assert.Equal(WaitingState.Conflicting, v.State);
+        Assert.Equal(RowOwner.Agent, v.Owner);
+        Assert.DoesNotContain("rebase", v.Reason, StringComparison.OrdinalIgnoreCase);
     }
 
     [Theory]
-    [InlineData("neutral")]
-    [InlineData("skipped")]
-    public void Resolve_NonFailingConclusionsCount(string conclusion)
-        => Assert.Equal(
-            WaitingState.Ready,
-            WaitingVerdict.Resolve(Declared("check:ci-required"), Facts(checks: [Check("ci-required", conclusion: conclusion)])).State);
-
-    [Fact]
-    public void Resolve_ReadyWithoutADeclaredNextIsNotReleasable()
+    [InlineData("unknown")]
+    [InlineData("")]
+    public void Resolve_UncomputedMergeabilityIsNeverTreatedAsMergeable(string mergeableState)
     {
-        WaitingVerdict verdict = WaitingVerdict.Resolve(
-            Declared("check:ci-required", next: null),
-            Facts(checks: [Check("ci-required")]));
+        // GitHub computes this lazily and answers `unknown` on the first read after a change. Letting it
+        // fall through as "not conflicting" is how a conflicted PR reads as ready.
+        WaitingVerdict done = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=2/2 rec=merge"), Facts(mergeableState: mergeableState));
 
-        Assert.Equal(WaitingState.Ready, verdict.State);
-        Assert.False(verdict.Releasable);
-        Assert.Null(verdict.Directive);
+        Assert.Equal(WaitingState.MergeUnverified, done.State);
+        Assert.Equal(RowOwner.Operator, done.Owner);
+
+        WaitingVerdict working = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=0/2"), Facts(mergeableState: mergeableState));
+
+        Assert.Equal(RowOwner.Nobody, working.Owner);
     }
 
     [Fact]
-    public void Resolve_InferredRecordIsNeverReleasable()
+    public void Resolve_WaitWithCitableBlockersStaysQuiet()
     {
-        // Nothing in an inferred record is the agent's word, so there is no decision to repeat.
-        WaitingVerdict verdict = WaitingVerdict.Resolve(Inferred(), Facts(checks: [Check("ci-required")]));
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=2/2 blocked=4629,4630 rec=wait"), Facts());
 
-        Assert.Equal(WaitingState.Ready, verdict.State);
-        Assert.False(verdict.Releasable);
+        Assert.Equal(WaitingState.Holding, v.State);
+        Assert.Equal(RowOwner.Nobody, v.Owner);
+        Assert.False(v.NeedsAttention);
+        Assert.Contains("#4629", v.Reason, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Resolve_WaitingNoneFallsBackToOverallHealth()
+    public void Resolve_IncompleteReviewsAreNobodysProblemYet()
     {
-        WaitingVerdict verdict = WaitingVerdict.Resolve(
-            Declared("none"),
-            Facts(checks: [Check("build"), Check("test")]));
+        WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e25 reviews=1/2"), Facts());
 
-        Assert.Equal(WaitingState.Ready, verdict.State);
-        Assert.Equal("round-3", verdict.Directive);
-        Assert.True(verdict.Releasable);
+        Assert.Equal(WaitingState.Holding, v.State);
+        Assert.Equal(RowOwner.Nobody, v.Owner);
+        Assert.Contains("1/2", v.Reason, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Resolve_OverallFailureNamesTheFailingJob()
+    public void Resolve_DualCleanAndMergeableIsTheMergeQueue()
     {
-        WaitingVerdict verdict = WaitingVerdict.Resolve(
-            Declared("none"),
-            Facts(checks: [Check("build"), Check("test", conclusion: "timed_out")]));
+        WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e25 reviews=2/2 rec=merge"), Facts());
 
-        Assert.Equal(WaitingState.Blocked, verdict.State);
-        Assert.Equal("fix test and push", verdict.Directive);
+        Assert.Equal(WaitingState.Ready, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
     }
 
     [Fact]
-    public void Resolve_OverallPendingListsWhatIsOutstanding()
+    public void Resolve_RedCiDoesNotBlockReady()
     {
-        WaitingVerdict verdict = WaitingVerdict.Resolve(
-            Declared("none"),
-            Facts(checks: [Check("build"), Check("windows", status: "queued", conclusion: null)]));
+        // Ready is dual-clean and mergeable. CI is reported because it is worth seeing, but it is not a
+        // gate: it goes red for reasons unrelated to the change, and clearing it is the operator's call.
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=2/2 rec=merge"),
+            Facts(checks: [new CheckRunFact("ci-required", "completed", "failure")]));
 
-        Assert.Equal(WaitingState.Holding, verdict.State);
-        Assert.Contains("windows", verdict.Reason, StringComparison.Ordinal);
+        Assert.Equal(WaitingState.Ready, v.State);
+        Assert.Contains("CI red (ci-required)", v.Reason, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Resolve_NoChecksAtAllIsHoldingNotGreen()
+    public void Resolve_PendingCiIsNotedButStillReady()
     {
-        // An empty rollup means CI has not started, which reads identically to "all green" if you only
-        // count failures. Holding is the honest answer.
-        WaitingVerdict verdict = WaitingVerdict.Resolve(Declared("none"), Facts());
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=2/2 rec=merge"),
+            Facts(checks: [new CheckRunFact("ci-required", "in_progress", null)]));
 
-        Assert.Equal(WaitingState.Holding, verdict.State);
+        Assert.Equal(WaitingState.Ready, v.State);
+        Assert.Contains("CI still running", v.Reason, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Resolve_ReviewWaitNeverPollsGitHubAgain()
+    public void Resolve_ReviewsCompleteCountsAsDoneEvenWithoutRecMerge()
     {
-        WaitingVerdict verdict = WaitingVerdict.Resolve(Declared("review"), Facts(checks: [Check("ci-required")]));
+        WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e25 reviews=2/2"), Facts());
 
-        Assert.Equal(WaitingState.Holding, verdict.State);
-        Assert.False(verdict.NeedsAttention);
+        Assert.Equal(WaitingState.Ready, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
+    }
+
+    [Fact]
+    public void Resolve_WindowNameOnlyRecordIsNotTreatedAsDone()
+    {
+        // No declared state at all: nothing has been handed over, so nothing is claimed on its behalf.
+        WaitingVerdict v = WaitingVerdict.Resolve(AgentState.Parse(null, "pr4595")!, Facts());
+
+        Assert.Equal(WaitingState.Holding, v.State);
+        Assert.Equal(RowOwner.Nobody, v.Owner);
     }
 }
