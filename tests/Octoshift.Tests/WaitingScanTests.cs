@@ -17,14 +17,15 @@ public class WaitingScanTests
     public void ParseWindows_ReadsTargetAttachmentAndActivity()
     {
         IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseWindows(
-            "night:3|1|1755900000|213|pr4595\nnight:4|0|1755800000|80|i158\n");
+            "night:3|1|1755900000|pr=4595 head=abc1234 reviews=2/2 rec=merge|pr4595\nnight:4|0|1755800000||i158\n");
 
         Assert.Equal(2, windows.Count);
         Assert.Equal("night:3", windows[0].Target);
         Assert.True(windows[0].SessionAttached);
         Assert.Equal("pr4595", windows[0].WindowName);
         Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(1755900000), windows[0].LastActivity);
-        Assert.Equal(213, windows[0].PaneWidth);
+        Assert.Equal("pr=4595 head=abc1234 reviews=2/2 rec=merge", windows[0].AgentStateOption);
+        Assert.Null(windows[1].AgentStateOption);
         Assert.False(windows[1].SessionAttached);
     }
 
@@ -32,7 +33,7 @@ public class WaitingScanTests
     public void ParseWindows_KeepsAPipeInTheWindowName()
     {
         // Window name is formatted last precisely so a separator inside it cannot shift earlier fields.
-        IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseWindows("night:3|1|1755900000|80|pr4595|round2");
+        IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseWindows("night:3|1|1755900000||pr4595|round2");
 
         TmuxPane window = Assert.Single(windows);
         Assert.Equal("night:3", window.Target);
@@ -42,8 +43,8 @@ public class WaitingScanTests
     [Theory]
     [InlineData("")]
     [InlineData("garbage\nmalformed row")]
-    [InlineData("|1|1755900000|80|name")]
-    [InlineData("night:3|1|1755900000|80")]
+    [InlineData("|1|1755900000||name")]
+    [InlineData("night:3|1|1755900000")]
     public void ParseWindows_DropsMalformedRows(string stdout)
         => Assert.Empty(TmuxScanner.ParseWindows(stdout));
 
@@ -135,8 +136,8 @@ public class WaitingScanTests
         var fetches = new List<int>();
         IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
             [
-                Pane("night:1", "NIGHTSHIFT-STATUS pr=4595 head=722512e25 waiting=none next=round-3", PaneActivity.Idle),
-                Pane("night:2", "NIGHTSHIFT-STATUS pr=4595 head=722512e25 waiting=none next=round-3", PaneActivity.Idle),
+                Pane("night:1", "", PaneActivity.Idle, agentState: "pr=4595 head=722512e25 waiting=none next=round-3"),
+                Pane("night:2", "", PaneActivity.Idle, agentState: "pr=4595 head=722512e25 waiting=none next=round-3"),
                 Pane("night:3", "Working on PR 4600\n(esc to interrupt)", PaneActivity.Working),
             ],
             (pr, _) => { fetches.Add(pr); return Task.FromResult<PrFacts?>(null); },
@@ -176,14 +177,14 @@ public class WaitingScanTests
             Checks = [new CheckRunFact("ci-required", "in_progress", null)],
         };
 
-        TmuxPane[] panes = [Pane("night:1", "NIGHTSHIFT-STATUS pr=4595 head=722512e25 waiting=check:ci-required next=round-3", PaneActivity.Idle)];
+        TmuxPane[] panes = [Pane("night:1", "", PaneActivity.Idle, agentState: "pr=4595 head=722512e25 waiting=check:ci-required next=round-3")];
 
         Assert.Empty(await WaitingCommand.BuildRowsAsync(panes, (_, _) => Task.FromResult<PrFacts?>(holding), DateTimeOffset.UtcNow, all: false, TestContext.Current.CancellationToken));
         Assert.Single(await WaitingCommand.BuildRowsAsync(panes, (_, _) => Task.FromResult<PrFacts?>(holding), DateTimeOffset.UtcNow, all: true, TestContext.Current.CancellationToken));
     }
 
     [Fact]
-    public async Task BuildRows_IdleWithNoRecordSurfacesOnlyUnderAll()
+    public async Task BuildRows_AWindowThatIdentifiesNothingSurfacesOnlyUnderAll()
     {
         TmuxPane[] panes = [Pane("night:1", "$ ", PaneActivity.Idle)];
 
@@ -191,7 +192,7 @@ public class WaitingScanTests
 
         WaitingRow row = Assert.Single(await WaitingCommand.BuildRowsAsync(panes, (_, _) => Task.FromResult<PrFacts?>(null), DateTimeOffset.UtcNow, all: true, TestContext.Current.CancellationToken));
         Assert.Null(row.Record);
-        Assert.Contains("no status record", row.Verdict.Reason, StringComparison.Ordinal);
+        Assert.Contains("no published state", row.Verdict.Reason, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -200,9 +201,9 @@ public class WaitingScanTests
         DateTimeOffset now = DateTimeOffset.UtcNow;
         IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
             [
-                Pane("night:1", "NIGHTSHIFT-STATUS pr=1 waiting=none next=x", PaneActivity.Idle, now.AddMinutes(-20)),
-                Pane("night:2", "NIGHTSHIFT-STATUS pr=2 waiting=none next=x", PaneActivity.Idle, now.AddHours(-6)),
-                Pane("night:3", "NIGHTSHIFT-STATUS pr=3 waiting=none next=x", PaneActivity.Idle, now.AddMinutes(-90)),
+                Pane("night:1", "", PaneActivity.Idle, now.AddMinutes(-20), agentState: "pr=1 waiting=none next=x"),
+                Pane("night:2", "", PaneActivity.Idle, now.AddHours(-6), agentState: "pr=2 waiting=none next=x"),
+                Pane("night:3", "", PaneActivity.Idle, now.AddMinutes(-90), agentState: "pr=3 waiting=none next=x"),
             ],
             (_, _) => Task.FromResult<PrFacts?>(null),
             now,
@@ -213,11 +214,12 @@ public class WaitingScanTests
         Assert.Equal(TimeSpan.FromHours(6), rows[0].StoppedFor);
     }
 
-    private static TmuxPane Pane(string target, string capture, PaneActivity activity, DateTimeOffset? lastActivity = null)
+    private static TmuxPane Pane(string target, string capture, PaneActivity activity, DateTimeOffset? lastActivity = null, string? agentState = null, string windowName = "w")
         => new()
         {
             Target = target,
-            WindowName = "w",
+            AgentStateOption = agentState,
+            WindowName = windowName,
             SessionAttached = true,
             LastActivity = lastActivity,
             Activity = activity,

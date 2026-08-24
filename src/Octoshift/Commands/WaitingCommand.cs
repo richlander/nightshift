@@ -10,8 +10,8 @@ internal sealed record WaitingRow
 {
     public required TmuxPane Pane { get; init; }
 
-    /// <summary>Null when the pane is idle but left nothing readable behind.</summary>
-    public StatusRecord? Record { get; init; }
+    /// <summary>Null when nothing — neither option nor window name — identified a PR.</summary>
+    public AgentState? Record { get; init; }
 
     public required WaitingVerdict Verdict { get; init; }
 
@@ -93,30 +93,24 @@ internal static class WaitingCommand
                 continue;
             }
 
-            StatusRecord? record = StatusRecord.Parse(pane.Capture, pane.PaneWidth);
+            AgentState? record = AgentState.Parse(pane.AgentStateOption, pane.WindowName);
 
             if (pane.Activity == PaneActivity.Blocked)
             {
                 // A held-open prompt is answered with a keystroke, not with a GitHub lookup.
                 rows.Add(Row(pane, record, new WaitingVerdict(
-                    WaitingState.NeedsOperator,
-                    "prompt open; awaiting a keystroke",
-                    null,
-                    false), now));
+                    WaitingState.NeedsOperator, RowOwner.Operator, "prompt open; awaiting a keystroke"), now));
                 continue;
             }
 
             if (record is null)
             {
-                // Idle and silent. Usually an empty shell, occasionally a genuinely stuck agent — so it is
+                // Neither a published state nor a pr#### window name. Usually an empty shell, so it is
                 // available under --all rather than mixed into the default view.
                 if (all)
                 {
                     rows.Add(Row(pane, null, new WaitingVerdict(
-                        WaitingState.Unknown,
-                        "idle with no status record",
-                        null,
-                        false), now));
+                        WaitingState.Unknown, RowOwner.Nobody, "no published state and no pr#### window name"), now));
                 }
 
                 continue;
@@ -133,14 +127,16 @@ internal static class WaitingCommand
 
         // Longest wait first among the rows that need you: coming back after hours away, the thing that
         // has been stuck longest is the thing that cost the most.
+        // The operator's queue first, longest wait at the top: after hours away, the row that has been
+        // stuck longest is the one that cost the most.
         return rows
-            .Where(r => all || r.Verdict.NeedsAttention)
+            .Where(r => all || r.Verdict.NeedsAttention || r.Record?.Defects.Count > 0)
             .OrderByDescending(r => r.Verdict.NeedsAttention)
             .ThenByDescending(r => r.StoppedFor ?? TimeSpan.Zero)
             .ToArray();
     }
 
-    private static WaitingRow Row(TmuxPane pane, StatusRecord? record, WaitingVerdict verdict, DateTimeOffset now)
+    private static WaitingRow Row(TmuxPane pane, AgentState? record, WaitingVerdict verdict, DateTimeOffset now)
         => new()
         {
             Pane = pane,
@@ -153,8 +149,8 @@ internal static class WaitingCommand
     {
         int attention = rows.Count(r => r.Verdict.NeedsAttention);
         Console.WriteLine(attention > 0
-            ? $"ATTENTION {attention} of {rows.Count} stopped pane(s) need you"
-            : $"QUIET {rows.Count} stopped pane(s), none blocked");
+            ? $"ATTENTION {attention} of {rows.Count} window(s) need you"
+            : $"QUIET {rows.Count} window(s), none need you");
 
         if (rows.Count > 0)
         {
@@ -166,7 +162,7 @@ internal static class WaitingCommand
             {
                 table.Add([
                     row.Pane.Target + (row.Pane.WindowName.Length > 0 ? $" {row.Pane.WindowName}" : string.Empty),
-                    row.Record is null ? "-" : $"#{row.Record.PrNumber}{(row.Record.Source == RecordSource.Inferred ? "~" : string.Empty)}",
+                    row.Record is null ? "-" : $"#{row.Record.PrNumber}{(row.Record.Source == StateSource.WindowName ? "~" : string.Empty)}",
                     row.Verdict.State.ToString().ToUpperInvariant(),
                     Duration(row.StoppedFor),
                     Detail(row),
@@ -183,9 +179,10 @@ internal static class WaitingCommand
     private static string Detail(WaitingRow row)
     {
         string detail = row.Verdict.Reason;
-        if (row.Verdict.Directive is { Length: > 0 } directive)
+        if (row.Record?.Defects is { Count: > 0 } defects)
         {
-            detail += row.Verdict.Releasable ? $" → release: {directive}" : $" → suggest: {directive}";
+            // Reported, never repaired: a state that contradicts itself is a signal about the agent.
+            detail += "  [!] " + string.Join("; ", defects);
         }
 
         return detail;
@@ -194,6 +191,11 @@ internal static class WaitingCommand
     private static string Budget(GhPrFactsSource facts)
     {
         var note = new StringBuilder($"{facts.Calls} REST call(s), {facts.NotModified} free (304)");
+        if (facts.Recomputed > 0)
+        {
+            note.Append($", {facts.Recomputed} mergeability re-read");
+        }
+
         if (facts.RateLimitRemaining is { } remaining)
         {
             note.Append($", {remaining} remaining");
@@ -263,21 +265,36 @@ internal static class WaitingCommand
             {
                 writer.WriteNumber("pr", record.PrNumber);
                 writer.WriteString("source", record.Source.ToString().ToLowerInvariant());
-                writer.WriteString("waiting", record.Waiting.ToString());
+                writer.WriteString("rec", record.Recommendation.ToString().ToLowerInvariant());
+                if (record.ReviewsRequired is { } required)
+                {
+                    writer.WriteString("reviews", $"{record.ReviewsClean ?? 0}/{required}");
+                }
+
                 if (record.Head is { } head)
                 {
                     writer.WriteString("head", head);
                 }
+
+                writer.WriteStartArray("blocked");
+                foreach (int b in record.Blocked)
+                {
+                    writer.WriteNumberValue(b);
+                }
+
+                writer.WriteEndArray();
+                writer.WriteStartArray("defects");
+                foreach (string d in record.Defects)
+                {
+                    writer.WriteStringValue(d);
+                }
+
+                writer.WriteEndArray();
             }
 
             writer.WriteString("state", row.Verdict.State.ToString().ToLowerInvariant());
+            writer.WriteString("owner", row.Verdict.Owner.ToString().ToLowerInvariant());
             writer.WriteString("reason", row.Verdict.Reason);
-            if (row.Verdict.Directive is { } directive)
-            {
-                writer.WriteString("directive", directive);
-            }
-
-            writer.WriteBoolean("releasable", row.Verdict.Releasable);
             if (row.StoppedFor is { } stopped)
             {
                 writer.WriteNumber("stoppedForSeconds", (long)stopped.TotalSeconds);

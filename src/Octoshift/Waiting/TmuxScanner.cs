@@ -34,8 +34,8 @@ internal sealed record TmuxPane
     /// <summary>When the window last produced output — an observed stop time, not a claimed one.</summary>
     public DateTimeOffset? LastActivity { get; init; }
 
-    /// <summary>Column count of the pane, which is the column the terminal hard-wraps at.</summary>
-    public int PaneWidth { get; init; }
+    /// <summary>The window's <c>@agent_state</c> option: the agent's own account of where it is.</summary>
+    public string? AgentStateOption { get; init; }
 
     public PaneActivity Activity { get; init; }
 
@@ -46,15 +46,17 @@ internal sealed record TmuxPane
 /// Lists tmux windows and captures what each one is showing.
 /// </summary>
 /// <remarks>
-/// Captures the visible screen only — no <c>-S</c>. Scrollback would widen the window until an old
-/// mention could outvote the current one, and the agent's last output is by definition at the bottom.
+/// One <c>list-windows</c> call carries identity and state, because the agent publishes both as window
+/// options. Panes are still captured, but only to classify activity: whether a window is mid-turn or
+/// holding a prompt open is the one thing an option cannot say.
 /// </remarks>
 internal sealed class TmuxScanner
 {
     /// <summary>
     /// Window name comes last so that a <c>|</c> inside it cannot shift the fields before it.
     /// </summary>
-    private const string ListFormat = "#{session_name}:#{window_index}|#{session_attached}|#{window_activity}|#{pane_width}|#{window_name}";
+    private const string ListFormat =
+        "#{session_name}:#{window_index}|#{session_attached}|#{window_activity}|#{@agent_state}|#{window_name}";
 
     private readonly Func<IReadOnlyList<string>, CancellationToken, Task<CommandResult>> _runAsync;
 
@@ -100,7 +102,7 @@ internal sealed class TmuxScanner
                 LastActivity = long.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out long epoch) && epoch > 0
                     ? DateTimeOffset.FromUnixTimeSeconds(epoch)
                     : null,
-                PaneWidth = int.TryParse(parts[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out int width) && width > 0 ? width : 0,
+                AgentStateOption = parts[3].Trim() is { Length: > 0 } option ? option : null,
                 WindowName = parts[4].Trim(),
             });
         }
