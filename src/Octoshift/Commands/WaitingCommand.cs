@@ -57,6 +57,9 @@ internal static class WaitingCommand
     /// <summary>Windows that were present at the last sweep and are gone now. Reported, not swallowed.</summary>
     internal static IReadOnlyList<string> Departed { get; private set; } = [];
 
+    /// <summary>Hosts collected before but not in this run, so the view is narrower than it has been.</summary>
+    internal static IReadOnlyList<string> Omitted { get; private set; } = [];
+
     public static async Task<int> RunAsync(string? repoFlag, IReadOnlyList<string> hosts, bool all, bool json, bool rename, CancellationToken ct)
     {
         string? repo = RepoScope.Resolve(repoFlag);
@@ -95,7 +98,7 @@ internal static class WaitingCommand
             (args, token) => GhAuthenticatedRunner.RunGhAsync(args, null, token));
         IReadOnlyList<WaitingRow> rows = await BuildRowsAsync(
             panes, facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, all, ct,
-            viewComplete: unreachable.Count == 0);
+            allHostsAnswered: unreachable.Count == 0);
 
         if (rename)
         {
@@ -125,9 +128,8 @@ internal static class WaitingCommand
         DateTimeOffset now,
         bool all,
         CancellationToken ct,
-        bool viewComplete = true)
+        bool allHostsAnswered = true)
     {
-        Departed = [];
         var rows = new List<WaitingRow>();
         var pending = new List<(TmuxPane Pane, AgentState State)>();
 
@@ -199,7 +201,17 @@ internal static class WaitingCommand
 
         // A PR claimed by more than one window is a fight in progress. Computed across every host, since
         // the two halves of it are often not on the same machine.
+        Departed = [];
         var history = new PaneHistory();
+
+        // A host that did not answer and a host nobody asked about produce the same thing: a view with
+        // windows missing from it. The second is invisible from the arguments alone — a host not named
+        // is indistinguishable from a host that does not exist — so it is caught by remembering which
+        // hosts have been collected before and noticing when a run covers fewer of them.
+        var collected = panes.Select(p => p.Host ?? "local").ToHashSet(StringComparer.Ordinal);
+        string[] omitted = [.. history.KnownHosts.Where(h => !collected.Contains(h))];
+        bool viewComplete = allHostsAnswered && omitted.Length == 0;
+        Omitted = omitted;
 
         // Adopt each host's tmux epoch first: a server that has restarted invalidates every pane id
         // remembered for it, and keeping those would present one window's registration as another's.
@@ -323,6 +335,11 @@ internal static class WaitingCommand
 
         Console.WriteLine();
         Console.WriteLine(Budget(facts));
+        if (Omitted.Count > 0)
+        {
+            Console.WriteLine($"NARROWED not collected this run: {string.Join(", ", Omitted)} — nothing is owned while the fleet is partly unseen");
+        }
+
         foreach (string gone in Departed)
         {
             Console.WriteLine($"DEPARTED {gone}");
@@ -444,6 +461,13 @@ internal static class WaitingCommand
         writer.WriteNumber("notModified", facts.NotModified);
         writer.WriteNumber("mergeabilityRereads", facts.Recomputed);
         writer.WriteBoolean("rateLimited", facts.RateLimited);
+        writer.WriteStartArray("omitted");
+        foreach (string host in Omitted)
+        {
+            writer.WriteStringValue(host);
+        }
+
+        writer.WriteEndArray();
         writer.WriteStartArray("unreachable");
         foreach (string failure in unreachable)
         {

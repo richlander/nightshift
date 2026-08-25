@@ -210,6 +210,43 @@ public class ModelCorrespondenceTests
     }
 
     /// <summary>
+    /// TLA+ <c>ViewCompleteOrNoOwner</c>, second half: a host nobody asked about is as absent as a host
+    /// that failed.
+    /// </summary>
+    /// <remarks>
+    /// A run cannot tell from its own arguments that it was given fewer hosts than the fleet has — a
+    /// host not named is indistinguishable from a host that does not exist. It can only know by
+    /// remembering which hosts it has collected before. Without this, narrowing to one host produces no
+    /// unreachable entries, the view reads as complete, and a window that is a follower on the full
+    /// fleet becomes the sole claimant and is actionable.
+    /// </remarks>
+    [Fact]
+    public void ViewIsNarrowerThanTheFleetItHasSeen()
+    {
+        string path = TempPath();
+        try
+        {
+            TmuxPane onFernie = Window("%1", host: "fernie");
+            TmuxPane onMerritt = Window("%9", host: "merritt");
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+            var first = new PaneHistory(path);
+            first.AdoptEpoch("fernie", "100:1", t);
+            first.AdoptEpoch("merritt", "200:1", t);
+            first.Save([onFernie, onMerritt], ["fernie", "merritt"]);
+
+            // A later run that collects only merritt is looking at less than it has already seen.
+            var narrowed = new PaneHistory(path);
+            Assert.Contains("fernie", narrowed.KnownHosts);
+            Assert.Contains("merritt", narrowed.KnownHosts);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    /// <summary>
     /// TLA+ <c>Observed</c>: the order is a fact only when every recorded time is distinct and at most
     /// one claimant has no record. The scenario the model exists to get right — one agent working, a
     /// second joining later, with the tool running throughout.

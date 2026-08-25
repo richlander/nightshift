@@ -110,6 +110,14 @@ internal sealed class PaneHistory
         return continuous;
     }
 
+    /// <summary>
+    /// Hosts this tool has collected before. A run that does not include one of them is looking at less
+    /// of the fleet than it has already seen — which is not something the run can work out from its own
+    /// arguments, because a host it was not told about is indistinguishable from a host that does not
+    /// exist.
+    /// </summary>
+    public IReadOnlyCollection<string> KnownHosts => _hosts.Keys;
+
     /// <summary>When this host was last collected in full under the current server, if it was.</summary>
     public DateTimeOffset? SweptAt(string? host)
         => _hosts.TryGetValue(host ?? "local", out HostMemory? known) ? known.SweptAt : null;
