@@ -52,13 +52,67 @@ public class AgentStateTests
     }
 
     [Fact]
-    public void Parse_FlagsAnUnrecognisedRecommendation()
+    public void Parse_AcceptsContinue()
     {
+        // The fleet's contract added `continue` after this reader was first written; it is a real value.
         AgentState? state = AgentState.Parse("pr=4618 head=25c9a13a round=3 reviews=0/2 rec=continue", "pr4618");
 
         Assert.NotNull(state);
+        Assert.Equal(Recommendation.Continue, state.Recommendation);
+        Assert.Empty(state.Defects);
+    }
+
+    [Fact]
+    public void Parse_FlagsAnUnrecognisedRecommendation()
+    {
+        AgentState? state = AgentState.Parse("pr=4618 head=25c9a13a reviews=0/2 rec=probably", "pr4618");
+
+        Assert.NotNull(state);
         Assert.Equal(Recommendation.Unrecognised, state.Recommendation);
-        Assert.Contains(state.Defects, d => d.Contains("rec=continue", StringComparison.Ordinal));
+        Assert.Contains(state.Defects, d => d.Contains("rec=probably", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Parse_AWaitingPredicateSatisfiesWaitWithoutACitableBlocker()
+    {
+        // The case that produced `blocked=ci` in the field: a check that has not reported is not a defect
+        // and does not deserve an issue, so it belongs in waiting rather than blocked.
+        AgentState? state = AgentState.Parse("pr=4142 head=872837ba6 reviews=2/2 waiting=check:ci-required rec=wait", "pr4142");
+
+        Assert.NotNull(state);
+        Assert.Equal(WaitKind.Check, state.Waiting.Kind);
+        Assert.Equal("ci-required", state.Waiting.CheckName);
+        Assert.Empty(state.Defects);
+    }
+
+    [Theory]
+    [InlineData("checks", "checks")]
+    [InlineData("merge", "merge")]
+    [InlineData("review", "review")]
+    [InlineData("check:test-windows", "check:test-windows")]
+    public void Parse_ReadsEveryWaitPredicate(string value, string expected)
+        => Assert.Equal(expected, AgentState.Parse($"pr=1 head=abc1234 waiting={value}", "pr1")!.Waiting.ToString());
+
+    [Fact]
+    public void Parse_FlagsAnUnevaluableWaitPredicate()
+    {
+        AgentState? state = AgentState.Parse("pr=1 head=abc1234 waiting=ci", "pr1");
+
+        Assert.NotNull(state);
+        Assert.Equal(WaitKind.None, state.Waiting.Kind);
+        Assert.Contains(state.Defects, d => d.Contains("waiting=ci", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Parse_TracksAnIssueBeforeAPrExists()
+    {
+        // A worker branch is local until the coordinator pushes it, so early rounds have no PR.
+        AgentState? state = AgentState.Parse("issue=4611 head=8d5f22a22 rec=continue", "i4611");
+
+        Assert.NotNull(state);
+        Assert.True(state.IsIssue);
+        Assert.Equal(4611, state.PrNumber);
+        Assert.Empty(state.Defects);
     }
 
     [Fact]
@@ -67,7 +121,7 @@ public class AgentStateTests
         AgentState? state = AgentState.Parse("pr=4600 head=abc1234 reviews=1/2 rec=wait", "pr4600");
 
         Assert.NotNull(state);
-        Assert.Contains(state.Defects, d => d.Contains("no citable blocker", StringComparison.Ordinal));
+        Assert.Contains(state.Defects, d => d.Contains("nothing in blocked or waiting", StringComparison.Ordinal));
     }
 
     [Fact]

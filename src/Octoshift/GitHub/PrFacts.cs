@@ -49,6 +49,12 @@ internal sealed record PrFacts
     /// </summary>
     public IReadOnlyList<CheckRunFact> Checks { get; init; } = [];
 
+    /// <summary>
+    /// False when the check-runs read failed or was truncated. An unreadable set and a genuinely empty
+    /// one look identical once collapsed to a list, and only one of them means "nothing is failing".
+    /// </summary>
+    public bool ChecksKnown { get; init; } = true;
+
     /// <summary>True when GitHub reports the branch cannot merge without integrating a later main.</summary>
     public bool IsConflicting => string.Equals(MergeableState, "dirty", StringComparison.OrdinalIgnoreCase);
 

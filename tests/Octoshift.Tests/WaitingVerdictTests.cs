@@ -33,6 +33,61 @@ public class WaitingVerdictTests
         };
 
     [Fact]
+    public void Resolve_ADeclaredWaitThatHasClearedIsTheWholePoint()
+    {
+        // The case the tool exists for: the agent is idle, the check it named passed hours ago, and
+        // nothing has told it. Until a nudge exists, that row is the operator's.
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=1/2 waiting=check:ci-required rec=wait"),
+            Facts(checks: [new CheckRunFact("ci-required", "completed", "success")]));
+
+        Assert.Equal(WaitingState.Unblocked, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
+        Assert.Contains("passed", v.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Resolve_AFailedCheckAlsoClearsTheWait()
+    {
+        // "Concluded" is the condition, not "passed": a red result is news the agent needs just as much.
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=1/2 waiting=check:ci-required rec=wait"),
+            Facts(checks: [new CheckRunFact("ci-required", "completed", "failure")]));
+
+        Assert.Equal(WaitingState.Unblocked, v.State);
+        Assert.Contains("failure", v.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Resolve_AnUnreportedCheckIsStillQuiet()
+    {
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=1/2 waiting=check:ci-required rec=wait"),
+            Facts(checks: [new CheckRunFact("build", "completed", "success")]));
+
+        Assert.Equal(WaitingState.Holding, v.State);
+        Assert.Equal(RowOwner.Nobody, v.Owner);
+    }
+
+    [Fact]
+    public void Resolve_WaitingOnMergeAnswersTheUncomputedCase()
+    {
+        AgentState state = State("pr=4595 head=722512e25 reviews=1/2 waiting=merge rec=wait");
+
+        Assert.Equal(WaitingState.Holding, WaitingVerdict.Resolve(state, Facts(mergeableState: "unknown")).State);
+        Assert.Equal(WaitingState.Unblocked, WaitingVerdict.Resolve(state, Facts(mergeableState: "clean")).State);
+    }
+
+    [Fact]
+    public void Resolve_AnIssueWindowIsNeverJoinedAgainstAPr()
+    {
+        WaitingVerdict v = WaitingVerdict.Resolve(AgentState.Parse("issue=4611 head=8d5f22a22 rec=continue", "i4611")!, null);
+
+        Assert.Equal(WaitingState.Holding, v.State);
+        Assert.Contains("no PR yet", v.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Resolve_UnreadablePrGoesToTheOperator()
     {
         WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e25 reviews=1/2"), null);

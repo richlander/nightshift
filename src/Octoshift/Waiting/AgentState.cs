@@ -21,6 +21,9 @@ internal enum Recommendation
     /// <summary>Asking to be released from the work. Pending until answered.</summary>
     Stop,
 
+    /// <summary>Still working; nothing is being asked of anyone.</summary>
+    Continue,
+
     /// <summary>A <c>rec=</c> value outside the four. Recorded so it can be reported, never acted on.</summary>
     Unrecognised,
 }
@@ -60,6 +63,16 @@ internal sealed partial record AgentState
     /// <summary>Issue or PR numbers the agent is waiting on that are not its to fix.</summary>
     public IReadOnlyList<int> Blocked { get; init; } = [];
 
+    /// <summary>
+    /// A condition a reader can evaluate against <see cref="Head"/>, for waits with nothing openable
+    /// behind them. Separate from <see cref="Blocked"/> because the two differ in who can act: a blocker
+    /// is for a person to prioritise, a predicate is for a tool to test.
+    /// </summary>
+    public WaitPredicate Waiting { get; init; }
+
+    /// <summary>True when this window is tracking an issue because no PR exists yet.</summary>
+    public bool IsIssue { get; init; }
+
     public Recommendation Recommendation { get; init; }
 
     public required StateSource Source { get; init; }
@@ -97,6 +110,27 @@ internal sealed partial record AgentState
         var defects = new List<string>();
 
         int? statePr = null;
+        if (!fields.ContainsKey("pr") && fields.TryGetValue("issue", out string? issueValue))
+        {
+            // A worker branch is local until the coordinator pushes it, so early round boundaries have an
+            // issue and no PR. Requiring `pr` there is what produces invented values.
+            if (int.TryParse(issueValue, NumberStyles.None, CultureInfo.InvariantCulture, out int issueNumber) && issueNumber > 0)
+            {
+                return new AgentState
+                {
+                    PrNumber = issueNumber,
+                    IsIssue = true,
+                    Head = fields.GetValueOrDefault("head") is { } h && IsSha(h) ? h.ToLowerInvariant() : null,
+                    Recommendation = ParseRecommendation(fields.GetValueOrDefault("rec"), defects),
+                    Source = StateSource.Declared,
+                    Defects = defects,
+                };
+            }
+
+            // Malformed: fall through to the window name rather than inventing an identity.
+            defects.Add($"issue={issueValue} is not an issue number");
+        }
+
         if (fields.TryGetValue("pr", out string? prValue))
         {
             if (int.TryParse(prValue, NumberStyles.None, CultureInfo.InvariantCulture, out int parsed) && parsed > 0)
@@ -127,12 +161,14 @@ internal sealed partial record AgentState
         (int? clean, int? required) = ParseReviews(fields.GetValueOrDefault("reviews"), defects);
         IReadOnlyList<int> blocked = ParseBlocked(fields.GetValueOrDefault("blocked"), defects);
         Recommendation rec = ParseRecommendation(fields.GetValueOrDefault("rec"), defects);
+        WaitPredicate waiting = WaitPredicate.Parse(fields.GetValueOrDefault("waiting"), defects);
 
-        // Wait asserts "what I listed in blocked= is still outstanding". With nothing listed there is
-        // nothing to wait on and nothing a reader can re-check, so the claim cannot be evaluated.
-        if (rec == Recommendation.Wait && blocked.Count == 0)
+        // Wait asserts that something it named is still outstanding. Either channel satisfies that — a
+        // citable blocker for a person, or an evaluable predicate for a reader — but one of them must be
+        // present, or there is nothing to re-check and the claim cannot be evaluated at all.
+        if (rec == Recommendation.Wait && blocked.Count == 0 && waiting.Kind == WaitKind.None)
         {
-            defects.Add("rec=wait with no citable blocker");
+            defects.Add("rec=wait with nothing in blocked or waiting");
         }
 
         // Ready is dual-clean and mergeable. Recommending a merge before the reviews are in contradicts
@@ -157,6 +193,7 @@ internal sealed partial record AgentState
             ReviewsClean = clean,
             ReviewsRequired = required,
             Blocked = blocked,
+            Waiting = waiting,
             Recommendation = rec,
             Source = StateSource.Declared,
             Defects = defects,
@@ -220,8 +257,9 @@ internal sealed partial record AgentState
             case "merge": return Recommendation.Merge;
             case "approve": return Recommendation.Approve;
             case "stop": return Recommendation.Stop;
+            case "continue": return Recommendation.Continue;
             default:
-                defects.Add($"rec={value} is not one of wait|merge|approve|stop");
+                defects.Add($"rec={value} is not one of continue|wait|merge|approve|stop");
                 return Recommendation.Unrecognised;
         }
     }

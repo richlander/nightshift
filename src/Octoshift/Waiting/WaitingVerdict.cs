@@ -14,6 +14,12 @@ internal enum WaitingState
     /// <summary>Reviews are in and the branch merges. This is the merge queue.</summary>
     Ready,
 
+    /// <summary>
+    /// The condition the agent said it was waiting on has cleared, and it does not know yet. This is the
+    /// case the whole tool exists for: an idle window whose blocker went away hours ago.
+    /// </summary>
+    Unblocked,
+
     /// <summary>The agent declared itself done and GitHub disagrees.</summary>
     Contradicted,
 
@@ -72,6 +78,17 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
     public static WaitingVerdict Resolve(AgentState state, PrFacts? facts)
     {
         ArgumentNullException.ThrowIfNull(state);
+
+        // An issue-tracking window has no PR to check, so there is nothing on GitHub to join it against.
+        if (state.IsIssue)
+        {
+            return state.Recommendation switch
+            {
+                Recommendation.Stop => new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to stop; grant or decline"),
+                Recommendation.Approve => new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to authorise more rounds"),
+                _ => new(WaitingState.Holding, RowOwner.Nobody, $"tracking issue #{state.PrNumber}; no PR yet"),
+            };
+        }
 
         if (facts is null)
         {
@@ -139,6 +156,18 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
                 : new(WaitingState.Conflicting, RowOwner.Agent, "CONFLICTING; integrate a later main");
         }
 
+        // The declared predicate is evaluated before the generic gates, because it is the agent's own
+        // statement of what would make it interesting again — including `merge`, which is precisely the
+        // uncomputed-mergeability case.
+        if (state.Waiting.Kind != WaitKind.None)
+        {
+            WaitingVerdict? predicate = EvaluateWait(state, facts);
+            if (predicate is { } resolved)
+            {
+                return resolved;
+            }
+        }
+
         if (!facts.MergeabilityKnown)
         {
             return declaredDone
@@ -177,6 +206,62 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
             : facts.Checks.Any(c => !c.IsComplete) ? "; CI still running" : string.Empty;
 
         return new(WaitingState.Ready, RowOwner.Operator, $"reviews {state.ReviewsClean}/{state.ReviewsRequired}, mergeable{ci}");
+    }
+
+    /// <summary>
+    /// Resolves a <c>waiting=</c> predicate, or null to fall through to the generic gates. Clearing is
+    /// reported rather than acted on: nothing here wakes the agent, so the row goes to the operator.
+    /// </summary>
+    private static WaitingVerdict? EvaluateWait(AgentState state, PrFacts facts)
+    {
+        switch (state.Waiting.Kind)
+        {
+            case WaitKind.Review:
+                // Nothing on GitHub can answer this one; only the agent knows.
+                return new(WaitingState.Holding, RowOwner.Nobody, "review round outstanding");
+
+            case WaitKind.Merge:
+                return !facts.MergeabilityKnown
+                    ? new(WaitingState.Holding, RowOwner.Nobody, "waiting on mergeability; not yet computed")
+                    : facts.IsMergeable
+                        ? new(WaitingState.Unblocked, RowOwner.Operator, "waited on mergeability, and the branch now merges")
+                        : new(WaitingState.NotMergeable, RowOwner.Operator, $"waited on mergeability; GitHub says {facts.MergeableState}");
+
+            case WaitKind.Checks:
+                if (!facts.ChecksKnown)
+                {
+                    return new(WaitingState.Holding, RowOwner.Nobody, "waiting on checks; the check list could not be read");
+                }
+
+                return facts.Checks.Any(c => !c.IsComplete)
+                    ? new(WaitingState.Holding, RowOwner.Nobody, $"waiting on {facts.Checks.Count(c => !c.IsComplete)} check(s)")
+                    : new(WaitingState.Unblocked, RowOwner.Operator, "waited on checks, and they have all concluded");
+
+            case WaitKind.Check:
+                string name = state.Waiting.CheckName!;
+                if (!facts.ChecksKnown)
+                {
+                    return new(WaitingState.Holding, RowOwner.Nobody, $"waiting on {name}; the check list could not be read");
+                }
+
+                CheckRunFact? check = facts.FindCheck(name);
+                if (check is null)
+                {
+                    return new(WaitingState.Holding, RowOwner.Nobody, $"{name} has not reported on {Short(facts.HeadSha)}");
+                }
+
+                if (!check.IsComplete)
+                {
+                    return new(WaitingState.Holding, RowOwner.Nobody, $"{name} is {check.Status}");
+                }
+
+                return check.IsFailure
+                    ? new(WaitingState.Unblocked, RowOwner.Operator, $"waited on {name}, which concluded {check.Conclusion}")
+                    : new(WaitingState.Unblocked, RowOwner.Operator, $"waited on {name}, which passed");
+
+            default:
+                return null;
+        }
     }
 
     private static bool ShaMatches(string recorded, string actual)
