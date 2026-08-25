@@ -133,10 +133,11 @@ internal static class WaitingCommand
                 continue;
             }
 
-            if (!seen.TryGetValue(record.PrNumber, out PrFacts? prFacts))
+            // An issue-tracking window has no PR, so spending a call on pulls/{n} would ask GitHub about
+            // a number that means something else entirely.
+            if (!record.IsIssue && !seen.TryGetValue(record.PrNumber, out _))
             {
-                prFacts = await fetchAsync(record.PrNumber, ct);
-                seen[record.PrNumber] = prFacts;
+                seen[record.PrNumber] = await fetchAsync(record.PrNumber, ct);
             }
 
             pending.Add((pane, record));
@@ -163,7 +164,7 @@ internal static class WaitingCommand
 
         foreach ((TmuxPane pane, AgentState state) in pending)
         {
-            rows.Add(Row(pane, state, WaitingVerdict.Resolve(state, seen[state.PrNumber]), now));
+            rows.Add(Row(pane, state, WaitingVerdict.Resolve(state, state.IsIssue ? null : seen.GetValueOrDefault(state.PrNumber)), now));
         }
 
         // Longest wait first among the rows that need you: coming back after hours away, the thing that
