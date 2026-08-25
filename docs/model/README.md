@@ -14,8 +14,10 @@ java -cp tla2tools.jar tla2sany.SANY Waiting.tla                     # parse
 java -cp tla2tools.jar tlc2.TLC -config Waiting.cfg -workers auto Waiting.tla
 ```
 
-Current bounds — 3 windows, 2 PRs, 9 steps — check in a few seconds: 809,393 states
-generated, 253,795 distinct, depth 10, zero violations.
+Current bounds — 3 windows, 2 PRs, 18 steps — take a few minutes: 319,153,961 states
+generated, 62,487,295 distinct, depth 19, zero violations. Drop `MaxTime` to 9 for a
+few-second run while iterating; it reaches depth 10 and catches everything the mutation
+matrix below covers.
 
 ## What is modelled, and what is not
 
@@ -32,6 +34,28 @@ collection frame and a record split by line wrapping — both parser bugs.
 The split is deliberate: the checker owns memory and ownership, tests own everything
 that produces the state vector. `InvariantTests` in the test project enumerates the
 verdict and confidence product exhaustively for the same reason.
+
+## Correspondence with the implementation
+
+A model checked exhaustively proves things about the model. It says nothing about the
+code unless the correspondence is demonstrated — an unchecked correspondence is how a
+specification ends up describing a system nobody built.
+
+`ModelCorrespondenceTests` in the test project mirrors each definition against the real
+implementation, named for what it mirrors:
+
+| TLA+ | Test |
+| --- | --- |
+| `SoleClaimantIsAlwaysOwner` | `SoleClaimantIsAlwaysOwner` |
+| `AtMostOneOwner` | `AtMostOneOwner` |
+| `NeverActOnUnwitnessedOrder` | `NeverActOnUnwitnessedOrder` |
+| `NoCrossEpochMemory` | `NoCrossEpochMemory` |
+| `RegistrationStableStep` | `RegistrationStableStep` |
+| `OwnerStableAcrossSweepStep` | `OwnerStableAcrossSweepStep` |
+| `Observed` | `ObservedRequiresAWitnessedRegistration` |
+
+The model is the authority on ordering and memory; those tests are the evidence the C#
+agrees with it.
 
 ## Validating the spec itself
 
