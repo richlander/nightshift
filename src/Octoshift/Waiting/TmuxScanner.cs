@@ -20,6 +20,13 @@ internal enum PaneActivity
 
     /// <summary>The pane could not be captured, so nothing about it is known.</summary>
     Unreadable,
+
+    /// <summary>
+    /// The agent itself failed — a refusal, a provider error, an exhausted retry. Distinct from every
+    /// other state here because the work is fine and the worker is not: nothing about the PR explains it
+    /// and nothing about the PR will clear it.
+    /// </summary>
+    Stalled,
 }
 
 /// <summary>Raised when tmux itself could not be reached, as distinct from finding no windows.</summary>
@@ -280,8 +287,57 @@ internal sealed class TmuxScanner
     /// same state set while the agent works on is not a handover, and a pane holding a prompt open is
     /// waiting on a keystroke rather than on GitHub.
     /// </summary>
+    /// <summary>
+    /// Signatures of the agent runtime failing, as opposed to the work failing.
+    /// </summary>
+    /// <remarks>
+    /// Read from pane text, which is untrusted for identity and appropriate here: this is not a claim
+    /// being believed, it is a symptom being noticed, and the agent cannot publish state about its own
+    /// inability to run. A false match costs one row shown to the operator; a miss costs a window that
+    /// sits stalled until someone happens to look at it.
+    /// </remarks>
+    private static readonly string[] StallSignatures =
+    [
+        "execution failed:",
+        "this content was flagged",
+        "failed to get response from the ai model",
+        "try rephrasing your request",
+        "rate limit reached",
+        "context deadline exceeded",
+    ];
+
+    /// <summary>The agent-failure text a pane ends on, or null.</summary>
+    internal static string? StallReason(string capture)
+    {
+        string footer = Footer(capture);
+        foreach (string signature in StallSignatures)
+        {
+            int at = footer.IndexOf(signature, StringComparison.OrdinalIgnoreCase);
+            if (at < 0)
+            {
+                continue;
+            }
+
+            // Report the line it appeared on: the signature alone says a class of failure, and the line
+            // says which one, which is the difference between "an agent is stuck" and a fix.
+            int start = footer.LastIndexOf('\n', at) + 1;
+            int end = footer.IndexOf('\n', at);
+            string line = (end < 0 ? footer[start..] : footer[start..end]).Trim();
+            return line.Length > 160 ? line[..160] + "…" : line;
+        }
+
+        return null;
+    }
+
     internal static PaneActivity ClassifyActivity(string capture)
     {
+        // A stall outranks the footer: a pane that failed mid-turn can still be showing an interrupt
+        // hint, which would otherwise read as an agent hard at work.
+        if (StallReason(capture) is not null)
+        {
+            return PaneActivity.Stalled;
+        }
+
         string footer = Footer(capture);
 
         if (footer.Contains("esc to cancel", StringComparison.OrdinalIgnoreCase)
@@ -301,7 +357,7 @@ internal sealed class TmuxScanner
         string[] lines = capture.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
         var tail = new StringBuilder();
         int taken = 0;
-        for (int i = lines.Length - 1; i >= 0 && taken < 8; i--)
+        for (int i = lines.Length - 1; i >= 0 && taken < 12; i--)
         {
             if (lines[i].Trim().Length == 0)
             {

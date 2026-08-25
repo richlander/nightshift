@@ -40,10 +40,13 @@ EXTENDS Integers, FiniteSets
 
 CONSTANTS
     Windows,    \* abstract window identities, standing in for tmux pane ids
+    Hosts,      \* the machines those windows live on
     PRs,        \* abstract PR numbers
     MaxTime     \* bound the model so the state space is finite
 
 ASSUME /\ MaxTime \in Nat
+       /\ Hosts \subseteq (Nat \ {0})
+       /\ Hosts # {}
        /\ Windows \subseteq (Nat \ {0})
        /\ PRs \subseteq (Nat \ {0})
        /\ Windows # {}
@@ -51,6 +54,9 @@ ASSUME /\ MaxTime \in Nat
 
 \* Windows and PRs are positive integers so that ties can be broken on a fixed order;
 \* 0 is the "claiming nothing" / "no window" sentinel, and -1 means never recorded.
+\* Which host a window is on. Fixed: a tmux pane does not migrate between machines.
+HostOf(w) == 1 + (w % Cardinality(Hosts))
+
 NoPr    == 0
 NoWindow == 0
 NoTime  == -1
@@ -63,10 +69,14 @@ VARIABLES
     regEpoch,    \* the epoch the remembered registrations belong to
     regTime,     \* window -> time it was first SEEN claiming its current PR
     regPr,       \* window -> the PR it was seen claiming
-    sweptAt,     \* last time the tool collected this host in full, or NoTime
-    viewComplete \* did the most recent sweep reach every host?
+    regFleet,    \* window -> the set of hosts known when its registration was made
+    sweptAt,      \* last time the tool collected this host in full, or NoTime
+    viewComplete, \* DERIVED by each sweep -- see Sweep
+    knownHosts,   \* hosts collected at least once before
+    lastCollected \* hosts the most recent sweep actually looked at
 
-vars == << now, claims, live, epoch, regEpoch, regTime, regPr, sweptAt, viewComplete >>
+vars == << now, claims, live, epoch, regEpoch, regTime, regPr, regFleet, sweptAt,
+            viewComplete, knownHosts, lastCollected >>
 
 TypeOK ==
     /\ now \in 0..MaxTime
@@ -76,18 +86,37 @@ TypeOK ==
     /\ regEpoch \in Nat
     /\ regTime \in [Windows -> Int]
     /\ regPr \in [Windows -> PRs \union {NoPr}]
+    /\ regFleet \in [Windows -> SUBSET Hosts]
     /\ sweptAt \in Int
     /\ viewComplete \in BOOLEAN
+    /\ knownHosts \subseteq Hosts
+    /\ lastCollected \subseteq Hosts
 
 (* ---- What the tool derives from what it remembers ---------------------------------
 
    Ownership among the windows claiming one PR. A window's registration counts only if
    it was recorded under the CURRENT epoch and for the PR the window still claims. *)
 
-Claimants(p) == { w \in live : claims[w] = p }
+\* Only windows the last sweep actually collected. The tool cannot count a window it
+\* never looked at, and an earlier version of this spec did -- which made the model
+\* strictly more informed than the implementation and let it "check" ordering between
+\* windows the real tool would never have seen together.
+Claimants(p) == { w \in live : claims[w] = p /\ HostOf(w) \in lastCollected }
 
+\* A registration counts only if it was made under the current tmux server, for the PR
+\* the window still claims, AND against the same fleet the tool knows about now.
+\*
+\* That last condition is what stops a narrow sweep manufacturing an order. Registering
+\* one claimant while its rival's host went uncollected makes the swept one look like the
+\* earlier arrival, when all that happened is that it was LOOKED AT first. TLC found this
+\* by exploring sweeps over host subsets: two unwitnessed claimants, a sweep covering one
+\* host, and ownership flipped. Requiring the fleet to match means an order established
+\* before the tool knew about a host is not an order over the windows on it.
 Registered(w) ==
-    IF regEpoch = epoch /\ regPr[w] = claims[w] /\ regTime[w] # NoTime
+    IF /\ regEpoch = epoch
+       /\ regPr[w] = claims[w]
+       /\ regTime[w] # NoTime
+       /\ regFleet[w] = knownHosts
     THEN regTime[w]
     ELSE NoTime
 
@@ -139,8 +168,11 @@ Init ==
     /\ regEpoch = 0
     /\ regTime = [w \in Windows |-> NoTime]
     /\ regPr = [w \in Windows |-> NoPr]
+    /\ regFleet = [w \in Windows |-> {}]
     /\ sweptAt = NoTime
     /\ viewComplete = FALSE
+    /\ knownHosts = {}
+    /\ lastCollected = {}
 
 \* Agents open windows, close them, and switch PRs on their own schedule. Exogenous:
 \* the tool observes this, it does not cause it.
@@ -160,7 +192,7 @@ AgentActs ==
                  /\ p # claims[w]
                  /\ live' = live
                  /\ claims' = [claims EXCEPT ![w] = p]
-    /\ UNCHANGED << epoch, regEpoch, regTime, regPr, sweptAt, viewComplete >>
+    /\ UNCHANGED << epoch, regEpoch, regTime, regPr, regFleet, sweptAt, viewComplete, knownHosts, lastCollected >>
 
 \* The tmux server restarts: pane ids restart, so every id may now name a different
 \* window. Everything live is replaced; what the tool remembers is about the old ones.
@@ -170,36 +202,52 @@ ServerRestarts ==
     /\ epoch' = epoch + 1
     /\ live' = {}
     /\ claims' = [w \in Windows |-> NoPr]
-    /\ UNCHANGED << regEpoch, regTime, regPr, sweptAt, viewComplete >>
+    /\ UNCHANGED << regEpoch, regTime, regPr, regFleet, sweptAt, viewComplete, knownHosts, lastCollected >>
 
-\* A sweep: record every live window's current claim, and mark the host swept. A window
-\* keeps its registration for as long as it keeps claiming the same PR; switching is a
-\* fresh registration.
+\* A sweep over some set of hosts. The set is nondeterministic because it is chosen by
+\* whoever ran the tool -- and because a host may fail to answer. Those two are the same
+\* thing from in here: windows on an uncollected host are unseen either way.
+\*
+\* viewComplete is DERIVED, and that is the reason hosts are modelled at all. An earlier
+\* version of this spec had a PartialSweep action that simply asserted
+\* viewComplete' = FALSE. That checks what FOLLOWS from a partial view and can never
+\* check when a view IS partial -- so it held while the implementation derived partiality
+\* from failures alone and missed the case of a run merely given fewer hosts: no
+\* failures, the view reads complete, and a window that is a follower on the full fleet
+\* becomes a sole claimant and is actionable. The model assumed exactly the fact that
+\* was wrong.
 Sweep ==
     /\ now < MaxTime
     /\ now' = now + 1
-    /\ regTime' = [w \in Windows |->
-                     IF w \in live /\ claims[w] # NoPr
-                     THEN IF regEpoch = epoch /\ regPr[w] = claims[w] /\ regTime[w] # NoTime
-                          THEN regTime[w]              \* unchanged claim keeps its place
-                          ELSE now                     \* new or switched claim registers now
-                     ELSE NoTime]
-    /\ regPr' = [w \in Windows |-> IF w \in live THEN claims[w] ELSE NoPr]
+    /\ \E collected \in (SUBSET Hosts) \ {{}} :
+         \* Registrations are renewed or dropped only by a sweep that looked at the host.
+         \* A window on an uncollected host is unseen, not gone -- forgetting it would
+         \* manufacture a departure and re-register it as new on the next full sweep.
+         /\ regTime' = [w \in Windows |->
+                          IF HostOf(w) \notin collected THEN regTime[w]
+                          ELSE IF w \in live /\ claims[w] # NoPr
+                               THEN IF regEpoch = epoch /\ regPr[w] = claims[w] /\ regTime[w] # NoTime
+                                    THEN regTime[w]
+                                    ELSE now
+                               ELSE NoTime]
+         /\ regPr' = [w \in Windows |->
+                        IF HostOf(w) \notin collected THEN regPr[w]
+                        ELSE IF w \in live THEN claims[w] ELSE NoPr]
+         /\ regFleet' = [w \in Windows |->
+                           IF HostOf(w) \notin collected THEN regFleet[w]
+                           ELSE knownHosts \union collected]
+         \* A run covering fewer hosts than it has already collected is looking at less
+         \* of the fleet than it has seen. It cannot tell that from its arguments -- a
+         \* host it was not told about is indistinguishable from one that does not
+         \* exist -- only from this memory.
+         /\ viewComplete' = (knownHosts \subseteq collected)
+         /\ knownHosts' = knownHosts \union collected
+         /\ lastCollected' = collected
     /\ regEpoch' = epoch
     /\ sweptAt' = now
-    /\ viewComplete' = TRUE
     /\ UNCHANGED << claims, live, epoch >>
 
-\* A sweep where a host did not answer. Windows on it are UNSEEN, not gone: their
-\* registrations must survive, or every failed sweep would manufacture a departure and
-\* the next full sweep would re-register them as newly arrived.
-PartialSweep ==
-    /\ now < MaxTime
-    /\ now' = now + 1
-    /\ viewComplete' = FALSE
-    /\ UNCHANGED << claims, live, epoch, regEpoch, regTime, regPr, sweptAt >>
-
-Next == AgentActs \/ ServerRestarts \/ Sweep \/ PartialSweep
+Next == AgentActs \/ ServerRestarts \/ Sweep
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Sweep)
 
@@ -237,7 +285,7 @@ NoCrossEpochMemory ==
 \* ordinary case. (Modelled on NoGenuineGapGoesUnnoticed in ZfsHoldTight, which rules
 \* out a "fix" that satisfies policy-independence by never reporting anything.)
 \* Conditioned on a complete view, and that condition is not a weakening. TLC refuted
-\* the unconditioned form in two steps once PartialSweep existed: a sweep that could not
+\* the unconditioned form in two steps once partial sweeps existed: a sweep that could not
 \* reach every host does not know a claim is sole, so "sole claimants are always
 \* actionable" and "a partial view owns nothing" are in direct conflict. The second wins
 \* -- it is the safety rule -- and this one keeps its job of ruling out a tool that
@@ -266,7 +314,9 @@ NoOwnerWhileViewIncomplete ==
 \* A sweep that could not reach a host must not forget what it already knew about it.
 \* Registrations are only ever renewed or dropped by a sweep that actually looked.
 NoPhantomDepartureStep ==
-    [][ (~viewComplete') => (regTime' = regTime /\ regPr' = regPr) ]_vars
+    [][ \A w \in Windows :
+          (regTime'[w] # regTime[w] \/ regPr'[w] # regPr[w] \/ regFleet'[w] # regFleet[w])
+            => HostOf(w) \in lastCollected' ]_vars
 
 RegistrationStableStep ==
     [][ \A w \in Windows :
@@ -279,8 +329,15 @@ RegistrationStableStep ==
 \* Invariant 9: if nothing observable changes, ownership does not change. Stated over
 \* a Sweep specifically, because that is the step that rewrites memory: sweeping an
 \* unchanged fleet must be idempotent with respect to who owns what.
+\* Also requires the known fleet to be unchanged, and that is not a weakening. Learning
+\* that the fleet is larger than it thought legitimately invalidates an ordering: an
+\* order established before the tool knew a host existed was never an order over the
+\* windows on it. TLC refuted the version without this condition as soon as sweeps could
+\* cover host subsets -- the fourth time this exercise has caught a property rather than
+\* a design.
 OwnerStableAcrossSweepStep ==
-    [][ (live' = live /\ claims' = claims /\ epoch' = epoch)
+    [][ (/\ live' = live /\ claims' = claims /\ epoch' = epoch
+         /\ knownHosts' = knownHosts /\ lastCollected' = lastCollected)
           => \A p \in PRs : (Claimants(p) # {} => Owner(p)' = Owner(p)) ]_vars
 
 ====

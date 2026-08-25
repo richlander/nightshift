@@ -147,6 +147,18 @@ internal static class WaitingCommand
 
             AgentState? record = AgentState.Parse(pane.AgentStateOption, pane.WindowName);
 
+            if (pane.Activity == PaneActivity.Stalled)
+            {
+                // The agent runtime failed. No GitHub lookup can explain it and none can clear it, so
+                // this goes straight to a person with the text that says why.
+                rows.Add(Row(pane, record, new WaitingVerdict(
+                    WaitingState.NeedsOperator,
+                    RowOwner.Operator,
+                    $"agent stalled: {TmuxScanner.StallReason(pane.Capture)}",
+                    Assurance.High), now));
+                continue;
+            }
+
             if (pane.Activity == PaneActivity.Blocked)
             {
                 // A held-open prompt is answered with a keystroke, not with a GitHub lookup.

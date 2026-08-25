@@ -14,10 +14,10 @@ java -cp tla2tools.jar tla2sany.SANY Waiting.tla                     # parse
 java -cp tla2tools.jar tlc2.TLC -config Waiting.cfg -workers auto Waiting.tla
 ```
 
-Current bounds — 3 windows, 2 PRs, 12 steps — run in about a minute: 16,611,004 states
-generated, 3,777,389 distinct, depth 13, zero violations. `MaxTime = 18` reaches depth
-19 across 62.5M distinct states in a few minutes; `MaxTime = 9` runs in seconds while
-iterating and still catches everything the mutation matrix below covers.
+Current bounds — 3 windows, 2 hosts, 2 PRs, 8 steps — run in about a minute: 1,742,181
+states generated, 527,638 distinct, depth 9, zero violations. Raise `MaxTime` for a
+deeper search; hosts multiply the state space quickly, since every sweep branches over
+the subsets of hosts it might have collected.
 
 ## What is modelled, and what is not
 
@@ -72,6 +72,7 @@ here has a mutation that breaks it:
 | sort unregistered windows first instead of last | `OwnerStableAcrossSweepStep` |
 | drop the `viewComplete` guard from `OwnsClaim` | `NoOwnerWhileViewIncomplete` |
 | let a partial sweep rewrite registrations | `NoPhantomDepartureStep` |
+| let a registration count against a fleet it was not made against | `OwnerStableAcrossSweepStep` |
 
 Every invariant and property in the config has an entry, which is the bar for calling
 the run clean. A mutation must also be attributed to the *intended* property: an early

@@ -796,6 +796,34 @@ public class WaitingScanTests
         Assert.Contains("reuse the window", retirement.Advice, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("✗ Execution failed: 422 This content was flagged for possible cybersecurity risk.")]
+    [InlineData("Execution failed: Failed to get response from the AI model; retried 5 times")]
+    [InlineData("  Rate limit reached for this model, try again later")]
+    public void ClassifyActivity_NoticesTheAgentItselfFailing(string line)
+    {
+        // A different beast from every other state: the work is fine and the worker is not. Nothing
+        // about the PR explains it, and nothing about the PR will clear it.
+        Assert.Equal(PaneActivity.Stalled, TmuxScanner.ClassifyActivity($"● Round 3 complete.\n{line}\n> "));
+        Assert.Contains("Execution failed", TmuxScanner.StallReason("x\nExecution failed: 422 flagged\n> ")!, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ClassifyActivity_AStallOutranksAnInterruptHint()
+    {
+        // A pane that failed mid-turn can still be showing "esc to interrupt", which would otherwise
+        // read as an agent hard at work.
+        const string Capture = "Execution failed: 422 This content was flagged\n· Working (esc to interrupt)";
+
+        Assert.Equal(PaneActivity.Stalled, TmuxScanner.ClassifyActivity(Capture));
+    }
+
+    [Fact]
+    public void ClassifyActivity_OrdinaryOutputIsNotAStall()
+    {
+        Assert.Null(TmuxScanner.StallReason("● Round 3 is complete for PR 4616.\n  Fix description: ...\n> "));
+    }
+
     private static TmuxPane Pane(string target, string capture, PaneActivity activity, DateTimeOffset? lastActivity = null, string? agentState = null, string windowName = "w")
         => new()
         {
