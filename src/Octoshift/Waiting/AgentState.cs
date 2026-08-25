@@ -116,7 +116,18 @@ internal sealed partial record AgentState
     /// working on one PR renamed a neighbour's window to its own PR, leaving two windows with one name
     /// and one of them describing work it was not doing.
     /// </param>
-    public static AgentState? Parse(string? agentState, string? windowName, bool nameIsAmbiguous = false)
+    /// <param name="paneContradictsPr">
+    /// Whether the window's own output mentions the PR its state claims. Corroboration only, never
+    /// identity: pane text is the one channel another agent cannot write, because a process writes to
+    /// its own terminal and nowhere else. An untargeted publish clobbers a neighbour's state AND name
+    /// together, so those two agree with each other about a PR the window is not working on — and there
+    /// is nothing in them to notice. Its own output is what disagrees.
+    /// </param>
+    public static AgentState? Parse(
+        string? agentState,
+        string? windowName,
+        bool nameIsAmbiguous = false,
+        Func<int, bool>? paneContradictsPr = null)
     {
         (int Number, bool IsIssue)? fromName = PrFromWindowName(windowName);
         Dictionary<string, string> fields = SplitFields(agentState);
@@ -175,6 +186,15 @@ internal sealed partial record AgentState
         else if (fromName is { IsIssue: false } window && window.Number != statePr)
         {
             defects.Add($"window is named pr{window.Number} but the record says pr={statePr}");
+        }
+
+        // Disagreement, not absence. Pane text is noisy — an earlier version of this reader took "PR 37"
+        // from the phrase "in PR 37 lines" — so requiring an exact match would manufacture
+        // disagreements. Asking only whether the claimed PR appears at all keeps the false-positive
+        // rate near zero while still catching a window whose state describes work it never did.
+        if (paneContradictsPr?.Invoke(statePr.Value) == true)
+        {
+            defects.Add($"the window's own output never mentions pr={statePr} — its state may have been written by another agent");
         }
 
         (int? clean, int? required) = ParseReviews(fields.GetValueOrDefault("reviews"), defects);

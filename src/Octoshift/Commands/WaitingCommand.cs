@@ -156,7 +156,8 @@ internal static class WaitingCommand
             AgentState? record = AgentState.Parse(
                 pane.AgentStateOption,
                 pane.WindowName,
-                nameIsAmbiguous: ambiguousNames.Contains($"{pane.Host ?? "local"}|{pane.WindowName}"));
+                nameIsAmbiguous: ambiguousNames.Contains($"{pane.Host ?? "local"}|{pane.WindowName}"),
+                paneContradictsPr: pr => TmuxScanner.PaneContradictsPr(pane.Capture, pr));
 
             if (pane.Activity == PaneActivity.Stalled)
             {

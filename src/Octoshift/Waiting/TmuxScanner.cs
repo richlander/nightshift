@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 
 /// <summary>What a pane's footer says the agent in it is doing right now.</summary>
 internal enum PaneActivity
@@ -96,7 +97,7 @@ internal sealed record TmuxPane
 /// options. Panes are still captured, but only to classify activity: whether a window is mid-turn or
 /// holding a prompt open is the one thing an option cannot say.
 /// </remarks>
-internal sealed class TmuxScanner
+internal sealed partial class TmuxScanner
 {
     /// <summary>
     /// The collection script, run once per host. It emits a <em>manifest</em> of every window, closes it,
@@ -329,6 +330,40 @@ internal sealed class TmuxScanner
         return null;
     }
 
+    /// <summary>
+    /// Whether a pane's own output contradicts a PR number it is supposed to be about.
+    /// </summary>
+    /// <remarks>
+    /// True only when the pane talks about PRs and never about this one. A pane holding no PR reference
+    /// at all is not disagreement, it is silence — and silence is the normal case here, because this UI
+    /// runs on the alternate screen with no scrollback, so a window whose report has scrolled past the
+    /// top shows nothing but chrome. Measured across the fleet: treating silence as disagreement flagged
+    /// a window whose state was perfectly good and whose pane was simply empty.
+    /// </remarks>
+    internal static bool PaneContradictsPr(string capture, int prNumber)
+        => !MentionsPr(capture, prNumber) && PrMention().IsMatch(capture);
+
+    /// <summary>Whether a pane's visible text mentions a PR number anywhere.</summary>
+    internal static bool MentionsPr(string capture, int prNumber)
+    {
+        string number = prNumber.ToString(CultureInfo.InvariantCulture);
+        int at = 0;
+        while ((at = capture.IndexOf(number, at, StringComparison.Ordinal)) >= 0)
+        {
+            // Bounded by non-digits so 4663 does not match inside 46631 or a sha-like run.
+            bool leftClear = at == 0 || !char.IsAsciiDigit(capture[at - 1]);
+            bool rightClear = at + number.Length >= capture.Length || !char.IsAsciiDigit(capture[at + number.Length]);
+            if (leftClear && rightClear)
+            {
+                return true;
+            }
+
+            at += number.Length;
+        }
+
+        return false;
+    }
+
     internal static PaneActivity ClassifyActivity(string capture)
     {
         // A stall outranks the footer: a pane that failed mid-turn can still be showing an interrupt
@@ -351,6 +386,10 @@ internal sealed class TmuxScanner
                 ? PaneActivity.Working
                 : PaneActivity.Idle;
     }
+
+    /// <summary>Any PR-shaped reference, used only to tell silence from disagreement.</summary>
+    [GeneratedRegex(@"\bPR\s*#?\d{2,6}\b", RegexOptions.IgnoreCase)]
+    private static partial Regex PrMention();
 
     private static string Footer(string capture)
     {

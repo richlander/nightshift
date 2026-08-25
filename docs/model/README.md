@@ -1,4 +1,44 @@
-# Model
+# Models
+
+Two TLA+ specifications, kept apart because they answer different questions.
+
+| Spec | Question |
+| --- | --- |
+| `Waiting.tla` | Over time, who owns a PR and what may be acted on? |
+| `TmuxWindows.tla` | At one instant, which window is this even, given that agents write to each other's? |
+
+Mixing them would blur both: "who owns this PR" and "which window is this" have
+different state, different actions and different failure modes.
+
+## TmuxWindows
+
+Several agents write one shared namespace with no access control, and the tool is one of
+the writers. A tmux command without an explicit target lands on whichever window is
+*current*, which is somebody else's — observed live twice, as four windows carrying a
+fifth's `@agent_state`, and as a window named for a PR its own state said it was not
+working on.
+
+The model does not ask whether agents make that mistake; they demonstrably do. It asks
+which identity channels survive it. The answer is sharper than expected:
+
+- **`@agent_state` and the window name are both writable by anyone**, and an untargeted
+  publish sets them *together* — so a clobbered window's two durable channels agree with
+  each other about a PR it never touched. There is nothing internal to notice.
+- **Pane text is the only channel another agent cannot write**, because a process writes
+  to its own terminal and nowhere else. That makes it useless for durability — it scrolls
+  away, and this UI has no scrollback — and uniquely sound for detecting a clobber.
+
+TLC confirms it: `IdentityIsSound` over the implemented rule is violated in three steps,
+and the corroborated rule holds. The implementation now flags state its window's own
+output contradicts.
+
+One refinement came from the fleet rather than the checker. Requiring the pane to
+*mention* the claimed PR flagged a window whose state was perfectly good and whose pane
+was simply empty — normal here, since a report that has scrolled past the top leaves only
+chrome. Silence is not disagreement, so the rule fires only when the pane talks about PRs
+and never about this one.
+
+## Waiting
 
 TLA+ specification of the memory and ownership rules in `octoshift waiting`.
 

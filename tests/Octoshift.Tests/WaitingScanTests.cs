@@ -851,6 +851,21 @@ public class WaitingScanTests
         Assert.Contains("no published state", nameless.Verdict.Reason, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("● Round 2 is complete for PR 4663.", 4448, true)]   // talks about a different PR
+    [InlineData("● Round 2 is complete for PR 4448.", 4448, false)]  // talks about this one
+    [InlineData("~/git/dotnet-inspect\n❯ ", 4448, false)]            // says nothing about any PR
+    public void PaneContradictsPr_TellsDisagreementFromSilence(string capture, int pr, bool contradicts)
+        => Assert.Equal(contradicts, TmuxScanner.PaneContradictsPr(capture, pr));
+
+    [Fact]
+    public void MentionsPr_IsBoundedByNonDigits()
+    {
+        // 4663 must not match inside 46631 or a sha-like run of digits.
+        Assert.True(TmuxScanner.MentionsPr("work on PR 4663 now", 4663));
+        Assert.False(TmuxScanner.MentionsPr("build 46631 failed", 4663));
+    }
+
     private static TmuxPane Pane(string target, string capture, PaneActivity activity, DateTimeOffset? lastActivity = null, string? agentState = null, string windowName = "w")
         => new()
         {

@@ -199,6 +199,35 @@ public class AgentStateTests
         => Assert.Null(AgentState.Parse(null, windowName));
 
     [Fact]
+    public void Parse_FlagsStateThatTheWindowsOwnOutputContradicts()
+    {
+        // The failure TmuxWindows.tla exposed: an untargeted publish clobbers a neighbour's state AND
+        // name together, so the two durable channels agree with each other about a PR that window never
+        // touched, and there is nothing in them to notice. Its own output is what disagrees, because a
+        // process writes to its own terminal and nowhere else.
+        AgentState? state = AgentState.Parse(
+            "pr=4551 head=abc1234 reviews=1/2 rec=wait", "pr4551",
+            paneContradictsPr: _ => true);
+
+        Assert.NotNull(state);
+        Assert.Contains(state.Defects, d => d.Contains("never mentions pr=4551", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Parse_SilenceFromAnEmptyPaneIsNotContradiction()
+    {
+        // This UI runs on the alternate screen with no scrollback, so a window whose report has
+        // scrolled past the top shows nothing but chrome. Measured across the fleet, treating that as
+        // disagreement flagged a window whose state was perfectly good.
+        AgentState? state = AgentState.Parse(
+            "pr=4448 head=abc1234 reviews=0/2 rec=continue", "pr4448",
+            paneContradictsPr: _ => false);
+
+        Assert.NotNull(state);
+        Assert.Empty(state.Defects);
+    }
+
+    [Fact]
     public void Parse_ADuplicatedWindowNameIdentifiesNothing()
     {
         // Observed live on fernie: two windows both named pr4551-blocked, one of them actually working
