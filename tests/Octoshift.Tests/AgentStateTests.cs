@@ -170,8 +170,28 @@ public class AgentStateTests
     public void Parse_ReadsThePrThroughAStateSuffix(string windowName, int expected)
         => Assert.Equal(expected, AgentState.Parse(null, windowName)?.PrNumber);
 
+    [Fact]
+    public void Parse_ReadsAnIssueWindowName()
+    {
+        // Observed live: an agent with no PR wrote `pr=none head=pending` rather than leave the field
+        // out. The window was named i4613 the whole time.
+        AgentState? state = AgentState.Parse("pr=none head=pending round=0 reviews=0/2 rec=continue", "i4613");
+
+        Assert.NotNull(state);
+        Assert.True(state.IsIssue);
+        Assert.Equal(4613, state.PrNumber);
+    }
+
+    [Fact]
+    public void Parse_FlagsAPrBlockedOnItself()
+    {
+        AgentState? state = AgentState.Parse("pr=4636 head=c11c50d91 reviews=1/2 blocked=4636 rec=approve", "pr4636");
+
+        Assert.NotNull(state);
+        Assert.Contains(state.Defects, d => d.Contains("its own PR #4636", StringComparison.Ordinal));
+    }
+
     [Theory]
-    [InlineData("i4611")]
     [InlineData("resolve-ci-test-flakes")]
     [InlineData("zsh")]
     [InlineData(null)]

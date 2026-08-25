@@ -105,7 +105,7 @@ internal sealed partial record AgentState
     /// </summary>
     public static AgentState? Parse(string? agentState, string? windowName)
     {
-        int? nameePr = PrFromWindowName(windowName);
+        (int Number, bool IsIssue)? fromName = PrFromWindowName(windowName);
         Dictionary<string, string> fields = SplitFields(agentState);
         var defects = new List<string>();
 
@@ -148,18 +148,25 @@ internal sealed partial record AgentState
             // The window name is the fallback identity and a good one: it is set once, survives the report
             // scrolling away, and cannot be confused by prose. Scraping the pane for a PR reference is
             // deliberately not attempted — it produced "PR #37" from the phrase "in PR 37 lines".
-            return nameePr is null
+            return fromName is not { } named
                 ? null
-                : new AgentState { PrNumber = nameePr.Value, Source = StateSource.WindowName };
+                : new AgentState { PrNumber = named.Number, IsIssue = named.IsIssue, Source = StateSource.WindowName };
         }
 
-        if (nameePr is not null && nameePr != statePr)
+        if (fromName is { IsIssue: false } window && window.Number != statePr)
         {
-            defects.Add($"window is named pr{nameePr} but the record says pr={statePr}");
+            defects.Add($"window is named pr{window.Number} but the record says pr={statePr}");
         }
 
         (int? clean, int? required) = ParseReviews(fields.GetValueOrDefault("reviews"), defects);
         IReadOnlyList<int> blocked = ParseBlocked(fields.GetValueOrDefault("blocked"), defects);
+        if (blocked.Contains(statePr.Value))
+        {
+            // Observed live. Self-reference reads as a real blocker to anything counting entries, and
+            // there is nothing behind it to clear.
+            defects.Add($"blocked lists its own PR #{statePr}");
+        }
+
         Recommendation rec = ParseRecommendation(fields.GetValueOrDefault("rec"), defects);
         WaitPredicate waiting = WaitPredicate.Parse(fields.GetValueOrDefault("waiting"), defects);
 
@@ -292,7 +299,7 @@ internal sealed partial record AgentState
         return fields;
     }
 
-    private static int? PrFromWindowName(string? windowName)
+    private static (int Number, bool IsIssue)? PrFromWindowName(string? windowName)
     {
         if (windowName is null)
         {
@@ -300,8 +307,8 @@ internal sealed partial record AgentState
         }
 
         Match match = WindowPr().Match(windowName);
-        return match.Success && int.TryParse(match.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out int pr)
-            ? pr
+        return match.Success && int.TryParse(match.Groups[2].Value, NumberStyles.None, CultureInfo.InvariantCulture, out int number)
+            ? (number, match.Groups[1].Value.Equals("i", StringComparison.OrdinalIgnoreCase))
             : null;
     }
 
@@ -323,7 +330,10 @@ internal sealed partial record AgentState
         return true;
     }
 
-    /// <summary>Matches the <c>pr4595</c> window-naming convention, tolerating a trailing state suffix.</summary>
-    [GeneratedRegex(@"^pr(\d{2,6})(?:-|$)", RegexOptions.IgnoreCase)]
+    /// <summary>
+    /// Matches the <c>pr4595</c> and <c>i4611</c> window-naming conventions, tolerating a trailing state
+    /// suffix such as <c>-blocked</c>.
+    /// </summary>
+    [GeneratedRegex(@"^(pr|i)(\d{2,6})(?:-|$)", RegexOptions.IgnoreCase)]
     private static partial Regex WindowPr();
 }
