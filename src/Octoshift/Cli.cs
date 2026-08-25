@@ -148,7 +148,7 @@ public static class Cli
         var host = new Option<string[]>("--host")
         {
             Description = "Collect from this host over ssh; repeatable. Omit to read this machine's tmux.",
-            Arity = ArgumentArity.ZeroOrMore,
+            Arity = ArgumentArity.OneOrMore,
             AllowMultipleArgumentsPerToken = false,
         };
         var json = new Option<bool>("--json") { Description = "Emit the rows as JSON instead of a table." };

@@ -251,6 +251,22 @@ public class WaitingScanTests
     }
 
     [Fact]
+    public void ParseCollection_TreatsAMarkerInPaneTextAsContent()
+    {
+        // Agent output quotes this tool's own source, so the marker does appear inside captures. Treating
+        // it as a boundary would truncate the real window and invent one that does not exist.
+        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
+            "@@OCTOSHIFT@@%1|night:1|1|1755900000||pr4595\n"
+            + "the collector emits @@OCTOSHIFT@@ before each window\n"
+            + "@@OCTOSHIFT@@not-a-window-row\n",
+            host: null);
+
+        TmuxPane pane = Assert.Single(panes);
+        Assert.Equal("pr4595", pane.WindowName);
+        Assert.Contains("not-a-window-row", pane.Capture, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task ScanAsync_RunsExactlyOneCommandPerHost()
     {
         // The reason fan-out is viable: a host with twenty-two agent windows costs one connection, not

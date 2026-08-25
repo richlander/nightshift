@@ -76,13 +76,17 @@ internal sealed class TmuxScanner
     /// per window, which is unnoticeable locally and ruinous over SSH: a host running twenty-two agent
     /// windows would cost twenty-three connections per sweep. Assigning the listing first also means a
     /// tmux that is not running fails the command instead of yielding an empty list through a pipeline.
+    ///
+    /// The capture is explicitly non-fatal. Without that, the loop inherits the last capture's status, so
+    /// a single pane closing between enumeration and capture exits non-zero and condemns the whole host —
+    /// discarding every row already collected. Host failure is reserved for transport and the listing.
     /// </remarks>
     private const string CollectScript = """
         w=$(tmux list-windows -a -F '#{pane_id}|#{session_name}:#{window_index}|#{session_attached}|#{window_activity}|#{@agent_state}|#{window_name}') || exit 3
         printf '%s\n' "$w" | while IFS= read -r m; do
           [ -n "$m" ] || continue
           printf '@@OCTOSHIFT@@%s\n' "$m"
-          tmux capture-pane -p -t "${m%%|*}" 2>/dev/null
+          tmux capture-pane -p -t "${m%%|*}" 2>/dev/null || true
         done
         """;
 
@@ -122,7 +126,14 @@ internal sealed class TmuxScanner
 
         foreach (string line in stdout.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
         {
-            if (!line.StartsWith(Marker, StringComparison.Ordinal))
+            // A boundary is the marker AND a well-formed window row. Pane text can contain the marker —
+            // agent output quotes this tool's own source — and treating that as a boundary would truncate
+            // the window it appeared in and invent one that does not exist.
+            TmuxPane? header = line.StartsWith(Marker, StringComparison.Ordinal)
+                ? ParseWindow(line[Marker.Length..], host)
+                : null;
+
+            if (header is null)
             {
                 if (pending is not null)
                 {
@@ -135,14 +146,10 @@ internal sealed class TmuxScanner
             if (pending is { } previous)
             {
                 panes.Add(Finish(previous, capture.ToString()));
-                capture.Clear();
             }
 
-            pending = ParseWindow(line[Marker.Length..], host);
-            if (pending is null)
-            {
-                capture.Clear();
-            }
+            capture.Clear();
+            pending = header;
         }
 
         if (pending is { } last)

@@ -57,7 +57,27 @@ internal static class ShellRunner
 
         proc.BeginOutputReadLine();
         proc.BeginErrorReadLine();
-        await proc.WaitForExitAsync(ct);
+
+        try
+        {
+            await proc.WaitForExitAsync(ct);
+        }
+        catch (OperationCanceledException)
+        {
+            // Disposing the Process alone leaves the ssh or tmux child running, and an abandoned ssh
+            // holds a connection open. Take the tree down before the cancellation propagates.
+            try
+            {
+                proc.Kill(entireProcessTree: true);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or Win32Exception)
+            {
+                // Already gone, or the platform will not walk the tree; nothing further to do.
+            }
+
+            throw;
+        }
+
         return new CommandResult(proc.ExitCode, stdout.ToString(), stderr.ToString());
     }
 }

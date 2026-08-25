@@ -61,6 +61,25 @@ internal static class WaitingCommand
             }
         }
 
+        // Total failure keeps its own path. A sweep where nothing could be collected is not a quiet fleet,
+        // and printing a QUIET summary above the failure inverts which of the two the reader sees first.
+        if (panes.Count == 0 && unreachable.Count == targets.Count)
+        {
+            if (json)
+            {
+                WriteJsonError(string.Join("; ", unreachable));
+            }
+            else
+            {
+                foreach (string failure in unreachable)
+                {
+                    Console.Error.WriteLine($"octoshift: {failure}");
+                }
+            }
+
+            return ExitCode.Unavailable;
+        }
+
         var facts = new GhPrFactsSource(
             repo,
             new FileConditionalCache(),
