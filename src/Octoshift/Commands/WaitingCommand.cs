@@ -192,6 +192,13 @@ internal static class WaitingCommand
         // the two halves of it are often not on the same machine.
         var history = new PaneHistory();
 
+        // Adopt each host's tmux epoch first: a server that has restarted invalidates every pane id
+        // remembered for it, and keeping those would present one window's registration as another's.
+        foreach (IGrouping<string?, TmuxPane> host in panes.Where(p => p.Epoch.Length > 0).GroupBy(p => p.Host))
+        {
+            history.AdoptEpoch(host.Key, host.First().Epoch, now);
+        }
+
         // Register every claim before ranking, so a window seen for the first time this sweep still has
         // a registration time to be ordered by.
         foreach ((TmuxPane pane, AgentState state) in pending)
@@ -201,7 +208,8 @@ internal static class WaitingCommand
 
         IReadOnlyDictionary<string, Claim> claims = Claim.Register(
             pending.Where(e => !e.State.IsIssue).Select(e => (e.Pane, e.State.PrNumber, e.State.Round)),
-            history.ClaimedAt);
+            history.ClaimedAt,
+            history.SweptAt);
 
         foreach ((TmuxPane pane, AgentState state) in pending)
         {
@@ -270,7 +278,11 @@ internal static class WaitingCommand
         // is sure has to be legible about when it was not, or "it did nothing" and "it saw nothing" look
         // the same from here.
         int actionable = rows.Count(r => r.MayAct);
-        int unsure = rows.Count(r => !r.Verdict.Assurance.MayAct);
+
+        // Counted as the complement, not by re-deriving the test: the two must always add up to the rows
+        // shown, and an earlier version counted only low confidence, so rows held back by a contested
+        // claim appeared in neither number.
+        int unsure = rows.Count - actionable;
         Console.WriteLine($"NOT ACTED nothing was sent to any agent; {actionable} row(s) met the bar to act, {unsure} did not");
 
         if (rows.Count > 0)

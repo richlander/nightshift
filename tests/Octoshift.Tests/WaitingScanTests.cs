@@ -19,6 +19,7 @@ public class WaitingScanTests
     private static string Stream(IEnumerable<string> manifest, params (string PaneId, string Text)[] captures)
     {
         var sb = new System.Text.StringBuilder();
+        sb.Append(Nonce).Append(":epoch 4242:1755900000\n");
         sb.Append(Nonce).Append(":manifest\n");
         foreach (string row in manifest)
         {
@@ -501,6 +502,83 @@ public class WaitingScanTests
         // ...but neither is entitled to be driven.
         Assert.False(ranked[Claim.Key(senior)].OwnsClaim);
         Assert.False(ranked[Claim.Key(junior)].OwnsClaim);
+    }
+
+    [Fact]
+    public void ParseCollection_CarriesTheServerEpoch()
+    {
+        TmuxPane pane = Assert.Single(TmuxScanner.ParseCollection(
+            Stream(["%1|night:1|1|1755900000||pr4595"]), host: null, Nonce));
+
+        Assert.Equal("4242:1755900000", pane.Epoch);
+    }
+
+    [Fact]
+    public void History_ForgetsAHostWhoseTmuxServerRestarted()
+    {
+        // Pane ids restart at %0 with the server, so keeping the old ones would attribute a departed
+        // window's registration to whatever now holds its id — and present that as observed fact.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-epoch-{Guid.NewGuid():N}.json");
+        try
+        {
+            TmuxPane before = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "fernie", Epoch = "100:1" };
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+            var first = new PaneHistory(path);
+            Assert.False(first.AdoptEpoch("fernie", "100:1", t));
+            first.Observe(before, t, claimedPr: 4448);
+            first.Save([before]);
+
+            // Same pane id, new server: the registration must not survive.
+            var second = new PaneHistory(path);
+            Assert.False(second.AdoptEpoch("fernie", "200:2", t.AddHours(1)));
+            Assert.Null(second.ClaimedAt(before));
+
+            // An unchanged server keeps it, and reports the host as continuously swept.
+            var third = new PaneHistory(path);
+            second.Observe(before, t.AddHours(1), claimedPr: 4448);
+            second.Save([before]);
+            Assert.True(new PaneHistory(path).AdoptEpoch("fernie", "200:2", t.AddHours(2)));
+            Assert.NotNull(new PaneHistory(path).ClaimedAt(before));
+            _ = third;
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void Claim_AWindowThatAppearedSinceTheLastSweepIsKnownToBeNewer()
+    {
+        // The common shape once the tool has been running: one claim was watched registering, the other
+        // was not there at the last full sweep, so it can only have arrived afterwards.
+        TmuxPane seen = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448");
+        TmuxPane fresh = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4448");
+        DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+        IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
+            [(fresh, 4448, null), (seen, 4448, null)],
+            p => p.PaneId == seen.PaneId ? t : null,
+            _ => t.AddMinutes(30));
+
+        Assert.Equal(ClaimRank.Owner, ranked[Claim.Key(seen)].Rank);
+        Assert.Equal(ClaimBasis.Observed, ranked[Claim.Key(seen)].Basis);
+        Assert.True(ranked[Claim.Key(seen)].OwnsClaim);
+    }
+
+    [Fact]
+    public void Claim_TwoWindowsBothUnseenCannotBeOrdered()
+    {
+        // Neither was watched registering, so nothing distinguishes them but a guess.
+        TmuxPane a = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448");
+        TmuxPane b = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4448");
+
+        IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
+            [(a, 4448, 3), (b, 4448, 9)], _ => null, _ => DateTimeOffset.UnixEpoch);
+
+        Assert.All(ranked.Values, c => Assert.Equal(ClaimBasis.Inferred, c.Basis));
+        Assert.All(ranked.Values, c => Assert.False(c.OwnsClaim));
     }
 
     [Fact]

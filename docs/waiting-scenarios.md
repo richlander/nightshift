@@ -82,6 +82,14 @@ owner by seniority, marks it `(order inferred, not observed)`, and treats
 driving it is a coin toss whose losing side drives the agent that is not doing
 the work.
 
+Knowledge of who registered first is remembered between runs, and deliberately
+forgotten when it stops being true. Every sweep records the tmux server's
+identity per host; pane ids restart at `%0` when a server does, so after a reboot
+the remembered ids name *different* windows. Rather than hand one window
+another's registration, the tool drops that host's history and says so —
+ownership falls back to inferred, and nothing is driven until it has watched the
+registrations again.
+
 Contested PRs also surface in the main view without asking, because neither
 window looks wrong on its own — the contest is the finding.
 

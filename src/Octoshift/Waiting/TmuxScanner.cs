@@ -40,6 +40,15 @@ internal sealed record TmuxPane
     /// <summary>The host this window lives on, or null for this machine.</summary>
     public string? Host { get; init; }
 
+    /// <summary>
+    /// Identifies the tmux server this window belongs to: its pid and its oldest session's creation
+    /// time. Pane ids restart at <c>%0</c> when a server does, so the same id before and after a reboot
+    /// names two different windows — and history keyed on the id alone would hand one window another's
+    /// registration and present it as observed fact. The timestamp guards the pid against reuse across a
+    /// host reboot.
+    /// </summary>
+    public string Epoch { get; init; } = string.Empty;
+
     /// <summary>How the window is named in a report: <c>fernie cp:3</c>, or just <c>cp:3</c> locally.</summary>
     public string Where => Host is null ? Target : $"{Host} {Target}";
 
@@ -111,6 +120,7 @@ internal sealed class TmuxScanner
     /// </summary>
     private const string ScriptTemplate = """
         w=$(tmux list-windows -a -F '#{pane_id}|#{session_name}:#{window_index}|#{session_attached}|#{window_activity}|#{@agent_state}|#{window_name}') || exit 3
+        printf 'NONCE:epoch %s:%s\n' "$(tmux display-message -p '#{pid}')" "$(tmux list-sessions -F '#{session_created}' | sort -n | head -1)"
         printf 'NONCE:manifest\n%s\nNONCE:end\n' "$w"
         printf '%s\n' "$w" | while IFS= read -r m; do
           [ -n "$m" ] || continue
@@ -154,6 +164,7 @@ internal sealed class TmuxScanner
     /// </summary>
     internal static IReadOnlyList<TmuxPane> ParseCollection(string stdout, string? host, string nonce)
     {
+        string epochPrefix = nonce + ":epoch ";
         string manifestOpen = nonce + ":manifest";
         string manifestClose = nonce + ":end";
         string paneHeader = nonce + ":pane ";
@@ -165,6 +176,7 @@ internal sealed class TmuxScanner
         bool inManifest = false;
         bool manifestClosed = false;
         string? current = null;
+        string epoch = string.Empty;
 
         foreach (string line in stdout.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
         {
@@ -172,6 +184,11 @@ internal sealed class TmuxScanner
             {
                 if (!inManifest)
                 {
+                    if (line.StartsWith(epochPrefix, StringComparison.Ordinal))
+                    {
+                        epoch = line[epochPrefix.Length..].Trim();
+                    }
+
                     inManifest = line == manifestOpen;
                     continue;
                 }
@@ -182,10 +199,10 @@ internal sealed class TmuxScanner
                     continue;
                 }
 
-                if (ParseWindow(line, host) is { } window && windows.TryAdd(window.PaneId, window))
+                if (ParseWindow(line, host) is { } parsed && windows.TryAdd(parsed.PaneId, parsed with { Epoch = epoch }))
                 {
-                    order.Add(window.PaneId);
-                    captures[window.PaneId] = new StringBuilder();
+                    order.Add(parsed.PaneId);
+                    captures[parsed.PaneId] = new StringBuilder();
                 }
 
                 continue;

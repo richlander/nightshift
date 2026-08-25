@@ -79,9 +79,16 @@ internal readonly record struct Claim(
     /// Windows the tool has not seen register yet sort last, and ties break on a fixed key rather than
     /// collection order — an owner that changes identity between runs would be worse than no owner.
     /// </summary>
+    /// <param name="registeredAt">When a window was first seen claiming its PR, or null if never seen.</param>
+    /// <param name="sweptAt">
+    /// When a host was last collected in full under its current tmux server, or null if it has not been.
+    /// A window with no registration on a host swept before must have appeared since that sweep, which
+    /// places it after everything already recorded without guessing.
+    /// </param>
     public static IReadOnlyDictionary<string, Claim> Register(
         IEnumerable<(TmuxPane Pane, int PrNumber, int? Round)> claims,
-        Func<TmuxPane, DateTimeOffset?> registeredAt)
+        Func<TmuxPane, DateTimeOffset?> registeredAt,
+        Func<string?, DateTimeOffset?>? sweptAt = null)
     {
         var ranked = new Dictionary<string, Claim>(StringComparer.Ordinal);
 
@@ -94,18 +101,23 @@ internal readonly record struct Claim(
                 continue;
             }
 
-            // Ownership is only a fact when the tool watched them register. Registrations are separated
-            // in time — one agent starts, another joins later — so a run that was up for both has the
-            // real order, and a run that started after both has none.
-            bool observed = contenders.All(c => registeredAt(c.Pane) is not null)
-                && contenders.Select(c => registeredAt(c.Pane)).Distinct().Count() == contenders.Length;
+            DateTimeOffset?[] recorded = [.. contenders.Select(c => registeredAt(c.Pane))];
+            int unrecorded = recorded.Count(r => r is null);
+            DateTimeOffset[] known = [.. recorded.OfType<DateTimeOffset>()];
+
+            // The order is a fact when every recorded time is distinct and at most one window has no
+            // record at all — that one appeared since its host was last swept in full, so it is newest.
+            // Two unrecorded windows cannot be ordered against each other by anything but a guess.
+            bool observed = known.Length == known.Distinct().Count()
+                && unrecorded <= 1
+                && (unrecorded == 0 || contenders.Any(c => registeredAt(c.Pane) is null && sweptAt?.Invoke(c.Pane.Host) is not null));
 
             (TmuxPane Pane, int PrNumber, int? Round)[] ordered = [.. contenders
                 .OrderBy(c => registeredAt(c.Pane) ?? DateTimeOffset.MaxValue)
 
                 // Failing that, seniority: an agent at round 15 has held this work longer than one that
                 // just arrived. Self-reported and therefore weak, which is why it only breaks a tie and
-                // never grants the right to be driven.
+                // never by itself grants the right to be driven.
                 .ThenByDescending(c => c.Round ?? -1)
 
                 // Then a fixed key, so an owner does not change identity between sweeps.

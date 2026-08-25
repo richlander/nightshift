@@ -3,6 +3,22 @@ namespace Octoshift.Waiting;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
+/// <summary>What is known about one host between runs.</summary>
+internal sealed record HostMemory
+{
+    /// <summary>The tmux server this host's pane ids belong to.</summary>
+    [JsonPropertyName("epoch")]
+    public string? Epoch { get; init; }
+
+    /// <summary>
+    /// When this host was last collected in full. A window with no record on a host that has been swept
+    /// before must have appeared since that sweep, which is what lets an unseen claim be ordered after a
+    /// seen one without guessing.
+    /// </summary>
+    [JsonPropertyName("sweptAt")]
+    public DateTimeOffset? SweptAt { get; init; }
+}
+
 /// <summary>What a window's body looked like last time, and when it last differed.</summary>
 internal sealed record PaneMemory
 {
@@ -39,6 +55,7 @@ internal sealed class PaneHistory
 {
     private readonly string _path;
     private readonly Dictionary<string, PaneMemory> _entries;
+    private readonly Dictionary<string, HostMemory> _hosts;
 
     public PaneHistory(string? path = null)
     {
@@ -50,16 +67,52 @@ internal sealed class PaneHistory
 
         try
         {
-            _entries = File.Exists(_path)
-                ? JsonSerializer.Deserialize(File.ReadAllText(_path), PaneHistoryJsonContext.Default.DictionaryStringPaneMemory) ?? []
-                : [];
+            HistoryFile? file = File.Exists(_path)
+                ? JsonSerializer.Deserialize(File.ReadAllText(_path), PaneHistoryJsonContext.Default.HistoryFile)
+                : null;
+
+            _entries = file?.Panes ?? [];
+            _hosts = file?.Hosts ?? [];
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
         {
             // Losing the history costs one sweep of silence measurements, never correctness.
             _entries = [];
+            _hosts = [];
         }
     }
+
+    /// <summary>
+    /// Discards everything remembered about a host whose tmux server has restarted, and reports whether
+    /// the host was swept under this same server before.
+    /// </summary>
+    /// <remarks>
+    /// Pane ids restart at <c>%0</c> with the server, so after a reboot the remembered ids name different
+    /// windows. Keeping them would not merely be unhelpful — it would hand one window another's
+    /// registration time and present the result as observed fact. Dropping them costs a sweep of
+    /// measurements and degrades ownership to inferred, which is the honest state to be in.
+    /// </remarks>
+    public bool AdoptEpoch(string? host, string epoch, DateTimeOffset now)
+    {
+        string key = host ?? "local";
+        _hosts.TryGetValue(key, out HostMemory? known);
+
+        bool continuous = known?.Epoch is { Length: > 0 } && known.Epoch == epoch && known.SweptAt is not null;
+        if (!continuous && known?.Epoch != epoch)
+        {
+            foreach (string pane in _entries.Keys.Where(k => k.StartsWith(key + "|", StringComparison.Ordinal)).ToArray())
+            {
+                _entries.Remove(pane);
+            }
+        }
+
+        _hosts[key] = new HostMemory { Epoch = epoch, SweptAt = now };
+        return continuous;
+    }
+
+    /// <summary>When this host was last collected in full under the current server, if it was.</summary>
+    public DateTimeOffset? SweptAt(string? host)
+        => _hosts.TryGetValue(host ?? "local", out HostMemory? known) ? known.SweptAt : null;
 
     /// <summary>
     /// Records the current digest and returns how long the body has been unchanged, or null the first
@@ -112,7 +165,9 @@ internal sealed class PaneHistory
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
-            File.WriteAllText(_path, JsonSerializer.Serialize(_entries, PaneHistoryJsonContext.Default.DictionaryStringPaneMemory));
+            File.WriteAllText(_path, JsonSerializer.Serialize(
+                new HistoryFile { Panes = _entries, Hosts = _hosts },
+                PaneHistoryJsonContext.Default.HistoryFile));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -120,8 +175,18 @@ internal sealed class PaneHistory
     }
 }
 
+/// <summary>The on-disk shape: what is known per window, and per host.</summary>
+internal sealed record HistoryFile
+{
+    [JsonPropertyName("panes")]
+    public Dictionary<string, PaneMemory>? Panes { get; init; }
+
+    [JsonPropertyName("hosts")]
+    public Dictionary<string, HostMemory>? Hosts { get; init; }
+}
+
 [JsonSourceGenerationOptions(PropertyNameCaseInsensitive = true)]
-[JsonSerializable(typeof(Dictionary<string, PaneMemory>))]
+[JsonSerializable(typeof(HistoryFile))]
 internal partial class PaneHistoryJsonContext : JsonSerializerContext
 {
 }
