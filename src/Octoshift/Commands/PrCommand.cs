@@ -30,6 +30,7 @@ internal static class PrCommand
 
         FleetScan scan = await FleetScan.CollectAsync(hosts, ct);
         var history = new PaneHistory();
+        DateTimeOffset now = DateTimeOffset.UtcNow;
 
         // Windows claiming this PR through either channel: a published state, or the window name alone.
         var claims = new List<(TmuxPane Pane, AgentState State)>();
@@ -41,6 +42,20 @@ internal static class PrCommand
             }
         }
 
+        claims.Sort((a, b) =>
+        {
+            // Same ordering the sweep uses, so the owner is the same window in both views.
+            int byTime = (history.ClaimedAt(a.Pane) ?? DateTimeOffset.MaxValue)
+                .CompareTo(history.ClaimedAt(b.Pane) ?? DateTimeOffset.MaxValue);
+            if (byTime != 0)
+            {
+                return byTime;
+            }
+
+            int byHost = string.CompareOrdinal(a.Pane.Host ?? string.Empty, b.Pane.Host ?? string.Empty);
+            return byHost != 0 ? byHost : string.CompareOrdinal(a.Pane.PaneId, b.Pane.PaneId);
+        });
+
         var facts = new GhPrFactsSource(repo, new FileConditionalCache(), (args, token) => GhAuthenticatedRunner.RunGhAsync(args, null, token));
         PrFacts? prFacts = await facts.FetchAsync(prNumber, ct);
         if (prFacts is not null && !prFacts.MergeabilityKnown && !prFacts.Merged)
@@ -51,13 +66,13 @@ internal static class PrCommand
                     : prFacts;
         }
 
-        DateTimeOffset now = DateTimeOffset.UtcNow;
         // Observe every window, not only the ones claiming this PR: the history is shared with `waiting`,
         // and a run that recorded a subset would prune the rest and reset their silence measurements.
         Dictionary<string, TimeSpan?> silence = [];
         foreach (TmuxPane pane in scan.Panes)
         {
-            silence[pane.PaneId] = history.Observe(pane, now);
+            AgentState? owner = AgentState.Parse(pane.AgentStateOption, pane.WindowName);
+            silence[pane.PaneId] = history.Observe(pane, now, owner is { IsIssue: false } ? owner.PrNumber : null);
         }
 
         history.Save(scan.Panes);
@@ -93,7 +108,8 @@ internal static class PrCommand
         foreach ((TmuxPane pane, AgentState state) in claims)
         {
             string name = pane.WindowName.Length > 0 ? $" {pane.WindowName}" : string.Empty;
-            Console.WriteLine($"  where     {pane.Where}{name}   {Activity(pane, now, silence.GetValueOrDefault(pane.PaneId))}");
+            string role = claims.Count > 1 ? (ReferenceEquals(pane, claims[0].Pane) ? "  [owner]" : "  [follows]") : string.Empty;
+            Console.WriteLine($"  where     {pane.Where}{name}   {Activity(pane, now, silence.GetValueOrDefault(pane.PaneId))}{role}");
             if (Agent(state) is { Length: > 0 } line)
             {
                 Console.WriteLine($"  agent     {line}");
@@ -105,8 +121,18 @@ internal static class PrCommand
         if (claims.Count > 1)
         {
             bool sameHost = claims.Select(c => c.Pane.Host).Distinct().Count() == 1;
-            Console.WriteLine($"  CONFLICT  {claims.Count} windows claim this PR"
-                + (sameHost ? " on one host — they are likely sharing a worktree" : " across hosts"));
+            Console.WriteLine($"  CONTESTED {claims.Count} windows claim this PR"
+                + (sameHost ? " on one host — they are likely sharing a worktree" : " across hosts")
+                + $"; owner is {claims[0].Pane.Where}, the rest are followed and never driven");
+
+            // The one contested shape worth calling out: the owner is putting the claim down while a
+            // follower is still working, so ownership is with the window that is doing the least.
+            if (facts is not null
+                && Claim.IsReleasing(claims[0].State, WaitingVerdict.Resolve(claims[0].State, facts))
+                && claims.Skip(1).Any(c => c.Pane.Activity == PaneActivity.Working))
+            {
+                Console.WriteLine("            the owner is disengaging while a follower is active — consider promoting it");
+            }
         }
 
         Console.WriteLine($"  github    {Github(facts, now)}");

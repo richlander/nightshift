@@ -67,8 +67,23 @@ PR #4448  Add full-screen annotated source explorer
   github    open · mergeable · CI green · head ff04746cf
 ```
 
-Contested PRs also surface in the main view without asking, because neither window looks wrong on its
-own — the contest is the finding.
+**Both claims are kept, and ranked.** Rejecting the second loses work that is
+really happening; treating them as equals gives two owners and a fight. So the
+first to register owns the PR and the rest are *followed* — reported, named in
+the status bar with a `-follows` suffix, and never spoken to. Driving two agents
+on one PR is worse than either agent alone; forgetting the second is equally bad.
+
+Ownership is only claimed as a fact when the tool watched both windows register.
+Rivals rarely appear in the same moment — one agent starts, another joins later —
+which is what makes registration order meaningful, and what makes it unavailable
+to a run that started after both. In that case the report still names a likely
+owner by seniority, marks it `(order inferred, not observed)`, and treats
+**neither** window as actionable: guessing which agent began first and then
+driving it is a coin toss whose losing side drives the agent that is not doing
+the work.
+
+Contested PRs also surface in the main view without asking, because neither
+window looks wrong on its own — the contest is the finding.
 
 ## 3b. Is that second agent actually doing anything?
 

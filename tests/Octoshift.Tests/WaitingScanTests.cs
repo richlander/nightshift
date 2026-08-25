@@ -421,10 +421,11 @@ public class WaitingScanTests
     }
 
     [Fact]
-    public async Task BuildRows_FlagsAPrClaimedByMoreThanOneWindow()
+    public async Task BuildRows_RanksTwoClaimsOnOnePrRatherThanRejectingEither()
     {
         // Observed live: PR 4448 claimed by a working window on one host and a blocked one on another.
-        // Two agents on one PR fight, and finding that out by noticing the symptoms takes far longer.
+        // Rejecting the second loses work that is really happening; treating them as equals gives two
+        // owners and a fight. First registration owns it, the rest are followed.
         IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
             [
                 Pane("cp:9", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234 reviews=0/2", windowName: "pr4448"),
@@ -437,9 +438,77 @@ public class WaitingScanTests
             all: true,
             ct: TestContext.Current.CancellationToken);
 
-        Assert.Equal(2, rows.Count(r => r.Rivals.Count > 0));
-        Assert.All(rows.Where(r => r.Record?.PrNumber == 4448), r => Assert.Single(r.Rivals));
-        Assert.Empty(rows.Single(r => r.Record?.PrNumber == 4600).Rivals);
+        WaitingRow[] contested = [.. rows.Where(r => r.Record?.PrNumber == 4448)];
+        Assert.Equal(2, contested.Length);
+        Assert.Single(contested, r => r.Claim.Rank == ClaimRank.Owner);
+        Assert.Single(contested, r => r.Claim.Rank == ClaimRank.Follower);
+        Assert.All(contested, r => Assert.Single(r.Claim.Others));
+
+        // The uncontested one is unaffected.
+        Assert.Equal(ClaimRank.Sole, rows.Single(r => r.Record?.PrNumber == 4600).Claim.Rank);
+    }
+
+    [Fact]
+    public void Claim_OrdersByRegistrationNotByCollectionOrder()
+    {
+        // An owner that changes identity between sweeps is worse than no owner, so ranking is by when
+        // each window first claimed the PR — remembered, not derived from this sweep's ordering.
+        TmuxPane late = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448");
+        TmuxPane early = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4448");
+        DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+        IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
+            [(late, 4448, null), (early, 4448, null)],
+            p => p.PaneId == early.PaneId ? t : t.AddHours(1));
+
+        Assert.Equal(ClaimRank.Owner, ranked[Claim.Key(early)].Rank);
+        Assert.Equal(ClaimBasis.Observed, ranked[Claim.Key(early)].Basis);
+        Assert.True(ranked[Claim.Key(early)].OwnsClaim);
+        Assert.Equal(ClaimRank.Follower, ranked[Claim.Key(late)].Rank);
+    }
+
+    [Fact]
+    public void Claim_AWindowNeverSeenRegisteringSortsLast()
+    {
+        TmuxPane known = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448");
+        TmuxPane unknown = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4448");
+
+        IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
+            [(unknown, 4448, null), (known, 4448, null)],
+            p => p.PaneId == known.PaneId ? DateTimeOffset.UnixEpoch : null);
+
+        Assert.Equal(ClaimRank.Owner, ranked[Claim.Key(known)].Rank);
+        Assert.Equal(ClaimRank.Follower, ranked[Claim.Key(unknown)].Rank);
+    }
+
+    [Fact]
+    public void Claim_OwnershipNobodyWatchedIsNotOwnershipDecided()
+    {
+        // Rivals rarely appear in the same moment, so registration order is real — and unavailable to a
+        // run that started after both. Guessing which agent began first and then driving it is a coin
+        // toss whose losing side drives the agent that is not doing the work.
+        TmuxPane senior = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448");
+        TmuxPane junior = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4448");
+
+        IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
+            [(junior, 4448, 1), (senior, 4448, 15)],
+            _ => null);
+
+        // Seniority still orders them, so the report names a likely owner...
+        Assert.Equal(ClaimRank.Owner, ranked[Claim.Key(senior)].Rank);
+        Assert.Equal(ClaimBasis.Inferred, ranked[Claim.Key(senior)].Basis);
+
+        // ...but neither is entitled to be driven.
+        Assert.False(ranked[Claim.Key(senior)].OwnsClaim);
+        Assert.False(ranked[Claim.Key(junior)].OwnsClaim);
+    }
+
+    [Fact]
+    public void Claim_ASoleClaimIsAlwaysItsOwnOwner()
+    {
+        TmuxPane only = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448");
+
+        Assert.True(Claim.Register([(only, 4448, null)], _ => null)[Claim.Key(only)].OwnsClaim);
     }
 
     [Fact]
@@ -459,6 +528,48 @@ public class WaitingScanTests
             ct: TestContext.Current.CancellationToken);
 
         Assert.Equal(2, rows.Count);
+    }
+
+    [Fact]
+    public async Task BuildRows_AContestedPrIsNeverActedOnHoweverGoodItsEvidence()
+    {
+        // The fix for two agents on one PR is not to drive both of them carefully.
+        PrFacts ready = new()
+        {
+            Number = 4448,
+            HeadSha = "abc1234ff",
+            State = "open",
+            MergeableState = "clean",
+            Checks = [new CheckRunFact("ci", "completed", "success")],
+        };
+
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [
+                Pane("cp:1", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234 reviews=2/2 rec=merge", windowName: "pr4448"),
+                Pane("cp:2", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234 reviews=2/2 rec=merge", windowName: "pr4448"),
+            ],
+            (_, _) => Task.FromResult<PrFacts?>(ready),
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            DateTimeOffset.UtcNow,
+            all: true,
+            ct: TestContext.Current.CancellationToken);
+
+        // Both rows are READY on identical evidence, and neither may be acted on: the follower because
+        // it is a follower, the owner because this sweep is the first to see either of them, so which
+        // registered first is inferred rather than known.
+        Assert.All(rows, r => Assert.Equal(WaitingState.Ready, r.Verdict.State));
+        Assert.All(rows, r => Assert.False(r.MayAct));
+        Assert.All(rows, r => Assert.Equal(ClaimBasis.Inferred, r.Claim.Basis));
+    }
+
+    [Fact]
+    public void WindowNaming_MarksAFollowerSoItIsVisibleInTheStatusBar()
+    {
+        // Forgetting the second window is as bad as driving it. The suffix keeps it present.
+        var follower = new Claim(ClaimRank.Follower, [], null);
+
+        Assert.Equal("follows", WindowNaming.SuffixFor(
+            new(WaitingState.Ready, RowOwner.Operator, "reviews 2/2", Assurance.High), follower));
     }
 
     [Fact]

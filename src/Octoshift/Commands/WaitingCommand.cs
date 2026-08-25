@@ -25,10 +25,18 @@ internal sealed record WaitingRow
     public TimeSpan? SilentFor { get; init; }
 
     /// <summary>
-    /// Other windows claiming the same PR. Two agents on one PR fight; on one host they fight over the
-    /// same worktree, which is more destructive and more discoverable at once.
+    /// This window's standing among the windows claiming its PR. Two agents on one PR fight; on one host
+    /// they fight over the same worktree, which is more destructive and more discoverable at once.
     /// </summary>
-    public IReadOnlyList<TmuxPane> Rivals { get; init; } = [];
+    public Claim Claim { get; init; } = Claim.Sole;
+
+    /// <summary>
+    /// Whether a tool may speak to this window unattended. The verdict decides whether the PR's state
+    /// warrants it; the claim decides whether this window is the one entitled to hear it. A follower is
+    /// never spoken to however good its evidence, because the fix for two agents on one PR is not to
+    /// drive both of them carefully.
+    /// </summary>
+    public bool MayAct => Verdict.MayAct && Claim.OwnsClaim;
 }
 
 /// <summary>
@@ -182,16 +190,26 @@ internal static class WaitingCommand
 
         // A PR claimed by more than one window is a fight in progress. Computed across every host, since
         // the two halves of it are often not on the same machine.
-        ILookup<int, TmuxPane> claims = pending.ToLookup(e => e.State.PrNumber, e => e.Pane);
         var history = new PaneHistory();
+
+        // Register every claim before ranking, so a window seen for the first time this sweep still has
+        // a registration time to be ordered by.
+        foreach ((TmuxPane pane, AgentState state) in pending)
+        {
+            history.Observe(pane, now, state.IsIssue ? null : state.PrNumber);
+        }
+
+        IReadOnlyDictionary<string, Claim> claims = Claim.Register(
+            pending.Where(e => !e.State.IsIssue).Select(e => (e.Pane, e.State.PrNumber, e.State.Round)),
+            history.ClaimedAt);
 
         foreach ((TmuxPane pane, AgentState state) in pending)
         {
             rows.Add(Row(pane, state, WaitingVerdict.Resolve(state, state.IsIssue ? null : seen.GetValueOrDefault(state.PrNumber)), now)
                 with
                 {
-                    Rivals = [.. claims[state.PrNumber].Where(p => p.PaneId != pane.PaneId || p.Host != pane.Host)],
-                    SilentFor = history.Observe(pane, now),
+                    Claim = claims.GetValueOrDefault(Claim.Key(pane), Claim.Sole),
+                    SilentFor = history.Observe(pane, now, state.IsIssue ? null : state.PrNumber),
                 });
         }
 
@@ -202,7 +220,7 @@ internal static class WaitingCommand
         // The operator's queue first, longest wait at the top: after hours away, the row that has been
         // stuck longest is the one that cost the most.
         return rows
-            .Where(r => all || r.Verdict.NeedsAttention || r.Record?.Defects.Count > 0 || r.Rivals.Count > 0)
+            .Where(r => all || r.Verdict.NeedsAttention || r.Record?.Defects.Count > 0 || r.Claim.IsContested)
             .OrderByDescending(r => r.Verdict.NeedsAttention)
             .ThenBy(r => r.Verdict.Severity)
             .ThenByDescending(r => r.StoppedFor ?? TimeSpan.Zero)
@@ -218,7 +236,7 @@ internal static class WaitingCommand
         foreach (IGrouping<string?, WaitingRow> host in rows.GroupBy(r => r.Pane.Host))
         {
             (TmuxPane Pane, string Desired)[] renames = [.. host
-                .Select(r => (r.Pane, Desired: WindowNaming.Apply(r.Pane.WindowName, WindowNaming.SuffixFor(r.Verdict))))
+                .Select(r => (r.Pane, Desired: WindowNaming.Apply(r.Pane.WindowName, WindowNaming.SuffixFor(r.Verdict, r.Claim))))
                 .Where(r => !string.Equals(r.Desired, r.Pane.WindowName, StringComparison.Ordinal))];
 
             if (WindowNaming.BuildRenameScript(renames) is { } script)
@@ -251,7 +269,7 @@ internal static class WaitingCommand
         // Said on every run, including when the number is zero. A tool that speaks to agents only when it
         // is sure has to be legible about when it was not, or "it did nothing" and "it saw nothing" look
         // the same from here.
-        int actionable = rows.Count(r => r.Verdict.MayAct);
+        int actionable = rows.Count(r => r.MayAct);
         int unsure = rows.Count(r => !r.Verdict.Assurance.MayAct);
         Console.WriteLine($"NOT ACTED nothing was sent to any agent; {actionable} row(s) met the bar to act, {unsure} did not");
 
@@ -287,13 +305,15 @@ internal static class WaitingCommand
     private static string Detail(WaitingRow row)
     {
         string detail = row.Verdict.Reason;
-        if (row.Rivals.Count > 0)
+        if (row.Claim.IsContested)
         {
             // Same host is called out separately: those two are sharing a worktree, so the damage is
             // direct rather than a race to push.
-            bool sameHost = row.Rivals.Any(r => r.Host == row.Pane.Host);
-            detail += $"  [!] also claimed by {string.Join(", ", row.Rivals.Select(r => r.Where))}"
-                + (sameHost ? " — same host, likely one worktree" : string.Empty);
+            bool sameHost = row.Claim.Others.Any(r => r.Host == row.Pane.Host);
+            string role = row.Claim.IsFollower ? "FOLLOWER of" : "OWNER; also claimed by";
+            string basis = row.Claim.Basis == ClaimBasis.Inferred ? " (order inferred, not observed)" : string.Empty;
+            detail += $"  [!] {role} {string.Join(", ", row.Claim.Others.Select(r => r.Where))}"
+                + (sameHost ? " — same host, likely one worktree" : string.Empty) + basis;
         }
 
         if (row.Verdict.Assurance.Caveat is { Length: > 0 } caveat)
@@ -451,14 +471,15 @@ internal static class WaitingCommand
                 writer.WriteString("caveat", caveat);
             }
 
-            writer.WriteBoolean("mayAct", row.Verdict.MayAct);
+            writer.WriteBoolean("mayAct", row.MayAct);
             writer.WriteBoolean("acted", false);
-            if (row.Rivals.Count > 0)
+            if (row.Claim.IsContested)
             {
+                writer.WriteString("claim", row.Claim.Rank.ToString().ToLowerInvariant());
                 writer.WriteStartArray("alsoClaimedBy");
-                foreach (TmuxPane rival in row.Rivals)
+                foreach (TmuxPane other in row.Claim.Others)
                 {
-                    writer.WriteStringValue(rival.Where);
+                    writer.WriteStringValue(other.Where);
                 }
 
                 writer.WriteEndArray();

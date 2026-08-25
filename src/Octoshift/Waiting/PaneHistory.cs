@@ -11,6 +11,19 @@ internal sealed record PaneMemory
 
     [JsonPropertyName("since")]
     public DateTimeOffset Since { get; init; }
+
+    /// <summary>The PR this window was claiming when first seen to claim it.</summary>
+    [JsonPropertyName("pr")]
+    public int? ClaimedPr { get; init; }
+
+    /// <summary>
+    /// When this window first claimed that PR. This is the registration order two claims are ranked by,
+    /// so it has to be remembered rather than derived: anything computed fresh each sweep — window index,
+    /// last activity, position in the collected list — can reorder between runs, and an ownership that
+    /// flips is worse than none.
+    /// </summary>
+    [JsonPropertyName("claimedAt")]
+    public DateTimeOffset? ClaimedAt { get; init; }
 }
 
 /// <summary>
@@ -52,17 +65,40 @@ internal sealed class PaneHistory
     /// Records the current digest and returns how long the body has been unchanged, or null the first
     /// time a window is seen.
     /// </summary>
-    public TimeSpan? Observe(TmuxPane pane, DateTimeOffset now)
+    public TimeSpan? Observe(TmuxPane pane, DateTimeOffset now, int? claimedPr = null)
     {
-        string key = $"{pane.Host ?? "local"}|{pane.PaneId}";
-        if (_entries.TryGetValue(key, out PaneMemory? previous) && previous.Digest == pane.BodyDigest)
+        string key = Key(pane);
+        _entries.TryGetValue(key, out PaneMemory? previous);
+
+        // A window keeps its registration for as long as it keeps claiming the same PR. Switching PRs is
+        // a fresh registration, and goes to the back of the queue.
+        bool sameClaim = previous?.ClaimedPr == claimedPr;
+        DateTimeOffset? claimedAt = claimedPr is null ? null
+            : sameClaim && previous?.ClaimedAt is { } held ? held
+            : now;
+
+        if (previous is not null && previous.Digest == pane.BodyDigest)
         {
+            _entries[key] = previous with { ClaimedPr = claimedPr, ClaimedAt = claimedAt };
             return now - previous.Since;
         }
 
-        _entries[key] = new PaneMemory { Digest = pane.BodyDigest, Since = now };
+        _entries[key] = new PaneMemory
+        {
+            Digest = pane.BodyDigest,
+            Since = now,
+            ClaimedPr = claimedPr,
+            ClaimedAt = claimedAt,
+        };
+
         return previous is null ? null : TimeSpan.Zero;
     }
+
+    /// <summary>When this window first claimed the PR it now claims, or null if it is not registered.</summary>
+    public DateTimeOffset? ClaimedAt(TmuxPane pane)
+        => _entries.TryGetValue(Key(pane), out PaneMemory? entry) ? entry.ClaimedAt : null;
+
+    private static string Key(TmuxPane pane) => $"{pane.Host ?? "local"}|{pane.PaneId}";
 
     /// <summary>Drops windows that no longer exist, so a long-lived file does not grow without bound.</summary>
     public void Save(IEnumerable<TmuxPane> live)

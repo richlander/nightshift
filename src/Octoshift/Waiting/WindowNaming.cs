@@ -19,7 +19,7 @@ using System.Text.RegularExpressions;
 internal static partial class WindowNaming
 {
     /// <summary>Every suffix the tool owns. Any of these is stripped before a new one is applied.</summary>
-    private static readonly string[] Owned = ["blocked", "conflict", "merged", "ready", "stale", "ask"];
+    private static readonly string[] Owned = ["blocked", "conflict", "merged", "ready", "stale", "ask", "follows"];
 
     /// <summary>The suffix a verdict earns, or null when the window should carry none.</summary>
     /// <remarks>
@@ -27,8 +27,15 @@ internal static partial class WindowNaming
     /// unambiguous and worth acting on; everything else leaves the base name clean rather than crowding
     /// the status bar with detail the row already gives.
     /// </remarks>
-    internal static string? SuffixFor(WaitingVerdict verdict)
+    internal static string? SuffixFor(WaitingVerdict verdict, Claim claim = default)
     {
+        // A follower is second-class and must stay visible as such. The status bar is where the operator
+        // notices which window to talk to, so the standing belongs there rather than only in a report.
+        if (claim.IsFollower)
+        {
+            return "follows";
+        }
+
         // A low-confidence verdict must not be published as a fact in the one place that is read without
         // context. The row can say "probably"; a window name cannot.
         if (verdict.Assurance.Level == Confidence.Low)
