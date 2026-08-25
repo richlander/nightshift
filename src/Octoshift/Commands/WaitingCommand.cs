@@ -131,8 +131,9 @@ internal static class WaitingCommand
             if (pane.Activity == PaneActivity.Blocked)
             {
                 // A held-open prompt is answered with a keystroke, not with a GitHub lookup.
+                // The pane itself is the evidence, and it is unambiguous: a prompt is open.
                 rows.Add(Row(pane, record, new WaitingVerdict(
-                    WaitingState.NeedsOperator, RowOwner.Operator, "prompt open; awaiting a keystroke"), now));
+                    WaitingState.NeedsOperator, RowOwner.Operator, "prompt open; awaiting a keystroke", Assurance.High), now));
                 continue;
             }
 
@@ -143,7 +144,8 @@ internal static class WaitingCommand
                 if (all)
                 {
                     rows.Add(Row(pane, null, new WaitingVerdict(
-                        WaitingState.Unknown, RowOwner.Nobody, "no published state and no pr#### window name"), now));
+                        WaitingState.Unknown, RowOwner.Nobody, "no published state and no pr#### window name",
+                        Assurance.Low("nothing identifies this window")), now));
                 }
 
                 continue;
@@ -211,18 +213,26 @@ internal static class WaitingCommand
             ? $"ATTENTION {attention} of {rows.Count} window(s) need you"
             : $"QUIET {rows.Count} window(s), none need you");
 
+        // Said on every run, including when the number is zero. A tool that speaks to agents only when it
+        // is sure has to be legible about when it was not, or "it did nothing" and "it saw nothing" look
+        // the same from here.
+        int actionable = rows.Count(r => r.Verdict.MayAct);
+        int unsure = rows.Count(r => !r.Verdict.Assurance.MayAct);
+        Console.WriteLine($"NOT ACTED nothing was sent to any agent; {actionable} row(s) met the bar to act, {unsure} did not");
+
         if (rows.Count > 0)
         {
             Console.WriteLine();
             // Built by Add: inside a collection initializer, `[...]` parses as an indexed element.
             var table = new List<string[]>();
-            table.Add(["WINDOW", "PR", "STATE", "FOR", "DETAIL"]);
+            table.Add(["WINDOW", "PR", "STATE", "CONF", "FOR", "DETAIL"]);
             foreach (WaitingRow row in rows)
             {
                 table.Add([
                     row.Pane.Where + (row.Pane.WindowName.Length > 0 ? $" {row.Pane.WindowName}" : string.Empty),
                     row.Record is null ? "-" : $"#{row.Record.PrNumber}{(row.Record.Source == StateSource.WindowName ? "~" : string.Empty)}",
                     row.Verdict.State.ToString().ToUpperInvariant(),
+                    row.Verdict.Assurance.Label,
                     Duration(row.StoppedFor),
                     Detail(row),
                 ]);
@@ -242,6 +252,12 @@ internal static class WaitingCommand
     private static string Detail(WaitingRow row)
     {
         string detail = row.Verdict.Reason;
+        if (row.Verdict.Assurance.Caveat is { Length: > 0 } caveat)
+        {
+            // Say what would have been needed, not merely that the tool was unsure.
+            detail += $"  (~ {caveat})";
+        }
+
         if (row.Record?.Defects is { Count: > 0 } defects)
         {
             // Reported, never repaired: a state that contradicts itself is a signal about the agent.
@@ -385,6 +401,14 @@ internal static class WaitingCommand
             writer.WriteString("state", row.Verdict.State.ToString().ToLowerInvariant());
             writer.WriteString("owner", row.Verdict.Owner.ToString().ToLowerInvariant());
             writer.WriteString("reason", row.Verdict.Reason);
+            writer.WriteString("confidence", row.Verdict.Assurance.Label);
+            if (row.Verdict.Assurance.Caveat is { } caveat)
+            {
+                writer.WriteString("caveat", caveat);
+            }
+
+            writer.WriteBoolean("mayAct", row.Verdict.MayAct);
+            writer.WriteBoolean("acted", false);
             if (row.StoppedFor is { } stopped)
             {
                 writer.WriteNumber("stoppedForSeconds", (long)stopped.TotalSeconds);

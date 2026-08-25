@@ -67,9 +67,13 @@ internal enum RowOwner
 /// <param name="State">The resolved state.</param>
 /// <param name="Owner">Whose attention this row belongs to.</param>
 /// <param name="Reason">One line naming the specific fact behind the state.</param>
-internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owner, string Reason)
+/// <param name="Assurance">How far the evidence behind it can be relied on, and why not further.</param>
+internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owner, string Reason, Assurance Assurance)
 {
     public bool NeedsAttention => Owner == RowOwner.Operator;
+
+    /// <summary>Whether a tool may speak to this window unattended.</summary>
+    public bool MayAct => Assurance.MayAct && State is WaitingState.Unblocked or WaitingState.Ready;
 
     /// <summary>
     /// Sort key for the operator's queue, most urgent first. Confirmed problems rank above "cannot tell
@@ -98,30 +102,32 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
     {
         ArgumentNullException.ThrowIfNull(state);
 
+        Assurance assurance = Assess(state, facts);
+
         // An issue-tracking window has no PR to check, so there is nothing on GitHub to join it against.
         if (state.IsIssue)
         {
             return state.Recommendation switch
             {
-                Recommendation.Stop => new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to stop; grant or decline"),
-                Recommendation.Approve => new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to authorise more rounds"),
-                _ => new(WaitingState.Holding, RowOwner.Nobody, $"tracking issue #{state.PrNumber}; no PR yet"),
+                Recommendation.Stop => new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to stop; grant or decline", assurance),
+                Recommendation.Approve => new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to authorise more rounds", assurance),
+                _ => new(WaitingState.Holding, RowOwner.Nobody, $"tracking issue #{state.PrNumber}; no PR yet", assurance),
             };
         }
 
         if (facts is null)
         {
-            return new(WaitingState.Unknown, RowOwner.Operator, $"could not read PR #{state.PrNumber} from GitHub");
+            return new(WaitingState.Unknown, RowOwner.Operator, $"could not read PR #{state.PrNumber} from GitHub", assurance);
         }
 
         if (facts.Merged)
         {
-            return new(WaitingState.Merged, RowOwner.Operator, $"PR #{facts.Number} merged; the window is done");
+            return new(WaitingState.Merged, RowOwner.Operator, $"PR #{facts.Number} merged; the window is done", assurance);
         }
 
         if (string.Equals(facts.State, "closed", StringComparison.OrdinalIgnoreCase))
         {
-            return new(WaitingState.Closed, RowOwner.Operator, $"PR #{facts.Number} closed without merging");
+            return new(WaitingState.Closed, RowOwner.Operator, $"PR #{facts.Number} closed without merging", assurance);
         }
 
         // Head divergence voids the record before anything in it is evaluated: every claim was made about
@@ -129,19 +135,19 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         if (state.Head is not null && !ShaMatches(state.Head, facts.HeadSha))
         {
             return new(WaitingState.Stale, RowOwner.Operator,
-                $"record describes {Short(state.Head)}, GitHub head is {Short(facts.HeadSha)}");
+                $"record describes {Short(state.Head)}, GitHub head is {Short(facts.HeadSha)}", assurance);
         }
 
         // Stop and Approve both need an answer before anything moves, and an escalation outranks whatever
         // the branch looks like — a person is already required.
         if (state.Recommendation == Recommendation.Stop)
         {
-            return new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to stop; grant or decline");
+            return new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to stop; grant or decline", assurance);
         }
 
         if (state.Recommendation == Recommendation.Approve)
         {
-            return new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to authorise more rounds");
+            return new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to authorise more rounds", assurance);
         }
 
         // Everything below decides whether a window is finished, so every one of these gates fails closed.
@@ -161,14 +167,14 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         // blocker is exactly how `blocked=ci rec=wait` would otherwise fall through into the merge queue.
         if (declaredDone && state.Defects.Count > 0)
         {
-            return new(WaitingState.Untrustworthy, RowOwner.Operator, "reported done, but the state contradicts itself");
+            return new(WaitingState.Untrustworthy, RowOwner.Operator, "reported done, but the state contradicts itself", assurance);
         }
 
         // Falsifiability is the point of `head`. Without one there is nothing tying the claim to a
         // revision, so it can be neither confirmed nor refuted.
         if (declaredDone && state.Head is null)
         {
-            return new(WaitingState.Untrustworthy, RowOwner.Operator, "reported done without a head to check it against");
+            return new(WaitingState.Untrustworthy, RowOwner.Operator, "reported done without a head to check it against", assurance);
         }
 
         if (facts.IsConflicting)
@@ -177,8 +183,8 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
             // sequencing against a moving main is an operator call, and repeated conflict passes are the
             // waste this tool exists to remove.
             return declaredDone
-                ? new(WaitingState.Contradicted, RowOwner.Operator, "reported done, but the branch is CONFLICTING")
-                : new(WaitingState.Conflicting, RowOwner.Agent, "CONFLICTING; integrate a later main");
+                ? new(WaitingState.Contradicted, RowOwner.Operator, "reported done, but the branch is CONFLICTING", assurance)
+                : new(WaitingState.Conflicting, RowOwner.Agent, "CONFLICTING; integrate a later main", assurance);
         }
 
         // The declared predicate is evaluated before the generic gates, because it is the agent's own
@@ -186,7 +192,7 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         // uncomputed-mergeability case.
         if (state.Waiting.Kind != WaitKind.None)
         {
-            WaitingVerdict? predicate = EvaluateWait(state, facts);
+            WaitingVerdict? predicate = EvaluateWait(state, facts, assurance);
             if (predicate is { } resolved)
             {
                 return resolved;
@@ -196,8 +202,8 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         if (!facts.MergeabilityKnown)
         {
             return declaredDone
-                ? new(WaitingState.MergeUnverified, RowOwner.Operator, "reported done, but GitHub has not computed mergeability")
-                : new(WaitingState.MergeUnverified, RowOwner.Nobody, "mergeability not yet computed");
+                ? new(WaitingState.MergeUnverified, RowOwner.Operator, "reported done, but GitHub has not computed mergeability", assurance)
+                : new(WaitingState.MergeUnverified, RowOwner.Nobody, "mergeability not yet computed", assurance);
         }
 
         // Wait is the one recommendation that needs no decision — the agent resumes itself when the
@@ -205,7 +211,7 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         if (state.Recommendation == Recommendation.Wait && state.Blocked.Count > 0)
         {
             return new(WaitingState.Holding, RowOwner.Nobody,
-                $"parked behind {string.Join(", ", state.Blocked.Select(b => "#" + b))}");
+                $"parked behind {string.Join(", ", state.Blocked.Select(b => "#" + b))}", assurance);
         }
 
         if (!declaredDone)
@@ -215,12 +221,12 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
             if (state.ReviewsMeetBar)
             {
                 return new(WaitingState.Holding, RowOwner.Nobody,
-                    $"rec={state.Recommendation.ToString().ToLowerInvariant()}; reviews {state.ReviewsClean}/{state.ReviewsRequired} is not a claim of done");
+                    $"rec={state.Recommendation.ToString().ToLowerInvariant()}; reviews {state.ReviewsClean}/{state.ReviewsRequired} is not a claim of done", assurance);
             }
 
             return state.ReviewsRequired is > 0
-                ? new(WaitingState.Holding, RowOwner.Nobody, $"reviews {state.ReviewsClean ?? 0}/{state.ReviewsRequired}")
-                : new(WaitingState.Holding, RowOwner.Nobody, "in progress");
+                ? new(WaitingState.Holding, RowOwner.Nobody, $"reviews {state.ReviewsClean ?? 0}/{state.ReviewsRequired}", assurance)
+                : new(WaitingState.Holding, RowOwner.Nobody, "in progress", assurance);
         }
 
         // Known, and not conflicting, but still not a state that says the branch can merge: `behind`,
@@ -228,7 +234,7 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         if (!facts.IsMergeable)
         {
             return new(WaitingState.NotMergeable, RowOwner.Operator,
-                $"reported done, but GitHub says {facts.MergeableState}");
+                $"reported done, but GitHub says {facts.MergeableState}", assurance);
         }
 
         // Reviews meet the bar and the branch merges. CI is reported but is deliberately not a gate: it
@@ -240,63 +246,105 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
                 ? $"; CI red ({failed.Name})"
                 : facts.Checks.Any(c => !c.IsComplete) ? "; CI still running" : string.Empty;
 
-        return new(WaitingState.Ready, RowOwner.Operator, $"reviews {state.ReviewsClean}/{state.ReviewsRequired}, mergeable{ci}");
+        // `reviews` is self-reported and measurably unreliable: two windows on one fleet published 2/2
+        // while their own round reports read "converging". So a Ready that rests on the count alone is
+        // never high — it needs a second, independently written field saying the same thing. Where both
+        // agree and the record is otherwise clean, every observed case was correct.
+        Assurance readiness = assurance.Level == Confidence.High && state.Recommendation != Recommendation.Merge
+            ? Assurance.Medium("reviews=2/2 is uncorroborated; rec does not also say merge")
+            : assurance;
+
+        return new(WaitingState.Ready, RowOwner.Operator, $"reviews {state.ReviewsClean}/{state.ReviewsRequired}, mergeable{ci}", readiness);
     }
 
     /// <summary>
     /// Resolves a <c>waiting=</c> predicate, or null to fall through to the generic gates. Clearing is
     /// reported rather than acted on: nothing here wakes the agent, so the row goes to the operator.
     /// </summary>
-    private static WaitingVerdict? EvaluateWait(AgentState state, PrFacts facts)
+    private static WaitingVerdict? EvaluateWait(AgentState state, PrFacts facts, Assurance assurance)
     {
         switch (state.Waiting.Kind)
         {
             case WaitKind.Review:
                 // Nothing on GitHub can answer this one; only the agent knows.
-                return new(WaitingState.Holding, RowOwner.Nobody, "review round outstanding");
+                return new(WaitingState.Holding, RowOwner.Nobody, "review round outstanding", assurance);
 
             case WaitKind.Merge:
                 return !facts.MergeabilityKnown
-                    ? new(WaitingState.Holding, RowOwner.Nobody, "waiting on mergeability; not yet computed")
+                    ? new(WaitingState.Holding, RowOwner.Nobody, "waiting on mergeability; not yet computed", assurance)
                     : facts.IsMergeable
-                        ? new(WaitingState.Unblocked, RowOwner.Operator, "waited on mergeability, and the branch now merges")
-                        : new(WaitingState.NotMergeable, RowOwner.Operator, $"waited on mergeability; GitHub says {facts.MergeableState}");
+                        ? new(WaitingState.Unblocked, RowOwner.Operator, "waited on mergeability, and the branch now merges", assurance)
+                        : new(WaitingState.NotMergeable, RowOwner.Operator, $"waited on mergeability; GitHub says {facts.MergeableState}", assurance);
 
             case WaitKind.Checks:
                 if (!facts.ChecksKnown)
                 {
-                    return new(WaitingState.Holding, RowOwner.Nobody, "waiting on checks; the check list could not be read");
+                    return new(WaitingState.Holding, RowOwner.Nobody, "waiting on checks; the check list could not be read", assurance);
                 }
 
                 return facts.Checks.Any(c => !c.IsComplete)
-                    ? new(WaitingState.Holding, RowOwner.Nobody, $"waiting on {facts.Checks.Count(c => !c.IsComplete)} check(s)")
-                    : new(WaitingState.Unblocked, RowOwner.Operator, "waited on checks, and they have all concluded");
+                    ? new(WaitingState.Holding, RowOwner.Nobody, $"waiting on {facts.Checks.Count(c => !c.IsComplete)} check(s)", assurance)
+                    : new(WaitingState.Unblocked, RowOwner.Operator, "waited on checks, and they have all concluded", assurance);
 
             case WaitKind.Check:
                 string name = state.Waiting.CheckName!;
                 if (!facts.ChecksKnown)
                 {
-                    return new(WaitingState.Holding, RowOwner.Nobody, $"waiting on {name}; the check list could not be read");
+                    return new(WaitingState.Holding, RowOwner.Nobody, $"waiting on {name}; the check list could not be read", assurance);
                 }
 
                 CheckRunFact? check = facts.FindCheck(name);
                 if (check is null)
                 {
-                    return new(WaitingState.Holding, RowOwner.Nobody, $"{name} has not reported on {Short(facts.HeadSha)}");
+                    return new(WaitingState.Holding, RowOwner.Nobody, $"{name} has not reported on {Short(facts.HeadSha)}", assurance);
                 }
 
                 if (!check.IsComplete)
                 {
-                    return new(WaitingState.Holding, RowOwner.Nobody, $"{name} is {check.Status}");
+                    return new(WaitingState.Holding, RowOwner.Nobody, $"{name} is {check.Status}", assurance);
                 }
 
                 return check.IsFailure
-                    ? new(WaitingState.Unblocked, RowOwner.Operator, $"waited on {name}, which concluded {check.Conclusion}")
-                    : new(WaitingState.Unblocked, RowOwner.Operator, $"waited on {name}, which passed");
+                    ? new(WaitingState.Unblocked, RowOwner.Operator, $"waited on {name}, which concluded {check.Conclusion}", assurance)
+                    : new(WaitingState.Unblocked, RowOwner.Operator, $"waited on {name}, which passed", assurance);
 
             default:
                 return null;
         }
+    }
+
+    /// <summary>
+    /// Grades the evidence a verdict will rest on. Deliberately pessimistic: every downgrade here was
+    /// observed on a live fleet rather than imagined, and the cost of overrating a record is that a tool
+    /// eventually speaks to an agent on the strength of something the agent did not mean.
+    /// </summary>
+    private static Assurance Assess(AgentState state, PrFacts? facts)
+    {
+        if (facts is null && !state.IsIssue)
+        {
+            return Assurance.Low("GitHub could not be read");
+        }
+
+        // A record that contradicts itself tells you the agent was not tracking the contract, which is a
+        // statement about everything else it wrote, not only the field that is wrong.
+        if (state.Defects.Count > 0)
+        {
+            return Assurance.Low($"the record contradicts itself ({state.Defects.Count} defect(s))");
+        }
+
+        if (state.Source == StateSource.WindowName)
+        {
+            return Assurance.Medium("identity read from the window name; the agent published no state");
+        }
+
+        // Without a head nothing ties the claims to a revision, so they can be neither confirmed nor
+        // refuted — the same reason a headless record cannot claim to be done.
+        if (state.Head is null)
+        {
+            return Assurance.Medium("no head to check the claims against");
+        }
+
+        return Assurance.High;
     }
 
     private static bool ShaMatches(string recorded, string actual)

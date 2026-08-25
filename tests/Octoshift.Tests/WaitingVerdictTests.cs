@@ -88,6 +88,74 @@ public class WaitingVerdictTests
     }
 
     [Fact]
+    public void Confidence_ACleanCorroboratedRecordIsTheOnlyThingActedOn()
+    {
+        // Two independently written fields saying the same thing, on a head GitHub agrees with. In the
+        // observed fleet every record of this shape was correct.
+        WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e25 round=2 reviews=2/2 rec=merge"), Facts());
+
+        Assert.Equal(WaitingState.Ready, v.State);
+        Assert.Equal(Confidence.High, v.Assurance.Level);
+        Assert.True(v.MayAct);
+    }
+
+    [Fact]
+    public void Confidence_ReviewsAloneIsNeverEnoughToActOn()
+    {
+        // `reviews=2/2` with no recommendation corroborating it: two windows published a 2/2 count while
+        // their own round reports read "converging". The verdict still shows, but nothing may be sent.
+        WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e25 round=2 reviews=2/2"), Facts());
+
+        Assert.Equal(WaitingState.Ready, v.State);
+        Assert.NotEqual(Confidence.High, v.Assurance.Level);
+        Assert.False(v.MayAct);
+        Assert.Contains("uncorroborated", v.Assurance.Caveat!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Confidence_ADefectiveRecordIsLowEverywhereNotOnlyInTheFieldThatIsWrong()
+    {
+        // A record that contradicts itself says the agent was not tracking the contract, which bears on
+        // everything else it wrote.
+        WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e25 reviews=2/2 blocked=ci rec=merge"), Facts());
+
+        Assert.Equal(Confidence.Low, v.Assurance.Level);
+        Assert.False(v.MayAct);
+    }
+
+    [Fact]
+    public void Confidence_AnInferredIdentityCapsAtMedium()
+    {
+        WaitingVerdict v = WaitingVerdict.Resolve(AgentState.Parse(null, "pr4595")!, Facts());
+
+        Assert.Equal(Confidence.Medium, v.Assurance.Level);
+        Assert.False(v.MayAct);
+        Assert.Contains("window name", v.Assurance.Caveat!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Confidence_AClearedWaitOnACleanRecordMayBeActedOn()
+    {
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=1/2 waiting=check:ci-required rec=wait"),
+            Facts(checks: [new CheckRunFact("ci-required", "completed", "success")]));
+
+        Assert.Equal(WaitingState.Unblocked, v.State);
+        Assert.True(v.MayAct);
+    }
+
+    [Fact]
+    public void Confidence_HoldingIsNeverActedOnEvenAtHighConfidence()
+    {
+        // Confidence is about the evidence; acting also needs a state where speaking means something.
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=0/2 blocked=4629 rec=wait"), Facts());
+
+        Assert.Equal(Confidence.High, v.Assurance.Level);
+        Assert.False(v.MayAct);
+    }
+
+    [Fact]
     public void Resolve_UnreadablePrGoesToTheOperator()
     {
         WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e25 reviews=1/2"), null);
