@@ -31,7 +31,7 @@ internal sealed record WaitingRow
 /// </remarks>
 internal static class WaitingCommand
 {
-    public static async Task<int> RunAsync(string? repoFlag, bool all, bool json, CancellationToken ct)
+    public static async Task<int> RunAsync(string? repoFlag, IReadOnlyList<string> hosts, bool all, bool json, CancellationToken ct)
     {
         string? repo = RepoScope.Resolve(repoFlag);
         if (repo is null)
@@ -40,30 +40,27 @@ internal static class WaitingCommand
             return ExitCode.Usage;
         }
 
-        var scanner = new TmuxScanner();
-        IReadOnlyList<TmuxPane> panes;
-        try
-        {
-            panes = await scanner.ScanAsync(ct);
-        }
-        catch (TmuxUnavailableException ex)
-        {
-            // An unreachable tmux and an idle fleet are different answers; reporting QUIET for both is
-            // how a silent tool gets mistaken for a quiet one.
-            if (json)
-            {
-                WriteJsonError(ex.Message);
-            }
-            else
-            {
-                Console.Error.WriteLine($"octoshift: tmux unavailable: {ex.Message}");
-            }
+        // No --host means this machine. Named hosts are collected over ssh, one command each, and the
+        // GitHub half stays here: putting a collector on every host would mean a cache and a rate-limit
+        // budget on every host too, which is the condition this tool exists to remove.
+        IReadOnlyList<string?> targets = hosts.Count > 0 ? [.. hosts] : [null];
 
-            return ExitCode.Unavailable;
+        var panes = new List<TmuxPane>();
+        var unreachable = new List<string>();
+        foreach (string? host in targets)
+        {
+            try
+            {
+                panes.AddRange(await new TmuxScanner(host).ScanAsync(ct));
+            }
+            catch (TmuxUnavailableException ex)
+            {
+                // One unreachable host must not hide the others, and must not be silently absorbed
+                // either — a fleet that is partly invisible looks exactly like a fleet that is quiet.
+                unreachable.Add(ex.Message);
+            }
         }
 
-        // The operator's own gh auth, on purpose: this is a hand-run report, and the App installation
-        // token is a separate bucket reserved for the resident daemon so it does not compete with agents.
         var facts = new GhPrFactsSource(
             repo,
             new FileConditionalCache(),
@@ -73,14 +70,14 @@ internal static class WaitingCommand
 
         if (json)
         {
-            WriteJson(rows, facts);
+            WriteJson(rows, facts, unreachable);
         }
         else
         {
-            WriteTable(rows, facts);
+            WriteTable(rows, facts, unreachable);
         }
 
-        return ExitCode.Ok;
+        return unreachable.Count > 0 ? ExitCode.Unavailable : ExitCode.Ok;
     }
 
     /// <summary>
@@ -188,7 +185,7 @@ internal static class WaitingCommand
             StoppedFor = pane.LastActivity is { } at && at <= now ? now - at : null,
         };
 
-    private static void WriteTable(IReadOnlyList<WaitingRow> rows, GhPrFactsSource facts)
+    private static void WriteTable(IReadOnlyList<WaitingRow> rows, GhPrFactsSource facts, IReadOnlyList<string> unreachable)
     {
         int attention = rows.Count(r => r.Verdict.NeedsAttention);
         Console.WriteLine(attention > 0
@@ -204,7 +201,7 @@ internal static class WaitingCommand
             foreach (WaitingRow row in rows)
             {
                 table.Add([
-                    row.Pane.Target + (row.Pane.WindowName.Length > 0 ? $" {row.Pane.WindowName}" : string.Empty),
+                    row.Pane.Where + (row.Pane.WindowName.Length > 0 ? $" {row.Pane.WindowName}" : string.Empty),
                     row.Record is null ? "-" : $"#{row.Record.PrNumber}{(row.Record.Source == StateSource.WindowName ? "~" : string.Empty)}",
                     row.Verdict.State.ToString().ToUpperInvariant(),
                     Duration(row.StoppedFor),
@@ -217,6 +214,10 @@ internal static class WaitingCommand
 
         Console.WriteLine();
         Console.WriteLine(Budget(facts));
+        foreach (string failure in unreachable)
+        {
+            Console.WriteLine($"UNREACHABLE {failure}");
+        }
     }
 
     private static string Detail(WaitingRow row)
@@ -299,7 +300,7 @@ internal static class WaitingCommand
         Console.WriteLine();
     }
 
-    private static void WriteJson(IReadOnlyList<WaitingRow> rows, GhPrFactsSource facts)
+    private static void WriteJson(IReadOnlyList<WaitingRow> rows, GhPrFactsSource facts, IReadOnlyList<string> unreachable)
     {
         using var writer = new Utf8JsonWriter(Console.OpenStandardOutput(), new JsonWriterOptions { Indented = true });
         writer.WriteStartObject();
@@ -307,6 +308,13 @@ internal static class WaitingCommand
         writer.WriteNumber("notModified", facts.NotModified);
         writer.WriteNumber("mergeabilityRereads", facts.Recomputed);
         writer.WriteBoolean("rateLimited", facts.RateLimited);
+        writer.WriteStartArray("unreachable");
+        foreach (string failure in unreachable)
+        {
+            writer.WriteStringValue(failure);
+        }
+
+        writer.WriteEndArray();
         if (facts.RateLimitRemaining is { } remaining)
         {
             writer.WriteNumber("rateLimitRemaining", remaining);
@@ -317,6 +325,11 @@ internal static class WaitingCommand
         {
             writer.WriteStartObject();
             writer.WriteString("target", row.Pane.Target);
+            if (row.Pane.Host is { } host)
+            {
+                writer.WriteString("host", host);
+            }
+
             writer.WriteString("window", row.Pane.WindowName);
             writer.WriteBoolean("attached", row.Pane.SessionAttached);
             if (row.Record is { } record)

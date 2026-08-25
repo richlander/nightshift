@@ -144,16 +144,24 @@ public static class Cli
     {
         var command = new Command("waiting", "Report stopped agent panes and what is actually blocking each one.");
 
-        var all = new Option<bool>("--all") { Description = "Include panes that are holding legitimately, and idle panes with no record." };
+        var all = new Option<bool>("--all") { Description = "Include windows that are holding legitimately, and windows that identify nothing." };
+        var host = new Option<string[]>("--host")
+        {
+            Description = "Collect from this host over ssh; repeatable. Omit to read this machine's tmux.",
+            Arity = ArgumentArity.ZeroOrMore,
+            AllowMultipleArgumentsPerToken = false,
+        };
         var json = new Option<bool>("--json") { Description = "Emit the rows as JSON instead of a table." };
         Option<string?> repo = CreateRepoOption();
 
         command.Options.Add(all);
+        command.Options.Add(host);
         command.Options.Add(json);
         command.Options.Add(repo);
 
         command.SetAction(async (parseResult, cancellationToken) => await WaitingCommand.RunAsync(
             parseResult.GetValue(repo),
+            parseResult.GetValue(host) ?? [],
             parseResult.GetValue(all),
             parseResult.GetValue(json),
             cancellationToken));

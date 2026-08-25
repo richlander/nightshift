@@ -14,10 +14,11 @@ public class WaitingScanTests
     private const string Head = "722512e25f0c1d4a9b8e7360a1c2d3e4f5061728";
 
     [Fact]
-    public void ParseWindows_ReadsTargetAttachmentAndActivity()
+    public void ParseCollection_ReadsTargetAttachmentAndActivity()
     {
-        IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseWindows(
-            "%1|night:3|1|1755900000|pr=4595 head=abc1234 reviews=2/2 rec=merge|pr4595\n%2|night:4|0|1755800000||i158\n");
+        IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseCollection(
+            "@@OCTOSHIFT@@%1|night:3|1|1755900000|pr=4595 head=abc1234 reviews=2/2 rec=merge|pr4595\n"
+            + "@@OCTOSHIFT@@%2|night:4|0|1755800000||i158\n", host: null);
 
         Assert.Equal(2, windows.Count);
         Assert.Equal("%1", windows[0].PaneId);
@@ -31,10 +32,10 @@ public class WaitingScanTests
     }
 
     [Fact]
-    public void ParseWindows_KeepsAPipeInTheWindowName()
+    public void ParseCollection_KeepsAPipeInTheWindowName()
     {
         // Window name is formatted last precisely so a separator inside it cannot shift earlier fields.
-        IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseWindows("%7|night:3|1|1755900000||pr4595|round2");
+        IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseCollection("@@OCTOSHIFT@@%7|night:3|1|1755900000||pr4595|round2", host: null);
 
         TmuxPane window = Assert.Single(windows);
         Assert.Equal("night:3", window.Target);
@@ -46,8 +47,9 @@ public class WaitingScanTests
     [InlineData("garbage\nmalformed row")]
     [InlineData("night:3|1|1755900000||name")]
     [InlineData("%1|night:3|1|1755900000")]
-    public void ParseWindows_DropsMalformedRows(string stdout)
-        => Assert.Empty(TmuxScanner.ParseWindows(stdout));
+    [InlineData("night:3|1|1755900000||80|name")]
+    public void ParseCollection_DropsMalformedRows(string stdout)
+        => Assert.Empty(TmuxScanner.ParseCollection("@@OCTOSHIFT@@" + stdout, host: null));
 
     [Fact]
     public void ClassifyActivity_ReadsTheFooter()
@@ -226,7 +228,7 @@ public class WaitingScanTests
     public async Task ScanAsync_TreatsAnUnreachableTmuxAsAFailureNotAnEmptyFleet()
     {
         // Reporting QUIET for both is how a silent tool gets mistaken for a quiet one.
-        var scanner = new TmuxScanner((_, _) => Task.FromResult(new CommandResult(1, string.Empty, "no server running")));
+        var scanner = new TmuxScanner(host: null, (_, _) => Task.FromResult(new CommandResult(1, string.Empty, "no server running")));
 
         TmuxUnavailableException ex = await Assert.ThrowsAsync<TmuxUnavailableException>(
             () => scanner.ScanAsync(TestContext.Current.CancellationToken));
@@ -237,14 +239,36 @@ public class WaitingScanTests
     [Fact]
     public async Task ScanAsync_MarksAPaneUnreadableWhenTheCaptureFails()
     {
-        var scanner = new TmuxScanner((args, _) => Task.FromResult(
-            args[0] == "list-windows"
-                ? new CommandResult(0, "%1|night:1|1|1755900000||pr4595\n", string.Empty)
-                : new CommandResult(1, string.Empty, "pane not found")));
+        // One command now carries every window and every capture, so a pane whose capture failed simply
+        // contributes no lines — which reads as idle, and is why the batched form is parsed by marker.
+        var scanner = new TmuxScanner(host: null, (_, _) => Task.FromResult(new CommandResult(
+            0, "@@OCTOSHIFT@@%1|night:1|1|1755900000||pr4595\n", string.Empty)));
 
         TmuxPane pane = Assert.Single(await scanner.ScanAsync(TestContext.Current.CancellationToken));
 
-        Assert.Equal(PaneActivity.Unreadable, pane.Activity);
+        Assert.Equal("%1", pane.PaneId);
+        Assert.Empty(pane.Capture.Trim());
+    }
+
+    [Fact]
+    public async Task ScanAsync_RunsExactlyOneCommandPerHost()
+    {
+        // The reason fan-out is viable: a host with twenty-two agent windows costs one connection, not
+        // twenty-three.
+        var calls = new List<string>();
+        var scanner = new TmuxScanner(host: "fernie", (script, _) =>
+        {
+            calls.Add(script);
+            return Task.FromResult(new CommandResult(0, string.Join('\n', Enumerable.Range(1, 22)
+                .Select(i => $"@@OCTOSHIFT@@%{i}|cp:{i}|1|1755900000||pr46{i:00}")), string.Empty));
+        });
+
+        IReadOnlyList<TmuxPane> panes = await scanner.ScanAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(22, panes.Count);
+        Assert.Single(calls);
+        Assert.All(panes, p => Assert.Equal("fernie", p.Host));
+        Assert.Equal("fernie cp:1", panes[0].Where);
     }
 
     [Fact]
@@ -309,6 +333,7 @@ public class WaitingScanTests
         => new()
         {
             PaneId = "%" + target.GetHashCode().ToString("x", System.Globalization.CultureInfo.InvariantCulture),
+            Host = null,
             Target = target,
             AgentStateOption = agentState,
             WindowName = windowName,

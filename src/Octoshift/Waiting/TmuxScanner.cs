@@ -24,9 +24,6 @@ internal enum PaneActivity
 /// <summary>Raised when tmux itself could not be reached, as distinct from finding no windows.</summary>
 internal sealed class TmuxUnavailableException(string message) : Exception(message);
 
-/// <summary>The result of running a local command.</summary>
-internal readonly record struct CommandResult(int ExitCode, string Stdout, string Stderr);
-
 /// <summary>One tmux window and the visible contents of its active pane.</summary>
 internal sealed record TmuxPane
 {
@@ -38,6 +35,12 @@ internal sealed record TmuxPane
 
     /// <summary>Human-readable <c>session:window</c>, for display only.</summary>
     public required string Target { get; init; }
+
+    /// <summary>The host this window lives on, or null for this machine.</summary>
+    public string? Host { get; init; }
+
+    /// <summary>How the window is named in a report: <c>fernie cp:3</c>, or just <c>cp:3</c> locally.</summary>
+    public string Where => Host is null ? Target : $"{Host} {Target}";
 
     public required string WindowName { get; init; }
 
@@ -66,75 +69,119 @@ internal sealed record TmuxPane
 internal sealed class TmuxScanner
 {
     /// <summary>
-    /// Window name comes last so that a <c>|</c> inside it cannot shift the fields before it.
+    /// One shell script, run once per host, that emits every window's metadata followed by its capture.
     /// </summary>
-    private const string ListFormat =
-        "#{pane_id}|#{session_name}:#{window_index}|#{session_attached}|#{window_activity}|#{@agent_state}|#{window_name}";
+    /// <remarks>
+    /// Batched on purpose. The obvious shape — list the windows, then capture each — is one round trip
+    /// per window, which is unnoticeable locally and ruinous over SSH: a host running twenty-two agent
+    /// windows would cost twenty-three connections per sweep. Assigning the listing first also means a
+    /// tmux that is not running fails the command instead of yielding an empty list through a pipeline.
+    /// </remarks>
+    private const string CollectScript = """
+        w=$(tmux list-windows -a -F '#{pane_id}|#{session_name}:#{window_index}|#{session_attached}|#{window_activity}|#{@agent_state}|#{window_name}') || exit 3
+        printf '%s\n' "$w" | while IFS= read -r m; do
+          [ -n "$m" ] || continue
+          printf '@@OCTOSHIFT@@%s\n' "$m"
+          tmux capture-pane -p -t "${m%%|*}" 2>/dev/null
+        done
+        """;
 
-    private readonly Func<IReadOnlyList<string>, CancellationToken, Task<CommandResult>> _runAsync;
+    private const string Marker = "@@OCTOSHIFT@@";
 
-    public TmuxScanner(Func<IReadOnlyList<string>, CancellationToken, Task<CommandResult>>? runAsync = null)
-        => _runAsync = runAsync ?? RunTmuxAsync;
+    private readonly string? _host;
+    private readonly Func<string, CancellationToken, Task<CommandResult>> _runAsync;
+
+    public TmuxScanner(string? host = null, Func<string, CancellationToken, Task<CommandResult>>? runAsync = null)
+    {
+        _host = host;
+        _runAsync = runAsync ?? ShellRunner.For(host);
+    }
 
     /// <summary>
-    /// Lists every window across every session, each with its active pane's visible text. Throws when
-    /// tmux itself could not be reached: no tmux and an idle fleet must not report the same thing.
+    /// Collects every window on this scanner's host. Throws when tmux could not be reached: an
+    /// unreachable host and an idle one must not report the same thing.
     /// </summary>
     public async Task<IReadOnlyList<TmuxPane>> ScanAsync(CancellationToken ct)
     {
-        CommandResult list = await _runAsync(["list-windows", "-a", "-F", ListFormat], ct);
-        if (list.ExitCode != 0)
+        CommandResult result = await _runAsync(CollectScript, ct);
+        if (result.ExitCode != 0)
         {
-            throw new TmuxUnavailableException(
-                list.Stderr.Trim() is { Length: > 0 } detail ? detail : $"tmux exited {list.ExitCode}");
+            string detail = result.Stderr.Trim() is { Length: > 0 } stderr ? stderr : $"exited {result.ExitCode}";
+            throw new TmuxUnavailableException(_host is null ? detail : $"{_host}: {detail}");
         }
 
-        var panes = new List<TmuxPane>();
-        foreach (TmuxPane window in ParseWindows(list.Stdout))
-        {
-            CommandResult capture = await _runAsync(["capture-pane", "-p", "-t", window.PaneId], ct);
+        return ParseCollection(result.Stdout, _host);
+    }
 
-            // A capture that failed is not a quiet pane. Leaving Activity unknown keeps a stopped agent
-            // from being reported as working, and a working one from being reported as stopped.
-            panes.Add(capture.ExitCode == 0
-                ? window with { Capture = capture.Stdout, Activity = ClassifyActivity(capture.Stdout) }
-                : window with { Capture = string.Empty, Activity = PaneActivity.Unreadable });
+    /// <summary>Splits the batched stream into windows, each with the capture that followed its header.</summary>
+    internal static IReadOnlyList<TmuxPane> ParseCollection(string stdout, string? host)
+    {
+        var panes = new List<TmuxPane>();
+        TmuxPane? pending = null;
+        var capture = new StringBuilder();
+
+        foreach (string line in stdout.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
+        {
+            if (!line.StartsWith(Marker, StringComparison.Ordinal))
+            {
+                if (pending is not null)
+                {
+                    capture.AppendLine(line);
+                }
+
+                continue;
+            }
+
+            if (pending is { } previous)
+            {
+                panes.Add(Finish(previous, capture.ToString()));
+                capture.Clear();
+            }
+
+            pending = ParseWindow(line[Marker.Length..], host);
+            if (pending is null)
+            {
+                capture.Clear();
+            }
+        }
+
+        if (pending is { } last)
+        {
+            panes.Add(Finish(last, capture.ToString()));
         }
 
         return panes;
     }
 
-    /// <summary>Parses <c>list-windows -F</c> output. Malformed rows are dropped, not guessed at.</summary>
-    internal static IReadOnlyList<TmuxPane> ParseWindows(string stdout)
-    {
-        var windows = new List<TmuxPane>();
-        foreach (string line in stdout.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
-        {
-            string[] parts = line.Split('|', 6);
-            if (parts.Length < 6 || !parts[0].StartsWith('%'))
-            {
-                continue;
-            }
+    private static TmuxPane Finish(TmuxPane pane, string capture)
+        => pane with { Capture = capture, Activity = ClassifyActivity(capture) };
 
-            windows.Add(new TmuxPane
-            {
-                PaneId = parts[0],
-                Target = parts[1],
-                SessionAttached = parts[2].Trim() != "0" && parts[2].Trim().Length > 0,
-                LastActivity = long.TryParse(parts[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out long epoch) && epoch > 0
-                    ? DateTimeOffset.FromUnixTimeSeconds(epoch)
-                    : null,
-                AgentStateOption = parts[4].Trim() is { Length: > 0 } option ? option : null,
-                WindowName = parts[5].Trim(),
-            });
+    /// <summary>Parses one metadata line. Malformed rows are dropped, not guessed at.</summary>
+    internal static TmuxPane? ParseWindow(string line, string? host)
+    {
+        string[] parts = line.Split('|', 6);
+        if (parts.Length < 6 || !parts[0].StartsWith('%'))
+        {
+            return null;
         }
 
-        return windows;
+        return new TmuxPane
+        {
+            PaneId = parts[0],
+            Target = parts[1],
+            Host = host,
+            SessionAttached = parts[2].Trim() != "0" && parts[2].Trim().Length > 0,
+            LastActivity = long.TryParse(parts[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out long epoch) && epoch > 0
+                ? DateTimeOffset.FromUnixTimeSeconds(epoch)
+                : null,
+            AgentStateOption = parts[4].Trim() is { Length: > 0 } option ? option : null,
+            WindowName = parts[5].Trim(),
+        };
     }
 
     /// <summary>
-    /// Classifies a pane from its footer. A record only means "stopped" in an idle pane: the same block
-    /// scrolled up while the agent works on is not a handover, and a pane holding a prompt open is
+    /// Classifies a pane from its footer. A published state only means "stopped" in an idle pane: the
+    /// same state set while the agent works on is not a handover, and a pane holding a prompt open is
     /// waiting on a keystroke rather than on GitHub.
     /// </summary>
     internal static PaneActivity ClassifyActivity(string capture)
@@ -170,40 +217,5 @@ internal sealed class TmuxScanner
         }
 
         return tail.ToString();
-    }
-
-    private static async Task<CommandResult> RunTmuxAsync(IReadOnlyList<string> args, CancellationToken ct)
-    {
-        var psi = new ProcessStartInfo("tmux")
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        };
-
-        foreach (string arg in args)
-        {
-            psi.ArgumentList.Add(arg);
-        }
-
-        using var proc = new Process { StartInfo = psi };
-        var stdout = new StringBuilder();
-        var stderr = new StringBuilder();
-        proc.OutputDataReceived += (_, e) => { if (e.Data is not null) { stdout.AppendLine(e.Data); } };
-        proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) { stderr.AppendLine(e.Data); } };
-
-        try
-        {
-            proc.Start();
-        }
-        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
-        {
-            return new CommandResult(127, string.Empty, ex.Message);
-        }
-
-        proc.BeginOutputReadLine();
-        proc.BeginErrorReadLine();
-        await proc.WaitForExitAsync(ct);
-        return new CommandResult(proc.ExitCode, stdout.ToString(), stderr.ToString());
     }
 }
