@@ -40,6 +40,12 @@ internal sealed record PrFacts
 
     public bool Merged { get; init; }
 
+    /// <summary>When it merged, so a finished window can be reported as finished-for-how-long.</summary>
+    public DateTimeOffset? MergedAt { get; init; }
+
+    /// <summary>The PR title, for a lookup that has to be recognisable without opening a browser.</summary>
+    public string? Title { get; init; }
+
     /// <summary>GitHub's <c>mergeable_state</c>: <c>clean</c>, <c>dirty</c>, <c>blocked</c>, <c>unstable</c>, <c>behind</c>, <c>unknown</c>.</summary>
     public string? MergeableState { get; init; }
 

@@ -6,7 +6,7 @@ using Octoshift.Commands;
 /// <summary>Entry dispatch for the <c>octoshift</c> GitHub-membrane CLI.</summary>
 public static class Cli
 {
-    private const string Usage = "usage: octoshift <reconcile|wait|watch|waiting> ...";
+    private const string Usage = "usage: octoshift <reconcile|wait|watch|waiting|pr> ...";
 
     /// <summary>
     /// The global <c>--socket</c> override, inherited by every verb and passed through to the
@@ -18,7 +18,7 @@ public static class Cli
         Recursive = true,
     };
 
-    private static readonly HashSet<string> KnownVerbs = ["reconcile", "wait", "watch", "waiting"];
+    private static readonly HashSet<string> KnownVerbs = ["reconcile", "wait", "watch", "waiting", "pr"];
 
     /// <summary>Parses and invokes the command line, preserving the exit-code contract.</summary>
     public static async Task<int> RunAsync(string[] args)
@@ -53,6 +53,7 @@ public static class Cli
         rootCommand.Subcommands.Add(CreateWaitCommand());
         rootCommand.Subcommands.Add(CreateWatchCommand());
         rootCommand.Subcommands.Add(CreateWaitingCommand());
+        rootCommand.Subcommands.Add(CreatePrCommand());
         return rootCommand;
     }
 
@@ -145,12 +146,7 @@ public static class Cli
         var command = new Command("waiting", "Report stopped agent panes and what is actually blocking each one.");
 
         var all = new Option<bool>("--all") { Description = "Include windows that are holding legitimately, and windows that identify nothing." };
-        var host = new Option<string[]>("--host")
-        {
-            Description = "Collect from this host over ssh; repeatable. Omit to read this machine's tmux.",
-            Arity = ArgumentArity.OneOrMore,
-            AllowMultipleArgumentsPerToken = false,
-        };
+        Option<string[]> host = CreateHostOption();
         var json = new Option<bool>("--json") { Description = "Emit the rows as JSON instead of a table." };
         Option<string?> repo = CreateRepoOption();
 
@@ -168,6 +164,38 @@ public static class Cli
 
         return command;
     }
+
+    private static Command CreatePrCommand()
+    {
+        var command = new Command("pr", "Locate a PR across the fleet and report what is happening to it.");
+
+        var number = new Argument<int>("number") { Description = "The pull request number." };
+        var host = CreateHostOption();
+        var json = new Option<bool>("--json") { Description = "Emit the answer as JSON." };
+        Option<string?> repo = CreateRepoOption();
+
+        command.Arguments.Add(number);
+        command.Options.Add(host);
+        command.Options.Add(json);
+        command.Options.Add(repo);
+
+        command.SetAction(async (parseResult, cancellationToken) => await PrCommand.RunAsync(
+            parseResult.GetValue(number),
+            parseResult.GetValue(repo),
+            parseResult.GetValue(host) ?? [],
+            parseResult.GetValue(json),
+            cancellationToken));
+
+        return command;
+    }
+
+    private static Option<string[]> CreateHostOption()
+        => new("--host")
+        {
+            Description = "Collect from this host over ssh; repeatable. Omit to read this machine's tmux.",
+            Arity = ArgumentArity.OneOrMore,
+            AllowMultipleArgumentsPerToken = false,
+        };
 
     private static Option<string?> CreateRepoOption()
         => new("--repo") { Description = "Repository scope owner/name; inferred from the git remote when omitted." };

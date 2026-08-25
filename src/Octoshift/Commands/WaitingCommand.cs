@@ -17,6 +17,12 @@ internal sealed record WaitingRow
 
     /// <summary>How long the pane has been quiet, from tmux's own activity clock.</summary>
     public TimeSpan? StoppedFor { get; init; }
+
+    /// <summary>
+    /// Other windows claiming the same PR. Two agents on one PR fight; on one host they fight over the
+    /// same worktree, which is more destructive and more discoverable at once.
+    /// </summary>
+    public IReadOnlyList<TmuxPane> Rivals { get; init; } = [];
 }
 
 /// <summary>
@@ -40,30 +46,13 @@ internal static class WaitingCommand
             return ExitCode.Usage;
         }
 
-        // No --host means this machine. Named hosts are collected over ssh, one command each, and the
-        // GitHub half stays here: putting a collector on every host would mean a cache and a rate-limit
-        // budget on every host too, which is the condition this tool exists to remove.
-        IReadOnlyList<string?> targets = hosts.Count > 0 ? [.. hosts] : [null];
-
-        var panes = new List<TmuxPane>();
-        var unreachable = new List<string>();
-        foreach (string? host in targets)
-        {
-            try
-            {
-                panes.AddRange(await new TmuxScanner(host).ScanAsync(ct));
-            }
-            catch (TmuxUnavailableException ex)
-            {
-                // One unreachable host must not hide the others, and must not be silently absorbed
-                // either — a fleet that is partly invisible looks exactly like a fleet that is quiet.
-                unreachable.Add(ex.Message);
-            }
-        }
+        FleetScan scan = await FleetScan.CollectAsync(hosts, ct);
+        IReadOnlyList<TmuxPane> panes = scan.Panes;
+        IReadOnlyList<string> unreachable = scan.Unreachable;
 
         // Total failure keeps its own path. A sweep where nothing could be collected is not a quiet fleet,
         // and printing a QUIET summary above the failure inverts which of the two the reader sees first.
-        if (panes.Count == 0 && unreachable.Count == targets.Count)
+        if (scan.TotalFailure)
         {
             if (json)
             {
@@ -180,9 +169,14 @@ internal static class WaitingCommand
                 : refreshed with { ChecksKnown = false };
         }
 
+        // A PR claimed by more than one window is a fight in progress. Computed across every host, since
+        // the two halves of it are often not on the same machine.
+        ILookup<int, TmuxPane> claims = pending.ToLookup(e => e.State.PrNumber, e => e.Pane);
+
         foreach ((TmuxPane pane, AgentState state) in pending)
         {
-            rows.Add(Row(pane, state, WaitingVerdict.Resolve(state, state.IsIssue ? null : seen.GetValueOrDefault(state.PrNumber)), now));
+            rows.Add(Row(pane, state, WaitingVerdict.Resolve(state, state.IsIssue ? null : seen.GetValueOrDefault(state.PrNumber)), now)
+                with { Rivals = [.. claims[state.PrNumber].Where(p => p.PaneId != pane.PaneId || p.Host != pane.Host)] });
         }
 
         // Longest wait first among the rows that need you: coming back after hours away, the thing that
@@ -190,7 +184,7 @@ internal static class WaitingCommand
         // The operator's queue first, longest wait at the top: after hours away, the row that has been
         // stuck longest is the one that cost the most.
         return rows
-            .Where(r => all || r.Verdict.NeedsAttention || r.Record?.Defects.Count > 0)
+            .Where(r => all || r.Verdict.NeedsAttention || r.Record?.Defects.Count > 0 || r.Rivals.Count > 0)
             .OrderByDescending(r => r.Verdict.NeedsAttention)
             .ThenBy(r => r.Verdict.Severity)
             .ThenByDescending(r => r.StoppedFor ?? TimeSpan.Zero)
@@ -252,6 +246,15 @@ internal static class WaitingCommand
     private static string Detail(WaitingRow row)
     {
         string detail = row.Verdict.Reason;
+        if (row.Rivals.Count > 0)
+        {
+            // Same host is called out separately: those two are sharing a worktree, so the damage is
+            // direct rather than a race to push.
+            bool sameHost = row.Rivals.Any(r => r.Host == row.Pane.Host);
+            detail += $"  [!] also claimed by {string.Join(", ", row.Rivals.Select(r => r.Where))}"
+                + (sameHost ? " — same host, likely one worktree" : string.Empty);
+        }
+
         if (row.Verdict.Assurance.Caveat is { Length: > 0 } caveat)
         {
             // Say what would have been needed, not merely that the tool was unsure.
@@ -409,6 +412,16 @@ internal static class WaitingCommand
 
             writer.WriteBoolean("mayAct", row.Verdict.MayAct);
             writer.WriteBoolean("acted", false);
+            if (row.Rivals.Count > 0)
+            {
+                writer.WriteStartArray("alsoClaimedBy");
+                foreach (TmuxPane rival in row.Rivals)
+                {
+                    writer.WriteStringValue(rival.Where);
+                }
+
+                writer.WriteEndArray();
+            }
             if (row.StoppedFor is { } stopped)
             {
                 writer.WriteNumber("stoppedForSeconds", (long)stopped.TotalSeconds);

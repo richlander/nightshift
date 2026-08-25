@@ -116,6 +116,8 @@ internal sealed class GhPrFactsSource
             HeadSha = headSha,
             State = pull.State ?? "open",
             Merged = pull.Merged ?? false,
+            MergedAt = DateTimeOffset.TryParse(pull.MergedAt, out DateTimeOffset mergedAt) ? mergedAt : null,
+            Title = pull.Title,
             MergeableState = pull.MergeableState,
             Checks = PrFacts.LatestPerName((checks?.CheckRuns ?? [])
                 .Where(c => !string.IsNullOrWhiteSpace(c.Name))
@@ -270,6 +272,12 @@ internal sealed record PullDetailDto
 
     [JsonPropertyName("merged")]
     public bool? Merged { get; init; }
+
+    [JsonPropertyName("merged_at")]
+    public string? MergedAt { get; init; }
+
+    [JsonPropertyName("title")]
+    public string? Title { get; init; }
 
     [JsonPropertyName("mergeable_state")]
     public string? MergeableState { get; init; }

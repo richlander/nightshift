@@ -83,6 +83,7 @@ then your role's skill (above). Reference the rest by topic:
 | Octoshift GitHub→land bridge | `docs/design/octoshift.md` |
 | Stacked orders — per-order base refs, dependent chains | `docs/design/stacked-orders.md` |
 | Issue → order mapping policy (planning) | `NIGHTSHIFT.md` (concept: `docs/design/charter.md`) |
+| What `octoshift waiting` is for, by scenario | `docs/waiting-scenarios.md` |
 
 ## Repository-wide engineering constraints
 

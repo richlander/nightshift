@@ -420,6 +420,56 @@ public class WaitingScanTests
         return $"{nonce}:manifest\n" + string.Join('\n', manifest) + $"\n{nonce}:end\n";
     }
 
+    [Fact]
+    public async Task BuildRows_FlagsAPrClaimedByMoreThanOneWindow()
+    {
+        // Observed live: PR 4448 claimed by a working window on one host and a blocked one on another.
+        // Two agents on one PR fight, and finding that out by noticing the symptoms takes far longer.
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [
+                Pane("cp:9", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234 reviews=0/2", windowName: "pr4448"),
+                Pane("cp:17", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234 round=15 reviews=0/2", windowName: "pr4448"),
+                Pane("cp:3", "", PaneActivity.Idle, agentState: "pr=4600 head=abc1234 reviews=0/2", windowName: "pr4600"),
+            ],
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            DateTimeOffset.UtcNow,
+            all: true,
+            ct: TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, rows.Count(r => r.Rivals.Count > 0));
+        Assert.All(rows.Where(r => r.Record?.PrNumber == 4448), r => Assert.Single(r.Rivals));
+        Assert.Empty(rows.Single(r => r.Record?.PrNumber == 4600).Rivals);
+    }
+
+    [Fact]
+    public async Task BuildRows_AContestedPrSurfacesEvenWhenNothingElseIsWrong()
+    {
+        // Both windows are legitimately in progress, so neither is an attention row on its own. The
+        // contest is the finding, and it must not need --all to be seen.
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [
+                Pane("cp:1", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234 reviews=0/2", windowName: "pr4448"),
+                Pane("cp:2", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234 reviews=0/2", windowName: "pr4448"),
+            ],
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            DateTimeOffset.UtcNow,
+            all: false,
+            ct: TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, rows.Count);
+    }
+
+    [Fact]
+    public async Task CollectAsync_OneBadHostDoesNotStopTheOthers()
+    {
+        FleetScan scan = await FleetScan.CollectAsync(["nosuchbox"], TestContext.Current.CancellationToken);
+
+        Assert.True(scan.TotalFailure);
+        Assert.Single(scan.Unreachable);
+    }
+
     private static TmuxPane Pane(string target, string capture, PaneActivity activity, DateTimeOffset? lastActivity = null, string? agentState = null, string windowName = "w")
         => new()
         {
