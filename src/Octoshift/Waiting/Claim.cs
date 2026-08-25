@@ -27,6 +27,12 @@ internal enum ClaimBasis
     /// <summary>Only one window claims it; nothing had to be decided.</summary>
     Uncontested,
 
+    /// <summary>
+    /// The fleet could not be collected in full, so "only one window claims this" is not a fact — the
+    /// other claimant may simply be on a host that did not answer.
+    /// </summary>
+    PartialView,
+
     /// <summary>The tool watched them register, so the order is a fact.</summary>
     Observed,
 
@@ -55,7 +61,13 @@ internal readonly record struct Claim(
     /// not ownership decided: if the tool cannot tell which agent started first, driving either of them
     /// is a coin toss, and a wrong guess drives the agent that is not doing the work.
     /// </summary>
-    public bool OwnsClaim => Rank == ClaimRank.Sole || (Rank == ClaimRank.Owner && Basis == ClaimBasis.Observed);
+    public bool OwnsClaim
+        => Basis switch
+        {
+            ClaimBasis.Uncontested => Rank == ClaimRank.Sole,
+            ClaimBasis.Observed => Rank is ClaimRank.Sole or ClaimRank.Owner,
+            _ => false,
+        };
 
     /// <summary>True when this window must never be spoken to because another owns the PR.</summary>
     public bool IsFollower => Rank == ClaimRank.Follower;
@@ -85,10 +97,18 @@ internal readonly record struct Claim(
     /// A window with no registration on a host swept before must have appeared since that sweep, which
     /// places it after everything already recorded without guessing.
     /// </param>
+    /// <param name="viewComplete">
+    /// Whether every host answered. When one did not, a window that appears to be the only claimant of
+    /// its PR may simply be the only one visible — measured live: with two hosts claiming one PR and one
+    /// host unreachable, the remaining window was a follower and looked sole. Since a sole claim is the
+    /// one shape that is always actionable, a partial view is exactly the condition under which the tool
+    /// would drive the wrong agent, so no claim is owned while the fleet is incompletely seen.
+    /// </param>
     public static IReadOnlyDictionary<string, Claim> Register(
         IEnumerable<(TmuxPane Pane, int PrNumber, int? Round)> claims,
         Func<TmuxPane, DateTimeOffset?> registeredAt,
-        Func<string?, DateTimeOffset?>? sweptAt = null)
+        Func<string?, DateTimeOffset?>? sweptAt = null,
+        bool viewComplete = true)
     {
         var ranked = new Dictionary<string, Claim>(StringComparer.Ordinal);
 
@@ -97,7 +117,9 @@ internal readonly record struct Claim(
             (TmuxPane Pane, int PrNumber, int? Round)[] contenders = [.. group];
             if (contenders.Length == 1)
             {
-                ranked[Key(contenders[0].Pane)] = Sole;
+                ranked[Key(contenders[0].Pane)] = viewComplete
+                    ? Sole
+                    : new Claim(ClaimRank.Sole, [], registeredAt(contenders[0].Pane), ClaimBasis.PartialView);
                 continue;
             }
 
@@ -131,7 +153,7 @@ internal readonly record struct Claim(
                     i == 0 ? ClaimRank.Owner : ClaimRank.Follower,
                     [.. ordered.Select(c => c.Pane).Where(p => Key(p) != Key(pane))],
                     registeredAt(pane),
-                    observed ? ClaimBasis.Observed : ClaimBasis.Inferred);
+                    observed && viewComplete ? ClaimBasis.Observed : ClaimBasis.Inferred);
             }
         }
 

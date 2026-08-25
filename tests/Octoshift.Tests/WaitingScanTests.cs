@@ -708,6 +708,94 @@ public class WaitingScanTests
         Assert.Equal("ready", WindowNaming.SuffixFor(new(WaitingState.Ready, RowOwner.Operator, "reviews 2/2", Assurance.High)));
     }
 
+    [Fact]
+    public void History_ReportsAWindowThatDepartedRatherThanPruningItSilently()
+    {
+        // A window vanishing is an event: an agent finished and reclaimed, one that crashed, or a
+        // session killed by hand. Pruning it quietly makes all three the same nothing.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-depart-{Guid.NewGuid():N}.json");
+        try
+        {
+            TmuxPane a = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448");
+            TmuxPane b = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4600");
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+            var first = new PaneHistory(path);
+            first.Observe(a, t, claimedPr: 4448);
+            first.Observe(b, t, claimedPr: 4600);
+            Assert.Empty(first.Save([a, b], [null]));
+
+            var second = new PaneHistory(path);
+            second.Observe(a, t.AddMinutes(10), claimedPr: 4448);
+            string gone = Assert.Single(second.Save([a], [null]));
+
+            Assert.Contains("#4600", gone, StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void History_AWindowOnAnUnreachableHostHasNotDeparted()
+    {
+        // It is unseen, not gone. Forgetting it would manufacture a departure on every failed sweep.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-unseen-{Guid.NewGuid():N}.json");
+        try
+        {
+            TmuxPane onFernie = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "fernie" };
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+            var first = new PaneHistory(path);
+            first.Observe(onFernie, t, claimedPr: 4448);
+            first.Save([onFernie], ["fernie"]);
+
+            // A sweep that only reached merritt must not conclude the fernie window is gone.
+            var second = new PaneHistory(path);
+            Assert.Empty(second.Save([], ["merritt"]));
+            Assert.NotNull(second.ClaimedAt(onFernie));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Theory]
+    [InlineData("pr=1 head=abc1234 reviews=2/2 rec=done", true)]
+    [InlineData("pr=1 head=abc1234 reviews=2/2 rec=merge", false)]
+    public void Retirement_ReadsTheAgentsOwnReportOfBeingFinished(string record, bool retirable)
+    {
+        // `done` is a report, not a request: the work is finished, so what it asks for is not a decision
+        // but a reclamation. `merge` is still asking for something.
+        AgentState state = AgentState.Parse(record, "pr1")!;
+        WaitingVerdict verdict = new(WaitingState.Holding, RowOwner.Nobody, "in progress", Assurance.High);
+
+        Assert.Equal(retirable, Retirement.For(verdict, state, PaneActivity.Idle).IsRetirable);
+    }
+
+    [Fact]
+    public void Retirement_AWorkingWindowIsNeverRetirableWhateverItLastPublished()
+    {
+        AgentState state = AgentState.Parse("pr=1 head=abc1234 reviews=2/2 rec=done", "pr1")!;
+        WaitingVerdict merged = new(WaitingState.Merged, RowOwner.Operator, "merged", Assurance.High);
+
+        Assert.False(Retirement.For(merged, state, PaneActivity.Working).IsRetirable);
+    }
+
+    [Fact]
+    public void Retirement_AdvisesClearingTheContextNotKillingTheWindow()
+    {
+        // The window and its session are worth keeping; a transcript of work that already merged is not.
+        WaitingVerdict merged = new(WaitingState.Merged, RowOwner.Operator, "merged", Assurance.High);
+        Retirement retirement = Retirement.For(merged, null, PaneActivity.Idle);
+
+        Assert.True(retirement.IsRetirable);
+        Assert.Contains("clear the context", retirement.Advice, StringComparison.Ordinal);
+        Assert.Contains("reuse the window", retirement.Advice, StringComparison.Ordinal);
+    }
+
     private static TmuxPane Pane(string target, string capture, PaneActivity activity, DateTimeOffset? lastActivity = null, string? agentState = null, string windowName = "w")
         => new()
         {

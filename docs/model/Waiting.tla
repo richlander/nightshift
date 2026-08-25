@@ -63,9 +63,10 @@ VARIABLES
     regEpoch,    \* the epoch the remembered registrations belong to
     regTime,     \* window -> time it was first SEEN claiming its current PR
     regPr,       \* window -> the PR it was seen claiming
-    sweptAt      \* last time the tool collected this host in full, or NoTime
+    sweptAt,     \* last time the tool collected this host in full, or NoTime
+    viewComplete \* did the most recent sweep reach every host?
 
-vars == << now, claims, live, epoch, regEpoch, regTime, regPr, sweptAt >>
+vars == << now, claims, live, epoch, regEpoch, regTime, regPr, sweptAt, viewComplete >>
 
 TypeOK ==
     /\ now \in 0..MaxTime
@@ -76,6 +77,7 @@ TypeOK ==
     /\ regTime \in [Windows -> Int]
     /\ regPr \in [Windows -> PRs \union {NoPr}]
     /\ sweptAt \in Int
+    /\ viewComplete \in BOOLEAN
 
 (* ---- What the tool derives from what it remembers ---------------------------------
 
@@ -115,9 +117,14 @@ Owner(p) ==
                  \/ (Placement(w) = Placement(o) /\ w < o)
 
 \* The one output with consequences: this window may be spoken to about this PR.
+\* A sweep that could not reach every host does not know that a window is the only
+\* claimant of its PR -- the other one may be on the host that did not answer. Since a
+\* sole claim is the one shape that is always actionable, a partial view is exactly the
+\* condition under which the tool would drive the wrong agent.
 OwnsClaim(w) ==
     /\ w \in live
     /\ claims[w] # NoPr
+    /\ viewComplete
     /\ LET p == claims[w] IN
          \/ Claimants(p) = {w}                     \* uncontested
          \/ (Owner(p) = w /\ Observed(p))          \* contested, and the order is known
@@ -133,6 +140,7 @@ Init ==
     /\ regTime = [w \in Windows |-> NoTime]
     /\ regPr = [w \in Windows |-> NoPr]
     /\ sweptAt = NoTime
+    /\ viewComplete = FALSE
 
 \* Agents open windows, close them, and switch PRs on their own schedule. Exogenous:
 \* the tool observes this, it does not cause it.
@@ -152,7 +160,7 @@ AgentActs ==
                  /\ p # claims[w]
                  /\ live' = live
                  /\ claims' = [claims EXCEPT ![w] = p]
-    /\ UNCHANGED << epoch, regEpoch, regTime, regPr, sweptAt >>
+    /\ UNCHANGED << epoch, regEpoch, regTime, regPr, sweptAt, viewComplete >>
 
 \* The tmux server restarts: pane ids restart, so every id may now name a different
 \* window. Everything live is replaced; what the tool remembers is about the old ones.
@@ -162,7 +170,7 @@ ServerRestarts ==
     /\ epoch' = epoch + 1
     /\ live' = {}
     /\ claims' = [w \in Windows |-> NoPr]
-    /\ UNCHANGED << regEpoch, regTime, regPr, sweptAt >>
+    /\ UNCHANGED << regEpoch, regTime, regPr, sweptAt, viewComplete >>
 
 \* A sweep: record every live window's current claim, and mark the host swept. A window
 \* keeps its registration for as long as it keeps claiming the same PR; switching is a
@@ -179,9 +187,19 @@ Sweep ==
     /\ regPr' = [w \in Windows |-> IF w \in live THEN claims[w] ELSE NoPr]
     /\ regEpoch' = epoch
     /\ sweptAt' = now
+    /\ viewComplete' = TRUE
     /\ UNCHANGED << claims, live, epoch >>
 
-Next == AgentActs \/ ServerRestarts \/ Sweep
+\* A sweep where a host did not answer. Windows on it are UNSEEN, not gone: their
+\* registrations must survive, or every failed sweep would manufacture a departure and
+\* the next full sweep would re-register them as newly arrived.
+PartialSweep ==
+    /\ now < MaxTime
+    /\ now' = now + 1
+    /\ viewComplete' = FALSE
+    /\ UNCHANGED << claims, live, epoch, regEpoch, regTime, regPr, sweptAt >>
+
+Next == AgentActs \/ ServerRestarts \/ Sweep \/ PartialSweep
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Sweep)
 
@@ -218,8 +236,19 @@ NoCrossEpochMemory ==
 \* its PR must always be actionable: no amount of caution elsewhere may starve the
 \* ordinary case. (Modelled on NoGenuineGapGoesUnnoticed in ZfsHoldTight, which rules
 \* out a "fix" that satisfies policy-independence by never reporting anything.)
+\* Conditioned on a complete view, and that condition is not a weakening. TLC refuted
+\* the unconditioned form in two steps once PartialSweep existed: a sweep that could not
+\* reach every host does not know a claim is sole, so "sole claimants are always
+\* actionable" and "a partial view owns nothing" are in direct conflict. The second wins
+\* -- it is the safety rule -- and this one keeps its job of ruling out a tool that
+\* never acts, now restricted to the runs where acting is permitted at all.
 SoleClaimantIsAlwaysOwner ==
-    \A w \in live : (claims[w] # NoPr /\ Claimants(claims[w]) = {w}) => OwnsClaim(w)
+    viewComplete =>
+        \A w \in live : (claims[w] # NoPr /\ Claimants(claims[w]) = {w}) => OwnsClaim(w)
+
+\* A partial sweep owns nothing, however clean the part it could see looks.
+NoOwnerWhileViewIncomplete ==
+    ~viewComplete => \A w \in live : ~OwnsClaim(w)
 
 (* ---- Step properties ---- *)
 
@@ -234,6 +263,11 @@ SoleClaimantIsAlwaysOwner ==
 \* is correct -- switching PRs is a fresh registration, and goes to the back of the
 \* queue -- so the mistake was in the phrasing, not the design. Registered(w) is null
 \* in exactly that case, which is why stating it this way is not merely a patch.
+\* A sweep that could not reach a host must not forget what it already knew about it.
+\* Registrations are only ever renewed or dropped by a sweep that actually looked.
+NoPhantomDepartureStep ==
+    [][ (~viewComplete') => (regTime' = regTime /\ regPr' = regPr) ]_vars
+
 RegistrationStableStep ==
     [][ \A w \in Windows :
           (/\ w \in live /\ w \in live'

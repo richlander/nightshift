@@ -14,10 +14,10 @@ java -cp tla2tools.jar tla2sany.SANY Waiting.tla                     # parse
 java -cp tla2tools.jar tlc2.TLC -config Waiting.cfg -workers auto Waiting.tla
 ```
 
-Current bounds — 3 windows, 2 PRs, 18 steps — take a few minutes: 319,153,961 states
-generated, 62,487,295 distinct, depth 19, zero violations. Drop `MaxTime` to 9 for a
-few-second run while iterating; it reaches depth 10 and catches everything the mutation
-matrix below covers.
+Current bounds — 3 windows, 2 PRs, 12 steps — run in about a minute: 16,611,004 states
+generated, 3,777,389 distinct, depth 13, zero violations. `MaxTime = 18` reaches depth
+19 across 62.5M distinct states in a few minutes; `MaxTime = 9` runs in seconds while
+iterating and still catches everything the mutation matrix below covers.
 
 ## What is modelled, and what is not
 
@@ -70,6 +70,8 @@ here has a mutation that breaks it:
 | let any registered claimant own, not only the first | `AtMostOneOwner` |
 | re-register every window on every sweep | `RegistrationStableStep` |
 | sort unregistered windows first instead of last | `OwnerStableAcrossSweepStep` |
+| drop the `viewComplete` guard from `OwnsClaim` | `NoOwnerWhileViewIncomplete` |
+| let a partial sweep rewrite registrations | `NoPhantomDepartureStep` |
 
 Every invariant and property in the config has an entry, which is the bar for calling
 the run clean. A mutation must also be attributed to the *intended* property: an early
@@ -79,6 +81,13 @@ leaves `regTime` untouched, so only the property under test can fire.
 
 That exercise earned its keep twice. TLC refuted `RegistrationStableStep` on the first
 run — the property, not the design, had forgotten that a window switching PRs re-registers.
+It earned it a third time when the partial-view rule arrived. `SoleClaimantIsAlwaysOwner`
+asserted that a sole claimant is *always* actionable, which stopped being true the moment
+a sweep could fail to reach a host — you cannot know a claim is sole if you did not look
+everywhere. TLC found the conflict between the two rules in two steps. The anti-degenerate
+property is now conditioned on a complete view, which keeps its job (ruling out a tool
+that never acts) without overruling the safety rule.
+
 And mutation found that `NeverActOnUnwitnessedOrder` was originally a **tautology**:
 phrased as `OwnsClaim(w) => Observed(...)`, it restated a definition, since `OwnsClaim`
 already requires `Observed`. TLC cannot report a vacuous invariant as a failure — it

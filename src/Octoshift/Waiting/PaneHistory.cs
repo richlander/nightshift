@@ -153,12 +153,41 @@ internal sealed class PaneHistory
 
     private static string Key(TmuxPane pane) => $"{pane.Host ?? "local"}|{pane.PaneId}";
 
-    /// <summary>Drops windows that no longer exist, so a long-lived file does not grow without bound.</summary>
-    public void Save(IEnumerable<TmuxPane> live)
+    /// <summary>
+    /// Drops windows that no longer exist and reports which they were.
+    /// </summary>
+    /// <remarks>
+    /// A window vanishing is an event, not housekeeping. It may be an agent finished and reclaimed, or
+    /// one that crashed, or a session someone killed by hand — and the difference matters to whoever is
+    /// watching. Pruning it silently, as this did, turns every one of those into the same nothing.
+    /// </remarks>
+    /// <param name="live">Windows collected this sweep.</param>
+    /// <param name="hosts">
+    /// Hosts collected this sweep. A window on a host that did not answer has not departed; it is merely
+    /// unseen, and forgetting it would manufacture a departure on every unreachable sweep.
+    /// </param>
+    public IReadOnlyList<string> Save(IEnumerable<TmuxPane> live, IEnumerable<string?>? hosts = null)
     {
-        var keep = live.Select(p => $"{p.Host ?? "local"}|{p.PaneId}").ToHashSet(StringComparer.Ordinal);
+        var seen = live.ToArray();
+        var keep = seen.Select(p => $"{p.Host ?? "local"}|{p.PaneId}").ToHashSet(StringComparer.Ordinal);
+        HashSet<string>? collected = hosts is null
+            ? null
+            : hosts.Select(h => h ?? "local").ToHashSet(StringComparer.Ordinal);
+
+        var departed = new List<string>();
         foreach (string gone in _entries.Keys.Where(k => !keep.Contains(k)).ToArray())
         {
+            string host = gone[..gone.IndexOf('|', StringComparison.Ordinal)];
+            if (collected is not null && !collected.Contains(host))
+            {
+                continue;
+            }
+
+            if (_entries[gone].ClaimedPr is { } pr)
+            {
+                departed.Add($"{gone.Replace("|", " ", StringComparison.Ordinal)} (was on #{pr})");
+            }
+
             _entries.Remove(gone);
         }
 
@@ -172,6 +201,8 @@ internal sealed class PaneHistory
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
         }
+
+        return departed;
     }
 }
 

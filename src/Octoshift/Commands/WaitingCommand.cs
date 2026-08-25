@@ -30,6 +30,9 @@ internal sealed record WaitingRow
     /// </summary>
     public Claim Claim { get; init; } = Claim.Sole;
 
+    /// <summary>Whether this window's work is over, and what to do about it.</summary>
+    public Retirement Retirement { get; init; } = Retirement.None;
+
     /// <summary>
     /// Whether a tool may speak to this window unattended. The verdict decides whether the PR's state
     /// warrants it; the claim decides whether this window is the one entitled to hear it. A follower is
@@ -51,6 +54,9 @@ internal sealed record WaitingRow
 /// </remarks>
 internal static class WaitingCommand
 {
+    /// <summary>Windows that were present at the last sweep and are gone now. Reported, not swallowed.</summary>
+    internal static IReadOnlyList<string> Departed { get; private set; } = [];
+
     public static async Task<int> RunAsync(string? repoFlag, IReadOnlyList<string> hosts, bool all, bool json, bool rename, CancellationToken ct)
     {
         string? repo = RepoScope.Resolve(repoFlag);
@@ -88,7 +94,8 @@ internal static class WaitingCommand
             new FileConditionalCache(),
             (args, token) => GhAuthenticatedRunner.RunGhAsync(args, null, token));
         IReadOnlyList<WaitingRow> rows = await BuildRowsAsync(
-            panes, facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, all, ct);
+            panes, facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, all, ct,
+            viewComplete: unreachable.Count == 0);
 
         if (rename)
         {
@@ -117,8 +124,10 @@ internal static class WaitingCommand
         Func<int, CancellationToken, Task<PrFacts?>> refreshMergeabilityAsync,
         DateTimeOffset now,
         bool all,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool viewComplete = true)
     {
+        Departed = [];
         var rows = new List<WaitingRow>();
         var pending = new List<(TmuxPane Pane, AgentState State)>();
 
@@ -213,7 +222,8 @@ internal static class WaitingCommand
         IReadOnlyDictionary<string, Claim> claims = Claim.Register(
             pending.Where(e => !e.State.IsIssue).Select(e => (e.Pane, e.State.PrNumber, e.State.Round)),
             history.ClaimedAt,
-            history.SweptAt);
+            history.SweptAt,
+            viewComplete);
 
         foreach ((TmuxPane pane, AgentState state) in pending)
         {
@@ -221,13 +231,14 @@ internal static class WaitingCommand
                 with
                 {
                     Claim = claims.GetValueOrDefault(Claim.Key(pane), Claim.Sole),
+                    Retirement = Retirement.For(WaitingVerdict.Resolve(state, state.IsIssue ? null : seen.GetValueOrDefault(state.PrNumber)), state, pane.Activity),
                     SilentFor = silence.GetValueOrDefault(Claim.Key(pane)),
                 });
         }
 
         // Longest wait first among the rows that need you: coming back after hours away, the thing that
         // has been stuck longest is the thing that cost the most.
-        history.Save(panes);
+        Departed = history.Save(panes, panes.Select(p => p.Host).Distinct());
 
         // The operator's queue first, longest wait at the top: after hours away, the row that has been
         // stuck longest is the one that cost the most.
@@ -312,6 +323,11 @@ internal static class WaitingCommand
 
         Console.WriteLine();
         Console.WriteLine(Budget(facts));
+        foreach (string gone in Departed)
+        {
+            Console.WriteLine($"DEPARTED {gone}");
+        }
+
         foreach (string failure in unreachable)
         {
             Console.WriteLine($"UNREACHABLE {failure}");
@@ -330,6 +346,11 @@ internal static class WaitingCommand
             string basis = row.Claim.Basis == ClaimBasis.Inferred ? " (order inferred, not observed)" : string.Empty;
             detail += $"  [!] {role} {string.Join(", ", row.Claim.Others.Select(r => r.Where))}"
                 + (sameHost ? " — same host, likely one worktree" : string.Empty) + basis;
+        }
+
+        if (row.Retirement.IsRetirable)
+        {
+            detail += $"  [retire] {row.Retirement.Advice}";
         }
 
         if (row.Verdict.Assurance.Caveat is { Length: > 0 } caveat)

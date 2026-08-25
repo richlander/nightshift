@@ -24,6 +24,13 @@ internal enum Recommendation
     /// <summary>Still working; nothing is being asked of anyone.</summary>
     Continue,
 
+    /// <summary>
+    /// The work is finished and there is nothing further to do on it. Distinct from <c>Stop</c>, which
+    /// is a request to be released from work that is not finished. This is a report, not a request: what
+    /// it asks for is not a decision but a reclamation.
+    /// </summary>
+    Done,
+
     /// <summary>A <c>rec=</c> value outside the four. Recorded so it can be reported, never acted on.</summary>
     Unrecognised,
 }
@@ -265,8 +272,9 @@ internal sealed partial record AgentState
             case "approve": return Recommendation.Approve;
             case "stop": return Recommendation.Stop;
             case "continue": return Recommendation.Continue;
+            case "done": return Recommendation.Done;
             default:
-                defects.Add($"rec={value} is not one of continue|wait|merge|approve|stop");
+                defects.Add($"rec={value} is not one of continue|wait|merge|approve|stop|done");
                 return Recommendation.Unrecognised;
         }
     }

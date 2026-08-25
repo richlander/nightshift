@@ -187,6 +187,29 @@ public class ModelCorrespondenceTests
     }
 
     /// <summary>
+    /// TLA+ <c>ViewCompleteOrNoOwner</c>: while any host is unseen, no claim is owned.
+    /// </summary>
+    /// <remarks>
+    /// Measured against the live fleet: PR 4448 was claimed by a window on merritt and one on fernie,
+    /// and the merritt window was the follower. Collected with fernie unreachable, that follower is the
+    /// only claimant visible — and a sole claimant is the one shape that is always actionable. A partial
+    /// view is therefore exactly the condition under which the tool would drive the wrong agent, which
+    /// is why an incomplete sweep owns nothing rather than owning what it can see.
+    /// </remarks>
+    [Fact]
+    public void ViewCompleteOrNoOwner()
+    {
+        TmuxPane visible = Window("%9", host: "merritt");
+
+        Assert.True(Claim.Register([(visible, 4448, null)], _ => null, _ => null, viewComplete: true)
+            [Claim.Key(visible)].OwnsClaim);
+
+        Claim partial = Claim.Register([(visible, 4448, null)], _ => null, _ => null, viewComplete: false)[Claim.Key(visible)];
+        Assert.Equal(ClaimBasis.PartialView, partial.Basis);
+        Assert.False(partial.OwnsClaim);
+    }
+
+    /// <summary>
     /// TLA+ <c>Observed</c>: the order is a fact only when every recorded time is distinct and at most
     /// one claimant has no record. The scenario the model exists to get right — one agent working, a
     /// second joining later, with the tool running throughout.
