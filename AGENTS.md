@@ -85,6 +85,7 @@ then your role's skill (above). Reference the rest by topic:
 | Issue → order mapping policy (planning) | `NIGHTSHIFT.md` (concept: `docs/design/charter.md`) |
 | What `octoshift waiting` is for, by scenario | `docs/waiting-scenarios.md` |
 | The waiting state machine and its invariants | `docs/design/waiting-model.md` |
+| TLA+ model of the memory/ownership rules | `docs/model/README.md` |
 
 ## Repository-wide engineering constraints
 
