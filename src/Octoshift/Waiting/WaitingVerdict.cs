@@ -147,9 +147,15 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         // Everything below decides whether a window is finished, so every one of these gates fails closed.
         // A claim that cannot be checked is not a claim that passes.
         //
-        // `rec=merge` alone is deliberately NOT enough. It is the agent's request, not its evidence, and
+        // `rec=merge` alone is deliberately NOT enough: it is the agent's request, not its evidence, and
         // the evidence is the review count measured against the repository bar.
-        bool declaredDone = state.ReviewsMeetBar;
+        //
+        // `continue` and `wait` are the other half of that rule, and the half this originally missed. They
+        // are the agent stating it is NOT finished, which outranks any count it also published — observed
+        // live as `reviews=2/2 rec=continue` on a window whose own round report read "converging" and
+        // "round 4 next". A recommendation cannot manufacture readiness; it can always deny it.
+        bool declaredDone = state.ReviewsMeetBar
+            && state.Recommendation is not (Recommendation.Continue or Recommendation.Wait);
 
         // A record that contradicts itself cannot be trusted to say it is finished — and a discarded
         // blocker is exactly how `blocked=ci rec=wait` would otherwise fall through into the merge queue.
@@ -204,6 +210,14 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
 
         if (!declaredDone)
         {
+            // Say which fact is holding it, so a count that meets the bar next to a recommendation that
+            // denies it does not read as "so why is this not ready?".
+            if (state.ReviewsMeetBar)
+            {
+                return new(WaitingState.Holding, RowOwner.Nobody,
+                    $"rec={state.Recommendation.ToString().ToLowerInvariant()}; reviews {state.ReviewsClean}/{state.ReviewsRequired} is not a claim of done");
+            }
+
             return state.ReviewsRequired is > 0
                 ? new(WaitingState.Holding, RowOwner.Nobody, $"reviews {state.ReviewsClean ?? 0}/{state.ReviewsRequired}")
                 : new(WaitingState.Holding, RowOwner.Nobody, "in progress");

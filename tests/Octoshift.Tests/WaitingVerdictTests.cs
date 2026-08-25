@@ -226,6 +226,20 @@ public class WaitingVerdictTests
         Assert.Equal(RowOwner.Operator, v.Owner);
     }
 
+    [Theory]
+    [InlineData("continue")]
+    [InlineData("wait")]
+    public void Resolve_AnAgentSayingItIsNotFinishedIsNotFinished(string rec)
+    {
+        // Observed live: `reviews=2/2 rec=continue` on a window whose round report read "converging" and
+        // whose next step was another round. The count meant "two reviewers reported", not "two clean";
+        // the recommendation is the agent stating plainly that it is still working, and it wins.
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State($"pr=4595 head=722512e25 round=3 reviews=2/2 blocked=4629 rec={rec}"), Facts());
+
+        Assert.NotEqual(WaitingState.Ready, v.State);
+    }
+
     [Fact]
     public void Resolve_RecMergeAloneDoesNotMakeAPrReady()
     {
@@ -250,8 +264,17 @@ public class WaitingVerdictTests
     public void Resolve_ADiscardedBlockerCannotFallThroughIntoTheMergeQueue()
     {
         // Observed live: `blocked=ci reviews=2/2 rec=wait`. "ci" is not citable so the blocker list is
-        // empty, the wait branch is skipped, and without this gate the row lands in the merge queue.
+        // empty and the wait branch is skipped. Two independent gates now stop it reaching the queue —
+        // `wait` denying readiness, and the defect gate below — and it needs only one of them to hold.
         WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e25 reviews=2/2 blocked=ci rec=wait"), Facts());
+
+        Assert.NotEqual(WaitingState.Ready, v.State);
+    }
+
+    [Fact]
+    public void Resolve_ASelfContradictingRecordCannotClaimToBeDone()
+    {
+        WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e25 reviews=2/2 blocked=ci rec=merge"), Facts());
 
         Assert.Equal(WaitingState.Untrustworthy, v.State);
         Assert.Equal(RowOwner.Operator, v.Owner);
