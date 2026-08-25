@@ -3,6 +3,7 @@ namespace Octoshift.Waiting;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 
 /// <summary>What a pane's footer says the agent in it is doing right now.</summary>
@@ -69,28 +70,41 @@ internal sealed record TmuxPane
 internal sealed class TmuxScanner
 {
     /// <summary>
-    /// One shell script, run once per host, that emits every window's metadata followed by its capture.
+    /// The collection script, run once per host. It emits a <em>manifest</em> of every window, closes it,
+    /// and only then emits the captures — each introduced by a header naming a pane id and nothing else.
     /// </summary>
     /// <remarks>
-    /// Batched on purpose. The obvious shape — list the windows, then capture each — is one round trip
-    /// per window, which is unnoticeable locally and ruinous over SSH: a host running twenty-two agent
-    /// windows would cost twenty-three connections per sweep. Assigning the listing first also means a
-    /// tmux that is not running fails the command instead of yielding an empty list through a pipeline.
+    /// Batched because the obvious shape — list, then capture each — is one round trip per window, which
+    /// is unnoticeable locally and ruinous over ssh: a host running twenty-two agent windows would cost
+    /// twenty-three connections per sweep.
     ///
-    /// The capture is explicitly non-fatal. Without that, the loop inherits the last capture's status, so
-    /// a single pane closing between enumeration and capture exits non-zero and condemns the whole host —
-    /// discarding every row already collected. Host failure is reserved for transport and the listing.
+    /// Framed this way because pane text is arbitrary, hostile-capable content. Agents routinely print
+    /// this tool's own output and source, so a capture can contain anything the framing uses. Requiring a
+    /// marker to <em>parse</em> as a window row does not help: a pane emitting a well-formed row would
+    /// split its own capture and inject a window that does not exist, carrying whatever state it liked —
+    /// and a forged row naming a real head with corroborating fields would be graded high confidence and
+    /// become eligible to act on. So window metadata comes only from the manifest, which is closed before
+    /// any capture begins, and captures may only attach text to a pane the manifest already named. The
+    /// per-run nonce makes the framing itself unguessable; the manifest makes guessing it insufficient.
+    ///
+    /// The capture is explicitly non-fatal: without that the loop inherits the last capture's status, so
+    /// one pane closing mid-sweep would condemn the host and discard every row already collected.
     /// </remarks>
-    private const string CollectScript = """
+    private static string BuildScript(string nonce) => ScriptTemplate.Replace("NONCE", nonce, StringComparison.Ordinal);
+
+    /// <summary>
+    /// The script with its framing token left as <c>NONCE</c>. Kept uninterpolated so the tmux format
+    /// braces and the shell's <c>${...}</c> read exactly as they will run.
+    /// </summary>
+    private const string ScriptTemplate = """
         w=$(tmux list-windows -a -F '#{pane_id}|#{session_name}:#{window_index}|#{session_attached}|#{window_activity}|#{@agent_state}|#{window_name}') || exit 3
+        printf 'NONCE:manifest\n%s\nNONCE:end\n' "$w"
         printf '%s\n' "$w" | while IFS= read -r m; do
           [ -n "$m" ] || continue
-          printf '@@OCTOSHIFT@@%s\n' "$m"
+          printf 'NONCE:pane %s\n' "${m%%|*}"
           tmux capture-pane -p -t "${m%%|*}" 2>/dev/null || true
         done
         """;
-
-    private const string Marker = "@@OCTOSHIFT@@";
 
     private readonly string? _host;
     private readonly Func<string, CancellationToken, Task<CommandResult>> _runAsync;
@@ -101,63 +115,92 @@ internal sealed class TmuxScanner
         _runAsync = runAsync ?? ShellRunner.For(host);
     }
 
+    /// <summary>A fresh, unguessable framing token per collection.</summary>
+    private static string NewNonce() => Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
+
     /// <summary>
     /// Collects every window on this scanner's host. Throws when tmux could not be reached: an
     /// unreachable host and an idle one must not report the same thing.
     /// </summary>
     public async Task<IReadOnlyList<TmuxPane>> ScanAsync(CancellationToken ct)
     {
-        CommandResult result = await _runAsync(CollectScript, ct);
+        string nonce = NewNonce();
+        CommandResult result = await _runAsync(BuildScript(nonce), ct);
         if (result.ExitCode != 0)
         {
             string detail = result.Stderr.Trim() is { Length: > 0 } stderr ? stderr : $"exited {result.ExitCode}";
             throw new TmuxUnavailableException(_host is null ? detail : $"{_host}: {detail}");
         }
 
-        return ParseCollection(result.Stdout, _host);
+        return ParseCollection(result.Stdout, _host, nonce);
     }
 
-    /// <summary>Splits the batched stream into windows, each with the capture that followed its header.</summary>
-    internal static IReadOnlyList<TmuxPane> ParseCollection(string stdout, string? host)
+    /// <summary>
+    /// Reads the manifest, then attaches each capture to the pane it names. Window metadata comes only
+    /// from the manifest, so no amount of pane content can introduce, rename or restate a window.
+    /// </summary>
+    internal static IReadOnlyList<TmuxPane> ParseCollection(string stdout, string? host, string nonce)
     {
-        var panes = new List<TmuxPane>();
-        TmuxPane? pending = null;
-        var capture = new StringBuilder();
+        string manifestOpen = nonce + ":manifest";
+        string manifestClose = nonce + ":end";
+        string paneHeader = nonce + ":pane ";
+
+        var order = new List<string>();
+        var windows = new Dictionary<string, TmuxPane>(StringComparer.Ordinal);
+        var captures = new Dictionary<string, StringBuilder>(StringComparer.Ordinal);
+
+        bool inManifest = false;
+        bool manifestClosed = false;
+        string? current = null;
 
         foreach (string line in stdout.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
         {
-            // A boundary is the marker AND a well-formed window row. Pane text can contain the marker —
-            // agent output quotes this tool's own source — and treating that as a boundary would truncate
-            // the window it appeared in and invent one that does not exist.
-            TmuxPane? header = line.StartsWith(Marker, StringComparison.Ordinal)
-                ? ParseWindow(line[Marker.Length..], host)
-                : null;
-
-            if (header is null)
+            if (!manifestClosed)
             {
-                if (pending is not null)
+                if (!inManifest)
                 {
-                    capture.AppendLine(line);
+                    inManifest = line == manifestOpen;
+                    continue;
+                }
+
+                if (line == manifestClose)
+                {
+                    manifestClosed = true;
+                    continue;
+                }
+
+                if (ParseWindow(line, host) is { } window && windows.TryAdd(window.PaneId, window))
+                {
+                    order.Add(window.PaneId);
+                    captures[window.PaneId] = new StringBuilder();
                 }
 
                 continue;
             }
 
-            if (pending is { } previous)
+            // Past the manifest, a header may only select a pane that is already known, and only once.
+            // A repeat would let a pane's own text reopen an earlier window and overwrite its capture.
+            if (line.StartsWith(paneHeader, StringComparison.Ordinal)
+                && line[paneHeader.Length..] is { Length: > 0 } paneId
+                && windows.ContainsKey(paneId)
+                && captures[paneId].Length == 0
+                && paneId != current)
             {
-                panes.Add(Finish(previous, capture.ToString()));
+                current = paneId;
+                continue;
             }
 
-            capture.Clear();
-            pending = header;
+            if (current is not null)
+            {
+                captures[current].AppendLine(line);
+            }
         }
 
-        if (pending is { } last)
-        {
-            panes.Add(Finish(last, capture.ToString()));
-        }
-
-        return panes;
+        // No manifest at all means the output was not this collection's: report nothing rather than
+        // salvage lines that cannot be attributed.
+        return manifestClosed
+            ? [.. order.Select(id => Finish(windows[id], captures[id].ToString()))]
+            : [];
     }
 
     private static TmuxPane Finish(TmuxPane pane, string capture)
