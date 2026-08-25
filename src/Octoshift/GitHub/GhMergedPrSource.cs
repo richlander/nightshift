@@ -78,14 +78,14 @@ internal sealed class GhMergedPrSource : IMergedPrSource
             }
 
             GhResult gh = await _runGhAsync(args, ct);
-            (string headerBlock, string body) = SplitHeadersAndBody(gh.Stdout);
-            int status = StatusCode(headerBlock, gh.Stderr);
+            (string headerBlock, string body) = GhResponse.SplitHeadersAndBody(gh.Stdout);
+            int status = GhResponse.StatusCode(headerBlock, gh.Stderr);
             if (pageNumber == 1)
             {
-                responseEtag = HeaderValue(headerBlock, "etag") ?? etag;
+                responseEtag = GhResponse.HeaderValue(headerBlock, "etag") ?? etag;
             }
 
-            pollInterval = Math.Max(pollInterval, HeaderInt(headerBlock, "x-poll-interval"));
+            pollInterval = Math.Max(pollInterval, GhResponse.HeaderInt(headerBlock, "x-poll-interval"));
 
             if (status == 304)
             {
@@ -99,7 +99,7 @@ internal sealed class GhMergedPrSource : IMergedPrSource
                 return ErrorPage(responseEtag, pollInterval, headerBlock);
             }
 
-            if (status is 403 or 429 || status >= 500 || RateBudgetDepleted(headerBlock))
+            if (status is 403 or 429 || status >= 500 || GhResponse.RateBudgetDepleted(headerBlock))
             {
                 return ErrorPage(responseEtag, pollInterval, headerBlock);
             }
@@ -207,7 +207,7 @@ internal sealed class GhMergedPrSource : IMergedPrSource
         ETag = etag,
         ProviderMinIntervalSeconds = pollInterval,
         RateLimited = true,
-        RateLimitResetSeconds = SecondsUntilReset(headerBlock),
+        RateLimitResetSeconds = GhResponse.SecondsUntilReset(headerBlock),
     };
 
     private static int PullCount(string body)
@@ -231,98 +231,6 @@ internal sealed class GhMergedPrSource : IMergedPrSource
         {
             return null;
         }
-    }
-
-    /// <summary>Splits a <c>gh api -i</c> response into its header block and JSON body at the first blank line.</summary>
-    internal static (string Headers, string Body) SplitHeadersAndBody(string response)
-    {
-        if (string.IsNullOrEmpty(response))
-        {
-            return (string.Empty, string.Empty);
-        }
-
-        string normalized = response.Replace("\r\n", "\n", StringComparison.Ordinal);
-        int split = normalized.IndexOf("\n\n", StringComparison.Ordinal);
-        return split < 0
-            ? (normalized, string.Empty)
-            : (normalized[..split], normalized[(split + 2)..]);
-    }
-
-    /// <summary>Reads the HTTP status code from the status line, falling back to a <c>(HTTP nnn)</c> note in stderr.</summary>
-    internal static int StatusCode(string headerBlock, string stderr)
-    {
-        foreach (string line in headerBlock.Split('\n'))
-        {
-            if (line.StartsWith("HTTP/", StringComparison.OrdinalIgnoreCase))
-            {
-                string[] parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length >= 2 && int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int code))
-                {
-                    return code;
-                }
-            }
-        }
-
-        int marker = stderr.IndexOf("(HTTP ", StringComparison.OrdinalIgnoreCase);
-        if (marker >= 0)
-        {
-            string tail = stderr[(marker + 6)..];
-            var digits = new string(tail.TakeWhile(char.IsDigit).ToArray());
-            if (int.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out int code))
-            {
-                return code;
-            }
-        }
-
-        marker = stderr.IndexOf("HTTP ", StringComparison.OrdinalIgnoreCase);
-        if (marker >= 0)
-        {
-            string tail = stderr[(marker + 5)..];
-            var digits = new string(tail.TakeWhile(char.IsDigit).ToArray());
-            if (int.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out int code))
-            {
-                return code;
-            }
-        }
-
-        return 0;
-    }
-
-    internal static string? HeaderValue(string headerBlock, string name)
-    {
-        foreach (string line in headerBlock.Split('\n'))
-        {
-            int colon = line.IndexOf(':', StringComparison.Ordinal);
-            if (colon > 0 && line[..colon].Trim().Equals(name, StringComparison.OrdinalIgnoreCase))
-            {
-                return line[(colon + 1)..].Trim();
-            }
-        }
-
-        return null;
-    }
-
-    private static int HeaderInt(string headerBlock, string name)
-        => int.TryParse(HeaderValue(headerBlock, name), NumberStyles.Integer, CultureInfo.InvariantCulture, out int value) && value > 0 ? value : 0;
-
-    private static bool RateBudgetDepleted(string headerBlock)
-    {
-        string? remaining = HeaderValue(headerBlock, "x-ratelimit-remaining");
-        return remaining is not null
-            && int.TryParse(remaining, NumberStyles.Integer, CultureInfo.InvariantCulture, out int left)
-            && left <= 0;
-    }
-
-    private static int SecondsUntilReset(string headerBlock)
-    {
-        string? reset = HeaderValue(headerBlock, "x-ratelimit-reset");
-        if (reset is null || !long.TryParse(reset, NumberStyles.Integer, CultureInfo.InvariantCulture, out long epoch))
-        {
-            return 0;
-        }
-
-        double seconds = DateTimeOffset.FromUnixTimeSeconds(epoch).Subtract(DateTimeOffset.UtcNow).TotalSeconds;
-        return seconds > 0 ? (int)Math.Ceiling(seconds) : 0;
     }
 
     private static async Task<GhResult> RunGhAsync(IReadOnlyList<string> args, CancellationToken ct)

@@ -72,6 +72,25 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
     public bool NeedsAttention => Owner == RowOwner.Operator;
 
     /// <summary>
+    /// Sort key for the operator's queue, most urgent first. Confirmed problems rank above "cannot tell
+    /// yet": GitHub computes mergeability lazily and can leave a PR `unknown` across many reads, so
+    /// unverified rows are common and must not bury a branch that is definitely conflicting.
+    /// </summary>
+    public int Severity => State switch
+    {
+        WaitingState.NeedsOperator => 0,   // someone is blocked on a person right now
+        WaitingState.Contradicted => 1,    // said done, demonstrably is not
+        WaitingState.Stale => 2,
+        WaitingState.Closed => 3,
+        WaitingState.Ready => 4,           // the merge queue: actionable
+        WaitingState.Merged => 5,          // window is finished, can be reclaimed
+        WaitingState.Conflicting => 6,
+        WaitingState.MergeUnverified => 7, // GitHub has not answered yet
+        WaitingState.Unknown => 8,
+        _ => 9,
+    };
+
+    /// <summary>
     /// Resolves a window's state against GitHub's account of the same PR. Pure — the whole decision table
     /// is testable without a pane or a network.
     /// </summary>
@@ -201,9 +220,11 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         // Reviews meet the bar and the branch merges. CI is reported but is deliberately not a gate: it
         // goes red for reasons unrelated to the change, and clearing it is the operator's call.
         CheckRunFact? failed = facts.Checks.FirstOrDefault(c => c.IsFailure);
-        string ci = failed is not null
-            ? $"; CI red ({failed.Name})"
-            : facts.Checks.Any(c => !c.IsComplete) ? "; CI still running" : string.Empty;
+        string ci = !facts.ChecksKnown
+            ? "; CI unreadable"
+            : failed is not null
+                ? $"; CI red ({failed.Name})"
+                : facts.Checks.Any(c => !c.IsComplete) ? "; CI still running" : string.Empty;
 
         return new(WaitingState.Ready, RowOwner.Operator, $"reviews {state.ReviewsClean}/{state.ReviewsRequired}, mergeable{ci}");
     }
