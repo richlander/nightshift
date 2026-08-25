@@ -201,9 +201,13 @@ internal static class WaitingCommand
 
         // Register every claim before ranking, so a window seen for the first time this sweep still has
         // a registration time to be ordered by.
+        // Observed once per window, and the answer kept: calling it twice happens to work, because the
+        // second call sees the digest it just stored, but it makes the silence measurement depend on
+        // call order rather than on the data.
+        var silence = new Dictionary<string, TimeSpan?>(StringComparer.Ordinal);
         foreach ((TmuxPane pane, AgentState state) in pending)
         {
-            history.Observe(pane, now, state.IsIssue ? null : state.PrNumber);
+            silence[Claim.Key(pane)] = history.Observe(pane, now, state.IsIssue ? null : state.PrNumber);
         }
 
         IReadOnlyDictionary<string, Claim> claims = Claim.Register(
@@ -217,7 +221,7 @@ internal static class WaitingCommand
                 with
                 {
                     Claim = claims.GetValueOrDefault(Claim.Key(pane), Claim.Sole),
-                    SilentFor = history.Observe(pane, now, state.IsIssue ? null : state.PrNumber),
+                    SilentFor = silence.GetValueOrDefault(Claim.Key(pane)),
                 });
         }
 
