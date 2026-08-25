@@ -494,9 +494,10 @@ nightshift coordinate
 
 One gap is yours to cover: Nightshift is not GitHub-aware, so `coordinate` surfaces Nightshift-side
 transitions (`done` / `escalated` / `landed` / `requeued`), but a **merge** only becomes visible once
-Octoshift turns a merged PR into a `land` (a `landed` transition). Until Octoshift is wired in, background
-a second waiter that polls `gh` for the merges of the PRs you have cleared, so a merge wakes you to
-`land` too.
+Octoshift turns a merged PR into a `land` (a `landed` transition). Cover it with `octoshift wait`, which is the
+single component that talks to GitHub — do **not** background a `gh` polling loop of your own. Every
+coordinator running its own waiter multiplies calls against one shared hourly budget, which is the
+condition AGENTS.md's no-polling rule exists to prevent.
 
 ## 7. Drain and stop
 

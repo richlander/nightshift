@@ -142,6 +142,102 @@ wait on it decides whether the loop keeps running:
 Each skill names the specific call its role waits on and points here for the
 shared technique.
 
+## Stopping: publish your state
+
+`Waiting without stalling` covers waits a tool can hold for you. This section covers the
+other kind — the wait whose answer lives on GitHub: a CI run, a required check, a
+mergeability recompute. You cannot block on those without polling, and polling is what
+exhausted the GraphQL budget (see
+[#157](https://github.com/richlander/nightshift/issues/157)).
+
+So: **hand the wait off, then stop.**
+
+- **Do not poll GitHub for a state change.** Re-asking about a head that has not moved
+  cannot tell you anything new.
+- **Never end on a bare narration.** "Waiting for CI" as your last output is a stall with
+  extra words: nothing is running to wake you, and the fact you paid a GitHub call to
+  learn dies where no tool can read it.
+- **Publish your state as a tmux window option instead**, and set it whenever the state
+  changes:
+
+```sh
+# Refuse to publish without a target of your own. This guard is the load-bearing
+# part: with $TMUX_PANE empty, `set` lands on whichever window is current — and
+# so does the matching `show`, so reading back through the same target confirms
+# a write that went to somebody else's window.
+[ -n "$TMUX_PANE" ] || { echo "no TMUX_PANE; do not publish"; exit 1; }
+
+tmux set -w -t "$TMUX_PANE" @agent_state \
+  "pr=4626 head=f4a8d1c84 round=1 reviews=2/2 blocked=4629 rec=wait"
+
+# Verify by looking at every window, not by re-reading your own target: exactly
+# one should carry your value. More than one means a write escaped.
+tmux list-windows -a -F '#{window_name} #{@agent_state}' | grep -c 'pr=4626'
+```
+
+**Why an option and not your output.** This UI runs on the alternate screen, so tmux
+keeps no scrollback for it — `capture-pane -S -400` returns the same single screen as a
+plain capture. Once your report scrolls past the top it is unrecoverable by any tool and
+the window is anonymous. An option persists until you change it and cannot be garbled by
+line wrapping.
+
+**Clear it when the window stops owning the work**, and re-publish rather than inherit
+after a resume or reassignment. A window option outlives the session that set it, so a
+stale one keeps advertising a merge or wait decision that nobody is standing behind:
+
+```sh
+tmux set -w -t "$TMUX_PANE" -u @agent_state
+```
+
+### The fields
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `pr` / `issue` | one of | PR number, or the issue number before a PR exists. |
+| `head` | yes | The head sha this state describes. |
+| `round` | review only | Review round just completed. |
+| `reviews` | yes | `<clean>/<required>` — the dual-clean count. |
+| `blocked` | when blocked | Issue or PR numbers. Omit when empty. |
+| `waiting` | when waiting | A predicate: `check:<name>`, `checks`, `merge`, `review`. |
+| `rec` | yes | `continue`, `wait`, `merge`, `approve`, or `stop`. |
+
+Values carry no spaces.
+
+**Identity before a PR exists.** A worker branch is local until the coordinator pushes it,
+so at early round boundaries there is no PR and no GitHub-visible head. Publish `issue=`
+then, and switch to `pr=` once the PR is open. A required field with no legal value is how
+you get invented ones.
+
+**`head` makes the state falsifiable.** It describes one sha; if GitHub has moved past it,
+a reader discards the claims rather than acting on assertions about code that no longer
+exists.
+
+**`reviews` is the one fact no tool can observe.** GitHub knows CI and mergeability. It has
+no idea one reviewer came back clean and the other has not reported — and that, with
+mergeability, is what **ready** means here. A green CI run is evidence, not the definition.
+
+**`blocked` and `waiting` split by who can act.** `blocked` takes issue or PR numbers only:
+things a person can open and prioritise, and that the next agent hitting the same wall can
+find instead of re-investigating. If a flake blocks you and no issue exists, file one and
+cite it. `waiting` takes a predicate a reader evaluates against your `head`, for when
+nothing is wrong and nothing is openable — a check that has not reported is not a defect
+and does not deserve an issue. `rec=wait` is coherent when either is populated; `blocked=ci`
+satisfies neither and is the error the split exists to remove.
+
+**`rec` is the disposition of the window.** `merge`, `approve` and `stop` each need a person
+before anything moves; `wait` and `continue` do not.
+
+### Name the window too
+
+```sh
+tmux rename-window -t "$TMUX_PANE" pr<number>
+```
+
+The name is the fallback identity when no state is published, and it is a good one: set
+once, unaffected by the report scrolling away. `octoshift waiting` reads both, joins them
+with GitHub, and reports which windows need a person — a state that contradicts itself
+(`rec=merge` at `reviews=0/2`) is reported as a defect rather than silently repaired.
+
 ## Building and testing
 
 Build the whole graph:
@@ -223,7 +319,10 @@ build (see below).
   coordinator**. Without subagents a worker is one model and cannot review its own
   build — the review goes to a different worker, and a worker offered review of an
   order it built declines as an invalid choice. The worker hands the coordinator
-  the **attestation** (models and rounds); it never posts to GitHub.
+  the **attestation** (models and rounds); it never posts to GitHub. A round boundary is a
+  stop, so the worker publishes its state ([above](#stopping-publish-your-state)) at each
+  one — that is what lets a round finishing at 03:44 be picked up at 03:45 instead of
+  whenever someone next looks.
 - **The coordinator owns the GitHub surface — and the push.** Only the coordinator
   pushes worker branches to origin, opens PRs, posts the single clearance note (from
   the worker's attestation), and lands merged orders. A verdict reaches GitHub through
