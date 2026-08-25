@@ -110,7 +110,13 @@ internal sealed partial record AgentState
     /// Reads a window's state. <paramref name="agentState"/> is the <c>@agent_state</c> option and
     /// <paramref name="windowName"/> the tmux window name. Returns null when neither identifies a PR.
     /// </summary>
-    public static AgentState? Parse(string? agentState, string? windowName)
+    /// <param name="nameIsAmbiguous">
+    /// True when another window on the same host carries this name. A duplicated name means a rename
+    /// landed somewhere it did not belong, so the name identifies nothing — observed live: an agent
+    /// working on one PR renamed a neighbour's window to its own PR, leaving two windows with one name
+    /// and one of them describing work it was not doing.
+    /// </param>
+    public static AgentState? Parse(string? agentState, string? windowName, bool nameIsAmbiguous = false)
     {
         (int Number, bool IsIssue)? fromName = PrFromWindowName(windowName);
         Dictionary<string, string> fields = SplitFields(agentState);
@@ -155,12 +161,18 @@ internal sealed partial record AgentState
             // The window name is the fallback identity and a good one: it is set once, survives the report
             // scrolling away, and cannot be confused by prose. Scraping the pane for a PR reference is
             // deliberately not attempted — it produced "PR #37" from the phrase "in PR 37 lines".
-            return fromName is not { } named
+            // With no published state the name is the only identity available, and a duplicated name is
+            // not one. Reporting nothing beats reporting somebody else's PR with confidence.
+            return fromName is not { } named || nameIsAmbiguous
                 ? null
                 : new AgentState { PrNumber = named.Number, IsIssue = named.IsIssue, Source = StateSource.WindowName };
         }
 
-        if (fromName is { IsIssue: false } window && window.Number != statePr)
+        if (nameIsAmbiguous)
+        {
+            defects.Add($"another window shares the name '{windowName}' — a rename landed on the wrong window");
+        }
+        else if (fromName is { IsIssue: false } window && window.Number != statePr)
         {
             defects.Add($"window is named pr{window.Number} but the record says pr={statePr}");
         }

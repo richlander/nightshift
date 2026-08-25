@@ -623,8 +623,10 @@ public class WaitingScanTests
 
         IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
             [
+                // Distinct window names: the contest is established by the published state, and two
+                // windows sharing a name is a different defect with its own test.
                 Pane("cp:1", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234 reviews=2/2 rec=merge", windowName: "pr4448"),
-                Pane("cp:2", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234 reviews=2/2 rec=merge", windowName: "pr4448"),
+                Pane("cp:2", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234 reviews=2/2 rec=merge", windowName: "pr4448-b"),
             ],
             (_, _) => Task.FromResult<PrFacts?>(ready),
             (_, _) => Task.FromResult<PrFacts?>(null),
@@ -822,6 +824,31 @@ public class WaitingScanTests
     public void ClassifyActivity_OrdinaryOutputIsNotAStall()
     {
         Assert.Null(TmuxScanner.StallReason("● Round 3 is complete for PR 4616.\n  Fix description: ...\n> "));
+    }
+
+    [Fact]
+    public async Task BuildRows_TwoWindowsSharingANameCannotBeIdentifiedByIt()
+    {
+        // Observed live on fernie: windows 0 and 6 both named pr4551-blocked, with window 0 actually
+        // working on 4663. An agent had renamed a neighbour. The one with published state is still
+        // identified correctly; the one without is not identified at all, because the only evidence it
+        // had was a name that demonstrably belongs to someone else.
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [
+                Pane("cp:0", "", PaneActivity.Idle, agentState: "pr=4663 head=abc1234 reviews=0/2 rec=wait", windowName: "pr4551-blocked"),
+                Pane("cp:6", "", PaneActivity.Idle, windowName: "pr4551-blocked"),
+            ],
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            DateTimeOffset.UtcNow,
+            all: true,
+            ct: TestContext.Current.CancellationToken);
+
+        WaitingRow stated = rows.Single(r => r.Record?.PrNumber == 4663);
+        Assert.Contains(stated.Record!.Defects, d => d.Contains("shares the name", StringComparison.Ordinal));
+
+        WaitingRow nameless = rows.Single(r => r.Record is null);
+        Assert.Contains("no published state", nameless.Verdict.Reason, StringComparison.Ordinal);
     }
 
     private static TmuxPane Pane(string target, string capture, PaneActivity activity, DateTimeOffset? lastActivity = null, string? agentState = null, string windowName = "w")

@@ -137,6 +137,14 @@ internal static class WaitingCommand
         // second window's question has the same answer as the first's.
         var seen = new Dictionary<int, PrFacts?>();
 
+        // Window names that appear twice on one host. A tmux name is not unique by construction, and a
+        // duplicate is evidence that a rename went somewhere it did not belong rather than a coincidence.
+        HashSet<string> ambiguousNames = [.. panes
+            .Where(p => p.WindowName.Length > 0)
+            .GroupBy(p => $"{p.Host ?? "local"}|{p.WindowName}", StringComparer.Ordinal)
+            .Where(g => g.Count() > 1)
+            .Select(g => g.Key)];
+
         foreach (TmuxPane pane in panes)
         {
             // A pane mid-turn has not handed anything over; there is nothing to resolve and nothing to do.
@@ -145,7 +153,10 @@ internal static class WaitingCommand
                 continue;
             }
 
-            AgentState? record = AgentState.Parse(pane.AgentStateOption, pane.WindowName);
+            AgentState? record = AgentState.Parse(
+                pane.AgentStateOption,
+                pane.WindowName,
+                nameIsAmbiguous: ambiguousNames.Contains($"{pane.Host ?? "local"}|{pane.WindowName}"));
 
             if (pane.Activity == PaneActivity.Stalled)
             {

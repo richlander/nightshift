@@ -199,6 +199,30 @@ public class AgentStateTests
         => Assert.Null(AgentState.Parse(null, windowName));
 
     [Fact]
+    public void Parse_ADuplicatedWindowNameIdentifiesNothing()
+    {
+        // Observed live on fernie: two windows both named pr4551-blocked, one of them actually working
+        // on 4663. A rename had landed on a neighbour. With no published state the name is the only
+        // identity available, and a duplicated name is not one.
+        Assert.Null(AgentState.Parse(null, "pr4551-blocked", nameIsAmbiguous: true));
+        Assert.NotNull(AgentState.Parse(null, "pr4551-blocked", nameIsAmbiguous: false));
+    }
+
+    [Fact]
+    public void Parse_ADuplicatedNameIsADefectEvenWhenTheRecordIsAuthoritative()
+    {
+        // The published state still identifies the window correctly, so the row is usable — but the
+        // collision is evidence that some agent is renaming windows it does not own, which is worth
+        // saying out loud rather than silently preferring the record.
+        AgentState? state = AgentState.Parse(
+            "pr=4663 head=0ab4d7473 round=2 reviews=0/2 rec=wait", "pr4551-blocked", nameIsAmbiguous: true);
+
+        Assert.NotNull(state);
+        Assert.Equal(4663, state.PrNumber);
+        Assert.Contains(state.Defects, d => d.Contains("shares the name", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void Parse_FlagsAWindowNameThatDisagreesWithTheRecord()
     {
         // Four windows on one host carried another window's state verbatim, from a `tmux set` that
