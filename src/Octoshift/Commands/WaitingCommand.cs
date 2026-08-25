@@ -19,6 +19,12 @@ internal sealed record WaitingRow
     public TimeSpan? StoppedFor { get; init; }
 
     /// <summary>
+    /// How long the window has produced no new content, measured across runs. Null until a second
+    /// observation exists. Distinct from <see cref="StoppedFor"/>, which a repainting spinner resets.
+    /// </summary>
+    public TimeSpan? SilentFor { get; init; }
+
+    /// <summary>
     /// Other windows claiming the same PR. Two agents on one PR fight; on one host they fight over the
     /// same worktree, which is more destructive and more discoverable at once.
     /// </summary>
@@ -37,7 +43,7 @@ internal sealed record WaitingRow
 /// </remarks>
 internal static class WaitingCommand
 {
-    public static async Task<int> RunAsync(string? repoFlag, IReadOnlyList<string> hosts, bool all, bool json, CancellationToken ct)
+    public static async Task<int> RunAsync(string? repoFlag, IReadOnlyList<string> hosts, bool all, bool json, bool rename, CancellationToken ct)
     {
         string? repo = RepoScope.Resolve(repoFlag);
         if (repo is null)
@@ -75,6 +81,11 @@ internal static class WaitingCommand
             (args, token) => GhAuthenticatedRunner.RunGhAsync(args, null, token));
         IReadOnlyList<WaitingRow> rows = await BuildRowsAsync(
             panes, facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, all, ct);
+
+        if (rename)
+        {
+            await RenameAsync(rows, ct);
+        }
 
         if (json)
         {
@@ -172,15 +183,22 @@ internal static class WaitingCommand
         // A PR claimed by more than one window is a fight in progress. Computed across every host, since
         // the two halves of it are often not on the same machine.
         ILookup<int, TmuxPane> claims = pending.ToLookup(e => e.State.PrNumber, e => e.Pane);
+        var history = new PaneHistory();
 
         foreach ((TmuxPane pane, AgentState state) in pending)
         {
             rows.Add(Row(pane, state, WaitingVerdict.Resolve(state, state.IsIssue ? null : seen.GetValueOrDefault(state.PrNumber)), now)
-                with { Rivals = [.. claims[state.PrNumber].Where(p => p.PaneId != pane.PaneId || p.Host != pane.Host)] });
+                with
+                {
+                    Rivals = [.. claims[state.PrNumber].Where(p => p.PaneId != pane.PaneId || p.Host != pane.Host)],
+                    SilentFor = history.Observe(pane, now),
+                });
         }
 
         // Longest wait first among the rows that need you: coming back after hours away, the thing that
         // has been stuck longest is the thing that cost the most.
+        history.Save(panes);
+
         // The operator's queue first, longest wait at the top: after hours away, the row that has been
         // stuck longest is the one that cost the most.
         return rows
@@ -189,6 +207,29 @@ internal static class WaitingCommand
             .ThenBy(r => r.Verdict.Severity)
             .ThenByDescending(r => r.StoppedFor ?? TimeSpan.Zero)
             .ToArray();
+    }
+
+    /// <summary>
+    /// Corrects window names the tool can see are wrong, one batched command per host. Only names that
+    /// actually differ are touched, so a fleet already correct costs nothing.
+    /// </summary>
+    private static async Task RenameAsync(IReadOnlyList<WaitingRow> rows, CancellationToken ct)
+    {
+        foreach (IGrouping<string?, WaitingRow> host in rows.GroupBy(r => r.Pane.Host))
+        {
+            (TmuxPane Pane, string Desired)[] renames = [.. host
+                .Select(r => (r.Pane, Desired: WindowNaming.Apply(r.Pane.WindowName, WindowNaming.SuffixFor(r.Verdict))))
+                .Where(r => !string.Equals(r.Desired, r.Pane.WindowName, StringComparison.Ordinal))];
+
+            if (WindowNaming.BuildRenameScript(renames) is { } script)
+            {
+                await ShellRunner.For(host.Key)(script, ct);
+                foreach ((TmuxPane pane, string desired) in renames)
+                {
+                    Console.WriteLine($"RENAMED {pane.Where} {pane.WindowName} -> {desired}");
+                }
+            }
+        }
     }
 
     private static WaitingRow Row(TmuxPane pane, AgentState? record, WaitingVerdict verdict, DateTimeOffset now)
@@ -227,7 +268,7 @@ internal static class WaitingCommand
                     row.Record is null ? "-" : $"#{row.Record.PrNumber}{(row.Record.Source == StateSource.WindowName ? "~" : string.Empty)}",
                     row.Verdict.State.ToString().ToUpperInvariant(),
                     row.Verdict.Assurance.Label,
-                    Duration(row.StoppedFor),
+                    Duration(row.SilentFor ?? row.StoppedFor),
                     Detail(row),
                 ]);
             }
@@ -425,6 +466,11 @@ internal static class WaitingCommand
             if (row.StoppedFor is { } stopped)
             {
                 writer.WriteNumber("stoppedForSeconds", (long)stopped.TotalSeconds);
+            }
+
+            if (row.SilentFor is { } silent)
+            {
+                writer.WriteNumber("silentForSeconds", (long)silent.TotalSeconds);
             }
 
             writer.WriteEndObject();

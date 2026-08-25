@@ -57,6 +57,19 @@ internal sealed record TmuxPane
     public PaneActivity Activity { get; init; }
 
     public string Capture { get; init; } = string.Empty;
+
+    /// <summary>
+    /// A digest of the capture with its last few lines removed.
+    /// </summary>
+    /// <remarks>
+    /// The footer is where a TUI draws its spinner and hint line, and it is repainted whether or not the
+    /// agent produced anything. Measured across one host over 45 seconds: four windows advanced
+    /// <c>window_activity</c> and changed on screen, but one of those had a byte-identical body — it was
+    /// animating and emitting nothing. So the whole-screen view and the activity stamp both call that
+    /// window active, and only the body says otherwise. Comparing this across sweeps is what separates
+    /// "produced output" from "redrew pixels".
+    /// </remarks>
+    public string BodyDigest { get; init; } = string.Empty;
 }
 
 /// <summary>
@@ -204,7 +217,23 @@ internal sealed class TmuxScanner
     }
 
     private static TmuxPane Finish(TmuxPane pane, string capture)
-        => pane with { Capture = capture, Activity = ClassifyActivity(capture) };
+        => pane with { Capture = capture, Activity = ClassifyActivity(capture), BodyDigest = DigestBody(capture) };
+
+    /// <summary>Hashes the capture minus its footer, so a repainting spinner does not read as progress.</summary>
+    internal static string DigestBody(string capture)
+    {
+        string[] lines = [.. capture
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Split('\n')
+            .Select(l => l.TrimEnd())
+            .Where(l => l.Length > 0)];
+
+        // Three lines covers the rule, the prompt and the hint line every agent TUI observed here draws.
+        int body = Math.Max(0, lines.Length - FooterLines);
+        return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join('\n', lines[..body]))))[..16];
+    }
+
+    private const int FooterLines = 3;
 
     /// <summary>Parses one metadata line. Malformed rows are dropped, not guessed at.</summary>
     internal static TmuxPane? ParseWindow(string line, string? host)

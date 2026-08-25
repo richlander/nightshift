@@ -29,6 +29,7 @@ internal static class PrCommand
         }
 
         FleetScan scan = await FleetScan.CollectAsync(hosts, ct);
+        var history = new PaneHistory();
 
         // Windows claiming this PR through either channel: a published state, or the window name alone.
         var claims = new List<(TmuxPane Pane, AgentState State)>();
@@ -50,13 +51,24 @@ internal static class PrCommand
                     : prFacts;
         }
 
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        // Observe every window, not only the ones claiming this PR: the history is shared with `waiting`,
+        // and a run that recorded a subset would prune the rest and reset their silence measurements.
+        Dictionary<string, TimeSpan?> silence = [];
+        foreach (TmuxPane pane in scan.Panes)
+        {
+            silence[pane.PaneId] = history.Observe(pane, now);
+        }
+
+        history.Save(scan.Panes);
+
         if (json)
         {
-            WriteJson(prNumber, claims, prFacts, scan, DateTimeOffset.UtcNow);
+            WriteJson(prNumber, claims, prFacts, scan, now);
         }
         else
         {
-            WriteReport(prNumber, claims, prFacts, scan, DateTimeOffset.UtcNow);
+            WriteReport(prNumber, claims, prFacts, scan, now, silence);
         }
 
         return prFacts is null && claims.Count == 0 ? ExitCode.Unavailable : ExitCode.Ok;
@@ -67,7 +79,8 @@ internal static class PrCommand
         IReadOnlyList<(TmuxPane Pane, AgentState State)> claims,
         PrFacts? facts,
         FleetScan scan,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        IReadOnlyDictionary<string, TimeSpan?> silence)
     {
         Console.WriteLine($"PR #{prNumber}{(facts?.Title is { Length: > 0 } title ? $"  {title}" : string.Empty)}");
 
@@ -80,7 +93,7 @@ internal static class PrCommand
         foreach ((TmuxPane pane, AgentState state) in claims)
         {
             string name = pane.WindowName.Length > 0 ? $" {pane.WindowName}" : string.Empty;
-            Console.WriteLine($"  where     {pane.Where}{name}   {Activity(pane, now)}");
+            Console.WriteLine($"  where     {pane.Where}{name}   {Activity(pane, now, silence.GetValueOrDefault(pane.PaneId))}");
             if (Agent(state) is { Length: > 0 } line)
             {
                 Console.WriteLine($"  agent     {line}");
@@ -118,12 +131,19 @@ internal static class PrCommand
         }
     }
 
-    private static string Activity(TmuxPane pane, DateTimeOffset now)
+    private static string Activity(TmuxPane pane, DateTimeOffset now, TimeSpan? silent)
     {
         string quiet = pane.LastActivity is { } at && at <= now ? $" for {Duration(now - at)}" : string.Empty;
+
+        // The distinction that matters when two windows claim one PR: a spinner is not progress, and
+        // both of them look busy from the outside.
+        string producing = silent is { } s && s > TimeSpan.FromMinutes(2)
+            ? $", no output for {Duration(s)}"
+            : string.Empty;
+
         return pane.Activity switch
         {
-            PaneActivity.Working => "working",
+            PaneActivity.Working => $"working{producing}",
             PaneActivity.Blocked => "blocked on a prompt",
             PaneActivity.Unreadable => "pane unreadable",
             _ => $"idle{quiet}",

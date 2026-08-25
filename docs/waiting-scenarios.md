@@ -70,7 +70,38 @@ PR #4448  Add full-screen annotated source explorer
 Contested PRs also surface in the main view without asking, because neither window looks wrong on its
 own — the contest is the finding.
 
-## 4. An agent says it is ready and it is not
+## 3b. Is that second agent actually doing anything?
+
+A window drawing a spinner looks busy. `window_activity` agrees with it, and so does a hash of the
+whole screen — both are moved by a repainting footer.
+
+Measured across one host over 45 seconds: four windows advanced their activity stamp and changed on
+screen, and one of those had a **byte-identical body**. It was animating and emitting nothing.
+
+So the tool hashes the capture with its footer removed and remembers that between runs. The `FOR`
+column reports how long a window has produced no new content, rather than how long since anything
+was drawn. Silence is only reported once there are two observations to compare — a first sighting
+says nothing rather than a fabricated zero.
+
+## 4. Window names that lie
+
+The suffix convention is sound and its upkeep is not: an agent sets `-blocked` when it blocks and has
+to remember to clear it later. Measured on one fleet, six windows carried `-blocked` and **three had
+no prompt open**.
+
+```
+$ octoshift waiting --rename
+RENAMED fernie cp:20 pr4553-blocked -> pr4553-merged
+RENAMED merritt cp:9 pr4635-blocked -> pr4635
+```
+
+Renaming a window is not talking to an agent — it edits tmux metadata in your own view, cannot reach
+an agent's input, and is idempotent, so a fleet already correct costs nothing. The tool owns the
+suffix and rewrites it every sweep; the agent owns the `pr####` base and sets it once. A low-confidence
+verdict is never published as a name: a row can say "probably", a name is read at a glance and
+believed.
+
+## 5. An agent says it is ready and it is not
 
 Agents do not follow a reporting contract reliably. Measured on one fleet in one day: states naming
 another window's PR, blockers naming nothing openable, a PR listed as its own blocker, and a `2/2`
@@ -89,7 +120,7 @@ Readiness is **two clean reviews plus a mergeable branch** — not green CI, whi
 that have nothing to do with the change. A recommendation to merge is treated as a request, never as
 evidence.
 
-## 5. A window is holding a machine slot for work that already landed
+## 6. A window is holding a machine slot for work that already landed
 
 ```
 $ octoshift pr 4553
@@ -101,7 +132,7 @@ PR #4553  Define agent behavior on session resume
 
 Three days merged, eleven hours idle, still occupying a window on a busy host.
 
-## 6. An agent is waiting on something that already cleared
+## 7. An agent is waiting on something that already cleared
 
 If an agent publishes what it is waiting for, the tool evaluates it against the head it named:
 
@@ -129,12 +160,14 @@ at `4967/5000`.
 
 ## What it will not do
 
-- **It does not act.** Every run prints `NOT ACTED` with a count of rows that met the bar, including
-  when that count is zero — otherwise "did nothing" and "saw nothing" look the same.
+- **It does not act on an agent.** Every run prints `NOT ACTED` with a count of
+  rows that met the bar, including when that count is zero — otherwise "did
+  nothing" and "saw nothing" look the same. (`--rename` writes window names,
+  which is metadata in your own view, never input to an agent.)
 - **It does not guess.** Missing evidence produces a low-confidence row saying
   what was missing, rather than a cheerful default.
-- **It does not put credentials on your agent hosts.** Collection is a `tmux` dump over ssh; every
-  GitHub call is made from the machine you run it on.
+- **It does not put credentials on your agent hosts.** Collection is a `tmux`
+  dump over ssh; every GitHub call is made from the machine you run it on.
 - **It does not require anything of agents.** Window names alone are enough to
   locate work. Agents that publish state get richer rows; those that do not are
   still found.
@@ -150,6 +183,9 @@ octoshift waiting --host fernie --host merritt
 
 # include the quiet and healthy windows too
 octoshift waiting --all
+
+# correct stale window-name suffixes from what the tool observes
+octoshift waiting --rename
 
 # locate one PR and report what is happening to it
 octoshift pr 4537 --host fernie --host merritt

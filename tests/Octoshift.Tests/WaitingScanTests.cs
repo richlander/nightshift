@@ -470,6 +470,55 @@ public class WaitingScanTests
         Assert.Single(scan.Unreachable);
     }
 
+    [Fact]
+    public void DigestBody_IgnoresTheFooterSoASpinnerIsNotProgress()
+    {
+        // Measured: a window advanced window_activity and changed on screen while its body was
+        // byte-identical. Only the body distinguishes producing output from animating.
+        const string Body = "● Round 3 is complete for PR 4616.\n  Fix description: authenticated every hop.";
+
+        string first = TmuxScanner.DigestBody($"{Body}\n~/git/dotnet-inspect\n────────\n· Working (esc to interrupt) ⠋");
+        string second = TmuxScanner.DigestBody($"{Body}\n~/git/dotnet-inspect\n────────\n· Working (esc to interrupt) ⠙");
+
+        Assert.Equal(first, second);
+    }
+
+    [Fact]
+    public void DigestBody_ChangesWhenTheAgentActuallyEmits()
+    {
+        string before = TmuxScanner.DigestBody("● Round 3 complete.\nfooter\nfooter\nfooter");
+        string after = TmuxScanner.DigestBody("● Round 3 complete.\n● Round 4 starting.\nfooter\nfooter\nfooter");
+
+        Assert.NotEqual(before, after);
+    }
+
+    [Theory]
+    [InlineData("pr4448-blocked", "pr4448")]
+    [InlineData("pr4448-merged", "pr4448")]
+    [InlineData("pr4448", "pr4448")]
+    [InlineData("tune-performance-triage", "tune-performance-triage")]
+    public void WindowNaming_StripsOnlyItsOwnSuffixes(string name, string expected)
+        => Assert.Equal(expected, WindowNaming.Strip(name));
+
+    [Fact]
+    public void WindowNaming_ReplacesAStaleSuffixRatherThanAppending()
+    {
+        // Three of six `-blocked` windows on one fleet had no prompt open. The suffix was believed and
+        // wrong, which is worse than absent.
+        Assert.Equal("pr4448-merged", WindowNaming.Apply("pr4448-blocked", "merged"));
+        Assert.Equal("pr4448", WindowNaming.Apply("pr4448-blocked", null));
+    }
+
+    [Fact]
+    public void WindowNaming_NeverPublishesALowConfidenceVerdictAsAName()
+    {
+        // A row can say "probably"; a name is read at a glance and believed.
+        WaitingVerdict unsure = new(WaitingState.Ready, RowOwner.Operator, "reviews 2/2", Assurance.Low("contradicts itself"));
+
+        Assert.Null(WindowNaming.SuffixFor(unsure));
+        Assert.Equal("ready", WindowNaming.SuffixFor(new(WaitingState.Ready, RowOwner.Operator, "reviews 2/2", Assurance.High)));
+    }
+
     private static TmuxPane Pane(string target, string capture, PaneActivity activity, DateTimeOffset? lastActivity = null, string? agentState = null, string windowName = "w")
         => new()
         {
