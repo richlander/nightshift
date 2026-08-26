@@ -101,41 +101,48 @@ internal sealed partial record AgentState
 
     /// <summary>
     /// Reads a window's state. <paramref name="agentState"/> is the <c>@agent_state</c> option and
-    /// <paramref name="windowName"/> the tmux window name. Returns null when neither identifies a PR.
+    /// <paramref name="windowName"/> the tmux window name. Returns null when neither identifies a PR or
+    /// an issue.
     /// </summary>
+    /// <remarks>
+    /// Identity is settled first and the rest of the record is read the same way whatever settled it.
+    /// Identity used to short-circuit the read: a window named <c>i4613</c> publishing <c>pr=none
+    /// head=pending round=0 reviews=0/2 rec=stop</c> — an observed value, and the reason the window name
+    /// is a fallback at all — returned a name-only record and dropped every other field, including the
+    /// <c>rec=stop</c> that was the agent asking to be released. A malformed identity is a defect in one
+    /// field; it says nothing about the fields beside it, and discarding them turns an escalation into a
+    /// window that looks like it is quietly getting on with things.
+    /// </remarks>
     public static AgentState? Parse(string? agentState, string? windowName)
     {
         (int Number, bool IsIssue)? fromName = PrFromWindowName(windowName);
         Dictionary<string, string> fields = SplitFields(agentState);
         var defects = new List<string>();
 
-        int? statePr = null;
+        int? number = null;
+        bool isIssue = false;
+        StateSource source = StateSource.Declared;
+
+        // A worker branch is local until the coordinator pushes it, so early round boundaries have an
+        // issue and no PR. Requiring `pr` there is what produces invented values.
         if (!fields.ContainsKey("pr") && fields.TryGetValue("issue", out string? issueValue))
         {
-            // A worker branch is local until the coordinator pushes it, so early round boundaries have an
-            // issue and no PR. Requiring `pr` there is what produces invented values.
-            if (int.TryParse(issueValue, NumberStyles.None, CultureInfo.InvariantCulture, out int issueNumber) && issueNumber > 0)
+            if (TryNumber(issueValue, out int issueNumber))
             {
-                return new AgentState
-                {
-                    PrNumber = issueNumber,
-                    IsIssue = true,
-                    Head = fields.GetValueOrDefault("head") is { } h && IsSha(h) ? h.ToLowerInvariant() : null,
-                    Recommendation = ParseRecommendation(fields.GetValueOrDefault("rec"), defects),
-                    Source = StateSource.Declared,
-                    Defects = defects,
-                };
+                number = issueNumber;
+                isIssue = true;
             }
-
-            // Malformed: fall through to the window name rather than inventing an identity.
-            defects.Add($"issue={issueValue} is not an issue number");
+            else
+            {
+                defects.Add($"issue={issueValue} is not an issue number");
+            }
         }
 
-        if (fields.TryGetValue("pr", out string? prValue))
+        if (number is null && fields.TryGetValue("pr", out string? prValue))
         {
-            if (int.TryParse(prValue, NumberStyles.None, CultureInfo.InvariantCulture, out int parsed) && parsed > 0)
+            if (TryNumber(prValue, out int parsed))
             {
-                statePr = parsed;
+                number = parsed;
             }
             else
             {
@@ -143,28 +150,36 @@ internal sealed partial record AgentState
             }
         }
 
-        if (statePr is null)
+        if (number is null)
         {
             // The window name is the fallback identity and a good one: it is set once, survives the report
             // scrolling away, and cannot be confused by prose. Scraping the pane for a PR reference is
             // deliberately not attempted — it produced "PR #37" from the phrase "in PR 37 lines".
-            return fromName is not { } named
-                ? null
-                : new AgentState { PrNumber = named.Number, IsIssue = named.IsIssue, Source = StateSource.WindowName };
-        }
+            if (fromName is not { } named)
+            {
+                return null;
+            }
 
-        if (fromName is { IsIssue: false } window && window.Number != statePr)
+            number = named.Number;
+            isIssue = named.IsIssue;
+
+            // Said honestly: the identity came from the name, so nothing here is corroborated by the
+            // record, and any defect that got us here is kept rather than forgotten.
+            source = StateSource.WindowName;
+        }
+        else if (!isIssue && fromName is { IsIssue: false } window && window.Number != number)
         {
-            defects.Add($"window is named pr{window.Number} but the record says pr={statePr}");
+            defects.Add($"window is named pr{window.Number} but the record says pr={number}");
         }
 
         (int? clean, int? required) = ParseReviews(fields.GetValueOrDefault("reviews"), defects);
         IReadOnlyList<int> blocked = ParseBlocked(fields.GetValueOrDefault("blocked"), defects);
-        if (blocked.Contains(statePr.Value))
+        if (blocked.Contains(number.Value))
         {
             // Observed live. Self-reference reads as a real blocker to anything counting entries, and
-            // there is nothing behind it to clear.
-            defects.Add($"blocked lists its own PR #{statePr}");
+            // there is nothing behind it to clear. Named for what this window is tracking: an issue window
+            // has no PR, and calling its issue a PR is a second wrong fact in a message about wrongness.
+            defects.Add($"blocked lists its own {(isIssue ? "issue" : "PR")} #{number}");
         }
 
         Recommendation rec = ParseRecommendation(fields.GetValueOrDefault("rec"), defects);
@@ -194,7 +209,8 @@ internal sealed partial record AgentState
 
         return new AgentState
         {
-            PrNumber = statePr.Value,
+            PrNumber = number.Value,
+            IsIssue = isIssue,
             Head = head?.ToLowerInvariant(),
             Round = int.TryParse(fields.GetValueOrDefault("round"), NumberStyles.None, CultureInfo.InvariantCulture, out int round) ? round : null,
             ReviewsClean = clean,
@@ -202,10 +218,13 @@ internal sealed partial record AgentState
             Blocked = blocked,
             Waiting = waiting,
             Recommendation = rec,
-            Source = StateSource.Declared,
+            Source = source,
             Defects = defects,
         };
     }
+
+    private static bool TryNumber(string value, out int number)
+        => int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out number) && number > 0;
 
     private static (int? Clean, int? Required) ParseReviews(string? value, List<string> defects)
     {

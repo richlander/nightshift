@@ -88,6 +88,23 @@ public class WaitingVerdictTests
     }
 
     [Fact]
+    public void Resolve_AnIssueWindowAskingToStopReachesTheOperator()
+    {
+        // The end of the dropped-fields bug: `pr=none … rec=stop` in an i#### window used to resolve as a
+        // window holding quietly, because the `rec` never survived the read. An agent asking to be
+        // released is the row a person most needs to see.
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            AgentState.Parse("pr=none head=pending round=0 reviews=0/2 rec=stop", "i4613")!, null);
+
+        Assert.Equal(WaitingState.NeedsOperator, v.State);
+        Assert.True(v.NeedsAttention);
+        Assert.Contains("stop", v.Reason, StringComparison.Ordinal);
+
+        // Reported, never acted on: the identity is inferred and the record contradicts itself.
+        Assert.False(v.MayAct);
+    }
+
+    [Fact]
     public void Confidence_ACleanCorroboratedRecordIsTheOnlyThingActedOn()
     {
         // Two independently written fields saying the same thing, on a head GitHub agrees with. In the

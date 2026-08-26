@@ -183,6 +183,109 @@ public class AgentStateTests
     }
 
     [Fact]
+    public void Parse_KeepsTheRestOfTheRecordWhenOnlyTheWindowNameIdentifiesIt()
+    {
+        // The blocking finding, on the same observed value with `rec=stop`: identity used to short-circuit
+        // the read, so a malformed `pr=` threw away every field beside it — including the one field that
+        // was an agent asking to be released. An escalation became a window quietly getting on with things.
+        AgentState? state = AgentState.Parse("pr=none head=pending round=0 reviews=0/2 rec=stop", "i4613");
+
+        Assert.NotNull(state);
+        Assert.True(state.IsIssue);
+        Assert.Equal(4613, state.PrNumber);
+        Assert.Equal(Recommendation.Stop, state.Recommendation);
+        Assert.Equal(0, state.Round);
+        Assert.Equal(0, state.ReviewsClean);
+        Assert.Equal(2, state.ReviewsRequired);
+
+        // Said honestly rather than repaired: the identity is the window's, and both bad fields are named.
+        Assert.Equal(StateSource.WindowName, state.Source);
+        Assert.Null(state.Head);
+        Assert.Contains(state.Defects, d => d.Contains("pr=none", StringComparison.Ordinal));
+        Assert.Contains(state.Defects, d => d.Contains("head=pending", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Parse_ReadsEveryFieldOnAFallbackIssueWindow()
+    {
+        AgentState? state = AgentState.Parse(
+            "pr=none head=8d5f22a22 round=3 reviews=1/2 waiting=check:ci-required blocked=4700 rec=wait", "i4613");
+
+        Assert.NotNull(state);
+        Assert.True(state.IsIssue);
+        Assert.Equal(4613, state.PrNumber);
+        Assert.Equal(StateSource.WindowName, state.Source);
+        Assert.Equal("8d5f22a22", state.Head);
+        Assert.Equal(3, state.Round);
+        Assert.Equal(1, state.ReviewsClean);
+        Assert.Equal(2, state.ReviewsRequired);
+        Assert.Equal(WaitKind.Check, state.Waiting.Kind);
+        Assert.Equal([4700], state.Blocked);
+        Assert.Equal(Recommendation.Wait, state.Recommendation);
+
+        // `pr=none` is still wrong, and is still the only thing reported wrong.
+        Assert.Contains(state.Defects, d => d.Contains("pr=none", StringComparison.Ordinal));
+        Assert.DoesNotContain(state.Defects, d => d.Contains("nothing in blocked or waiting", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Parse_ContinueOnAFallbackIssueWindowIsStillContinue()
+    {
+        AgentState? state = AgentState.Parse("pr=none head=8d5f22a22 round=2 reviews=0/2 rec=continue", "i4613");
+
+        Assert.NotNull(state);
+        Assert.Equal(Recommendation.Continue, state.Recommendation);
+        Assert.Equal(2, state.Round);
+        Assert.Equal("8d5f22a22", state.Head);
+    }
+
+    [Fact]
+    public void Parse_ReadsTheWholeRecordOfAnIssueThatDeclaredItself()
+    {
+        // The declared issue path dropped the same fields for the same reason. An issue window publishes
+        // rounds and reviews long before a PR exists; they are the only account of what it is doing.
+        AgentState? state = AgentState.Parse(
+            "issue=4611 head=8d5f22a22 round=4 reviews=1/2 waiting=review rec=wait", "i4611");
+
+        Assert.NotNull(state);
+        Assert.Equal(StateSource.Declared, state.Source);
+        Assert.Equal(4, state.Round);
+        Assert.Equal(1, state.ReviewsClean);
+        Assert.Equal(WaitKind.Review, state.Waiting.Kind);
+        Assert.Equal(Recommendation.Wait, state.Recommendation);
+        Assert.Empty(state.Defects);
+    }
+
+    [Fact]
+    public void Parse_AnIssueBlockedOnItselfIsNotCalledAPr()
+    {
+        // Self-reference is as wrong here as on a PR, but an issue window has no PR — calling its issue
+        // one puts a second wrong fact in a message about wrongness.
+        AgentState? state = AgentState.Parse("issue=4611 head=8d5f22a22 blocked=4611 rec=wait", "i4611");
+
+        Assert.NotNull(state);
+        Assert.Contains(state.Defects, d => d.Contains("its own issue #4611", StringComparison.Ordinal));
+        Assert.DoesNotContain(state.Defects, d => d.Contains("PR", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Parse_KeepsTheRestOfTheRecordWhenOnlyTheWindowNameIdentifiesAPr()
+    {
+        // The same rule on the PR side: a window named pr4595 whose `pr=` is unusable still published a
+        // head and a count, and they still describe this window.
+        AgentState? state = AgentState.Parse("pr=#4595 head=722512e25 reviews=2/2 rec=merge", "pr4595");
+
+        Assert.NotNull(state);
+        Assert.False(state.IsIssue);
+        Assert.Equal(4595, state.PrNumber);
+        Assert.Equal(StateSource.WindowName, state.Source);
+        Assert.Equal("722512e25", state.Head);
+        Assert.True(state.ReviewsMeetBar);
+        Assert.Equal(Recommendation.Merge, state.Recommendation);
+        Assert.Contains(state.Defects, d => d.Contains("pr=#4595", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void Parse_FlagsAPrBlockedOnItself()
     {
         AgentState? state = AgentState.Parse("pr=4636 head=c11c50d91 reviews=1/2 blocked=4636 rec=approve", "pr4636");
