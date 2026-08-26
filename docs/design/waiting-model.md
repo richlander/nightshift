@@ -147,17 +147,22 @@ because several of them were violated by code that passed its unit tests.
    change. *(An owner whose identity flips is worse than no owner.)*
 10. After a host's epoch changes, no claim on that host has `basis = Observed`
     until the tool has witnessed those windows registering again.
-11. A window's silence duration never decreases while its body digest is
+11. A contested claim has `basis = Observed` only when every claimant's host was
+    swept in full *before* this run. *(Adding a host must not launder a narrow
+    view: a rival first seen this sweep has a "now" registration that is a first
+    look, not a witnessed appearance, so ordering a recorded rival against it is
+    a guess.)*
+12. A window's silence duration never decreases while its body digest is
     unchanged.
-12. A claim's registration time is stable for as long as the window keeps
+13. A claim's registration time is stable for as long as the window keeps
     claiming the same PR.
 
 **Liveness — the tool does not go quiet by accident.**
 
-13. An unreachable host is reported, never absorbed into an empty result.
-14. A sweep that collects nothing reports failure rather than an idle fleet.
+14. An unreachable host is reported, never absorbed into an empty result.
+15. A sweep that collects nothing reports failure rather than an idle fleet.
 
-Invariants 9–12 are the ones unit tests cover least well, because they are
+Invariants 9–13 are the ones unit tests cover least well, because they are
 statements about *sequences* of sweeps interleaved with fleet events rather than
 about a single decision. Every defect found in this area so far — pane ids reused
 across a server restart, silence measured from a repainting footer, ownership
