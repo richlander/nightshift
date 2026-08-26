@@ -232,6 +232,59 @@ public class WaitingVerdictTests
     }
 
     [Fact]
+    public void Resolve_UnreadablePrStillSurfacesAStopEscalation()
+    {
+        // GitHub is down or rate-limited, so the PR cannot be read — but the agent asking to be released
+        // is the row a person most needs to see, and it does not depend on the branch being legible.
+        // Dropping it to Unknown would erase the ask exactly when it matters most.
+        WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e25 rec=stop"), null);
+
+        Assert.Equal(WaitingState.NeedsOperator, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
+        Assert.True(v.NeedsAttention);
+        Assert.Contains("stop", v.Reason, StringComparison.Ordinal);
+        Assert.Contains("could not be read", v.Reason, StringComparison.Ordinal);
+
+        // Low assurance and a state MayAct does not admit: reported to a person, never acted on unattended.
+        Assert.False(v.MayAct);
+    }
+
+    [Fact]
+    public void Resolve_UnreadablePrStillSurfacesAnApprovalEscalation()
+    {
+        WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e25 rec=approve"), null);
+
+        Assert.Equal(WaitingState.NeedsOperator, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
+        Assert.Contains("authorise more rounds", v.Reason, StringComparison.Ordinal);
+        Assert.Contains("could not be read", v.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Resolve_UnreadablePrRescuedByWindowNameStillSurfacesAStop()
+    {
+        // A malformed identity is a defect in one field; the window name rescues the PR number, and the
+        // escalation beside it still reaches the operator rather than dropping to Unknown when GitHub is
+        // silent.
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            AgentState.Parse("pr=none head=pending round=0 reviews=0/2 rec=stop", "pr4595")!, null);
+
+        Assert.Equal(WaitingState.NeedsOperator, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
+        Assert.Contains("stop", v.Reason, StringComparison.Ordinal);
+        Assert.False(v.MayAct);
+    }
+
+    [Fact]
+    public void Resolve_UnreadablePrWithAnOrdinaryRecommendationStaysUnknown()
+    {
+        // Everything that is not an explicit escalation loses its evidence when GitHub goes silent, so the
+        // ordinary unreadable behaviour is unchanged.
+        Assert.Equal(WaitingState.Unknown, WaitingVerdict.Resolve(State("pr=4595 head=722512e25 reviews=2/2 rec=merge"), null).State);
+        Assert.Equal(WaitingState.Unknown, WaitingVerdict.Resolve(State("pr=4595 head=722512e25 rec=continue"), null).State);
+    }
+
+    [Fact]
     public void Resolve_MergedAndClosedAreReported()
     {
         Assert.Equal(WaitingState.Merged, WaitingVerdict.Resolve(State("pr=4595 head=722512e25"), Facts(merged: true, state: "closed")).State);

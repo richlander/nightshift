@@ -149,7 +149,22 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
 
         if (facts is null)
         {
-            return new(WaitingState.Unknown, RowOwner.Operator, $"could not read PR #{state.PrNumber} from GitHub", assurance);
+            // GitHub is unreadable, so there is no branch to join the record against. An explicit
+            // escalation survives that anyway: `stop` and `approve` are the agent asking a person to
+            // decide, and that request does not depend on the PR being legible — dropping it to Unknown is
+            // the same erasure as the field never surviving the read, and it happens exactly when GitHub is
+            // down or rate-limited and an operator most needs to see the ask. So keep it as the operator's,
+            // at the low assurance the unreadable side already earns, and say both halves: what was asked,
+            // and that the PR could not be read. Every other recommendation has no evidence left to stand
+            // on once GitHub is silent, so it stays Unknown.
+            return state.Recommendation switch
+            {
+                Recommendation.Stop => new(WaitingState.NeedsOperator, RowOwner.Operator,
+                    $"asking to stop, but PR #{state.PrNumber} could not be read from GitHub", assurance),
+                Recommendation.Approve => new(WaitingState.NeedsOperator, RowOwner.Operator,
+                    $"asking to authorise more rounds, but PR #{state.PrNumber} could not be read from GitHub", assurance),
+                _ => new(WaitingState.Unknown, RowOwner.Operator, $"could not read PR #{state.PrNumber} from GitHub", assurance),
+            };
         }
 
         if (facts.Merged)
