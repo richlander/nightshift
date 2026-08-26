@@ -75,7 +75,7 @@ internal static class WaitingCommand
     /// <summary>Hosts collected before but not in this run, so the view is narrower than it has been.</summary>
     internal static IReadOnlyList<string> Omitted { get; private set; } = [];
 
-    public static async Task<int> RunAsync(string? repoFlag, IReadOnlyList<string> hosts, bool all, bool json, bool rename, CancellationToken ct)
+    public static async Task<int> RunAsync(string? repoFlag, IReadOnlyList<string> hosts, bool all, bool json, bool rename, CancellationToken ct, string? historyPath = null)
     {
         string? repo = RepoScope.Resolve(repoFlag);
         if (repo is null)
@@ -108,7 +108,7 @@ internal static class WaitingCommand
         {
             FleetResult result = await CollectAndResolveAsync(
                 hosts, (host, token) => new TmuxScanner(host).ScanAsync(token),
-                facts.FetchAsync, facts.RefreshMergeabilityAsync, now: null, ct);
+                facts.FetchAsync, facts.RefreshMergeabilityAsync, now: null, ct, historyPath: historyPath);
 
             // Total failure keeps its own path. A sweep where nothing could be collected is not a quiet
             // fleet, and printing a QUIET summary above the failure inverts which of the two the reader
@@ -161,12 +161,20 @@ internal static class WaitingCommand
         }
         catch (HistoryUnavailableException ex)
         {
+            // A history failure — a malformed or unreadable file, a lock that could not be taken, or a
+            // persistence write that did not land — leaves fleet ownership unknown. The human output leads
+            // its first stdout line with the same PARTIAL token the sweep's own summary and trailer lines
+            // use, so a harness sees the disposition before the diagnostic, matching the unavailable exit;
+            // the specific cause goes to stderr. JSON stays a single error document, never a token prepended
+            // to it. A genuine caller cancellation is a different exception, not caught here, so it
+            // propagates without a token. The separate total-collection-failure stdout-token gap is #169.
             if (json)
             {
                 WriteJsonError(Console.OpenStandardOutput(), ex.Message);
             }
             else
             {
+                Console.Out.WriteLine("PARTIAL pane history unavailable; fleet ownership is unknown");
                 Console.Error.WriteLine($"octoshift: {DisplayText.Safe(ex.Message)}");
             }
 

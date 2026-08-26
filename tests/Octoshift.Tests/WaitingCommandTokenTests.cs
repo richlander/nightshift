@@ -1,0 +1,120 @@
+namespace Octoshift.Tests;
+
+using Octoshift;
+using Octoshift.Commands;
+using Xunit;
+
+/// <summary>
+/// Serializes the console-capturing tests so two of them never redirect the process-wide
+/// <see cref="System.Console"/> streams at once. Disabling parallelization on the collection keeps it from
+/// running alongside any other collection too, so the redirect is always exclusive.
+/// </summary>
+[CollectionDefinition("ConsoleCapture", DisableParallelization = true)]
+public sealed class ConsoleCaptureCollection
+{
+}
+
+/// <summary>
+/// The first-line token contract of <c>octoshift waiting</c> when the pane history cannot be read. A
+/// strict-load, lock, or persistence failure returns unavailable, and the human path must lead its first
+/// stdout line with the stable PARTIAL token — not only a stderr diagnostic — so a shell loop sees the
+/// disposition before the details. JSON stays a single error document.
+/// </summary>
+[Collection("ConsoleCapture")]
+public sealed class WaitingCommandTokenTests
+{
+    private static async Task<(int Exit, string Out, string Err)> RunWithCapturedConsoleAsync(Func<CancellationToken, Task<int>> run, CancellationToken ct)
+    {
+        TextWriter savedOut = Console.Out;
+        TextWriter savedErr = Console.Error;
+        var outWriter = new StringWriter();
+        var errWriter = new StringWriter();
+        try
+        {
+            Console.SetOut(outWriter);
+            Console.SetError(errWriter);
+            int exit = await run(ct);
+            return (exit, outWriter.ToString(), errWriter.ToString());
+        }
+        finally
+        {
+            Console.SetOut(savedOut);
+            Console.SetError(savedErr);
+        }
+    }
+
+    [Fact]
+    public async Task RunAsync_LeadsWithAPartialTokenWhenTheHistoryIsMalformed()
+    {
+        // Blocker 3 (round 8): a strict-load failure leaves fleet ownership unknown, so the human output
+        // leads its first stdout line with the stable PARTIAL token — matching the unavailable exit — and
+        // the detail goes to stderr. The malformed history fails the load before any collection, so this
+        // needs no ssh or GitHub; an empty host list keeps it entirely local.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-waittoken-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, "{ not a history ]");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            (int exit, string stdout, string stderr) = await RunWithCapturedConsoleAsync(
+                token => WaitingCommand.RunAsync("owner/name", [], all: false, json: false, rename: false, token, historyPath: path), ct);
+
+            Assert.Equal(ExitCode.Unavailable, exit);
+            Assert.StartsWith("PARTIAL", stdout, StringComparison.Ordinal);
+            Assert.Contains("pane history unavailable", stdout, StringComparison.Ordinal);
+            Assert.NotEqual(string.Empty, stderr.Trim());
+            Assert.Equal("{ not a history ]", File.ReadAllText(path));
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task RunAsync_LeadsWithAPartialTokenWhenTheHistoryLockCannotBeTaken()
+    {
+        // The same aligned failure headline for a lock/persistence failure, distinct from the malformed
+        // case: the history path sits under a regular file, so the lock's directory cannot be created.
+        string blocker = Path.Combine(Path.GetTempPath(), $"octoshift-waitblock-{Guid.NewGuid():N}");
+        File.WriteAllText(blocker, "not a directory");
+        string path = Path.Combine(blocker, "panes.json");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            (int exit, string stdout, string stderr) = await RunWithCapturedConsoleAsync(
+                token => WaitingCommand.RunAsync("owner/name", [], all: false, json: false, rename: false, token, historyPath: path), ct);
+
+            Assert.Equal(ExitCode.Unavailable, exit);
+            Assert.StartsWith("PARTIAL", stdout, StringComparison.Ordinal);
+            Assert.NotEqual(string.Empty, stderr.Trim());
+        }
+        finally
+        {
+            File.Delete(blocker);
+        }
+    }
+
+    [Fact]
+    public async Task RunAsync_JsonHistoryFailureStaysOneErrorDocumentWithoutAHumanToken()
+    {
+        // Under --json the failure is one error document written to the raw stdout stream, and the human
+        // PARTIAL token is not emitted through Console.Out.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-waittokenjson-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, "{ not a history ]");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            (int exit, string stdout, _) = await RunWithCapturedConsoleAsync(
+                token => WaitingCommand.RunAsync("owner/name", [], all: false, json: true, rename: false, token, historyPath: path), ct);
+
+            Assert.Equal(ExitCode.Unavailable, exit);
+            Assert.DoesNotContain("PARTIAL", stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+}

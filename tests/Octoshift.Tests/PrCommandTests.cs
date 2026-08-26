@@ -14,6 +14,7 @@ using Xunit;
 /// decides ownership exactly as <c>waiting</c> does — the same contest, the same epoch and view-safety —
 /// and that a partly invisible fleet fails rather than answering with confidence it does not have.
 /// </summary>
+[Collection("ConsoleCapture")]
 public class PrCommandTests
 {
     private static readonly PrFacts Ready = new()
