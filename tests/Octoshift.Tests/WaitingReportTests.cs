@@ -1,0 +1,246 @@
+namespace Octoshift.Tests;
+
+using System.Globalization;
+using System.Text;
+using System.Text.Json;
+using Octoshift.Commands;
+using Octoshift.Waiting;
+using Xunit;
+
+/// <summary>
+/// What a sweep prints. Two things are load-bearing here and neither is cosmetic: the first line is a
+/// claim about coverage that a reader acts on, and every value in the table was chosen by somebody else.
+/// </summary>
+public class WaitingReportTests
+{
+    private static readonly WaitingCommand.Budget NoBudget = new(0, 0, 0, null, false);
+
+    private static WaitingRow Row(
+        WaitingVerdict verdict,
+        string target = "night:1",
+        string windowName = "pr4595",
+        AgentState? record = null,
+        string? host = null)
+        => new()
+        {
+            Pane = new TmuxPane
+            {
+                PaneId = "%1",
+                Target = target,
+                Host = host,
+                WindowName = windowName,
+                SessionAttached = false,
+                Activity = PaneActivity.Idle,
+            },
+            Record = record,
+            Verdict = verdict,
+            StoppedFor = TimeSpan.FromMinutes(5),
+        };
+
+    private static WaitingVerdict Ready()
+        => new(WaitingState.Ready, RowOwner.Operator, "reviews 2/2, mergeable", Assurance.High);
+
+    private static WaitingVerdict Holding()
+        => new(WaitingState.Holding, RowOwner.Nobody, "in progress", Assurance.High);
+
+    private static WaitingVerdict Unsure()
+        => new(WaitingState.Unknown, RowOwner.Operator, "could not read PR #4595 from GitHub", Assurance.Low("GitHub could not be read"));
+
+    private static string Render(IReadOnlyList<WaitingRow> rows, params string[] unreachable)
+    {
+        var output = new StringWriter(CultureInfo.InvariantCulture);
+        WaitingCommand.WriteTable(output, rows, NoBudget, unreachable);
+        return output.ToString();
+    }
+
+    private static string RenderJson(IReadOnlyList<WaitingRow> rows, params string[] unreachable)
+    {
+        using var stream = new MemoryStream();
+        WaitingCommand.WriteJson(stream, rows, NoBudget, unreachable);
+        return Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    [Fact]
+    public void Summary_QuietIsAClaimAboutTheWholeFleet()
+        => Assert.StartsWith("QUIET", WaitingCommand.Summary([Row(Holding())], []), StringComparison.Ordinal);
+
+    [Fact]
+    public void Summary_AttentionCountsTheRowsThatNeedAPerson()
+        => Assert.Equal(
+            "ATTENTION 1 of 2 window(s) need you",
+            WaitingCommand.Summary([Row(Ready()), Row(Holding(), "night:2")], []));
+
+    [Fact]
+    public void Summary_AnUnreachableHostIsNeverQuiet()
+    {
+        // The shape this existed to prevent: one host succeeds with nothing on it, another has gone dark,
+        // and the first line reported a quiet fleet while the reason sat on the last line under the
+        // budget. Nothing about the dark host was collected, so nothing about it can be called quiet.
+        string summary = WaitingCommand.Summary([], ["fernie: no server running"]);
+
+        Assert.StartsWith("PARTIAL", summary, StringComparison.Ordinal);
+        Assert.DoesNotContain("QUIET", summary, StringComparison.Ordinal);
+        Assert.Contains("1 host(s) unreachable", summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Summary_RowsBesideAnUnreachableHostStillLeadWithThePartialSweep()
+    {
+        string summary = WaitingCommand.Summary([Row(Ready()), Row(Holding(), "night:2")], ["fernie: no server running"]);
+
+        Assert.StartsWith("PARTIAL", summary, StringComparison.Ordinal);
+
+        // The rows are still counted honestly — they are just counted as what was visible.
+        Assert.Contains("1 of 2 visible window(s) need you", summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Collect_AQuietHostBesideAnUnreachableOneIsAPartialSweep()
+    {
+        // Nothing was collected anywhere, but one host was read and one was not, so this is not the
+        // total-failure path — and it is exactly the shape that used to print QUIET on the first line
+        // with the reason buried under the budget on the last.
+        WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(
+            ["fernie", "banff"],
+            (host, _) => host == "fernie"
+                ? throw new TmuxUnavailableException("fernie: no server running")
+                : Task.FromResult<IReadOnlyList<TmuxPane>>([]),
+            TestContext.Current.CancellationToken);
+
+        Assert.Empty(collected.Panes);
+        Assert.False(collected.TotalFailure);
+        Assert.True(collected.AnyFailure);
+        Assert.StartsWith("PARTIAL", WaitingCommand.Summary([], collected.Unreachable), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void WriteTable_APartialSweepStillPrintsEveryRowAndNamesEveryUnreachableHost()
+    {
+        string text = Render([Row(Ready())], "fernie: no server running", "banff: connection refused");
+
+        Assert.StartsWith("PARTIAL 2 host(s) unreachable", text, StringComparison.Ordinal);
+        Assert.Contains("night:1 pr4595", text, StringComparison.Ordinal);
+        Assert.Contains("READY", text, StringComparison.Ordinal);
+        Assert.Contains("UNREACHABLE fernie: no server running", text, StringComparison.Ordinal);
+        Assert.Contains("UNREACHABLE banff: connection refused", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void WriteTable_EveryReportedRowIsCountedExactlyOnce()
+    {
+        // The counts partition the table, so they add up to the rows printed under them. Taking the second
+        // from assurance instead of from the first left a hole: a high-confidence row that is merely
+        // holding may not be acted on and is not unsure, so it was counted in neither.
+        string text = Render([Row(Ready()), Row(Holding(), "night:2"), Row(Unsure(), "night:3")]);
+
+        Assert.Contains("1 row(s) met the bar to act, 2 did not", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void WriteTable_AWindowNameCannotForgeARow()
+    {
+        // A window name is arbitrary text an agent sets, and the report is line-oriented, so a newline in
+        // one prints a second line that reads exactly like the tool's own summary.
+        string text = Render([Row(Ready(), windowName: "pr4595\nATTENTION 9 of 9 window(s) need you")]);
+
+        // Exactly one ATTENTION line: the real summary, which this row's own verdict produced.
+        Assert.Single(text.Split('\n'), l => l.StartsWith("ATTENTION", StringComparison.Ordinal));
+        Assert.Contains(@"pr4595\nATTENTION", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void WriteTable_ACarriageReturnCannotOverwriteTheLineAlreadyPrinted()
+    {
+        string text = Render([Row(Ready(), target: "night:1\rQUIET 0 window(s), none need you")]);
+
+        Assert.DoesNotContain('\r', text);
+        Assert.Contains(@"night:1\rQUIET", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void WriteTable_AnEscapeSequenceInADefectCannotDriveTheTerminal()
+    {
+        // The defect quotes the record back verbatim, which is the point of it — so the record is where
+        // an ESC arrives. `ESC[2J` clears the reader's screen; the reader is who this row is for.
+        AgentState record = AgentState.Parse("pr=4595 head=722512e25 reviews=2/2 blocked=\u001b[2J rec=merge", "pr4595")!;
+        string text = Render([Row(Unsure(), record: record)]);
+
+        Assert.NotEmpty(record.Defects);
+        Assert.DoesNotContain('\u001b', text);
+        Assert.Contains(@"\e[2J", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void WriteTable_AnUnreachableMessageCarriesARemotesStderrAndIsEscapedToo()
+    {
+        string text = Render([], "fernie: \u001b[2Jgone\nUNREACHABLE banff: invented");
+
+        Assert.DoesNotContain('\u001b', text);
+        Assert.Single(text.Split('\n'), l => l.StartsWith("UNREACHABLE", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void WriteTable_OrdinaryTextIsUntouchedAndTheColumnsStayAligned()
+    {
+        string text = Render([Row(Ready(), target: "night:1", windowName: "pr4595"), Row(Holding(), "a-much-longer-session:12", "pr4600")]);
+
+        string[] rows = [.. text.Split('\n').Where(l => l.Contains("pr459", StringComparison.Ordinal) || l.Contains("pr4600", StringComparison.Ordinal))];
+        Assert.Equal(2, rows.Length);
+
+        // The state column starts at the same offset on both rows: escaping happens before the widths are
+        // measured, so the padded width is the width actually printed.
+        Assert.Equal(rows[0].IndexOf("#", StringComparison.Ordinal), rows[1].IndexOf("#", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void WriteJson_IsStructurallySafeAndKeepsTheValueTheAgentPublished()
+    {
+        // The consumer is a program, and Utf8JsonWriter already makes a newline or an ESC unable to end a
+        // string. So the value travels intact rather than in this tool's terminal rendering of it.
+        const string Hostile = "pr4595\n\u001b[2J\"},{\"window\":\"forged";
+        string json = RenderJson([Row(Ready(), windowName: Hostile)]);
+
+        using JsonDocument parsed = JsonDocument.Parse(json);
+        JsonElement row = Assert.Single(parsed.RootElement.GetProperty("rows").EnumerateArray().ToArray());
+        Assert.Equal(Hostile, row.GetProperty("window").GetString());
+    }
+
+    [Fact]
+    public void WriteJson_CarriesEveryUnreachableHost()
+    {
+        string json = RenderJson([], "fernie: no server running", "banff: connection refused");
+
+        using JsonDocument parsed = JsonDocument.Parse(json);
+        Assert.Equal(
+            ["fernie: no server running", "banff: connection refused"],
+            parsed.RootElement.GetProperty("unreachable").EnumerateArray().Select(e => e.GetString()));
+    }
+
+    [Fact]
+    public void WriteJsonError_IsStillJson()
+    {
+        using var stream = new MemoryStream();
+        WaitingCommand.WriteJsonError(stream, "fernie: no server running; banff: connection refused");
+
+        using JsonDocument parsed = JsonDocument.Parse(Encoding.UTF8.GetString(stream.ToArray()));
+        Assert.Contains("fernie", parsed.RootElement.GetProperty("error").GetString()!, StringComparison.Ordinal);
+        Assert.Empty(parsed.RootElement.GetProperty("rows").EnumerateArray());
+    }
+
+    [Theory]
+    [InlineData("night:1", "night:1")]
+    [InlineData("caf\u00e9 \u2014 ok", "caf\u00e9 \u2014 ok")]
+    [InlineData("a\nb", @"a\nb")]
+    [InlineData("a\rb", @"a\rb")]
+    [InlineData("a\tb", @"a\tb")]
+    [InlineData("a\u001b[2Jb", @"a\e[2Jb")]
+    [InlineData("a\u0007b", @"a\x07b")]
+    [InlineData("a\u009bb", @"a\x9bb")]
+    [InlineData("a\u2028b", @"a\u2028b")]
+    public void Safe_EscapesWhatATerminalActsOnAndNothingElse(string value, string expected)
+        => Assert.Equal(expected, DisplayText.Safe(value));
+
+    [Fact]
+    public void Safe_TreatsAMissingValueAsEmpty()
+        => Assert.Equal(string.Empty, DisplayText.Safe(null));
+}

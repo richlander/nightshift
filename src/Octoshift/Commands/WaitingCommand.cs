@@ -63,13 +63,13 @@ internal static class WaitingCommand
         {
             if (json)
             {
-                WriteJsonError(string.Join("; ", collected.Unreachable));
+                WriteJsonError(Console.OpenStandardOutput(), string.Join("; ", collected.Unreachable));
             }
             else
             {
                 foreach (string failure in collected.Unreachable)
                 {
-                    Console.Error.WriteLine($"octoshift: {failure}");
+                    Console.Error.WriteLine($"octoshift: {DisplayText.Safe(failure)}");
                 }
             }
 
@@ -85,11 +85,11 @@ internal static class WaitingCommand
 
         if (json)
         {
-            WriteJson(rows, facts, collected.Unreachable);
+            WriteJson(Console.OpenStandardOutput(), rows, Budget.From(facts), collected.Unreachable);
         }
         else
         {
-            WriteTable(rows, facts, collected.Unreachable);
+            WriteTable(Console.Out, rows, Budget.From(facts), collected.Unreachable);
         }
 
         // A partly invisible fleet is not a clean sweep, so a single failed host still costs the exit
@@ -260,23 +260,79 @@ internal static class WaitingCommand
             StoppedFor = pane.LastActivity is { } at && at <= now ? now - at : null,
         };
 
-    private static void WriteTable(IReadOnlyList<WaitingRow> rows, GhPrFactsSource facts, IReadOnlyList<string> unreachable)
+    /// <summary>
+    /// What one sweep cost GitHub, lifted off the source that spent it so the report can be written — and
+    /// tested — without a live fetcher.
+    /// </summary>
+    internal readonly record struct Budget(int Calls, int NotModified, int Recomputed, int? RateLimitRemaining, bool RateLimited)
+    {
+        public static Budget From(GhPrFactsSource facts)
+            => new(facts.Calls, facts.NotModified, facts.Recomputed, facts.RateLimitRemaining, facts.RateLimited);
+
+        public override string ToString()
+        {
+            var note = new StringBuilder($"{Calls} REST call(s), {NotModified} free (304)");
+            if (Recomputed > 0)
+            {
+                note.Append($", {Recomputed} mergeability re-read");
+            }
+
+            if (RateLimitRemaining is { } remaining)
+            {
+                note.Append($", {remaining} remaining");
+            }
+
+            if (RateLimited)
+            {
+                note.Append(" — RATE LIMITED");
+            }
+
+            return note.ToString();
+        }
+    }
+
+    /// <summary>
+    /// The first line: what this sweep saw, said so that it cannot overstate its own coverage.
+    /// </summary>
+    /// <remarks>
+    /// QUIET is a claim about the fleet, not about the rows that happened to arrive, so it may only be
+    /// made when the whole fleet was read. With a host unreachable the honest lead is that the sweep is
+    /// partial — otherwise the one shape that matters most, a host that has gone dark while its windows
+    /// sit finished, prints the word QUIET on the first line and the reason on the last. The
+    /// <c>UNREACHABLE</c> lines and the exit code already said it; the summary was the only part that
+    /// did not.
+    /// </remarks>
+    internal static string Summary(IReadOnlyList<WaitingRow> rows, IReadOnlyList<string> unreachable)
     {
         int attention = rows.Count(r => r.Verdict.NeedsAttention);
-        Console.WriteLine(attention > 0
+        if (unreachable.Count > 0)
+        {
+            return $"PARTIAL {unreachable.Count} host(s) unreachable; {attention} of {rows.Count} visible window(s) need you";
+        }
+
+        return attention > 0
             ? $"ATTENTION {attention} of {rows.Count} window(s) need you"
-            : $"QUIET {rows.Count} window(s), none need you");
+            : $"QUIET {rows.Count} window(s), none need you";
+    }
+
+    internal static void WriteTable(TextWriter output, IReadOnlyList<WaitingRow> rows, Budget budget, IReadOnlyList<string> unreachable)
+    {
+        output.WriteLine(Summary(rows, unreachable));
 
         // Said on every run, including when the number is zero. A tool that speaks to agents only when it
         // is sure has to be legible about when it was not, or "it did nothing" and "it saw nothing" look
         // the same from here.
+        //
+        // The two counts partition the reported rows, so they add up to what the table shows. They did not
+        // when the second was taken from assurance alone: a high-confidence row that is merely holding is
+        // neither actionable nor unsure, so it was counted in neither and the line described fewer rows
+        // than were printed under it.
         int actionable = rows.Count(r => r.Verdict.MayAct);
-        int unsure = rows.Count(r => !r.Verdict.Assurance.MayAct);
-        Console.WriteLine($"NOT ACTED nothing was sent to any agent; {actionable} row(s) met the bar to act, {unsure} did not");
+        output.WriteLine($"NOT ACTED nothing was sent to any agent; {actionable} row(s) met the bar to act, {rows.Count - actionable} did not");
 
         if (rows.Count > 0)
         {
-            Console.WriteLine();
+            output.WriteLine();
             // Built by Add: inside a collection initializer, `[...]` parses as an indexed element.
             var table = new List<string[]>();
             table.Add(["WINDOW", "PR", "STATE", "CONF", "FOR", "DETAIL"]);
@@ -292,14 +348,15 @@ internal static class WaitingCommand
                 ]);
             }
 
-            WriteAligned(table);
+            WriteAligned(output, table);
         }
 
-        Console.WriteLine();
-        Console.WriteLine(Budget(facts));
+        output.WriteLine();
+        output.WriteLine(budget.ToString());
         foreach (string failure in unreachable)
         {
-            Console.WriteLine($"UNREACHABLE {failure}");
+            // An ssh failure carries the remote's stderr, which is as arbitrary as anything else here.
+            output.WriteLine($"UNREACHABLE {DisplayText.Safe(failure)}");
         }
     }
 
@@ -321,49 +378,35 @@ internal static class WaitingCommand
         return detail;
     }
 
-    private static string Budget(GhPrFactsSource facts)
+    private static void WriteAligned(TextWriter output, IReadOnlyList<string[]> table)
     {
-        var note = new StringBuilder($"{facts.Calls} REST call(s), {facts.NotModified} free (304)");
-        if (facts.Recomputed > 0)
-        {
-            note.Append($", {facts.Recomputed} mergeability re-read");
-        }
+        // The single output boundary for untrusted text. Window and session names, verdict reasons and
+        // the defects that quote a record back are all arbitrary strings somebody else chose, and this is
+        // where they become terminal rows — so they are escaped here, once, rather than at each of the
+        // half-dozen places that compose a cell. Escaping before the widths are measured is what keeps
+        // the alignment honest: the padded width is the width that will actually be printed.
+        string[][] cells = [.. table.Select(row => row.Select(DisplayText.Safe).ToArray())];
 
-        if (facts.RateLimitRemaining is { } remaining)
-        {
-            note.Append($", {remaining} remaining");
-        }
-
-        if (facts.RateLimited)
-        {
-            note.Append(" — RATE LIMITED");
-        }
-
-        return note.ToString();
-    }
-
-    private static void WriteAligned(IReadOnlyList<string[]> table)
-    {
-        int columns = table[0].Length;
+        int columns = cells[0].Length;
         var widths = new int[columns];
-        foreach (string[] cells in table)
+        foreach (string[] row in cells)
         {
             for (int i = 0; i < columns; i++)
             {
-                widths[i] = Math.Max(widths[i], cells[i].Length);
+                widths[i] = Math.Max(widths[i], row[i].Length);
             }
         }
 
-        foreach (string[] cells in table)
+        foreach (string[] row in cells)
         {
             var line = new StringBuilder();
             for (int i = 0; i < columns; i++)
             {
                 // The last column is free-form, so it is never padded.
-                line.Append(i == columns - 1 ? cells[i] : cells[i].PadRight(widths[i] + 2));
+                line.Append(i == columns - 1 ? row[i] : row[i].PadRight(widths[i] + 2));
             }
 
-            Console.WriteLine(line.ToString().TrimEnd());
+            output.WriteLine(line.ToString().TrimEnd());
         }
     }
 
@@ -377,26 +420,37 @@ internal static class WaitingCommand
     };
 
     /// <summary>Emits a machine-readable failure so <c>--json</c> never returns non-JSON.</summary>
-    private static void WriteJsonError(string message)
+    internal static void WriteJsonError(Stream output, string message)
     {
-        using var writer = new Utf8JsonWriter(Console.OpenStandardOutput(), new JsonWriterOptions { Indented = true });
+        using var writer = new Utf8JsonWriter(output, new JsonWriterOptions { Indented = true });
         writer.WriteStartObject();
         writer.WriteString("error", message);
         writer.WriteStartArray("rows");
         writer.WriteEndArray();
         writer.WriteEndObject();
         writer.Flush();
-        Console.WriteLine();
+        output.Write("\n"u8);
+        output.Flush();
     }
 
-    private static void WriteJson(IReadOnlyList<WaitingRow> rows, GhPrFactsSource facts, IReadOnlyList<string> unreachable)
+    /// <summary>
+    /// Emits the rows as JSON.
+    /// </summary>
+    /// <remarks>
+    /// Untrusted strings are written verbatim rather than escaped for display, and that is deliberate:
+    /// <see cref="Utf8JsonWriter"/> already makes them structurally safe — a newline or an ESC inside a
+    /// window name cannot end a string or forge a field — while the consumer is a program that wants the
+    /// value the agent actually published, not this tool's rendering of it. Escaping is a property of
+    /// printing to a terminal, so it belongs to the table and not here.
+    /// </remarks>
+    internal static void WriteJson(Stream output, IReadOnlyList<WaitingRow> rows, Budget budget, IReadOnlyList<string> unreachable)
     {
-        using var writer = new Utf8JsonWriter(Console.OpenStandardOutput(), new JsonWriterOptions { Indented = true });
+        using var writer = new Utf8JsonWriter(output, new JsonWriterOptions { Indented = true });
         writer.WriteStartObject();
-        writer.WriteNumber("calls", facts.Calls);
-        writer.WriteNumber("notModified", facts.NotModified);
-        writer.WriteNumber("mergeabilityRereads", facts.Recomputed);
-        writer.WriteBoolean("rateLimited", facts.RateLimited);
+        writer.WriteNumber("calls", budget.Calls);
+        writer.WriteNumber("notModified", budget.NotModified);
+        writer.WriteNumber("mergeabilityRereads", budget.Recomputed);
+        writer.WriteBoolean("rateLimited", budget.RateLimited);
         writer.WriteStartArray("unreachable");
         foreach (string failure in unreachable)
         {
@@ -404,7 +458,7 @@ internal static class WaitingCommand
         }
 
         writer.WriteEndArray();
-        if (facts.RateLimitRemaining is { } remaining)
+        if (budget.RateLimitRemaining is { } remaining)
         {
             writer.WriteNumber("rateLimitRemaining", remaining);
         }
@@ -474,6 +528,7 @@ internal static class WaitingCommand
         writer.WriteEndArray();
         writer.WriteEndObject();
         writer.Flush();
-        Console.WriteLine();
+        output.Write("\n"u8);
+        output.Flush();
     }
 }

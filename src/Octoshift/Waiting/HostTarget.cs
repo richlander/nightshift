@@ -13,6 +13,11 @@ namespace Octoshift.Waiting;
 internal static class HostTarget
 {
     /// <summary>Returns null when the value is usable, or the usage message explaining why it is not.</summary>
+    /// <remarks>
+    /// The message quotes the value back, and the value is whatever was typed on a command line, so it is
+    /// escaped on the way in: this string is printed to a terminal by both the parser's error path and
+    /// the command's own, and an alias carrying an ESC sequence should be reported, not executed.
+    /// </remarks>
     public static string? Validate(string? host)
     {
         if (string.IsNullOrWhiteSpace(host))
@@ -24,12 +29,12 @@ internal static class HostTarget
         // and anything ssh would read as an option is not.
         if (host.StartsWith('-'))
         {
-            return $"--host requires a hostname or ssh-config alias; '{host}' looks like an option.";
+            return $"--host requires a hostname or ssh-config alias; '{DisplayText.Safe(host)}' looks like an option.";
         }
 
         if (host.Any(char.IsWhiteSpace))
         {
-            return $"--host requires a hostname or ssh-config alias; '{host}' contains whitespace.";
+            return $"--host requires a hostname or ssh-config alias; '{DisplayText.Safe(host)}' contains whitespace.";
         }
 
         return null;
