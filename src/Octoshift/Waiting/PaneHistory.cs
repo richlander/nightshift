@@ -1,5 +1,6 @@
 namespace Octoshift.Waiting;
 
+using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -469,7 +470,11 @@ internal sealed class PaneHistory : IDisposable
             throw new HistoryUnavailableException($"could not lock pane history at {path}: {ex.Message}", ex);
         }
 
-        DateTimeOffset deadline = DateTimeOffset.UtcNow + LockTimeout;
+        // A monotonic clock for the retry budget. Wall-clock arithmetic (DateTimeOffset.UtcNow + timeout)
+        // can be stretched or shortened by an NTP correction or a manual clock change mid-wait, so the
+        // nominal 30-second window would not be honest — a backward step could extend it well past 30s.
+        // Stopwatch measures elapsed time from a monotonic source a clock step cannot move.
+        long startTimestamp = Stopwatch.GetTimestamp();
         while (true)
         {
             ct.ThrowIfCancellationRequested();
@@ -479,16 +484,16 @@ internal sealed class PaneHistory : IDisposable
                 // serializes the transaction across processes. OpenOrCreate so the first writer makes it.
                 return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
             }
-            catch (IOException) when (DateTimeOffset.UtcNow < deadline)
+            catch (IOException) when (Stopwatch.GetElapsedTime(startTimestamp) < LockTimeout)
             {
                 // Held by another octoshift process (a sharing violation), or a transient I/O hiccup: wait
-                // and retry until it frees up or the deadline passes. Task.Delay carries the caller's token,
-                // so a cancellation here escapes as the caller's own.
+                // and retry until it frees up or the elapsed budget passes. Task.Delay carries the caller's
+                // token, so a cancellation here escapes as the caller's own.
                 await Task.Delay(LockRetry, ct);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                // The deadline passed with the lock still unavailable, or a non-transient failure: the
+                // The budget passed with the lock still unavailable, or a non-transient failure: the
                 // transaction cannot be serialized, so it is unavailable rather than a bypassed write.
                 throw new HistoryUnavailableException($"could not lock pane history at {path}: {ex.Message}", ex);
             }
