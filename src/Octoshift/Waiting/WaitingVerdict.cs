@@ -466,6 +466,9 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
     /// The display width that keeps two shas distinct: the concise default when they differ early, widened
     /// to one character past a longer shared prefix, and the full length of the longer value when one is an
     /// abbreviated prefix of the other (no character distinguishes them, so the whole of each is shown).
+    /// When both values are shorter than the concise default they already differ within their length, so
+    /// the lower bound collapses to that length — clamping to <see cref="ShortWidth"/> there would ask for
+    /// a minimum wider than the maximum and throw.
     /// </summary>
     private static int DistinguishingWidth(string recorded, string actual)
     {
@@ -476,7 +479,7 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
             return longer;
         }
 
-        return Math.Clamp(shared + 1, ShortWidth, longer);
+        return Math.Clamp(shared + 1, Math.Min(ShortWidth, longer), longer);
     }
 
     /// <summary>Length of the leading run the two shas share, compared case-insensitively as <see cref="ShaMatches"/> does.</summary>

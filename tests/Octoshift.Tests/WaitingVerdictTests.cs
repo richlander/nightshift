@@ -434,6 +434,44 @@ public class WaitingVerdictTests
     }
 
     [Fact]
+    public void Resolve_StaleShortDivergentHeadsRenderInFullWithoutThrowing()
+    {
+        // The accepted blocker: two divergent heads both shorter than the concise nine-character default
+        // (here eight). The displayed width can never reach nine, so clamping the lower bound to nine asked
+        // Math.Clamp for a minimum wider than the maximum and threw. The whole of each short value is shown,
+        // and the two stay distinct.
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=12345678 reviews=2/2 rec=merge"), Facts(head: "87654321"));
+
+        Assert.Equal(WaitingState.Stale, v.State);
+        Assert.Contains("record describes 12345678, GitHub head is 87654321", v.Reason, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("stop", 8)]
+    [InlineData("approve", 8)]
+    [InlineData("stop", 7)]
+    [InlineData("approve", 7)]
+    public void Resolve_StaleEscalationWithShortDivergentHeadsDistinguishesThemInOneSharedDiagnostic(string rec, int width)
+    {
+        // The same short-head collision reached through the stop/approve escalation path, at both edge
+        // lengths seven and eight: no exception, the heads stay distinct, and the reason and the assurance
+        // caveat remain byte-for-byte the same diagnostic.
+        string recorded = "1234567890"[..width];
+        string github = "0987654321"[..width];
+        WaitingVerdict v = WaitingVerdict.Resolve(State($"pr=4595 head={recorded} rec={rec}"), Facts(head: github));
+
+        Assert.Equal(WaitingState.NeedsOperator, v.State);
+        Assert.Equal(Confidence.Low, v.Assurance.Level);
+        Assert.Contains(recorded, v.Reason, StringComparison.Ordinal);
+        Assert.Contains(github, v.Reason, StringComparison.Ordinal);
+        Assert.NotEqual(recorded, github);
+        Assert.Contains(v.Assurance.Caveat!, v.Reason, StringComparison.Ordinal);
+        Assert.Contains(recorded, v.Assurance.Caveat!, StringComparison.Ordinal);
+        Assert.Contains(github, v.Assurance.Caveat!, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Resolve_OrdinaryDifferentHeadsStayConciseAtNineCharacters()
     {
         // Heads that diverge in the first character need no widening; the concise nine-character form is
