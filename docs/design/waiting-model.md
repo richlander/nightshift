@@ -158,15 +158,22 @@ because several of them were violated by code that passed its unit tests.
 12. A window that stops claiming a PR — going quiet, publishing an issue, or a
     malformed record — clears its registration and its witness, so a later
     reclaim is a fresh registration that cannot inherit its old place in the
-    queue.
+    queue. The same holds across a *gap*: a host absent from the previous sweep
+    and collected now may have released and reclaimed unseen, so its window's
+    registration and witness are reset rather than preserved. Continuity is
+    membership in the previous sweep's collected set, not merely an unchanged
+    epoch and claim.
 13. A window's silence duration never decreases while its body digest is
     unchanged.
 14. A claim's registration time — and its witness — are stable for as long as the
-    window keeps claiming the same PR. *(The place in the queue and the trust in
-    it travel together: a later sweep that finally sees the whole fleet cannot
-    flip a continuing first look's witness from false to true, which is the
-    temporal half of the fleet-expansion fix. Modelled as the
-    `RegistrationStableStep` and `RegWitnessedStableStep` step properties.)*
+    window keeps claiming the same PR *across continuous observation*. *(The place
+    in the queue and the trust in it travel together: a later sweep that finally
+    sees the whole fleet cannot flip a continuing first look's witness from false
+    to true, which is the temporal half of the fleet-expansion fix. Modelled as
+    the `RegistrationStableStep` and `RegWitnessedStableStep` step properties,
+    whose antecedents require the host to have been in the previous sweep
+    (`HostOf(w) ∈ lastCollected`) — so a gap-return is free to reset both, but
+    continuity freezes both.)*
 
 **Liveness — the tool does not go quiet by accident.**
 

@@ -248,10 +248,15 @@ Sweep ==
          \* Registrations are renewed or dropped only by a sweep that looked at the host.
          \* A window on an uncollected host is unseen, not gone -- forgetting it would
          \* manufacture a departure and re-register it as new on the next full sweep.
+         \* A registration is preserved only across CONTINUOUS observation: the host must
+         \* have been in the PREVIOUS sweep too (HostOf(w) \in lastCollected, unprimed). A
+         \* host collected now but absent last sweep is a gap -- it may have released and
+         \* reclaimed unseen -- so its window is freshened (regTime = now) even when the
+         \* epoch and claim are unchanged, exactly as the code's HostMemory.Continuous does.
          /\ regTime' = [w \in Windows |->
                           IF HostOf(w) \notin collected THEN regTime[w]
                           ELSE IF w \in live /\ claims[w] # NoPr
-                               THEN IF regEpoch = epoch /\ regPr[w] = claims[w] /\ regTime[w] # NoTime
+                               THEN IF regEpoch = epoch /\ regPr[w] = claims[w] /\ regTime[w] # NoTime /\ HostOf(w) \in lastCollected
                                     THEN regTime[w]
                                     ELSE now
                                ELSE NoTime]
@@ -267,21 +272,22 @@ Sweep ==
          \* exist -- only from this memory.
          /\ viewComplete' = (knownHosts \subseteq collected)
          \* Provenance, persisted with the registration. A window unseen this sweep keeps
-         \* whatever it had. One that keeps the same claim keeps its witness -- so a first
-         \* look stays a first look no matter how many later sweeps see it. A fresh
-         \* registration is witnessed only when the tool's memory is continuous with the
-         \* current server (regEpoch = epoch, so no restart since the last sweep), its host
-         \* was already known BEFORE this run (in knownHosts, unprimed), AND this run's view
-         \* is complete; otherwise it is a first look, recorded FALSE. Dropping a claim
-         \* clears it. This is what stops the three-sweep promotion: recomputing witness
-         \* from the current sweep's coverage let the fleet-expansion sweep relabel an old
-         \* first look as witnessed.
+         \* whatever it had. One that keeps the same claim ACROSS CONTINUOUS OBSERVATION
+         \* keeps its witness -- so a first look stays a first look no matter how many
+         \* later sweeps see it. A fresh registration is witnessed only when the tool's
+         \* memory is continuous with the current server (regEpoch = epoch, so no restart
+         \* since the last sweep), its host was in the PREVIOUS sweep (HostOf(w) \in
+         \* lastCollected, so there is no gap to have released across), AND this run's view
+         \* is complete; otherwise it is a first look, recorded FALSE. Dropping a claim, or
+         \* a gap on the host, clears it. This is what stops the three-sweep promotion AND
+         \* the gap-return promotion: the witness is never recomputed to TRUE for a claim
+         \* whose host was not under continuous observation when it was registered.
          /\ regWitnessed' = [w \in Windows |->
                                IF HostOf(w) \notin collected THEN regWitnessed[w]
                                ELSE IF w \in live /\ claims[w] # NoPr
-                                    THEN IF regEpoch = epoch /\ regPr[w] = claims[w] /\ regTime[w] # NoTime
+                                    THEN IF regEpoch = epoch /\ regPr[w] = claims[w] /\ regTime[w] # NoTime /\ HostOf(w) \in lastCollected
                                          THEN regWitnessed[w]
-                                         ELSE (regEpoch = epoch /\ HostOf(w) \in knownHosts /\ knownHosts \subseteq collected)
+                                         ELSE (regEpoch = epoch /\ HostOf(w) \in lastCollected /\ knownHosts \subseteq collected)
                                     ELSE FALSE]
          /\ knownHosts' = knownHosts \union collected
          /\ lastCollected' = collected
@@ -354,8 +360,9 @@ NoOwnerFromUnwitnessedRegistration ==
 
 (* ---- Step properties ---- *)
 
-\* Invariant 12: a window's registration is stable while it keeps claiming the same PR.
-\* An owner whose place in the queue drifts is an owner that can change identity.
+\* Invariant 12: a window's registration is stable while it keeps claiming the same PR
+\* ACROSS CONTINUOUS OBSERVATION. An owner whose place in the queue drifts is an owner
+\* that can change identity.
 \*
 \* The antecedent uses Registered(w) rather than regTime[w] # NoTime, and that
 \* distinction is the whole property. A first version said only "the window is live and
@@ -367,6 +374,13 @@ NoOwnerFromUnwitnessedRegistration ==
 \* in exactly that case, which is why stating it this way is not merely a patch.
 \* A sweep that could not reach a host must not forget what it already knew about it.
 \* Registrations are only ever renewed or dropped by a sweep that actually looked.
+\*
+\* The antecedent also requires the host to have been in the PREVIOUS sweep
+\* (HostOf(w) \in lastCollected). A gap -- the host absent last sweep and collected now --
+\* is a DELIBERATE reset: the window may have released and reclaimed unseen, so a fresh
+\* registration is correct there and the property must not forbid it. Continuity
+\* (in-lastCollected) is exactly the condition under which the place in the queue is
+\* frozen; outside it, the reset is allowed.
 NoPhantomDepartureStep ==
     [][ \A w \in Windows :
           (regTime'[w] # regTime[w] \/ regPr'[w] # regPr[w] \/ regFleet'[w] # regFleet[w]
@@ -378,24 +392,28 @@ RegistrationStableStep ==
           (/\ w \in live /\ w \in live'
            /\ claims[w] # NoPr /\ claims'[w] = claims[w]
            /\ epoch' = epoch
+           /\ HostOf(w) \in lastCollected
            /\ Registered(w) # NoTime)
              => regTime'[w] = regTime[w] ]_vars
 
 \* Invariant 13: a registration's witness is as stable as its time. While one claim
-\* continues under one server, regWitnessed must not move -- this is the temporal half of
-\* the fleet-expansion fix. The registration stability step keeps the PLACE in the queue
-\* fixed; this keeps the TRUST fixed, so a later sweep that finally sees the whole fleet
-\* cannot flip a first look's witness from FALSE to TRUE while it keeps claiming. The
-\* antecedent is RegistrationStableStep's exactly, because the two facts travel together:
-\* a registration whose time may not drift is one whose witness may not drift either.
-\* A deliberate mutation recomputing regWitnessed from the current sweep's coverage while
-\* the same claim continues -- the laundering NoOwnerFromUnwitnessedRegistration rules out
-\* at a state -- is refuted here as a step.
+\* continues under one server ACROSS CONTINUOUS OBSERVATION, regWitnessed must not move --
+\* this is the temporal half of the fleet-expansion fix. The registration stability step
+\* keeps the PLACE in the queue fixed; this keeps the TRUST fixed, so a later sweep that
+\* finally sees the whole fleet cannot flip a first look's witness from FALSE to TRUE
+\* while it keeps claiming. The antecedent is RegistrationStableStep's exactly -- the same
+\* continuity condition (HostOf(w) \in lastCollected) -- because the two facts travel
+\* together: a registration whose time may not drift is one whose witness may not drift
+\* either, and a gap resets both. A deliberate mutation recomputing regWitnessed from the
+\* current sweep's coverage while the same claim continues under continuous observation --
+\* the laundering NoOwnerFromUnwitnessedRegistration rules out at a state -- is refuted
+\* here as a step; but a gap-return, where continuity is broken, is permitted to reset it.
 RegWitnessedStableStep ==
     [][ \A w \in Windows :
           (/\ w \in live /\ w \in live'
            /\ claims[w] # NoPr /\ claims'[w] = claims[w]
            /\ epoch' = epoch
+           /\ HostOf(w) \in lastCollected
            /\ Registered(w) # NoTime)
              => regWitnessed'[w] = regWitnessed[w] ]_vars
 

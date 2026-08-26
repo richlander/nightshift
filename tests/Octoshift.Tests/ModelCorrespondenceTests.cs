@@ -370,4 +370,58 @@ public class ModelCorrespondenceTests
             File.Delete(path);
         }
     }
+
+    /// <summary>
+    /// TLA+ <c>Sweep</c> gap semantics, and the continuity antecedent
+    /// (<c>HostOf(w) \in lastCollected</c>) the step properties now carry: a registration is frozen only
+    /// across CONTINUOUS observation. A host absent from the previous sweep and collected now is a gap —
+    /// the window may have released and reclaimed unseen — so both its place in the queue and its witness
+    /// are reset. This is the reset the model permits outside continuity, and the counterexample the
+    /// earlier Sweep transition missed by preserving a registration whenever the epoch and claim matched,
+    /// regardless of whether the host was in the prior sweep.
+    /// </summary>
+    [Fact]
+    public void AGapBreaksContinuityAndResetsBothTimeAndWitness()
+    {
+        string path = TempPath();
+        try
+        {
+            TmuxPane a = Window("%1", host: "a", epoch: "1:1");
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+            var history = new PaneHistory(path);
+
+            // Sweep 1: host "a" collected, establishing continuity; the window claims nothing yet.
+            history.AdoptEpoch("a", "1:1", t);
+            history.Observe(a, t, claimedPr: null);
+            history.Save([a], ["a"]);
+
+            // Sweep 2: continuous (a was in the prior collected set) under a complete view, so the window's
+            // new claim is witnessed and takes its place in the queue.
+            Assert.True(history.AdoptEpoch("a", "1:1", t.AddMinutes(10)));
+            history.Observe(a, t.AddMinutes(10), claimedPr: 4448, registrationWitnessed: true);
+            DateTimeOffset? placedAt = history.ClaimedAt(a);
+            Assert.True(history.IsWitnessed(a));
+            history.Save([a], ["a"]);
+
+            // Sweep 3: a gap — a different host is collected and "a" is omitted, so Save records the break
+            // in continuity. Its window is unseen, not departed, so the registration is retained for now.
+            history.Save([], ["b"]);
+            Assert.Equal(placedAt, history.ClaimedAt(a));
+
+            // Sweep 4: "a" reappears at the same epoch. AdoptEpoch reports it is no longer continuous and
+            // clears the stale registration; the reclaim is a fresh, unwitnessed one — the model's
+            // gap-return resetting regTime and setting regWitnessed FALSE, which the continuity antecedent
+            // on the stability steps is what permits.
+            Assert.False(history.AdoptEpoch("a", "1:1", t.AddMinutes(30)));
+            history.Observe(a, t.AddMinutes(30), claimedPr: 4448, registrationWitnessed: false);
+
+            Assert.Equal(t.AddMinutes(30), history.ClaimedAt(a));
+            Assert.NotEqual(placedAt, history.ClaimedAt(a));
+            Assert.False(history.IsWitnessed(a));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
 }
