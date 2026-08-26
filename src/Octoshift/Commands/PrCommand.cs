@@ -1,6 +1,5 @@
 namespace Octoshift.Commands;
 
-using System.Text;
 using System.Text.Json;
 using Octoshift.GitHub;
 using Octoshift.Waiting;
@@ -14,8 +13,13 @@ using Octoshift.Waiting;
 /// into one question with one answer.
 ///
 /// It is cheap for the same reason the full sweep is not: asking about one PR costs two REST calls
-/// rather than two per open PR, and the host collection runs concurrently. That is what keeps it usable
-/// as a reflex rather than something worth avoiding.
+/// rather than two per open PR, and the host collection runs one command per host. That is what keeps it
+/// usable as a reflex rather than something worth avoiding.
+///
+/// Ownership is decided by the same <see cref="Claim.Register"/> logic <c>waiting</c> uses, over the same
+/// shared history: a sort local to this command would label the first row owner even when the order is
+/// only inferred, and would answer "who owns PR 1234" differently from the full sweep. The two must agree,
+/// so the answer comes from one place.
 /// </remarks>
 internal static class PrCommand
 {
@@ -28,33 +32,103 @@ internal static class PrCommand
             return ExitCode.Usage;
         }
 
-        FleetScan scan = await FleetScan.CollectAsync(hosts, ct);
-        var history = new PaneHistory();
-        DateTimeOffset now = DateTimeOffset.UtcNow;
-
-        // Windows claiming this PR through either channel: a published state, or the window name alone.
-        var claims = new List<(TmuxPane Pane, AgentState State)>();
-        foreach (TmuxPane pane in scan.Panes)
+        // Validated here as well as at the parser, because every value becomes an ssh argument and an
+        // option-shaped one succeeds quietly as a quiet fleet.
+        foreach (string host in hosts)
         {
-            if (AgentState.Parse(pane.AgentStateOption, pane.WindowName) is { } state && state.PrNumber == prNumber && !state.IsIssue)
+            if (HostTarget.Validate(host) is { } invalid)
             {
-                claims.Add((pane, state));
+                Console.Error.WriteLine($"octoshift: {invalid}");
+                return ExitCode.Usage;
             }
         }
 
-        claims.Sort((a, b) =>
+        WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(
+            hosts, (host, token) => new TmuxScanner(host).ScanAsync(token), ct);
+
+        var history = new PaneHistory();
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+
+        // Window names that appear twice on one host. A duplicate is a rename that went where it did not
+        // belong, so the name identifies nothing — the same safeguard `waiting` applies, so `pr` cannot
+        // report a claim `waiting` rejects as defective.
+        HashSet<string> ambiguousNames = [.. collected.Panes
+            .Where(p => p.WindowName.Length > 0)
+            .GroupBy(p => $"{p.Host ?? "local"}|{p.WindowName}", StringComparer.Ordinal)
+            .Where(g => g.Count() > 1)
+            .Select(g => g.Key)];
+
+        // Read every pane once, with the duplicate-name and pane-corroboration safeguards, and collect
+        // every claimant across the whole fleet — not just this PR's — so the contest is ranked exactly as
+        // the full sweep ranks it.
+        var readings = new List<(TmuxPane Pane, AgentState State)>();
+        var claimants = new List<(TmuxPane Pane, int PrNumber, int? Round)>();
+        foreach (TmuxPane pane in collected.Panes)
         {
-            // Same ordering the sweep uses, so the owner is the same window in both views.
-            int byTime = (history.ClaimedAt(a.Pane) ?? DateTimeOffset.MaxValue)
-                .CompareTo(history.ClaimedAt(b.Pane) ?? DateTimeOffset.MaxValue);
-            if (byTime != 0)
+            AgentState? state = AgentState.Parse(
+                pane.AgentStateOption,
+                pane.WindowName,
+                nameIsAmbiguous: ambiguousNames.Contains($"{pane.Host ?? "local"}|{pane.WindowName}"),
+                paneContradictsPr: pr => TmuxScanner.PaneContradictsPr(pane.Capture, pr));
+
+            if (state is { IsIssue: false } claim)
             {
-                return byTime;
+                claimants.Add((pane, claim.PrNumber, claim.Round));
             }
 
-            int byHost = string.CompareOrdinal(a.Pane.Host ?? string.Empty, b.Pane.Host ?? string.Empty);
-            return byHost != 0 ? byHost : string.CompareOrdinal(a.Pane.PaneId, b.Pane.PaneId);
-        });
+            if (state is not null)
+            {
+                readings.Add((pane, state));
+            }
+        }
+
+        // A host that did not answer, and a host nobody asked about, both leave windows unseen — so a
+        // window that is a follower on the full fleet can look like the sole claimant of its PR. The view
+        // is complete only when every asked host answered and no previously-collected host was dropped.
+        var collectedSet = collected.CollectedHosts.Select(h => h ?? "local").ToHashSet(StringComparer.Ordinal);
+        bool viewComplete = collected.Unreachable.Count == 0
+            && !history.KnownHosts.Any(h => !collectedSet.Contains(h));
+
+        // Adopt each host's tmux epoch, capturing the prior sweep so a host first seen this run does not
+        // hand a genuinely observed rival a witnessed order it never earned.
+        var sweptBefore = new Dictionary<string, DateTimeOffset?>(StringComparer.Ordinal);
+        foreach (IGrouping<string?, TmuxPane> host in collected.Panes.Where(p => p.Epoch.Length > 0).GroupBy(p => p.Host))
+        {
+            string key = host.Key ?? "local";
+            DateTimeOffset? prior = history.SweptAt(host.Key);
+            bool continuous = history.AdoptEpoch(host.Key, host.First().Epoch, now);
+            sweptBefore[key] = continuous ? prior : null;
+        }
+
+        // Observe every window, not only the ones claiming this PR: the history is shared with `waiting`,
+        // and a run that recorded a subset would prune the rest and reset their silence measurements.
+        // Keyed by host and pane id together, because a pane id is unique only within one tmux server —
+        // `%3` on two hosts is two windows, and a host-local key would let one overwrite the other.
+        var silence = new Dictionary<string, TimeSpan?>(StringComparer.Ordinal);
+        foreach ((TmuxPane pane, AgentState state) in readings)
+        {
+            silence[Claim.Key(pane)] = history.Observe(pane, now, state.IsIssue ? null : state.PrNumber);
+        }
+
+        IReadOnlyDictionary<string, Claim> claims = Claim.Register(
+            claimants,
+            history.ClaimedAt,
+            host => sweptBefore.GetValueOrDefault(host ?? "local"),
+            viewComplete);
+
+        // Persist history only for the hosts actually collected, so a partial sweep keeps what it did not
+        // look at rather than deleting the claim memory of unreachable or unrequested hosts.
+        history.Save(collected.Panes, collected.CollectedHosts);
+
+        // This PR's claimants, owner first. The rank comes from Claim.Register, so followers sort after the
+        // owner; ties break on the same fixed key the sweep uses, so the owner is the same window in both.
+        (TmuxPane Pane, AgentState State, Claim Claim)[] mine = [.. readings
+            .Where(r => !r.State.IsIssue && r.State.PrNumber == prNumber)
+            .Select(r => (r.Pane, r.State, Claim: claims.GetValueOrDefault(Claim.Key(r.Pane), Claim.Sole)))
+            .OrderBy(m => m.Claim.IsFollower ? 1 : 0)
+            .ThenBy(m => history.ClaimedAt(m.Pane) ?? DateTimeOffset.MaxValue)
+            .ThenBy(m => m.Pane.Host ?? string.Empty, StringComparer.Ordinal)
+            .ThenBy(m => m.Pane.PaneId, StringComparer.Ordinal)];
 
         var facts = new GhPrFactsSource(repo, new FileConditionalCache(), (args, token) => GhAuthenticatedRunner.RunGhAsync(args, null, token));
         PrFacts? prFacts = await facts.FetchAsync(prNumber, ct);
@@ -66,53 +140,50 @@ internal static class PrCommand
                     : prFacts;
         }
 
-        // Observe every window, not only the ones claiming this PR: the history is shared with `waiting`,
-        // and a run that recorded a subset would prune the rest and reset their silence measurements.
-        Dictionary<string, TimeSpan?> silence = [];
-        foreach (TmuxPane pane in scan.Panes)
-        {
-            AgentState? owner = AgentState.Parse(pane.AgentStateOption, pane.WindowName);
-            silence[pane.PaneId] = history.Observe(pane, now, owner is { IsIssue: false } ? owner.PrNumber : null);
-        }
-
-        history.Save(scan.Panes);
-
         if (json)
         {
-            WriteJson(prNumber, claims, prFacts, scan, now);
+            WriteJson(prNumber, mine, prFacts, collected, viewComplete, now);
         }
         else
         {
-            WriteReport(prNumber, claims, prFacts, scan, now, silence);
+            WriteReport(prNumber, mine, prFacts, collected, viewComplete, now, silence);
         }
 
-        return prFacts is null && claims.Count == 0 ? ExitCode.Unavailable : ExitCode.Ok;
+        // A partly invisible fleet cannot produce success-shaped output: the PR may well be claimed on a
+        // host that did not answer, so a partial sweep fails even when this run happened to find it.
+        if (collected.AnyFailure)
+        {
+            return ExitCode.Unavailable;
+        }
+
+        return prFacts is null && mine.Length == 0 ? ExitCode.Unavailable : ExitCode.Ok;
     }
 
     private static void WriteReport(
         int prNumber,
-        IReadOnlyList<(TmuxPane Pane, AgentState State)> claims,
+        IReadOnlyList<(TmuxPane Pane, AgentState State, Claim Claim)> claims,
         PrFacts? facts,
-        FleetScan scan,
+        WaitingCommand.Collection collected,
+        bool viewComplete,
         DateTimeOffset now,
         IReadOnlyDictionary<string, TimeSpan?> silence)
     {
-        Console.WriteLine($"PR #{prNumber}{(facts?.Title is { Length: > 0 } title ? $"  {title}" : string.Empty)}");
+        Console.WriteLine($"PR #{prNumber}{(facts?.Title is { Length: > 0 } title ? $"  {DisplayText.Safe(title)}" : string.Empty)}");
 
         if (claims.Count == 0)
         {
-            string where = scan.Panes.Count == 0 ? "no windows collected" : "no window claims it";
+            string where = collected.Panes.Count == 0 ? "no windows collected" : "no window claims it";
             Console.WriteLine($"  where     {where}");
         }
 
-        foreach ((TmuxPane pane, AgentState state) in claims)
+        foreach ((TmuxPane pane, AgentState state, Claim claim) in claims)
         {
-            string name = pane.WindowName.Length > 0 ? $" {pane.WindowName}" : string.Empty;
-            string role = claims.Count > 1 ? (ReferenceEquals(pane, claims[0].Pane) ? "  [owner]" : "  [follows]") : string.Empty;
-            Console.WriteLine($"  where     {pane.Where}{name}   {Activity(pane, now, silence.GetValueOrDefault(pane.PaneId))}{role}");
+            string name = pane.WindowName.Length > 0 ? $" {DisplayText.Safe(pane.WindowName)}" : string.Empty;
+            string role = claims.Count > 1 ? (claim.IsFollower ? "  [follows]" : "  [owner]") : string.Empty;
+            Console.WriteLine($"  where     {DisplayText.Safe(pane.Where)}{name}   {Activity(pane, now, silence.GetValueOrDefault(Claim.Key(pane)))}{role}");
             if (Agent(state) is { Length: > 0 } line)
             {
-                Console.WriteLine($"  agent     {line}");
+                Console.WriteLine($"  agent     {DisplayText.Safe(line)}");
             }
         }
 
@@ -120,10 +191,18 @@ internal static class PrCommand
         // other's edits rather than racing to push.
         if (claims.Count > 1)
         {
+            (TmuxPane ownerPane, _, Claim ownerClaim) = claims[0];
             bool sameHost = claims.Select(c => c.Pane.Host).Distinct().Count() == 1;
+            string order = ownerClaim.Basis switch
+            {
+                ClaimBasis.Observed => string.Empty,
+                ClaimBasis.PartialView => " — order unconfirmed while the fleet is partly unseen",
+                _ => " — order inferred, not observed",
+            };
             Console.WriteLine($"  CONTESTED {claims.Count} windows claim this PR"
                 + (sameHost ? " on one host — they are likely sharing a worktree" : " across hosts")
-                + $"; owner is {claims[0].Pane.Where}, the rest are followed and never driven");
+                + $"; owner is {DisplayText.Safe(ownerPane.Where)}, the rest are followed and never driven"
+                + order);
 
             // The one contested shape worth calling out: the owner is putting the claim down while a
             // follower is still working, so ownership is with the window that is doing the least.
@@ -139,7 +218,7 @@ internal static class PrCommand
 
         // One verdict per claim when contested: the disagreement between them is the finding, and
         // collapsing it to a single row would hide which window the answer came from.
-        foreach ((TmuxPane pane, AgentState state) in claims)
+        foreach ((TmuxPane pane, AgentState state, _) in claims)
         {
             if (facts is null)
             {
@@ -147,13 +226,18 @@ internal static class PrCommand
             }
 
             WaitingVerdict verdict = WaitingVerdict.Resolve(state, facts);
-            string from = claims.Count > 1 ? $" [{pane.Where}]" : string.Empty;
-            Console.WriteLine($"  verdict   {verdict.State.ToString().ToUpperInvariant()} ({verdict.Assurance.Label}) — {verdict.Reason}{from}");
+            string from = claims.Count > 1 ? $" [{DisplayText.Safe(pane.Where)}]" : string.Empty;
+            Console.WriteLine($"  verdict   {verdict.State.ToString().ToUpperInvariant()} ({verdict.Assurance.Label}) — {DisplayText.Safe(verdict.Reason)}{from}");
         }
 
-        foreach (string failure in scan.Unreachable)
+        if (!viewComplete && collected.Unreachable.Count == 0)
         {
-            Console.WriteLine($"  UNREACHABLE {failure}");
+            Console.WriteLine("  NARROWED  fewer hosts than have been collected before; a claim may be on a host not swept this run");
+        }
+
+        foreach (string failure in collected.Unreachable)
+        {
+            Console.WriteLine($"  UNREACHABLE {DisplayText.Safe(failure)}");
         }
     }
 
@@ -171,6 +255,7 @@ internal static class PrCommand
         {
             PaneActivity.Working => $"working{producing}",
             PaneActivity.Blocked => "blocked on a prompt",
+            PaneActivity.Stalled => "agent stalled",
             PaneActivity.Unreadable => "pane unreadable",
             _ => $"idle{quiet}",
         };
@@ -238,7 +323,7 @@ internal static class PrCommand
         }
 
         var parts = new List<string> { "open" };
-        parts.Add(facts.IsConflicting ? "CONFLICTING" : facts.IsMergeable ? "mergeable" : facts.MergeableState ?? "mergeability unknown");
+        parts.Add(facts.IsConflicting ? "CONFLICTING" : facts.IsMergeable ? "mergeable" : DisplayText.Safe(facts.MergeableState) ?? "mergeability unknown");
 
         if (!facts.ChecksKnown)
         {
@@ -246,7 +331,7 @@ internal static class PrCommand
         }
         else if (facts.Checks.FirstOrDefault(c => c.IsFailure) is { } failed)
         {
-            parts.Add($"CI red ({failed.Name})");
+            parts.Add($"CI red ({DisplayText.Safe(failed.Name)})");
         }
         else if (facts.Checks.Any(c => !c.IsComplete))
         {
@@ -272,9 +357,10 @@ internal static class PrCommand
 
     private static void WriteJson(
         int prNumber,
-        IReadOnlyList<(TmuxPane Pane, AgentState State)> claims,
+        IReadOnlyList<(TmuxPane Pane, AgentState State, Claim Claim)> claims,
         PrFacts? facts,
-        FleetScan scan,
+        WaitingCommand.Collection collected,
+        bool viewComplete,
         DateTimeOffset now)
     {
         using var writer = new Utf8JsonWriter(Console.OpenStandardOutput(), new JsonWriterOptions { Indented = true });
@@ -286,7 +372,7 @@ internal static class PrCommand
         }
 
         writer.WriteStartArray("claims");
-        foreach ((TmuxPane pane, AgentState state) in claims)
+        foreach ((TmuxPane pane, AgentState state, Claim claim) in claims)
         {
             writer.WriteStartObject();
             writer.WriteString("where", pane.Where);
@@ -297,6 +383,11 @@ internal static class PrCommand
             }
 
             writer.WriteString("activity", pane.Activity.ToString().ToLowerInvariant());
+            if (claims.Count > 1)
+            {
+                writer.WriteString("role", claim.IsFollower ? "follower" : "owner");
+            }
+
             if (state.Round is { } round)
             {
                 writer.WriteNumber("round", round);
@@ -307,6 +398,23 @@ internal static class PrCommand
 
         writer.WriteEndArray();
         writer.WriteBoolean("contested", claims.Count > 1);
+        if (claims.Count > 1)
+        {
+            writer.WriteString("order", claims[0].Claim.Basis.ToString().ToLowerInvariant());
+        }
+
+        // A partly invisible fleet is named in the output as well as the exit code: the requested PR may
+        // be claimed on a host that did not answer, so success-shaped JSON that omits the failure would
+        // assert a completeness the sweep did not have.
+        writer.WriteBoolean("viewComplete", viewComplete && collected.Unreachable.Count == 0);
+        writer.WriteStartArray("unreachable");
+        foreach (string failure in collected.Unreachable)
+        {
+            writer.WriteStringValue(failure);
+        }
+
+        writer.WriteEndArray();
+
         if (facts is not null)
         {
             writer.WriteString("state", facts.Merged ? "merged" : facts.State);

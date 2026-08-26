@@ -93,9 +93,12 @@ internal readonly record struct Claim(
     /// </summary>
     /// <param name="registeredAt">When a window was first seen claiming its PR, or null if never seen.</param>
     /// <param name="sweptAt">
-    /// When a host was last collected in full under its current tmux server, or null if it has not been.
-    /// A window with no registration on a host swept before must have appeared since that sweep, which
-    /// places it after everything already recorded without guessing.
+    /// When a host was last collected in full under its current tmux server <em>before this run</em>, or
+    /// null if it has not been. The prior sweep, deliberately, not this one's: a registration time orders
+    /// a claim only if the host was under observation when it was recorded, so a host first seen this run
+    /// contributes null here and its windows' registrations are treated as first looks rather than
+    /// witnessed appearances. A window with no registration on a host swept before must have appeared
+    /// since that sweep, which places it after everything already recorded without guessing.
     /// </param>
     /// <param name="viewComplete">
     /// Whether every host answered. When one did not, a window that appears to be the only claimant of
@@ -127,12 +130,19 @@ internal readonly record struct Claim(
             int unrecorded = recorded.Count(r => r is null);
             DateTimeOffset[] known = [.. recorded.OfType<DateTimeOffset>()];
 
-            // The order is a fact when every recorded time is distinct and at most one window has no
-            // record at all — that one appeared since its host was last swept in full, so it is newest.
-            // Two unrecorded windows cannot be ordered against each other by anything but a guess.
+            // The order is a fact only when every contender's host was already under observation before
+            // its registration was recorded. A recorded time is a genuine "when it first claimed" only if
+            // the tool was watching that host beforehand; a host first seen this run has "now" for every
+            // window on it, which is a first look rather than an appearance. Ranking a genuinely observed
+            // rival against one of those would award ownership without proving which claim came first —
+            // fleet expansion cannot launder a narrow view into a fleet-wide fact. Given that, the usual
+            // conditions hold: every recorded time is distinct, and at most one window has no record at all
+            // (that one appeared since its host's prior sweep, which places it last). Two unrecorded
+            // windows cannot be ordered against each other by anything but a guess.
+            bool everyHostObservedBefore = contenders.All(c => sweptAt?.Invoke(c.Pane.Host) is not null);
             bool observed = known.Length == known.Distinct().Count()
                 && unrecorded <= 1
-                && (unrecorded == 0 || contenders.Any(c => registeredAt(c.Pane) is null && sweptAt?.Invoke(c.Pane.Host) is not null));
+                && everyHostObservedBefore;
 
             (TmuxPane Pane, int PrNumber, int? Round)[] ordered = [.. contenders
                 .OrderBy(c => registeredAt(c.Pane) ?? DateTimeOffset.MaxValue)

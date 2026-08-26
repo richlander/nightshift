@@ -86,13 +86,45 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         WaitingState.Contradicted => 1,    // said done, demonstrably is not
         WaitingState.Stale => 2,
         WaitingState.Closed => 3,
-        WaitingState.Ready => 4,           // the merge queue: actionable
+        WaitingState.Ready or WaitingState.Unblocked => 4, // actionable merge/resume queue
         WaitingState.Merged => 5,          // window is finished, can be reclaimed
         WaitingState.Conflicting => 6,
         WaitingState.MergeUnverified => 7, // GitHub has not answered yet
         WaitingState.Unknown => 8,
         _ => 9,
     };
+
+    /// <summary>
+    /// Resolves a record that named nothing this reader can look up. There is no GitHub side to join it
+    /// against — no PR to fetch, no head to falsify it with — so this is the whole decision.
+    /// </summary>
+    /// <remarks>
+    /// The row is reported and never actionable, and both halves of that are deliberate. Reported,
+    /// because an agent published something and the one thing certain about it is that it is wrong;
+    /// dropping it is how <c>rec=stop</c> in a window named <c>worker</c> became silence. Never
+    /// actionable, twice over: assurance is low, and neither state a record without an identity can reach
+    /// is one <see cref="MayAct"/> admits. An escalation still reaches the operator as an escalation —
+    /// what it has lost is the subject, so the row says so rather than implying one.
+    /// </remarks>
+    public static WaitingVerdict Unidentified(UnidentifiedState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+
+        // The same words the empty-shell row uses, because it is the same missing fact — and said once
+        // here rather than restated from the reason, which already carries what the record asked for and
+        // is followed in the detail column by every defect verbatim.
+        Assurance assurance = Assurance.Low("nothing identifies this window");
+
+        return state.Recommendation switch
+        {
+            Recommendation.Stop => new(WaitingState.NeedsOperator, RowOwner.Operator,
+                "asking to stop, but the record names no PR or issue", assurance),
+            Recommendation.Approve => new(WaitingState.NeedsOperator, RowOwner.Operator,
+                "asking to authorise more rounds, but the record names no PR or issue", assurance),
+            _ => new(WaitingState.Untrustworthy, RowOwner.Operator,
+                "published state that names no PR or issue", assurance),
+        };
+    }
 
     /// <summary>
     /// Resolves a window's state against GitHub's account of the same PR. Pure — the whole decision table
@@ -111,13 +143,50 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
             {
                 Recommendation.Stop => new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to stop; grant or decline", assurance),
                 Recommendation.Approve => new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to authorise more rounds", assurance),
+
+                // `merge` on an issue window is impossible — there is no PR to merge — and the parser
+                // records it as a defect. Surfaced as untrustworthy and operator-owned rather than falling
+                // to the quiet Holding below, so the impossible request is not filtered out of view.
+                Recommendation.Merge => new(WaitingState.Untrustworthy, RowOwner.Operator,
+                    $"asking to merge issue #{state.PrNumber}, which has no PR to merge", assurance),
+
                 _ => new(WaitingState.Holding, RowOwner.Nobody, $"tracking issue #{state.PrNumber}; no PR yet", assurance),
             };
         }
 
         if (facts is null)
         {
-            return new(WaitingState.Unknown, RowOwner.Operator, $"could not read PR #{state.PrNumber} from GitHub", assurance);
+            // GitHub is unreadable, so there is no branch to join the record against. An explicit
+            // escalation survives that anyway: `stop` and `approve` are the agent asking a person to
+            // decide, and that request does not depend on the PR being legible — dropping it to Unknown is
+            // the same erasure as the field never surviving the read, and it happens exactly when GitHub is
+            // down or rate-limited and an operator most needs to see the ask. So keep it as the operator's,
+            // at the low assurance the unreadable side already earns, and say both halves: what was asked,
+            // and that the PR could not be read. Every other recommendation has no evidence left to stand
+            // on once GitHub is silent, so it stays Unknown.
+            return state.Recommendation switch
+            {
+                Recommendation.Stop => new(WaitingState.NeedsOperator, RowOwner.Operator,
+                    $"asking to stop, but PR #{state.PrNumber} could not be read from GitHub", assurance),
+                Recommendation.Approve => new(WaitingState.NeedsOperator, RowOwner.Operator,
+                    $"asking to authorise more rounds, but PR #{state.PrNumber} could not be read from GitHub", assurance),
+                _ => new(WaitingState.Unknown, RowOwner.Operator, $"could not read PR #{state.PrNumber} from GitHub", assurance),
+            };
+        }
+
+        // Stop and Approve both need an answer before anything moves, and an explicit escalation outranks
+        // whatever the branch looks like — a merged, closed, or stale PR does not retract the agent's ask,
+        // and a person is already required. Placed before the branch-state gates so the escalation is not
+        // swallowed by a Merged/Closed/Stale return. Assurance is still whatever the facts and defects
+        // earn, so a stale or contradictory record's escalation reaches the operator graded low.
+        if (state.Recommendation == Recommendation.Stop)
+        {
+            return Escalation(state, facts, assurance, "asking to stop; grant or decline");
+        }
+
+        if (state.Recommendation == Recommendation.Approve)
+        {
+            return Escalation(state, facts, assurance, "asking to authorise more rounds");
         }
 
         if (facts.Merged)
@@ -132,22 +201,10 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
 
         // Head divergence voids the record before anything in it is evaluated: every claim was made about
         // code GitHub is no longer serving.
-        if (state.Head is not null && !ShaMatches(state.Head, facts.HeadSha))
+        if (IsStale(state, facts))
         {
             return new(WaitingState.Stale, RowOwner.Operator,
-                $"record describes {Short(state.Head)}, GitHub head is {Short(facts.HeadSha)}", assurance);
-        }
-
-        // Stop and Approve both need an answer before anything moves, and an escalation outranks whatever
-        // the branch looks like — a person is already required.
-        if (state.Recommendation == Recommendation.Stop)
-        {
-            return new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to stop; grant or decline", assurance);
-        }
-
-        if (state.Recommendation == Recommendation.Approve)
-        {
-            return new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to authorise more rounds", assurance);
+                DescribeMismatch(state.Head!, facts.HeadSha), assurance);
         }
 
         // Everything below decides whether a window is finished, so every one of these gates fails closed.
@@ -177,6 +234,17 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
             return new(WaitingState.Untrustworthy, RowOwner.Operator, "reported done without a head to check it against", assurance);
         }
 
+        // A named blocker is an explicit unresolved dependency. A predicate beside it can add another
+        // reason to wait, but clearing that predicate cannot clear the issue or PR the record still names.
+        // It also outranks a conflict against today's main: waking the agent before its dependency lands
+        // buys a conflict pass that the dependency is likely to invalidate. Stop/approve escalations were
+        // handled above, while a contradictory merge recommendation was already made untrustworthy.
+        if (state.Blocked.Count > 0)
+        {
+            return new(WaitingState.Holding, RowOwner.Nobody,
+                $"parked behind {string.Join(", ", state.Blocked.Select(b => "#" + b))}", assurance);
+        }
+
         if (facts.IsConflicting)
         {
             // The agent believes it is finished and the branch does not merge. Do NOT send it back round:
@@ -187,10 +255,14 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
                 : new(WaitingState.Conflicting, RowOwner.Agent, "CONFLICTING; integrate a later main", assurance);
         }
 
-        // The declared predicate is evaluated before the generic gates, because it is the agent's own
-        // statement of what would make it interesting again — including `merge`, which is precisely the
-        // uncomputed-mergeability case.
-        if (state.Waiting.Kind != WaitKind.None)
+        // The declared predicate is the agent's own statement of what would make it interesting again —
+        // including `merge`, the uncomputed-mergeability case — so it is evaluated before the generic
+        // gates, but only when the agent is actually parked on it. `continue` says the window is still
+        // working, not idle behind a predicate, so a cleared `waiting=` cannot wake a window that never
+        // stopped: evaluating it turned "still working" into an actionable Unblocked, observed as
+        // `waiting=check:ci rec=continue` on a branch whose ci had gone green. Continue denies readiness
+        // exactly as it denies done-ness, so it falls through to the in-progress gate below instead.
+        if (state.Recommendation != Recommendation.Continue && state.Waiting.Kind != WaitKind.None)
         {
             WaitingVerdict? predicate = EvaluateWait(state, facts, assurance);
             if (predicate is { } resolved)
@@ -204,14 +276,6 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
             return declaredDone
                 ? new(WaitingState.MergeUnverified, RowOwner.Operator, "reported done, but GitHub has not computed mergeability", assurance)
                 : new(WaitingState.MergeUnverified, RowOwner.Nobody, "mergeability not yet computed", assurance);
-        }
-
-        // Wait is the one recommendation that needs no decision — the agent resumes itself when the
-        // numbers it named close. It stays quiet, and becomes interesting again exactly then.
-        if (state.Recommendation == Recommendation.Wait && state.Blocked.Count > 0)
-        {
-            return new(WaitingState.Holding, RowOwner.Nobody,
-                $"parked behind {string.Join(", ", state.Blocked.Select(b => "#" + b))}", assurance);
         }
 
         if (!declaredDone)
@@ -334,7 +398,7 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
 
         if (state.Source == StateSource.WindowName)
         {
-            return Assurance.Medium("identity read from the window name; the agent published no state");
+            return Assurance.Medium("agent published no identity; identity read from the window name");
         }
 
         // Without a head nothing ties the claims to a revision, so they can be neither confirmed nor
@@ -353,5 +417,83 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         return length >= 7 && recorded.AsSpan(0, length).Equals(actual.AsSpan(0, length), StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string Short(string sha) => sha.Length <= 9 ? sha : sha[..9];
+    /// <summary>
+    /// Whether the record describes a head GitHub has moved past. A record naming no head names no
+    /// revision, so it can never be stale — there is nothing to diverge from.
+    /// </summary>
+    private static bool IsStale(AgentState state, PrFacts facts) =>
+        state.Head is not null && !ShaMatches(state.Head, facts.HeadSha);
+
+    /// <summary>
+    /// Builds a stop or approve escalation once GitHub is readable. The ask to stop or authorise is about
+    /// the window's work, not the code, so it reaches the operator whatever the branch looks like. But a
+    /// record describing a head GitHub has moved past is asking about code that is gone: the escalation
+    /// still stands and stays non-actionable, yet its assurance is graded down to low and the head
+    /// mismatch is named, so a stale escalation cannot reach the operator wearing the high confidence a
+    /// clean record would have earned.
+    /// </summary>
+    private static WaitingVerdict Escalation(AgentState state, PrFacts facts, Assurance assurance, string ask)
+    {
+        if (IsStale(state, facts))
+        {
+            string mismatch = DescribeMismatch(state.Head!, facts.HeadSha);
+            return new(WaitingState.NeedsOperator, RowOwner.Operator, $"{ask} — but the {mismatch}", Assurance.Low(mismatch));
+        }
+
+        return new(WaitingState.NeedsOperator, RowOwner.Operator, ask, assurance);
+    }
+
+    private static string Short(string sha) => sha.Length <= ShortWidth ? sha : sha[..ShortWidth];
+
+    /// <summary>The concise default width a lone sha is displayed at.</summary>
+    private const int ShortWidth = 9;
+
+    /// <summary>
+    /// Renders a stale head mismatch so the recorded sha and the GitHub head are always visibly distinct.
+    /// Ordinary different shas diverge within the first few characters and print at the concise default
+    /// width; two shas that agree past it — the failure this exists for, where both would otherwise clip
+    /// to the same nine characters — are widened by just enough to expose the first differing character.
+    /// Both sides are clipped to one shared width so the reason and the assurance caveat are byte-for-byte
+    /// the same diagnostic.
+    /// </summary>
+    private static string DescribeMismatch(string recorded, string actual)
+    {
+        int width = DistinguishingWidth(recorded, actual);
+        return $"record describes {Clip(recorded, width)}, GitHub head is {Clip(actual, width)}";
+    }
+
+    /// <summary>
+    /// The display width that keeps two shas distinct: the concise default when they differ early, widened
+    /// to one character past a longer shared prefix, and the full length of the longer value when one is an
+    /// abbreviated prefix of the other (no character distinguishes them, so the whole of each is shown).
+    /// When both values are shorter than the concise default they already differ within their length, so
+    /// the lower bound collapses to that length — clamping to <see cref="ShortWidth"/> there would ask for
+    /// a minimum wider than the maximum and throw.
+    /// </summary>
+    private static int DistinguishingWidth(string recorded, string actual)
+    {
+        int shared = CommonPrefixLength(recorded, actual);
+        int longer = Math.Max(recorded.Length, actual.Length);
+        if (shared >= Math.Min(recorded.Length, actual.Length))
+        {
+            return longer;
+        }
+
+        return Math.Clamp(shared + 1, Math.Min(ShortWidth, longer), longer);
+    }
+
+    /// <summary>Length of the leading run the two shas share, compared case-insensitively as <see cref="ShaMatches"/> does.</summary>
+    private static int CommonPrefixLength(string a, string b)
+    {
+        int length = Math.Min(a.Length, b.Length);
+        int i = 0;
+        while (i < length && char.ToLowerInvariant(a[i]) == char.ToLowerInvariant(b[i]))
+        {
+            i++;
+        }
+
+        return i;
+    }
+
+    private static string Clip(string sha, int width) => sha.Length <= width ? sha : sha[..width];
 }
