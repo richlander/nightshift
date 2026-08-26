@@ -40,7 +40,7 @@ public class ModelCorrespondenceTests
     {
         TmuxPane only = Window("%1");
 
-        Assert.True(Claim.Register([(only, 4448, null)], _ => null, _ => null)[Claim.Key(only)].OwnsClaim);
+        Assert.True(Claim.Register([(only, 4448, null)], _ => null, _ => false)[Claim.Key(only)].OwnsClaim);
     }
 
     /// <summary>
@@ -58,7 +58,7 @@ public class ModelCorrespondenceTests
         IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
             [(a, 4448, null), (b, 4448, null)],
             p => witnessed ? (p.PaneId == a.PaneId ? t : t.AddMinutes(5)) : null,
-            _ => t);
+            _ => witnessed);
 
         Assert.True(ranked.Values.Count(c => c.OwnsClaim) <= 1);
     }
@@ -77,7 +77,7 @@ public class ModelCorrespondenceTests
         IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
             [(a, 4448, 3), (b, 4448, 15)],
             _ => null,
-            _ => DateTimeOffset.UnixEpoch);
+            _ => false);
 
         Assert.All(ranked.Values, c => Assert.False(c.OwnsClaim));
     }
@@ -173,7 +173,7 @@ public class ModelCorrespondenceTests
                 history.Observe(b, at, claimedPr: 4448);
 
                 IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
-                    [(a, 4448, null), (b, 4448, null)], history.ClaimedAt, history.SweptAt);
+                    [(a, 4448, null), (b, 4448, null)], history.ClaimedAt, history.IsWitnessed);
 
                 string current = ranked.Single(e => e.Value.Rank == ClaimRank.Owner).Key;
                 owner ??= current;
@@ -201,10 +201,10 @@ public class ModelCorrespondenceTests
     {
         TmuxPane visible = Window("%9", host: "merritt");
 
-        Assert.True(Claim.Register([(visible, 4448, null)], _ => null, _ => null, viewComplete: true)
+        Assert.True(Claim.Register([(visible, 4448, null)], _ => null, _ => false, viewComplete: true)
             [Claim.Key(visible)].OwnsClaim);
 
-        Claim partial = Claim.Register([(visible, 4448, null)], _ => null, _ => null, viewComplete: false)[Claim.Key(visible)];
+        Claim partial = Claim.Register([(visible, 4448, null)], _ => null, _ => false, viewComplete: false)[Claim.Key(visible)];
         Assert.Equal(ClaimBasis.PartialView, partial.Basis);
         Assert.False(partial.OwnsClaim);
     }
@@ -247,9 +247,9 @@ public class ModelCorrespondenceTests
     }
 
     /// <summary>
-    /// TLA+ <c>Observed</c>: the order is a fact only when every recorded time is distinct and at most
-    /// one claimant has no record. The scenario the model exists to get right — one agent working, a
-    /// second joining later, with the tool running throughout.
+    /// TLA+ <c>Observed</c>: the order is a fact only when every claim was recorded, witnessed, and the
+    /// times are distinct. The scenario the model exists to get right — one agent working, a second
+    /// joining later, with the tool watching both hosts throughout, so both registrations are witnessed.
     /// </summary>
     [Fact]
     public void ObservedRequiresAWitnessedRegistration()
@@ -260,8 +260,8 @@ public class ModelCorrespondenceTests
 
         IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
             [(joined, 4448, null), (first, 4448, null)],
-            p => p.PaneId == first.PaneId ? t : null,
-            _ => t.AddMinutes(30));
+            p => p.PaneId == first.PaneId ? t : t.AddMinutes(5),
+            _ => true);
 
         Assert.Equal(ClaimBasis.Observed, ranked[Claim.Key(first)].Basis);
         Assert.True(ranked[Claim.Key(first)].OwnsClaim);
@@ -269,32 +269,65 @@ public class ModelCorrespondenceTests
     }
 
     /// <summary>
-    /// TLA+ <c>Observed</c>, fleet-expansion case: a registration only orders a claim if its host was
-    /// under observation before the time was recorded. A rival on a host first seen this run has "now"
-    /// for its registration, which is a first look rather than an appearance — ranking a genuinely
-    /// observed record against it would launder a narrow view into a fleet-wide fact.
+    /// TLA+ <c>NoOwnerFromUnwitnessedRegistration</c>, the three-sweep counterexample: a claim first
+    /// recorded under a narrow view must stay untrusted across every later sweep, even once the whole
+    /// fleet is finally collected. Recomputing trust from the current sweep's coverage is what let fleet
+    /// expansion promote a first look; persisting per-registration provenance is what stops it.
     /// </summary>
     /// <remarks>
-    /// The exact laundering the review found: host A's window is recorded from an earlier run, host B is
-    /// added this run, and B's window gets "now". Both times are recorded and distinct, so the old rule
-    /// called the order observed and granted A ownership without proving which claim came first.
+    /// B truly predates A, but B's host joins the tool's view later. Sweep 1 collects only A's host, so
+    /// A's registration is unwitnessed. Sweep 2 adds B's host — B is new, so also unwitnessed — and A
+    /// continues, keeping its unwitnessed status. Sweep 3 collects the same full fleet: both witness
+    /// conditions now hold, but both claims are unchanged, so the persisted unwitnessed status survives and
+    /// the order is STILL inferred. Only a witnessed re-registration — B releases and re-claims while the
+    /// tool watches — can establish a trustworthy order.
     /// </remarks>
     [Fact]
-    public void ObservedRequiresEveryHostSweptBeforeThisRun()
+    public void ObservedNeverPromotesAClaimFirstSeenUnderANarrowView()
     {
-        TmuxPane onA = Window("%1", host: "a");
-        TmuxPane onB = Window("%2", host: "b");
-        DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+        string path = TempPath();
+        try
+        {
+            TmuxPane a = Window("%1", host: "a");
+            TmuxPane b = Window("%2", host: "b");
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+            var history = new PaneHistory(path);
 
-        IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
-            [(onA, 4448, null), (onB, 4448, null)],
-            p => p.PaneId == onA.PaneId ? t : t.AddHours(1),
+            // Sweep 1 (narrow): A's host is seen for the first time, so its registration is unwitnessed.
+            history.AdoptEpoch("a", "1:1", t);
+            history.Observe(a, t, claimedPr: 4448, registrationWitnessed: false);
 
-            // Only A was swept in full before this run; B is newly configured, so its recorded time is a
-            // first look, not a witnessed appearance.
-            host => host == "a" ? t.AddHours(-1) : null);
+            // Sweep 2 (B's host joins): B is new — unwitnessed — and A continues, keeping unwitnessed.
+            history.AdoptEpoch("a", "1:1", t.AddMinutes(10));
+            history.AdoptEpoch("b", "2:1", t.AddMinutes(10));
+            history.Observe(a, t.AddMinutes(10), claimedPr: 4448, registrationWitnessed: true);
+            history.Observe(b, t.AddMinutes(10), claimedPr: 4448, registrationWitnessed: false);
 
-        Assert.Equal(ClaimBasis.Inferred, ranked[Claim.Key(onA)].Basis);
-        Assert.All(ranked.Values, c => Assert.False(c.OwnsClaim));
+            Claim sweep2 = Claim.Register([(a, 4448, null), (b, 4448, null)], history.ClaimedAt, history.IsWitnessed)[Claim.Key(a)];
+            Assert.Equal(ClaimBasis.Inferred, sweep2.Basis);
+            Assert.False(sweep2.OwnsClaim);
+
+            // Sweep 3 (same full fleet): both witness conditions now hold, but both claims are unchanged,
+            // so the persisted unwitnessed status survives and the order is STILL inferred.
+            history.Observe(a, t.AddMinutes(20), claimedPr: 4448, registrationWitnessed: true);
+            history.Observe(b, t.AddMinutes(20), claimedPr: 4448, registrationWitnessed: true);
+            IReadOnlyDictionary<string, Claim> sweep3 = Claim.Register([(a, 4448, null), (b, 4448, null)], history.ClaimedAt, history.IsWitnessed);
+            Assert.Equal(ClaimBasis.Inferred, sweep3[Claim.Key(a)].Basis);
+            Assert.All(sweep3.Values, c => Assert.False(c.OwnsClaim));
+
+            // Only a witnessed re-registration establishes a trustworthy order. Both release and re-claim
+            // while the tool watches: now both are witnessed and the order is observed.
+            history.Observe(a, t.AddMinutes(30), claimedPr: null);
+            history.Observe(b, t.AddMinutes(30), claimedPr: null);
+            history.Observe(a, t.AddMinutes(40), claimedPr: 4448, registrationWitnessed: true);
+            history.Observe(b, t.AddMinutes(50), claimedPr: 4448, registrationWitnessed: true);
+            Claim sweep5 = Claim.Register([(a, 4448, null), (b, 4448, null)], history.ClaimedAt, history.IsWitnessed)[Claim.Key(a)];
+            Assert.Equal(ClaimBasis.Observed, sweep5.Basis);
+            Assert.True(sweep5.OwnsClaim);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
     }
 }

@@ -147,22 +147,29 @@ because several of them were violated by code that passed its unit tests.
    change. *(An owner whose identity flips is worse than no owner.)*
 10. After a host's epoch changes, no claim on that host has `basis = Observed`
     until the tool has witnessed those windows registering again.
-11. A contested claim has `basis = Observed` only when every claimant's host was
-    swept in full *before* this run. *(Adding a host must not launder a narrow
-    view: a rival first seen this sweep has a "now" registration that is a first
-    look, not a witnessed appearance, so ordering a recorded rival against it is
-    a guess.)*
-12. A window's silence duration never decreases while its body digest is
+11. A contested claim has `basis = Observed` only when every claimant's
+    registration was *witnessed* — recorded while the tool was already watching
+    its host under a complete view — and that witness is persisted with the
+    registration, not recomputed each sweep. *(A claim first recorded under a
+    narrow view stays untrusted across every later sweep, even once the whole
+    fleet is collected; only a release and a witnessed re-registration can
+    establish a trustworthy order. Recomputing trust from the current sweep's
+    coverage is what let the third sweep of a full fleet promote a first look.)*
+12. A window that stops claiming a PR — going quiet, publishing an issue, or a
+    malformed record — clears its registration and its witness, so a later
+    reclaim is a fresh registration that cannot inherit its old place in the
+    queue.
+13. A window's silence duration never decreases while its body digest is
     unchanged.
-13. A claim's registration time is stable for as long as the window keeps
+14. A claim's registration time is stable for as long as the window keeps
     claiming the same PR.
 
 **Liveness — the tool does not go quiet by accident.**
 
-14. An unreachable host is reported, never absorbed into an empty result.
-15. A sweep that collects nothing reports failure rather than an idle fleet.
+15. An unreachable host is reported, never absorbed into an empty result.
+16. A sweep that collects nothing reports failure rather than an idle fleet.
 
-Invariants 9–13 are the ones unit tests cover least well, because they are
+Invariants 9–14 are the ones unit tests cover least well, because they are
 statements about *sequences* of sweeps interleaved with fleet events rather than
 about a single decision. Every defect found in this area so far — pane ids reused
 across a server restart, silence measured from a repainting footer, ownership

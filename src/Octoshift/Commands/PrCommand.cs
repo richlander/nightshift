@@ -78,11 +78,12 @@ internal static class PrCommand
         IReadOnlyDictionary<string, TimeSpan?> Silence)
     {
         /// <summary>
-        /// A partly invisible fleet cannot produce success-shaped output: the PR may well be claimed on a
-        /// host that did not answer, so a partial sweep fails even when this run happened to find it.
-        /// Otherwise, finding neither a claim nor a PR is the not-found failure.
+        /// Any incompleteness in the view fails: a host that did not answer, or a previously-collected
+        /// host this run omitted, both mean the PR may be claimed somewhere this sweep could not see, so a
+        /// success-shaped exit would assert a completeness the sweep did not have. Otherwise, finding
+        /// neither a claim nor a PR is the not-found failure.
         /// </summary>
-        public int ExitCode => Collected.AnyFailure
+        public int ExitCode => !ViewComplete
             ? Octoshift.ExitCode.Unavailable
             : Facts is null && Claims.Count == 0 ? Octoshift.ExitCode.Unavailable : Octoshift.ExitCode.Ok;
     }
@@ -109,10 +110,11 @@ internal static class PrCommand
             .Where(g => g.Count() > 1)
             .Select(g => g.Key)];
 
-        // Read every pane once, with the duplicate-name and pane-corroboration safeguards, and collect
-        // every claimant across the whole fleet — not just this PR's — so the contest is ranked exactly as
-        // the full sweep ranks it.
-        var readings = new List<(TmuxPane Pane, AgentState State)>();
+        // Read every pane once, with the duplicate-name and pane-corroboration safeguards. Keep every
+        // pane's reading — including the ones that identify nothing — so each is observed below and its
+        // stale registration cleared; collect the claimants across the whole fleet so the contest is
+        // ranked exactly as the full sweep ranks it.
+        var parsed = new List<(TmuxPane Pane, AgentState? State)>();
         var claimants = new List<(TmuxPane Pane, int PrNumber, int? Round)>();
         foreach (TmuxPane pane in collected.Panes)
         {
@@ -122,14 +124,10 @@ internal static class PrCommand
                 nameIsAmbiguous: ambiguousNames.Contains($"{pane.Host ?? "local"}|{pane.WindowName}"),
                 paneContradictsPr: pr => TmuxScanner.PaneContradictsPr(pane.Capture, pr));
 
+            parsed.Add((pane, state));
             if (state is { IsIssue: false } claim)
             {
                 claimants.Add((pane, claim.PrNumber, claim.Round));
-            }
-
-            if (state is not null)
-            {
-                readings.Add((pane, state));
             }
         }
 
@@ -164,20 +162,24 @@ internal static class PrCommand
             }
         }
 
-        // Observe every window, not only the ones claiming this PR: the history is shared with `waiting`,
-        // and a run that recorded a subset would prune the rest and reset their silence measurements.
-        // Keyed by host and pane id together, because a pane id is unique only within one tmux server —
-        // `%3` on two hosts is two windows, and a host-local key would let one overwrite the other.
+        // Observe every collected window, claiming or not: the history is shared with `waiting`, and a run
+        // that recorded only the claimants would prune the rest and reset their silence. A pane that now
+        // identifies no PR — absent, malformed, or an issue — is observed with a null claim, which clears
+        // its stale registration and provenance while keeping its digest, so a window that owned this PR,
+        // fell silent, and later reclaimed it cannot inherit its old place in the queue. Keyed by host and
+        // pane id together, because a pane id is unique only within one tmux server.
         var silence = new Dictionary<string, TimeSpan?>(StringComparer.Ordinal);
-        foreach ((TmuxPane pane, AgentState state) in readings)
+        foreach ((TmuxPane pane, AgentState? state) in parsed)
         {
-            silence[Claim.Key(pane)] = history.Observe(pane, now, state.IsIssue ? null : state.PrNumber);
+            int? claimedPr = state is { IsIssue: false } id ? id.PrNumber : null;
+            bool registrationWitnessed = viewComplete && sweptBefore.GetValueOrDefault(pane.Host ?? "local") is not null;
+            silence[Claim.Key(pane)] = history.Observe(pane, now, claimedPr, registrationWitnessed);
         }
 
         IReadOnlyDictionary<string, Claim> claims = Claim.Register(
             claimants,
             history.ClaimedAt,
-            host => sweptBefore.GetValueOrDefault(host ?? "local"),
+            history.IsWitnessed,
             viewComplete);
 
         // Persist history only for the hosts actually collected, so a partial sweep keeps what it did not
@@ -186,9 +188,9 @@ internal static class PrCommand
 
         // This PR's claimants, owner first. The rank comes from Claim.Register, so followers sort after the
         // owner; ties break on the same fixed key the sweep uses, so the owner is the same window in both.
-        (TmuxPane Pane, AgentState State, Claim Claim)[] mine = [.. readings
-            .Where(r => !r.State.IsIssue && r.State.PrNumber == prNumber)
-            .Select(r => (r.Pane, r.State, Claim: claims.GetValueOrDefault(Claim.Key(r.Pane), Claim.Sole)))
+        (TmuxPane Pane, AgentState State, Claim Claim)[] mine = [.. parsed
+            .Where(r => r.State is { IsIssue: false } s && s.PrNumber == prNumber)
+            .Select(r => (r.Pane, State: r.State!, Claim: claims.GetValueOrDefault(Claim.Key(r.Pane), Claim.Sole)))
             .OrderBy(m => m.Claim.IsFollower ? 1 : 0)
             .ThenBy(m => history.ClaimedAt(m.Pane) ?? DateTimeOffset.MaxValue)
             .ThenBy(m => m.Pane.Host ?? string.Empty, StringComparer.Ordinal)
@@ -457,9 +459,10 @@ internal static class PrCommand
         }
 
         // A partly invisible fleet is named in the output as well as the exit code: the requested PR may
-        // be claimed on a host that did not answer, so success-shaped JSON that omits the failure would
-        // assert a completeness the sweep did not have.
-        writer.WriteBoolean("viewComplete", viewComplete && collected.Unreachable.Count == 0);
+        // be claimed on a host that did not answer, or on one this run omitted, so success-shaped JSON that
+        // omitted the failure would assert a completeness the sweep did not have. This mirrors the exit
+        // code, which fails on any incomplete view.
+        writer.WriteBoolean("viewComplete", viewComplete);
         writer.WriteStartArray("unreachable");
         foreach (string failure in collected.Unreachable)
         {

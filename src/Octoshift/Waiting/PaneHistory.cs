@@ -40,6 +40,22 @@ internal sealed record PaneMemory
     /// </summary>
     [JsonPropertyName("claimedAt")]
     public DateTimeOffset? ClaimedAt { get; init; }
+
+    /// <summary>
+    /// Whether this registration was <em>witnessed</em>: recorded while its host was already under
+    /// continuous observation and the fleet view was complete, so the time is a real appearance rather
+    /// than a first look.
+    /// </summary>
+    /// <remarks>
+    /// Persisted with the registration and preserved for as long as the same claim continues, so trust
+    /// cannot be recomputed from a later sweep's coverage. A claim first recorded under a narrow view
+    /// stays untrusted across every subsequent sweep — fleet expansion must not promote it — until the
+    /// window releases or switches and re-registers under a view that can witness it. Missing in an older
+    /// history file, which deserialises to <c>false</c>: an unlabelled registration is treated as
+    /// untrusted, never silently promoted.
+    /// </remarks>
+    [JsonPropertyName("witnessed")]
+    public bool Witnessed { get; init; }
 }
 
 /// <summary>
@@ -142,23 +158,36 @@ internal sealed class PaneHistory
 
     /// <summary>
     /// Records the current digest and returns how long the body has been unchanged, or null the first
-    /// time a window is seen.
+    /// time a window is seen. Also carries the current claim registration: which PR the window claims now
+    /// (or null when it claims none), and whether that registration is witnessed.
     /// </summary>
-    public TimeSpan? Observe(TmuxPane pane, DateTimeOffset now, int? claimedPr = null)
+    /// <remarks>
+    /// Called for <em>every</em> collected pane each sweep, claiming or not. A pane that now publishes no
+    /// usable identity — absent, malformed, or an issue rather than a PR — is observed with
+    /// <paramref name="claimedPr"/> null, which clears its stale registration and provenance while keeping
+    /// its digest and silence. Without that, a window that owned a PR, went quiet, and later reclaimed it
+    /// would inherit its old registration time and jump the queue ahead of a rival that claimed it in the
+    /// meantime.
+    /// </remarks>
+    public TimeSpan? Observe(TmuxPane pane, DateTimeOffset now, int? claimedPr = null, bool registrationWitnessed = false)
     {
         string key = Key(pane);
         _entries.TryGetValue(key, out PaneMemory? previous);
 
-        // A window keeps its registration for as long as it keeps claiming the same PR. Switching PRs is
-        // a fresh registration, and goes to the back of the queue.
-        bool sameClaim = previous?.ClaimedPr == claimedPr;
+        // A window keeps its registration — time AND provenance — for as long as it keeps claiming the
+        // same PR. Switching PRs, or dropping the claim entirely, is a fresh registration and goes to the
+        // back of the queue. Provenance is persisted rather than recomputed: a registration first recorded
+        // without prior continuous observation stays untrusted across later sweeps, so fleet expansion
+        // cannot promote it; only a genuinely witnessed re-registration earns trust.
+        bool sameClaim = claimedPr is not null && previous?.ClaimedPr == claimedPr;
         DateTimeOffset? claimedAt = claimedPr is null ? null
             : sameClaim && previous?.ClaimedAt is { } held ? held
             : now;
+        bool witnessed = claimedPr is not null && (sameClaim ? previous?.Witnessed ?? false : registrationWitnessed);
 
         if (previous is not null && previous.Digest == pane.BodyDigest)
         {
-            _entries[key] = previous with { ClaimedPr = claimedPr, ClaimedAt = claimedAt };
+            _entries[key] = previous with { ClaimedPr = claimedPr, ClaimedAt = claimedAt, Witnessed = witnessed };
             return now - previous.Since;
         }
 
@@ -168,6 +197,7 @@ internal sealed class PaneHistory
             Since = now,
             ClaimedPr = claimedPr,
             ClaimedAt = claimedAt,
+            Witnessed = witnessed,
         };
 
         return previous is null ? null : TimeSpan.Zero;
@@ -176,6 +206,14 @@ internal sealed class PaneHistory
     /// <summary>When this window first claimed the PR it now claims, or null if it is not registered.</summary>
     public DateTimeOffset? ClaimedAt(TmuxPane pane)
         => _entries.TryGetValue(Key(pane), out PaneMemory? entry) ? entry.ClaimedAt : null;
+
+    /// <summary>
+    /// Whether this window's current claim registration was witnessed — recorded while the tool was
+    /// already watching its host under a complete view. Consulted by <see cref="Claim.Register"/> so that
+    /// trust is read from the persisted registration, not recomputed from the current sweep's coverage.
+    /// </summary>
+    public bool IsWitnessed(TmuxPane pane)
+        => _entries.TryGetValue(Key(pane), out PaneMemory? entry) && entry.Witnessed;
 
     private static string Key(TmuxPane pane) => $"{pane.Host ?? "local"}|{pane.PaneId}";
 

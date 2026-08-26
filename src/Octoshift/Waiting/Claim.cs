@@ -92,13 +92,14 @@ internal readonly record struct Claim(
     /// collection order — an owner that changes identity between runs would be worse than no owner.
     /// </summary>
     /// <param name="registeredAt">When a window was first seen claiming its PR, or null if never seen.</param>
-    /// <param name="sweptAt">
-    /// When a host was last collected in full under its current tmux server <em>before this run</em>, or
-    /// null if it has not been. The prior sweep, deliberately, not this one's: a registration time orders
-    /// a claim only if the host was under observation when it was recorded, so a host first seen this run
-    /// contributes null here and its windows' registrations are treated as first looks rather than
-    /// witnessed appearances. A window with no registration on a host swept before must have appeared
-    /// since that sweep, which places it after everything already recorded without guessing.
+    /// <param name="witnessed">
+    /// Whether a window's current registration was <em>witnessed</em> — recorded while its host was
+    /// already under continuous observation and the fleet view was complete. Persisted with the
+    /// registration and preserved while the same claim continues, so it is read here rather than
+    /// recomputed from this run's coverage: a claim first recorded under a narrow view stays untrusted
+    /// across every later sweep, which is what stops fleet expansion promoting it once every host is
+    /// finally collected. Only two windows whose registrations were both witnessed can be ordered against
+    /// each other as an observed fact.
     /// </param>
     /// <param name="viewComplete">
     /// Whether every host answered. When one did not, a window that appears to be the only claimant of
@@ -110,7 +111,7 @@ internal readonly record struct Claim(
     public static IReadOnlyDictionary<string, Claim> Register(
         IEnumerable<(TmuxPane Pane, int PrNumber, int? Round)> claims,
         Func<TmuxPane, DateTimeOffset?> registeredAt,
-        Func<string?, DateTimeOffset?>? sweptAt = null,
+        Func<TmuxPane, bool>? witnessed = null,
         bool viewComplete = true)
     {
         var ranked = new Dictionary<string, Claim>(StringComparer.Ordinal);
@@ -130,19 +131,17 @@ internal readonly record struct Claim(
             int unrecorded = recorded.Count(r => r is null);
             DateTimeOffset[] known = [.. recorded.OfType<DateTimeOffset>()];
 
-            // The order is a fact only when every contender's host was already under observation before
-            // its registration was recorded. A recorded time is a genuine "when it first claimed" only if
-            // the tool was watching that host beforehand; a host first seen this run has "now" for every
-            // window on it, which is a first look rather than an appearance. Ranking a genuinely observed
-            // rival against one of those would award ownership without proving which claim came first —
-            // fleet expansion cannot launder a narrow view into a fleet-wide fact. Given that, the usual
-            // conditions hold: every recorded time is distinct, and at most one window has no record at all
-            // (that one appeared since its host's prior sweep, which places it last). Two unrecorded
-            // windows cannot be ordered against each other by anything but a guess.
-            bool everyHostObservedBefore = contenders.All(c => sweptAt?.Invoke(c.Pane.Host) is not null);
-            bool observed = known.Length == known.Distinct().Count()
-                && unrecorded <= 1
-                && everyHostObservedBefore;
+            // The order is a fact only when every contender's registration was witnessed — recorded while
+            // the tool was already watching its host under a complete view. Witness is persisted with the
+            // registration and read here, not recomputed from this run: a claim first recorded under a
+            // narrow view stays untrusted forever after, so expanding the fleet and re-collecting cannot
+            // turn a first look into a witnessed appearance and promote it. Given that, the order also has
+            // to be unambiguous: every contender recorded, and every recorded time distinct. A window that
+            // was never seen registering cannot be placed, and two identical times cannot be separated.
+            bool everyWitnessed = contenders.All(c => witnessed?.Invoke(c.Pane) ?? false);
+            bool observed = unrecorded == 0
+                && known.Length == known.Distinct().Count()
+                && everyWitnessed;
 
             (TmuxPane Pane, int PrNumber, int? Round)[] ordered = [.. contenders
                 .OrderBy(c => registeredAt(c.Pane) ?? DateTimeOffset.MaxValue)

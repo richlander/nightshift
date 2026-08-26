@@ -1,6 +1,7 @@
 namespace Octoshift.Commands;
 
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Octoshift.GitHub;
@@ -131,9 +132,12 @@ internal static class WaitingCommand
             collected.Panes, facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, ct,
             collected.CollectedHosts, allHostsAnswered: collected.Unreachable.Count == 0);
 
+        int renameFailures = 0;
         if (rename)
         {
-            await RenameAsync(resolved, ShellRunner.For, Console.Error, ct);
+            // Diagnostics (RENAMED, and the failure/skip lines) go to stderr, never stdout, so a
+            // --json --rename run leaves a single valid JSON document on stdout.
+            renameFailures = await RenameAsync(resolved, ShellRunner.For, Console.Error, ct);
         }
 
         IReadOnlyList<WaitingRow> shown = Present(resolved, all);
@@ -146,9 +150,11 @@ internal static class WaitingCommand
             WriteTable(Console.Out, shown, Budget.From(facts), collected.Unreachable, Omitted, Departed);
         }
 
-        // A partly invisible fleet is not a clean sweep, so a single failed host still costs the exit
-        // code even though every other host's rows were printed.
-        return collected.AnyFailure ? ExitCode.Unavailable : ExitCode.Ok;
+        // A partly invisible fleet is not a clean sweep, so a single failed host — or a previously
+        // collected host this run omitted — still costs the exit code even though every other host's rows
+        // were printed. A rename that could not be confirmed does too, so a harness is not told everything
+        // was corrected when some of it was not. Omitted is set by ResolveAllAsync and reflects this run.
+        return collected.AnyFailure || Omitted.Count > 0 || renameFailures > 0 ? ExitCode.Unavailable : ExitCode.Ok;
     }
 
     /// <summary>What one sweep managed to collect, and from how many targets it tried.</summary>
@@ -287,9 +293,10 @@ internal static class WaitingCommand
         bool all,
         CancellationToken ct,
         IReadOnlyList<string?>? collectedHosts = null,
-        bool allHostsAnswered = true)
+        bool allHostsAnswered = true,
+        PaneHistory? history = null)
         => Present(
-            await ResolveAllAsync(panes, fetchAsync, refreshMergeabilityAsync, now, ct, collectedHosts, allHostsAnswered),
+            await ResolveAllAsync(panes, fetchAsync, refreshMergeabilityAsync, now, ct, collectedHosts, allHostsAnswered, history),
             all);
 
     /// <summary>
@@ -311,7 +318,8 @@ internal static class WaitingCommand
         DateTimeOffset now,
         CancellationToken ct,
         IReadOnlyList<string?>? collectedHosts,
-        bool allHostsAnswered)
+        bool allHostsAnswered,
+        PaneHistory? history = null)
     {
         Departed = [];
         Omitted = [];
@@ -378,7 +386,7 @@ internal static class WaitingCommand
                 : refreshed with { ChecksKnown = false };
         }
 
-        var history = new PaneHistory();
+        history ??= new PaneHistory();
 
         // A host that did not answer and a host nobody asked about produce the same thing: a view with
         // windows missing from it. The second is invisible from the arguments alone — a host not named is
@@ -419,22 +427,25 @@ internal static class WaitingCommand
             }
         }
 
-        // Register every claim before ranking, so a window seen for the first time this sweep still has a
-        // registration time to be ordered by. Every identified window is observed — including working and
-        // blocked ones — so its registration and silence are tracked whatever it is doing.
+        // Observe every collected pane, claiming or not, and register its claim before ranking. A pane
+        // that now identifies no PR — absent, malformed, or an issue — is observed with a null claim,
+        // which clears its stale registration and provenance while keeping its digest and silence: without
+        // that, a window that owned a PR, went quiet, then reclaimed it would inherit its old place in the
+        // queue ahead of a rival that claimed it in between. A new registration is witnessed only when its
+        // host was under continuous observation before this run and the view was complete, so a claim seen
+        // for the first time under a narrow view is recorded untrusted and stays that way.
         var silence = new Dictionary<string, TimeSpan?>(StringComparer.Ordinal);
         foreach ((TmuxPane pane, StateReading reading) in readings)
         {
-            if (reading.Identified is { } identified)
-            {
-                silence[Claim.Key(pane)] = history.Observe(pane, now, identified.IsIssue ? null : identified.PrNumber);
-            }
+            int? claimedPr = reading.Identified is { IsIssue: false } identified ? identified.PrNumber : null;
+            bool registrationWitnessed = viewComplete && sweptBefore.GetValueOrDefault(pane.Host ?? "local") is not null;
+            silence[Claim.Key(pane)] = history.Observe(pane, now, claimedPr, registrationWitnessed);
         }
 
         IReadOnlyDictionary<string, Claim> claims = Claim.Register(
             claimants,
             history.ClaimedAt,
-            host => sweptBefore.GetValueOrDefault(host ?? "local"),
+            history.IsWitnessed,
             viewComplete);
 
         var rows = new List<WaitingRow>(readings.Count);
@@ -514,25 +525,72 @@ internal static class WaitingCommand
     /// <c>RENAMED</c> lines before it. The shell runner and the diagnostics sink are injected so the whole
     /// decision is testable without a tmux server.
     /// </remarks>
-    internal static async Task RenameAsync(
+    internal static async Task<int> RenameAsync(
         IReadOnlyList<WaitingRow> rows,
         Func<string?, Func<string, CancellationToken, Task<CommandResult>>> shellFor,
         TextWriter diagnostics,
         CancellationToken ct)
     {
+        int failures = 0;
         foreach (IGrouping<string?, WaitingRow> host in rows.GroupBy(r => r.Pane.Host))
         {
             (TmuxPane Pane, string Desired)[] renames = [.. RenamePlan(host)];
-
-            if (WindowNaming.BuildRenameScript(renames) is { } script)
+            if (renames.Length == 0)
             {
-                await shellFor(host.Key)(script, ct);
-                foreach ((TmuxPane pane, string desired) in renames)
+                continue;
+            }
+
+            // All panes on a host share one tmux server, so any of their scanned epochs is the batch's.
+            string scannedEpoch = renames[0].Pane.Epoch;
+            string nonce = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(8));
+            string script = WindowNaming.BuildRenameScript(renames, scannedEpoch, nonce)!;
+            CommandResult result = await shellFor(host.Key)(script, ct);
+
+            string label = host.Key ?? "local";
+
+            // A nonzero exit is the shell or ssh transport failing before anything was confirmed: nothing
+            // renamed, so nothing is reported as renamed.
+            if (result.ExitCode != 0)
+            {
+                failures += renames.Length;
+                string detail = result.Stderr.Trim() is { Length: > 0 } stderr ? stderr : $"exited {result.ExitCode}";
+                diagnostics.WriteLine($"RENAME-FAILED {DisplayText.Safe(label)}: {DisplayText.Safe(detail)}; {renames.Length} window(s) not renamed");
+                continue;
+            }
+
+            string[] lines = result.Stdout.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
+
+            // The server changed between the sweep and the mutation: pane ids may now name different
+            // windows, so the batch aborted itself. Reported, and counted as not done.
+            if (Array.Exists(lines, l => l == nonce + ":epoch"))
+            {
+                failures += renames.Length;
+                diagnostics.WriteLine($"RENAME-SKIPPED {DisplayText.Safe(label)}: tmux server changed since the sweep; {renames.Length} window(s) not renamed");
+                continue;
+            }
+
+            // Only the renames tmux confirmed. A window whose rename failed (a pane that vanished
+            // mid-batch) prints no marker, so it is named as failed rather than reported renamed.
+            string okPrefix = nonce + ":ok ";
+            HashSet<string> confirmed = [.. lines
+                .Where(l => l.StartsWith(okPrefix, StringComparison.Ordinal))
+                .Select(l => l[okPrefix.Length..])];
+
+            foreach ((TmuxPane pane, string desired) in renames)
+            {
+                if (confirmed.Contains(pane.PaneId))
                 {
                     diagnostics.WriteLine($"RENAMED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)} -> {DisplayText.Safe(desired)}");
                 }
+                else
+                {
+                    failures++;
+                    diagnostics.WriteLine($"RENAME-FAILED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)}: tmux did not confirm the rename");
+                }
             }
         }
+
+        return failures;
     }
 
     /// <summary>The windows whose current name differs from the one the tool would give them.</summary>
@@ -588,15 +646,23 @@ internal static class WaitingCommand
     /// <remarks>
     /// QUIET is a claim about the fleet, not about the rows that happened to arrive, so it may only be
     /// made when the whole fleet was read. With a host unreachable the honest lead is that the sweep is
-    /// partial — otherwise the one shape that matters most, a host that has gone dark while its windows
-    /// sit finished, prints the word QUIET on the first line and the reason on the last.
+    /// partial; with a previously-collected host omitted this run the lead is that it is narrowed —
+    /// otherwise the one shape that matters most, a host that has gone dark while its windows sit
+    /// finished, prints the word QUIET on the first line and the reason on the last. Both PARTIAL and
+    /// NARROWED are the same tokens the trailer lines and the exit code already use, so nothing new has to
+    /// be taught to a reader or a harness.
     /// </remarks>
-    internal static string Summary(IReadOnlyList<WaitingRow> rows, IReadOnlyList<string> unreachable)
+    internal static string Summary(IReadOnlyList<WaitingRow> rows, IReadOnlyList<string> unreachable, IReadOnlyList<string>? omitted = null)
     {
         int attention = rows.Count(r => r.Verdict.NeedsAttention);
         if (unreachable.Count > 0)
         {
             return $"PARTIAL {unreachable.Count} host(s) unreachable; {attention} of {rows.Count} visible window(s) need you";
+        }
+
+        if (omitted is { Count: > 0 })
+        {
+            return $"NARROWED {omitted.Count} host(s) not collected this run; {attention} of {rows.Count} visible window(s) need you";
         }
 
         return attention > 0
@@ -612,7 +678,7 @@ internal static class WaitingCommand
         IReadOnlyList<string>? omitted = null,
         IReadOnlyList<string>? departed = null)
     {
-        output.WriteLine(Summary(rows, unreachable));
+        output.WriteLine(Summary(rows, unreachable, omitted));
 
         // Said on every run, including when the number is zero. A tool that speaks to agents only when it
         // is sure has to be legible about when it was not, or "it did nothing" and "it saw nothing" look

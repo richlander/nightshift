@@ -75,17 +75,71 @@ internal static partial class WindowNaming
     /// rename per window would cost an ssh round trip per window, which is what made the collection
     /// itself unusable before it was batched.
     /// </summary>
-    internal static string? BuildRenameScript(IEnumerable<(TmuxPane Pane, string Desired)> renames)
+    /// <remarks>
+    /// <strong>No byte of tmux text enters shell syntax.</strong> A window's existing name is
+    /// agent-controlled arbitrary text, and it flows into <paramref name="renames"/> as the base of the
+    /// desired name; interpolating it into a quoted string is an injection, since a single quote closes
+    /// the quote and the rest is shell. So every target and desired name is encoded byte-for-byte as a
+    /// <c>printf %b</c> octal-escape string — only backslashes and the digits 0-7, which are inert in
+    /// single quotes — and decoded back to the exact bytes as a command-substitution <em>argument</em>,
+    /// never re-parsed as syntax. A name carrying a quote, a semicolon, a newline, backticks or
+    /// <c>$(...)</c> is data.
+    ///
+    /// Two guards make the mutation safe and its result trustworthy. First an <em>epoch guard</em>: the
+    /// host's current tmux server generation is recomputed and compared to the one the sweep saw, and the
+    /// whole batch aborts on a mismatch, because a restarted server recycles pane ids and a stale id could
+    /// name a different window. Then each rename is <em>confirmed</em>: it prints an <c>ok</c> marker only
+    /// when tmux reports success, so the caller reports exactly the renames that happened and names the
+    /// ones that did not.
+    /// </remarks>
+    internal static string? BuildRenameScript(
+        IReadOnlyList<(TmuxPane Pane, string Desired)> renames,
+        string scannedEpoch,
+        string nonce)
     {
-        var script = new StringBuilder();
-        foreach ((TmuxPane pane, string desired) in renames)
+        if (renames.Count == 0)
         {
-            // Pane ids are tmux-generated (%12) and desired names are built from a fixed vocabulary plus
-            // an existing window name, so neither can carry shell metacharacters; quoted regardless.
-            script.Append("tmux rename-window -t '").Append(pane.PaneId).Append("' '").Append(desired).Append("'\n");
+            return null;
         }
 
-        return script.Length > 0 ? script.ToString() : null;
+        var script = new StringBuilder();
+
+        // Epoch guard. Recompute the server generation exactly as the collection script did — pid, and the
+        // oldest session's creation time — and abort the batch on a mismatch rather than rename a possibly
+        // recycled id. Skipped only when the sweep recorded no epoch (nothing to compare against).
+        if (scannedEpoch.Length > 0)
+        {
+            script.Append("__e=$(printf '%s:%s' \"$(tmux display-message -p '#{pid}' 2>/dev/null)\" \"$(tmux list-sessions -F '#{session_created}' 2>/dev/null | sort -n | head -1)\")\n");
+            script.Append("if [ \"$__e\" != \"$(printf %b '").Append(ShellEncode(scannedEpoch))
+                  .Append("')\" ]; then printf '").Append(nonce).Append(":epoch\\n'; exit 0; fi\n");
+        }
+
+        foreach ((TmuxPane pane, string desired) in renames)
+        {
+            script.Append("if tmux rename-window -t \"$(printf %b '").Append(ShellEncode(pane.PaneId))
+                  .Append("')\" \"$(printf %b '").Append(ShellEncode(desired))
+                  .Append("')\" 2>/dev/null; then printf '").Append(nonce).Append(":ok %s\\n' \"$(printf %b '")
+                  .Append(ShellEncode(pane.PaneId)).Append("')\"; fi\n");
+        }
+
+        return script.ToString();
+    }
+
+    /// <summary>
+    /// Encodes arbitrary text as a POSIX <c>printf %b</c> octal-escape string: each UTF-8 byte becomes
+    /// <c>\0ooo</c> with exactly three octal digits. The result contains only backslashes and the digits
+    /// 0-7, all inert inside single quotes, so no byte of the input can reach shell syntax; <c>printf %b</c>
+    /// decodes it back to the exact bytes.
+    /// </summary>
+    internal static string ShellEncode(string value)
+    {
+        var sb = new StringBuilder(value.Length * 4);
+        foreach (byte b in Encoding.UTF8.GetBytes(value))
+        {
+            sb.Append("\\0").Append(Convert.ToString(b, 8).PadLeft(3, '0'));
+        }
+
+        return sb.ToString();
     }
 
     [GeneratedRegex(@"^(.*)-([A-Za-z]+)$")]

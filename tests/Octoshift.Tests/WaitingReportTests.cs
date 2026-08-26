@@ -86,6 +86,19 @@ public class WaitingReportTests
     }
 
     [Fact]
+    public void Summary_AnOmittedHostIsNarrowedNeverQuiet()
+    {
+        // Blocker 5: a run that omits a previously-collected host is looking at less of the fleet than it
+        // has seen, so its first line must not say QUIET. It leads with NARROWED — the same token the
+        // trailer line and the exit code use — even when nothing it could see needs a person.
+        string summary = WaitingCommand.Summary([Row(Holding())], [], ["fernie"]);
+
+        Assert.StartsWith("NARROWED", summary, StringComparison.Ordinal);
+        Assert.DoesNotContain("QUIET", summary, StringComparison.Ordinal);
+        Assert.Contains("1 host(s) not collected this run", summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Summary_RowsBesideAnUnreachableHostStillLeadWithThePartialSweep()
     {
         string summary = WaitingCommand.Summary([Row(Ready()), Row(Holding(), "night:2")], ["fernie: no server running"]);
@@ -344,53 +357,15 @@ public class WaitingReportTests
     }
 
     [Fact]
-    public async Task Rename_CorrectsQuietAndWorkingWindowsNotOnlyTheShownRows()
+    public void WriteJson_ARenameDoesNotWriteToTheJsonStream()
     {
-        // The blocking finding: rename must work on the complete resolved fleet, not the presentation
-        // subset. A quiet holding window and a low-confidence (working) window each carry a stale suffix;
-        // both are dropped from the report, and both are still wrong. Neither would be corrected if rename
-        // only saw the shown rows.
-        var scripts = new List<string>();
-        var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
-        IReadOnlyList<WaitingRow> rows =
-        [
-            Row(Holding(), target: "cp:1", windowName: "pr4448-blocked"),
-            Row(new WaitingVerdict(WaitingState.Unknown, RowOwner.Agent, "mid-turn", Assurance.Low("busy")), target: "cp:2", windowName: "pr4600-ready"),
-        ];
-
-        await WaitingCommand.RenameAsync(
-            rows,
-            _ => (script, _) => { scripts.Add(script); return Task.FromResult(new CommandResult(0, string.Empty, string.Empty)); },
-            diagnostics,
-            TestContext.Current.CancellationToken);
-
-        string issued = string.Join("\n", scripts);
-        Assert.Contains("'pr4448'", issued, StringComparison.Ordinal);
-        Assert.Contains("'pr4600'", issued, StringComparison.Ordinal);
-        Assert.Contains("RENAMED", diagnostics.ToString(), StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public async Task Rename_DiagnosticsGoToTheDiagnosticsSinkSoJsonStdoutStaysValid()
-    {
-        // The blocking finding: `--json --rename` used to write `RENAMED ...` lines to stdout before the
-        // JSON document, making stdout invalid JSON. Diagnostics now go to a separate sink (stderr in
-        // production), so the JSON stdout parses cleanly.
-        var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
-        IReadOnlyList<WaitingRow> rows = [Row(Holding(), target: "cp:1", windowName: "pr4448-blocked")];
-
-        await WaitingCommand.RenameAsync(
-            rows,
-            _ => (_, _) => Task.FromResult(new CommandResult(0, string.Empty, string.Empty)),
-            diagnostics,
-            TestContext.Current.CancellationToken);
-
-        Assert.Contains("RENAMED", diagnostics.ToString(), StringComparison.Ordinal);
-
-        // Stdout, written separately, is a single valid JSON document with no RENAMED line before it.
+        // The blocking finding, from the JSON side: `--json --rename` must leave a single valid JSON
+        // document on stdout. WriteJson is the only thing that writes stdout, and it emits nothing but the
+        // document — the rename diagnostics are written to a separate sink (stderr in production).
         using var stream = new MemoryStream();
-        WaitingCommand.WriteJson(stream, rows, NoBudget, []);
+        WaitingCommand.WriteJson(stream, [Row(Ready())], NoBudget, []);
         string stdout = Encoding.UTF8.GetString(stream.ToArray());
+
         Assert.DoesNotContain("RENAMED", stdout, StringComparison.Ordinal);
         using JsonDocument parsed = JsonDocument.Parse(stdout);
         Assert.True(parsed.RootElement.TryGetProperty("rows", out _));

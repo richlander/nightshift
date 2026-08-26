@@ -29,16 +29,17 @@
 
    Status: parsed with SANY and model-checked with TLC against Waiting.cfg -- run TLC
    after any change here to regenerate the state count and confirm zero violations
-   (the `sweptBefore` variable added for the fleet-expansion invariant widens the state
+   (the `regWitnessed` variable added for the fleet-expansion invariant widens the state
    space, so the earlier count is stale until re-run). Validated by mutation:
    reintroducing the real pane-id-across-restart bug (dropping the epoch check in
    Registered) violates NoCrossEpochMemory; allowing two unwitnessed claimants to be
    ordered violates NeverActOnUnwitnessedOrder; making a sole claimant unownable violates
-   SoleClaimantIsAlwaysOwner; and dropping the sweptBefore clause from Observed -- the
-   fleet-expansion laundering, where a host added this run lends its "now" registration
-   an order it never earned -- violates NoOwnerFromUnobservedHost. The corresponding code
-   is covered by InvariantTests, ModelCorrespondenceTests and WaitingScanTests against the
-   real implementation, not just this model. *)
+   SoleClaimantIsAlwaysOwner; and dropping the regWitnessed clause from Observed -- or
+   recomputing witness from the current sweep's coverage, the fleet-expansion laundering
+   where the third sweep of a full fleet promotes a claim first recorded under a narrow
+   view -- violates NoOwnerFromUnwitnessedRegistration. The corresponding code is covered
+   by InvariantTests, ModelCorrespondenceTests and WaitingScanTests against the real
+   implementation, not just this model. *)
 
 EXTENDS Integers, FiniteSets
 
@@ -78,10 +79,10 @@ VARIABLES
     viewComplete, \* DERIVED by each sweep -- see Sweep
     knownHosts,   \* hosts collected at least once before
     lastCollected, \* hosts the most recent sweep actually looked at
-    sweptBefore   \* hosts collected in full BEFORE the most recent sweep, under this epoch
+    regWitnessed  \* window -> was the current registration witnessed (recorded under observation)
 
 vars == << now, claims, live, epoch, regEpoch, regTime, regPr, regFleet, sweptAt,
-            viewComplete, knownHosts, lastCollected, sweptBefore >>
+            viewComplete, knownHosts, lastCollected, regWitnessed >>
 
 TypeOK ==
     /\ now \in 0..MaxTime
@@ -96,7 +97,7 @@ TypeOK ==
     /\ viewComplete \in BOOLEAN
     /\ knownHosts \subseteq Hosts
     /\ lastCollected \subseteq Hosts
-    /\ sweptBefore \subseteq Hosts
+    /\ regWitnessed \in [Windows -> BOOLEAN]
 
 (* ---- What the tool derives from what it remembers ---------------------------------
 
@@ -130,25 +131,27 @@ Registered(w) ==
 \* appeared since that sweep -- so it is newer than everything already recorded.
 Placement(w) == IF Registered(w) # NoTime THEN Registered(w) ELSE MaxTime + 1
 
-\* The order is a FACT only when every recorded time is distinct and at most one
-\* claimant has no record at all (that one arrived after the last full sweep). Two
-\* unrecorded claimants cannot be ordered against each other by anything but a guess.
+\* The order is a FACT only when every claimant's registration was witnessed, every one is
+\* recorded, and the recorded times are distinct.
 \*
-\* And every claimant's host must have been swept in full BEFORE this run. A recorded
-\* time orders a claim only if the tool was watching that host when the time was
-\* recorded; a host first seen this sweep has "now" for every window on it, which is a
-\* first look rather than a witnessed appearance. Ordering a genuinely recorded rival
-\* against one of those is what let fleet expansion launder a narrow view into an
-\* observed order -- W1 recorded under fleet {A}, host B added, W1 kept its old time
-\* while B's window got "now", and the tool called the order observed and drove W1.
+\* Witnessed means the registration was made while the tool was already watching the
+\* window's host under a complete view. This is read from regWitnessed -- persisted with
+\* the registration and preserved for as long as the same claim continues -- not
+\* recomputed from this sweep's coverage. That distinction is the whole of the
+\* fleet-expansion fix: a claim first recorded under a narrow view has regWitnessed FALSE
+\* and keeps it across every later sweep, so collecting the whole fleet on a subsequent
+\* sweep cannot turn its first look into a witnessed appearance and promote it. Only a
+\* release and a witnessed re-registration set it TRUE. An earlier version consulted the
+\* current sweep's host set here, and the three-sweep counterexample -- W recorded under a
+\* narrow view, its rival's host added, then the same full fleet swept -- promoted the
+\* order on the third sweep, exactly the laundering this closes.
 Observed(p) ==
     LET C == Claimants(p)
         recorded == { w \in C : Registered(w) # NoTime }
         unrecorded == C \ recorded
     IN /\ \A a, b \in recorded : a # b => Registered(a) # Registered(b)
-       /\ Cardinality(unrecorded) <= 1
-       /\ (unrecorded = {} \/ (sweptAt # NoTime /\ regEpoch = epoch))
-       /\ \A w \in C : HostOf(w) \in sweptBefore
+       /\ unrecorded = {}
+       /\ \A w \in C : regWitnessed[w]
 
 \* Deterministic pick of the earliest claimant, ties broken on a fixed key, so an owner
 \* never changes identity merely because a set was enumerated differently.
@@ -188,7 +191,7 @@ Init ==
     /\ viewComplete = FALSE
     /\ knownHosts = {}
     /\ lastCollected = {}
-    /\ sweptBefore = {}
+    /\ regWitnessed = [w \in Windows |-> FALSE]
 
 \* Agents open windows, close them, and switch PRs on their own schedule. Exogenous:
 \* the tool observes this, it does not cause it.
@@ -208,7 +211,7 @@ AgentActs ==
                  /\ p # claims[w]
                  /\ live' = live
                  /\ claims' = [claims EXCEPT ![w] = p]
-    /\ UNCHANGED << epoch, regEpoch, regTime, regPr, regFleet, sweptAt, viewComplete, knownHosts, lastCollected, sweptBefore >>
+    /\ UNCHANGED << epoch, regEpoch, regTime, regPr, regFleet, sweptAt, viewComplete, knownHosts, lastCollected, regWitnessed >>
 
 \* The tmux server restarts: pane ids restart, so every id may now name a different
 \* window. Everything live is replaced; what the tool remembers is about the old ones.
@@ -218,10 +221,10 @@ ServerRestarts ==
     /\ epoch' = epoch + 1
     /\ live' = {}
     /\ claims' = [w \in Windows |-> NoPr]
-    \* A restart voids every host's prior observation: pane ids restart, so nothing seen
-    \* under the old server orders a claim under the new one. sweptBefore empties for the
-    \* same reason regEpoch stops matching -- both say "what came before does not count".
-    /\ sweptBefore' = {}
+    \* A restart voids every registration's provenance: pane ids restart, so nothing seen
+    \* under the old server witnessed anything under the new one. regWitnessed empties for
+    \* the same reason regEpoch stops matching -- both say "what came before does not count".
+    /\ regWitnessed' = [w \in Windows |-> FALSE]
     /\ UNCHANGED << regEpoch, regTime, regPr, regFleet, sweptAt, viewComplete, knownHosts, lastCollected >>
 
 \* A sweep over some set of hosts. The set is nondeterministic because it is chosen by
@@ -261,11 +264,23 @@ Sweep ==
          \* host it was not told about is indistinguishable from one that does not
          \* exist -- only from this memory.
          /\ viewComplete' = (knownHosts \subseteq collected)
-         \* The hosts observed BEFORE this run: knownHosts as it stood before the sweep
-         \* widened it. A registration counts as a witnessed order only against these, so
-         \* a host first seen this sweep cannot lend its "now" registration an order it
-         \* never earned -- the fleet-expansion laundering, closed.
-         /\ sweptBefore' = knownHosts
+         \* Provenance, persisted with the registration. A window unseen this sweep keeps
+         \* whatever it had. One that keeps the same claim keeps its witness -- so a first
+         \* look stays a first look no matter how many later sweeps see it. A fresh
+         \* registration is witnessed only when the tool's memory is continuous with the
+         \* current server (regEpoch = epoch, so no restart since the last sweep), its host
+         \* was already known BEFORE this run (in knownHosts, unprimed), AND this run's view
+         \* is complete; otherwise it is a first look, recorded FALSE. Dropping a claim
+         \* clears it. This is what stops the three-sweep promotion: recomputing witness
+         \* from the current sweep's coverage let the fleet-expansion sweep relabel an old
+         \* first look as witnessed.
+         /\ regWitnessed' = [w \in Windows |->
+                               IF HostOf(w) \notin collected THEN regWitnessed[w]
+                               ELSE IF w \in live /\ claims[w] # NoPr
+                                    THEN IF regEpoch = epoch /\ regPr[w] = claims[w] /\ regTime[w] # NoTime
+                                         THEN regWitnessed[w]
+                                         ELSE (regEpoch = epoch /\ HostOf(w) \in knownHosts /\ knownHosts \subseteq collected)
+                                    ELSE FALSE]
          /\ knownHosts' = knownHosts \union collected
          /\ lastCollected' = collected
     /\ regEpoch' = epoch
@@ -323,17 +338,17 @@ SoleClaimantIsAlwaysOwner ==
 NoOwnerWhileViewIncomplete ==
     ~viewComplete => \A w \in live : ~OwnsClaim(w)
 
-\* A contested claim is owned only when every claimant's host was under observation
-\* before this run. This is the fleet-expansion property: adding a host must not let its
-\* window's "now" registration be ordered against a genuinely recorded rival, which is
-\* how a narrow view was laundered into an observed order. Stated over the underlying
-\* fact -- every claimant's host in sweptBefore -- rather than as "OwnsClaim => Observed",
-\* which is a tautology TLC cannot refute; a deliberate mutation dropping the sweptBefore
-\* clause from Observed violates this.
-NoOwnerFromUnobservedHost ==
+\* A contested claim is owned only when every claimant's registration was witnessed. This
+\* is the fleet-expansion property: a claim first recorded under a narrow view stays
+\* untrusted across every later sweep, so collecting the whole fleet cannot promote its
+\* first look into an owned order. Stated over the persisted fact -- every claimant's
+\* regWitnessed -- rather than as "OwnsClaim => Observed", which is a tautology TLC cannot
+\* refute; a deliberate mutation dropping the regWitnessed clause from Observed, or
+\* recomputing witness from the current sweep's coverage, violates this.
+NoOwnerFromUnwitnessedRegistration ==
     \A w \in live :
         (claims[w] # NoPr /\ Cardinality(Claimants(claims[w])) > 1 /\ OwnsClaim(w))
-          => \A c \in Claimants(claims[w]) : HostOf(c) \in sweptBefore
+          => \A c \in Claimants(claims[w]) : regWitnessed[c]
 
 (* ---- Step properties ---- *)
 

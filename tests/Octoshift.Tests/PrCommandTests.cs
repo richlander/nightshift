@@ -239,6 +239,42 @@ public class PrCommandTests
     }
 
     [Fact]
+    public async Task Locate_ANarrowedViewFailsTheExitCodeEvenWithoutAnUnreachableHost()
+    {
+        // Blocker 5, pr: a run that omits a previously-collected host is narrower than the fleet has been,
+        // so the PR may be claimed on a host it did not sweep. The exit fails and the JSON says so, even
+        // though no host actively errored.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-prnarrow-{Guid.NewGuid():N}.json");
+        try
+        {
+            var seed = new PaneHistory(path);
+            seed.AdoptEpoch("fernie", "1:1", DateTimeOffset.UtcNow);
+            seed.AdoptEpoch("banff", "2:1", DateTimeOffset.UtcNow);
+            seed.Save([], ["fernie", "banff"]);
+
+            TmuxPane onBanff = Pane("banff", "%1", "cp:1", agentState: "pr=4448 head=abc1234", windowName: "pr4448", epoch: "2:1");
+            PrCommand.PrLocation located = await PrCommand.LocateAsync(
+                4448,
+                Collection([onBanff], ["banff"]),
+                new PaneHistory(path),
+                (_, _) => Task.FromResult<PrFacts?>(Ready),
+                (_, _) => Task.FromResult<PrFacts?>(null),
+                DateTimeOffset.UtcNow,
+                TestContext.Current.CancellationToken);
+
+            Assert.False(located.ViewComplete);
+            Assert.Equal(ExitCode.Unavailable, located.ExitCode);
+
+            using JsonDocument doc = JsonDocument.Parse(new PrLocationResult(located).Json());
+            Assert.False(doc.RootElement.GetProperty("viewComplete").GetBoolean());
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task Locate_JsonIsValidEvenWhenThePrIsNotFound()
     {
         // Nothing claims 4448 and GitHub could not be read: the not-found failure still produces a single

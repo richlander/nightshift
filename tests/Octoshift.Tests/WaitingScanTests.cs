@@ -1278,6 +1278,140 @@ public class WaitingScanTests
     }
 
     [Fact]
+    public void History_AWindowThatStopsClaimingClearsItsRegistrationAndCannotInheritOwnership()
+    {
+        // Blocker 3: A owned PR 4448, then published no usable identity while B claimed it, then reclaimed
+        // it. Observing A with a null claim while it was quiet cleared its registration, so the reclaim is
+        // a fresh, later registration — A cannot jump the queue ahead of B, which claimed it in the
+        // meantime. Without the clear, A's stale time would keep it the owner.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-clear-{Guid.NewGuid():N}.json");
+        try
+        {
+            TmuxPane a = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "h" };
+            TmuxPane b = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "h" };
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+            var history = new PaneHistory(path);
+
+            history.Observe(a, t, claimedPr: 4448, registrationWitnessed: true);
+            history.Observe(a, t.AddMinutes(10), claimedPr: null);
+            Assert.Null(history.ClaimedAt(a));
+            Assert.False(history.IsWitnessed(a));
+
+            history.Observe(b, t.AddMinutes(10), claimedPr: 4448, registrationWitnessed: true);
+            history.Observe(a, t.AddMinutes(20), claimedPr: 4448, registrationWitnessed: true);
+            Assert.Equal(t.AddMinutes(20), history.ClaimedAt(a));
+
+            IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
+                [(a, 4448, null), (b, 4448, null)], history.ClaimedAt, history.IsWitnessed);
+
+            Assert.Equal(ClaimRank.Owner, ranked[Claim.Key(b)].Rank);
+            Assert.Equal(ClaimRank.Follower, ranked[Claim.Key(a)].Rank);
+            Assert.True(ranked[Claim.Key(b)].OwnsClaim);
+            Assert.False(ranked[Claim.Key(a)].OwnsClaim);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void History_AnIssueOrMalformedStateClearsAPriorPrRegistration()
+    {
+        // The other shapes blocker 3 covers: a window that had claimed a PR now tracks an issue, or
+        // publishes a record that names nothing. Both are observed with a null claim, so the stale PR
+        // registration and its provenance are cleared while the digest and silence survive.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-clear2-{Guid.NewGuid():N}.json");
+        try
+        {
+            TmuxPane w = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "h" };
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+            var history = new PaneHistory(path);
+
+            history.Observe(w, t, claimedPr: 4448, registrationWitnessed: true);
+            Assert.NotNull(history.ClaimedAt(w));
+
+            // Now the window tracks an issue (an issue-state resolves to a null claim) or a malformed
+            // record — the command passes claimedPr null in both cases.
+            TimeSpan? silence = history.Observe(w, t.AddMinutes(30), claimedPr: null);
+
+            Assert.Null(history.ClaimedAt(w));
+            Assert.False(history.IsWitnessed(w));
+
+            // The silence measurement survives the claim being cleared: the digest is unchanged.
+            Assert.Equal(TimeSpan.FromMinutes(30), silence);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task BuildRows_AReclaimAfterGoingQuietDoesNotInheritOldOwnership()
+    {
+        // Blocker 3, end to end through waiting: across three sweeps sharing one history, A claims 4448,
+        // goes quiet (no identity) while B claims it, then reclaims. B claimed it first of the two live
+        // registrations, so B owns and A follows — A does not inherit its original ownership.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-reclaim-{Guid.NewGuid():N}.json");
+        try
+        {
+            var history = new PaneHistory(path);
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+            TmuxPane aClaims = Pane("cp:1", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234", windowName: "a") with { Host = "h", Epoch = "1:1" };
+            TmuxPane aQuiet = Pane("cp:1", "", PaneActivity.Idle, agentState: null, windowName: "worker") with { Host = "h", Epoch = "1:1" };
+            TmuxPane bClaims = Pane("cp:2", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234", windowName: "b") with { Host = "h", Epoch = "1:1" };
+
+            static Task<PrFacts?> None(int _, CancellationToken __) => Task.FromResult<PrFacts?>(null);
+
+            await WaitingCommand.BuildRowsAsync([aClaims], None, None, t, all: true, TestContext.Current.CancellationToken, collectedHosts: ["h"], history: history);
+            await WaitingCommand.BuildRowsAsync([aQuiet, bClaims], None, None, t.AddMinutes(10), all: true, TestContext.Current.CancellationToken, collectedHosts: ["h"], history: history);
+            IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+                [aClaims, bClaims], None, None, t.AddMinutes(20), all: true, TestContext.Current.CancellationToken, collectedHosts: ["h"], history: history);
+
+            WaitingRow aRow = rows.Single(r => r.Pane.PaneId == aClaims.PaneId);
+            WaitingRow bRow = rows.Single(r => r.Pane.PaneId == bClaims.PaneId);
+
+            Assert.Equal(ClaimRank.Owner, bRow.Claim.Rank);
+            Assert.Equal(ClaimRank.Follower, aRow.Claim.Rank);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task BuildRows_AnOmittedKnownHostNarrowsTheViewAndIsReported()
+    {
+        // Blocker 5, waiting: a run that omits a previously-collected host is narrower than the fleet has
+        // been, so Omitted names it and the first line leads with NARROWED rather than QUIET.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-narrow-{Guid.NewGuid():N}.json");
+        try
+        {
+            var seed = new PaneHistory(path);
+            seed.AdoptEpoch("fernie", "1:1", DateTimeOffset.UtcNow);
+            seed.AdoptEpoch("banff", "2:1", DateTimeOffset.UtcNow);
+            seed.Save([], ["fernie", "banff"]);
+
+            var history = new PaneHistory(path);
+            static Task<PrFacts?> None(int _, CancellationToken __) => Task.FromResult<PrFacts?>(null);
+            TmuxPane onBanff = Pane("cp:1", "$ ", PaneActivity.Idle, windowName: "w") with { Host = "banff", Epoch = "2:1" };
+
+            IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+                [onBanff], None, None, DateTimeOffset.UtcNow, all: true, TestContext.Current.CancellationToken,
+                collectedHosts: ["banff"], history: history);
+
+            Assert.Contains("fernie", WaitingCommand.Omitted);
+            Assert.StartsWith("NARROWED", WaitingCommand.Summary(rows, [], WaitingCommand.Omitted), StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
     public void Claim_OrdersByRegistrationNotByCollectionOrder()
     {
         // An owner that changes identity between sweeps is worse than no owner, so ranking is by when
@@ -1291,7 +1425,7 @@ public class WaitingScanTests
         IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
             [(late, 4448, null), (early, 4448, null)],
             p => p.PaneId == early.PaneId ? t : t.AddHours(1),
-            _ => t.AddHours(-1));
+            _ => true);
 
         Assert.Equal(ClaimRank.Owner, ranked[Claim.Key(early)].Rank);
         Assert.Equal(ClaimBasis.Observed, ranked[Claim.Key(early)].Basis);
@@ -1380,10 +1514,11 @@ public class WaitingScanTests
     }
 
     [Fact]
-    public void Claim_AWindowThatAppearedSinceTheLastSweepIsKnownToBeNewer()
+    public void Claim_AnUnwitnessedRivalCannotBeOrderedSoTheContestStaysInferred()
     {
-        // The common shape once the tool has been running: one claim was watched registering, the other
-        // was not there at the last full sweep, so it can only have arrived afterwards.
+        // The stricter rule: an ownership order is a fact only when BOTH claims were witnessed
+        // registering. A window watched registering cannot be ranked against one that was not — the
+        // unwatched one may be older, not newer — so the contest stays inferred until both are witnessed.
         TmuxPane seen = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448");
         TmuxPane fresh = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4448");
         DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
@@ -1391,11 +1526,10 @@ public class WaitingScanTests
         IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
             [(fresh, 4448, null), (seen, 4448, null)],
             p => p.PaneId == seen.PaneId ? t : null,
-            _ => t.AddMinutes(30));
+            p => p.PaneId == seen.PaneId);
 
-        Assert.Equal(ClaimRank.Owner, ranked[Claim.Key(seen)].Rank);
-        Assert.Equal(ClaimBasis.Observed, ranked[Claim.Key(seen)].Basis);
-        Assert.True(ranked[Claim.Key(seen)].OwnsClaim);
+        Assert.All(ranked.Values, c => Assert.Equal(ClaimBasis.Inferred, c.Basis));
+        Assert.All(ranked.Values, c => Assert.False(c.OwnsClaim));
     }
 
     [Fact]
@@ -1406,7 +1540,7 @@ public class WaitingScanTests
         TmuxPane b = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4448");
 
         IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
-            [(a, 4448, 3), (b, 4448, 9)], _ => null, _ => DateTimeOffset.UnixEpoch);
+            [(a, 4448, 3), (b, 4448, 9)], _ => null, _ => false);
 
         Assert.All(ranked.Values, c => Assert.Equal(ClaimBasis.Inferred, c.Basis));
         Assert.All(ranked.Values, c => Assert.False(c.OwnsClaim));
