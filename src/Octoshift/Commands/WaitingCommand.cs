@@ -406,6 +406,19 @@ internal static class WaitingCommand
             sweptBefore[key] = continuous ? prior : null;
         }
 
+        // A host that answered with no windows contributed no pane and no epoch, so the loop above never
+        // saw it. Record it anyway: an empty successful sweep is evidence the host was observed, and if it
+        // never enters KnownHosts a later run that omits it cannot tell the fleet narrowed. No epoch is
+        // claimed, so a window reappearing on it next run is not treated as continuous across the gap.
+        var hostsWithPanes = panes.Select(p => p.Host ?? "local").ToHashSet(StringComparer.Ordinal);
+        foreach (string? host in collected)
+        {
+            if (!hostsWithPanes.Contains(host ?? "local"))
+            {
+                history.RecordSweptEmpty(host, now);
+            }
+        }
+
         // Register every claim before ranking, so a window seen for the first time this sweep still has a
         // registration time to be ordered by. Every identified window is observed — including working and
         // blocked ones — so its registration and silence are tracked whatever it is doing.

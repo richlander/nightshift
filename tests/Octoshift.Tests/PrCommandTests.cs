@@ -32,7 +32,8 @@ public class PrCommandTests
         string? agentState = null,
         string windowName = "w",
         PaneActivity activity = PaneActivity.Idle,
-        string capture = "")
+        string capture = "",
+        string epoch = "")
         => new()
         {
             PaneId = paneId,
@@ -43,6 +44,7 @@ public class PrCommandTests
             AgentStateOption = agentState,
             Activity = activity,
             Capture = capture,
+            Epoch = epoch,
         };
 
     private static WaitingCommand.Collection Collection(
@@ -167,6 +169,73 @@ public class PrCommandTests
         Assert.Contains("fernie|%3", result.Located.Silence.Keys);
         Assert.Contains("banff|%3", result.Located.Silence.Keys);
         Assert.Equal(2, result.Located.Silence.Count);
+    }
+
+    [Fact]
+    public async Task Locate_AnEmptySuccessfulHostIsRememberedSoALaterOmissionNarrowsTheView()
+    {
+        // Finding 3, across runs and through the pr path: run 1 successfully collects an empty fernie
+        // beside a busy banff; run 2 omits fernie and must read as a narrowed, incomplete view rather
+        // than a complete one.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-prtest-{Guid.NewGuid():N}.json");
+        try
+        {
+            TmuxPane onBanff = Pane("banff", "%1", "cp:1", agentState: "pr=4448 head=abc1234", windowName: "pr4448", epoch: "1:1");
+
+            PrCommand.PrLocation first = await PrCommand.LocateAsync(
+                4448,
+                Collection([onBanff], ["fernie", "banff"]),
+                new PaneHistory(path),
+                (_, _) => Task.FromResult<PrFacts?>(Ready),
+                (_, _) => Task.FromResult<PrFacts?>(null),
+                DateTimeOffset.UtcNow,
+                TestContext.Current.CancellationToken);
+            Assert.True(first.ViewComplete);
+
+            PrCommand.PrLocation second = await PrCommand.LocateAsync(
+                4448,
+                Collection([onBanff], ["banff"]),
+                new PaneHistory(path),
+                (_, _) => Task.FromResult<PrFacts?>(Ready),
+                (_, _) => Task.FromResult<PrFacts?>(null),
+                DateTimeOffset.UtcNow,
+                TestContext.Current.CancellationToken);
+
+            Assert.False(second.ViewComplete);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void Report_TheAgentLineSaysNoIdentityNotNoStateWhenFieldsWerePublished()
+    {
+        // #164 round 12: a record can publish rec, reviews and the rest while omitting its pr/issue, so
+        // identity falls back to the window name. Calling that "published no state" is false -- the fields
+        // were published -- so the line names the one thing certainly missing, the identity.
+        TmuxPane pane = Pane("fernie", "%1", "cp:1", agentState: "rec=stop reviews=0/2", windowName: "pr4448");
+        AgentState state = AgentState.Parse("rec=stop reviews=0/2", "pr4448")!;
+        Assert.Equal(StateSource.WindowName, state.Source);
+
+        var located = new PrCommand.PrLocation(
+            4448,
+            [(pane, state, Claim.Sole)],
+            Ready,
+            true,
+            Collection([pane], ["fernie"]),
+            new Dictionary<string, TimeSpan?>());
+
+        var output = new StringWriter(CultureInfo.InvariantCulture);
+        PrCommand.WriteReport(output, located, DateTimeOffset.UtcNow);
+        string text = output.ToString();
+
+        Assert.Contains("published no identity; identity read from the window name", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("published no state", text, StringComparison.Ordinal);
+
+        // The published fields still follow, so nothing the agent said is dropped.
+        Assert.Contains("rec stop", text, StringComparison.Ordinal);
     }
 
     [Fact]

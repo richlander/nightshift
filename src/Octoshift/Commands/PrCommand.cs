@@ -151,6 +151,19 @@ internal static class PrCommand
             sweptBefore[key] = continuous ? prior : null;
         }
 
+        // A host that answered with no windows contributed no pane and no epoch, so the loop above never
+        // saw it. Record it anyway, exactly as `waiting` does: an empty successful sweep is evidence the
+        // host was observed, and if it never enters KnownHosts a later run that omits it reads its narrowed
+        // view as complete. No epoch is claimed, so continuity is not invented across the empty gap.
+        var hostsWithPanes = collected.Panes.Select(p => p.Host ?? "local").ToHashSet(StringComparer.Ordinal);
+        foreach (string? host in collected.CollectedHosts)
+        {
+            if (!hostsWithPanes.Contains(host ?? "local"))
+            {
+                history.RecordSweptEmpty(host, now);
+            }
+        }
+
         // Observe every window, not only the ones claiming this PR: the history is shared with `waiting`,
         // and a run that recorded a subset would prune the rest and reset their silence measurements.
         // Keyed by host and pane id together, because a pane id is unique only within one tmux server —
@@ -193,7 +206,7 @@ internal static class PrCommand
         return new PrLocation(prNumber, mine, prFacts, viewComplete, collected, silence);
     }
 
-    private static void WriteReport(TextWriter output, PrLocation located, DateTimeOffset now)
+    internal static void WriteReport(TextWriter output, PrLocation located, DateTimeOffset now)
     {
         int prNumber = located.PrNumber;
         IReadOnlyList<(TmuxPane Pane, AgentState State, Claim Claim)> claims = located.Claims;
@@ -297,11 +310,6 @@ internal static class PrCommand
 
     private static string Agent(AgentState state)
     {
-        if (state.Source == StateSource.WindowName)
-        {
-            return "published no state; identified by window name";
-        }
-
         var parts = new List<string>();
         if (state.Round is { } round)
         {
@@ -331,6 +339,17 @@ internal static class PrCommand
         if (state.Defects.Count > 0)
         {
             parts.Add($"[!] {string.Join("; ", state.Defects)}");
+        }
+
+        if (state.Source == StateSource.WindowName)
+        {
+            // Identity came from the window name, not the record. Saying "published no state" is false when
+            // the agent published fields but omitted its pr/issue — #164 established that a record can carry
+            // rec, reviews and the rest while its identity is read from the name. So the lead names the one
+            // thing certainly missing, the identity (the shared wording WaitingVerdict uses), and the
+            // published fields, if any, still follow.
+            const string Lead = "published no identity; identity read from the window name";
+            return parts.Count == 0 ? Lead : $"{Lead}, {string.Join(", ", parts)}";
         }
 
         return string.Join(", ", parts);

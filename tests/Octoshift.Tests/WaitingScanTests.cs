@@ -1224,6 +1224,60 @@ public class WaitingScanTests
     }
 
     [Fact]
+    public void History_AnEmptySuccessfulHostIsRememberedSoALaterOmissionNarrows()
+    {
+        // Finding 3, across runs: a host that answered with no windows must still enter KnownHosts, or a
+        // later run that omits it cannot tell the fleet narrowed and reads its view as complete.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-empty-{Guid.NewGuid():N}.json");
+        try
+        {
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+            TmuxPane onBanff = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "banff" };
+
+            var first = new PaneHistory(path);
+            first.AdoptEpoch("banff", "1:1", t);
+            first.Observe(onBanff, t, claimedPr: 4448);
+            first.RecordSweptEmpty("fernie", t);
+            first.Save([onBanff], ["fernie", "banff"]);
+
+            // A later run reads the same history: fernie is remembered even though it had no windows.
+            var second = new PaneHistory(path);
+            Assert.Contains("fernie", second.KnownHosts);
+
+            // The omitted set both commands compute -- KnownHosts not collected this run -- flags it.
+            var collectedThisRun = new HashSet<string>(["banff"], StringComparer.Ordinal);
+            Assert.Contains("fernie", second.KnownHosts.Where(h => !collectedThisRun.Contains(h)));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void History_AHostSweptEmptyDoesNotLendEpochContinuityToALaterSweep()
+    {
+        // The empty sweep records no epoch, so a window reappearing on the host next run is registered
+        // fresh rather than treated as continuous across a gap the tool never watched.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-emptyepoch-{Guid.NewGuid():N}.json");
+        try
+        {
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+            var first = new PaneHistory(path);
+            first.RecordSweptEmpty("fernie", t);
+            first.Save([], ["fernie"]);
+
+            var second = new PaneHistory(path);
+            Assert.False(second.AdoptEpoch("fernie", "1:1", t.AddHours(1)));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
     public void Claim_OrdersByRegistrationNotByCollectionOrder()
     {
         // An owner that changes identity between sweeps is worse than no owner, so ranking is by when

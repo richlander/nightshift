@@ -111,6 +111,24 @@ internal sealed class PaneHistory
     }
 
     /// <summary>
+    /// Records that a host was successfully collected this sweep even though it produced no windows. An
+    /// empty successful sweep is still evidence the host was observed, so the host must enter <see
+    /// cref="KnownHosts"/> — otherwise a later run that omits it cannot tell the fleet narrowed and reads
+    /// its view as complete, the exact gap <see cref="AdoptEpoch"/> leaves because it runs only for hosts
+    /// that contributed a pane and an epoch.
+    /// </summary>
+    /// <remarks>
+    /// The epoch is left null on purpose. No windows means no tmux server generation was observed, so
+    /// there is nothing for a later nonempty sweep to be continuous <em>from</em>: a window appearing next
+    /// run is registered fresh rather than inheriting a place in a queue across a gap the tool did not see,
+    /// which is why the first later nonempty epoch is not treated as continuous from this one. Any pane
+    /// entries the host used to have are pruned by <see cref="Save"/> — the host is in the collected set,
+    /// so they are reported departed there rather than swallowed here.
+    /// </remarks>
+    public void RecordSweptEmpty(string? host, DateTimeOffset now)
+        => _hosts[host ?? "local"] = new HostMemory { Epoch = null, SweptAt = now };
+
+    /// <summary>
     /// Hosts this tool has collected before. A run that does not include one of them is looking at less
     /// of the fleet than it has already seen — which is not something the run can work out from its own
     /// arguments, because a host it was not told about is indistinguishable from a host that does not
