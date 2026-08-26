@@ -1482,6 +1482,45 @@ public class WaitingScanTests
     }
 
     [Fact]
+    public void History_ACorruptedHistoryFileFailsClosedAndCannotCrashLoadingOrReporting()
+    {
+        // Follow-up 1: a history file whose keys are this scheme's tag but corrupted payloads — a host key
+        // `RA` (impossible base64), a pane key `R_w|%3` (byte 0xFF, not valid UTF-8) carrying a witnessed
+        // claim. None is a canonical target key, so all are dropped on load: KnownHosts is empty, nothing
+        // is witnessed, and neither loading nor a subsequent Save/report throws trying to display them.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-corrupt-{Guid.NewGuid():N}.json");
+        try
+        {
+            File.WriteAllText(path, """
+                {
+                  "panes": { "R_w|%3": { "digest": "d", "since": "2026-08-25T12:00:00+00:00", "pr": 4448, "claimedAt": "2026-08-25T12:00:00+00:00", "witnessed": true } },
+                  "hosts": {
+                    "RA": { "epoch": "1:1", "sweptAt": "2026-08-25T12:00:00+00:00", "continuous": true },
+                    "RQR": { "epoch": "2:1", "sweptAt": "2026-08-25T12:00:00+00:00", "continuous": true }
+                  }
+                }
+                """);
+
+            var history = new PaneHistory(path);
+            Assert.Empty(history.KnownHosts);
+
+            // Reporting over a fresh live pane must not touch the dropped corrupt entries, and Save must
+            // not throw trying to render a departure or an omission from a key it cannot decode.
+            TmuxPane live = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4600") with { Host = "banff", PaneId = "%9" };
+            history.AdoptEpoch("banff", "9:1", new DateTimeOffset(2026, 8, 26, 12, 0, 0, TimeSpan.Zero));
+            history.Observe(live, new DateTimeOffset(2026, 8, 26, 12, 0, 0, TimeSpan.Zero), claimedPr: 4600);
+            IReadOnlyList<string> departed = history.Save([live], ["banff"]);
+
+            Assert.False(history.IsWitnessed(live) && history.ClaimedAt(live) is null);
+            Assert.DoesNotContain(departed, d => d.Contains("4448", StringComparison.Ordinal));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task BuildRows_AReclaimAfterGoingQuietDoesNotInheritOldOwnership()
     {
         // Blocker 3, end to end through waiting: across three sweeps sharing one history, A claims 4448,

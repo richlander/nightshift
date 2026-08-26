@@ -77,4 +77,41 @@ public class TargetIdTests
         Assert.True(TargetId.IsValidKey(TargetId.Local.Key));
         Assert.True(TargetId.IsValidKey(TargetId.ForHost("fernie").Key));
     }
+
+    [Theory]
+    [InlineData("RA")]     // payload length ≡ 1 mod 4 — impossible base64, would crash Convert
+    [InlineData("R_w")]    // canonical base64url of byte 0xFF — decodes, but not valid UTF-8
+    [InlineData("RQR")]    // noncanonical: unused trailing bits set, re-encodes to a different payload
+    [InlineData("R=")]     // padding is never part of a payload
+    [InlineData("R with space")]
+    public void ACorruptedRemoteKeyIsRejectedRatherThanCrashingOrResolvingToAnAlias(string key)
+    {
+        // Validation is total and canonical, not just an alphabet check: every one of these would either
+        // throw inside Display or resolve to an alias different from the one it was written as. All are
+        // rejected, and none can be turned into a TargetId that could then throw.
+        Assert.False(TargetId.IsValidKey(key));
+        Assert.False(TargetId.TryFromKey(key, out _));
+        Assert.Throws<ArgumentException>(() => TargetId.FromKey(key));
+        Assert.Null(TargetId.HostOfComposite(key + "|%3"));
+    }
+
+    [Theory]
+    [InlineData("fernie")]
+    [InlineData("local")]
+    [InlineData("a|b")]
+    [InlineData("café-日本語")]
+    [InlineData("\uD83D\uDE80 rocket")]
+    [InlineData("x")]
+    public void EveryKeyForHostMintsRoundTripsAndDisplaysWithoutThrowing(string host)
+    {
+        // The bijection the corrupted-key rejection depends on: a key this scheme produces is always
+        // valid, and always displays back the exact alias it encoded, for any UTF-8 input including
+        // multibyte and astral characters.
+        TargetId id = TargetId.ForHost(host);
+
+        Assert.True(TargetId.IsValidKey(id.Key));
+        Assert.True(TargetId.TryFromKey(id.Key, out TargetId parsed));
+        Assert.Equal(host, parsed.Display);
+        Assert.Equal(host, TargetId.FromKey(id.Key).Display);
+    }
 }

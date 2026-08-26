@@ -40,23 +40,52 @@ internal readonly record struct TargetId
     /// <summary>True for the local machine, never for a remote alias — even one named <c>local</c>.</summary>
     public bool IsLocal => Key == LocalKey;
 
-    /// <summary>Wraps a key this scheme produced (e.g. a <see cref="PaneHistory.KnownHosts"/> entry) so it
-    /// can be shown; the caller supplies a key it knows to be valid.</summary>
-    public static TargetId FromKey(string key) => new(key);
+    /// <summary>
+    /// Wraps a key this scheme produced (e.g. a <see cref="PaneHistory.KnownHosts"/> entry) so it can be
+    /// shown, validating it first. A key that <see cref="IsValidKey"/> rejects is not a target this scheme
+    /// would ever have minted, so it is a caller error rather than something to display — use <see
+    /// cref="TryFromKey"/> at a trust boundary where an untrusted key must fail closed instead.
+    /// </summary>
+    public static TargetId FromKey(string key)
+        => TryFromKey(key, out TargetId id) ? id : throw new ArgumentException($"not a target key: '{key}'", nameof(key));
 
-    /// <summary>The alias for display, decoded from the key. <c>local</c> only for the real local machine.</summary>
-    public string Display => IsLocal ? "local" : Encoding.UTF8.GetString(Base64Url.Decode(Key[1..]));
+    /// <summary>Wraps a key only if it is one this scheme produced, so an untrusted key fails closed rather
+    /// than becoming a <see cref="TargetId"/> whose <see cref="Display"/> would throw.</summary>
+    public static bool TryFromKey(string key, out TargetId id)
+    {
+        if (IsValidKey(key))
+        {
+            id = new TargetId(key);
+            return true;
+        }
+
+        id = default;
+        return false;
+    }
+
+    /// <summary>The alias for display, decoded from the key. <c>local</c> only for the real local machine.
+    /// Total for every key <see cref="IsValidKey"/> accepts — which is every key any instance can hold,
+    /// since all of them are minted by <see cref="ForHost"/>, <see cref="TryFromKey"/> or a validated
+    /// <see cref="HostOfComposite"/> — so it never throws in practice.</summary>
+    public string Display
+        => IsLocal ? "local"
+            : Base64Url.TryDecodeText(Key[1..], out string alias) ? alias
+            : throw new InvalidOperationException($"target key is not canonical: '{Key}'");
 
     /// <summary>The composite key for a pane or window id on this target, joined by a byte neither can contain.</summary>
     public string ComposeWith(string id) => Key + "|" + id;
 
     /// <summary>
-    /// Whether a string is a well-formed target key. Anything else — including every key an older,
-    /// differently-shaped history file wrote — is rejected so its entries are dropped rather than
-    /// misattributed to a target this scheme would never have produced.
+    /// Whether a string is a well-formed target key. Anything else — an older, differently-shaped history
+    /// file's key, or a corrupted one — is rejected so its entries are dropped rather than misattributed
+    /// to a target this scheme would never have produced. The check is total and canonical: a remote key's
+    /// payload must be the exact base64url this scheme would emit for some UTF-8 alias, so a wrong-length
+    /// encoding (<c>RA</c>), a noncanonical one, or bytes that are not valid UTF-8 are all rejected rather
+    /// than surviving to crash <see cref="Display"/> or resolve to a different alias than they were written
+    /// as.
     /// </summary>
     public static bool IsValidKey(string key)
-        => key == LocalKey || (key.Length > 1 && key[0] == RemoteTag && Base64Url.IsValid(key[1..]));
+        => key == LocalKey || (key.Length > 1 && key[0] == RemoteTag && Base64Url.TryDecodeText(key[1..], out _));
 
     /// <summary>The target portion of a composite <c>key|id</c>, or null when the string is not one this
     /// scheme wrote. A remote key contains no <c>|</c>, so the first <c>|</c> is always the composite's
@@ -69,8 +98,7 @@ internal readonly record struct TargetId
             return null;
         }
 
-        string host = composite[..bar];
-        return IsValidKey(host) ? new TargetId(host) : null;
+        return TryFromKey(composite[..bar], out TargetId id) ? id : null;
     }
 
     /// <summary>The pane or window id portion of a composite <c>key|id</c>, or null when it is not one.</summary>
@@ -84,17 +112,60 @@ internal readonly record struct TargetId
 /// <summary>URL-safe base64 with no padding, over the alphabet <c>A-Za-z0-9-_</c>.</summary>
 internal static class Base64Url
 {
+    // Strict: invalid bytes throw rather than being replaced with U+FFFD, so a payload that is not valid
+    // UTF-8 is rejected instead of decoding to a mangled alias that differs from what it was written as.
+    private static readonly Encoding StrictUtf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
     public static string Encode(byte[] bytes)
         => Convert.ToBase64String(bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=');
 
-    public static byte[] Decode(string value)
+    /// <summary>
+    /// Decodes a payload to the alias it encodes, but only when the payload is exactly the canonical
+    /// base64url this class would emit for some UTF-8 string. Returns false — never throws — for anything
+    /// else: a wrong-length encoding (a length ≡ 1 mod 4 is impossible base64), a non-alphabet or
+    /// malformed one, a <em>noncanonical</em> one (unused trailing bits set, so a different payload decodes
+    /// to the same bytes), or bytes that are not valid UTF-8. Requiring <c>Encode(bytes) == payload</c> is
+    /// what makes the mapping a bijection, so a corrupted key can never round-trip to a valid-looking
+    /// alias.
+    /// </summary>
+    public static bool TryDecodeText(string payload, out string text)
     {
-        string padded = value.Replace('-', '+').Replace('_', '/');
-        padded += (padded.Length % 4) switch { 2 => "==", 3 => "=", _ => string.Empty };
-        return Convert.FromBase64String(padded);
+        text = string.Empty;
+        if (!IsAlphabet(payload) || payload.Length % 4 == 1)
+        {
+            return false;
+        }
+
+        byte[] bytes;
+        try
+        {
+            string padded = payload.Replace('-', '+').Replace('_', '/');
+            padded += (padded.Length % 4) switch { 2 => "==", 3 => "=", _ => string.Empty };
+            bytes = Convert.FromBase64String(padded);
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+
+        if (!string.Equals(Encode(bytes), payload, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        try
+        {
+            text = StrictUtf8.GetString(bytes);
+        }
+        catch (DecoderFallbackException)
+        {
+            return false;
+        }
+
+        return true;
     }
 
-    public static bool IsValid(string value)
+    private static bool IsAlphabet(string value)
     {
         if (value.Length == 0)
         {

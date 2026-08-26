@@ -35,8 +35,11 @@ internal sealed class TmuxUnavailableException(string message) : Exception(messa
 internal sealed record TmuxPane
 {
     /// <summary>
-    /// The tmux pane id (<c>%12</c>). Used for every follow-up call: it is unique, stable across renames
-    /// and reindexing, and cannot be confused by a delimiter inside a session or window name.
+    /// The tmux pane id (<c>%12</c>): the identity used to read this window's active pane and to key its
+    /// body digest, silence and claim history. It is unique within a server and cannot be confused by a
+    /// delimiter inside a session or window name. It is <em>not</em> the rename target — pane ids are
+    /// recycled by break/join, so a mutation is aimed at <see cref="WindowId"/> instead — and it is not
+    /// stable across a server restart, which is what <see cref="Epoch"/> guards.
     /// </summary>
     public required string PaneId { get; init; }
 
