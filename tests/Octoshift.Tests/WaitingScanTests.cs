@@ -15,8 +15,11 @@ public class WaitingScanTests
 
     private const string Nonce = "deadbeefcafe0123";
 
-    /// <summary>Builds a collection stream the way the script emits one: manifest, then captures.</summary>
-    private static string Stream(IEnumerable<string> manifest, params (string PaneId, string Text)[] captures)
+    /// <summary>
+    /// Builds a collection stream the way the script emits one: manifest, then framed captures. A null
+    /// capture text is a pane whose <c>capture-pane</c> failed — headed, then closed as lost.
+    /// </summary>
+    private static string Stream(IEnumerable<string> manifest, params (string PaneId, string? Text)[] captures)
     {
         var sb = new System.Text.StringBuilder();
         sb.Append(Nonce).Append(":manifest\n");
@@ -26,9 +29,16 @@ public class WaitingScanTests
         }
 
         sb.Append(Nonce).Append(":end\n");
-        foreach ((string paneId, string text) in captures)
+        foreach ((string paneId, string? text) in captures)
         {
-            sb.Append(Nonce).Append(":pane ").Append(paneId).Append('\n').Append(text).Append('\n');
+            sb.Append(Nonce).Append(":pane ").Append(paneId).Append('\n');
+            if (text is null)
+            {
+                sb.Append(Nonce).Append(":lost ").Append(paneId).Append('\n');
+                continue;
+            }
+
+            sb.Append(text).Append('\n').Append(Nonce).Append(":read ").Append(paneId).Append('\n');
         }
 
         return sb.ToString();
@@ -179,6 +189,33 @@ public class WaitingScanTests
     }
 
     [Fact]
+    public async Task BuildRows_AnUnreadablePaneIsReportedButNeverActionable()
+    {
+        // The record here is the strongest one the contract allows — head, a clean 2/2, rec=merge — and
+        // on an idle pane it resolves Ready and high. Unread, it must not: the capture is the only
+        // evidence the agent actually stopped, and nobody has it.
+        var fetches = new List<int>();
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [Pane("night:1", string.Empty, PaneActivity.Unreadable, agentState: $"pr=4595 head={Head} reviews=2/2 rec=merge")],
+            (pr, _) => { fetches.Add(pr); return Task.FromResult<PrFacts?>(null); },
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            DateTimeOffset.UtcNow,
+            all: false,
+            TestContext.Current.CancellationToken);
+
+        WaitingRow row = Assert.Single(rows);
+        Assert.Equal(WaitingState.Unknown, row.Verdict.State);
+        Assert.False(row.Verdict.MayAct);
+
+        // Still surfaced, and still identified: the window options came from the manifest, which is sound.
+        Assert.True(row.Verdict.NeedsAttention);
+        Assert.Equal(4595, row.Record?.PrNumber);
+
+        // And no budget spent asking GitHub about a pane whose own state could not be read.
+        Assert.Empty(fetches);
+    }
+
+    [Fact]
     public async Task BuildRows_BlockedPaneNeedsAKeystrokeNotALookup()
     {
         var fetches = new List<int>();
@@ -263,15 +300,50 @@ public class WaitingScanTests
     [Fact]
     public async Task ScanAsync_MarksAPaneUnreadableWhenTheCaptureFails()
     {
-        // One command now carries every window and every capture, so a pane whose capture failed simply
-        // contributes no lines — which reads as idle, and is why the batched form is parsed by marker.
+        // One command carries every window and every capture, so a pane whose capture failed contributes
+        // no lines — which would read as idle, the one state a published record is acted on in. The
+        // script closes each capture with its own marker so "nothing was captured" is said, not inferred.
         var scanner = new TmuxScanner(host: null, (script, _) => Task.FromResult(new CommandResult(
             0, Framed(script, ["%1|night:1|1|1755900000||pr4595"]), string.Empty)));
 
         TmuxPane pane = Assert.Single(await scanner.ScanAsync(TestContext.Current.CancellationToken));
 
         Assert.Equal("%1", pane.PaneId);
-        Assert.Empty(pane.Capture.Trim());
+        Assert.Equal(PaneActivity.Unreadable, pane.Activity);
+        Assert.Empty(pane.Capture);
+    }
+
+    [Fact]
+    public void ParseCollection_AFailedCaptureIsUnreadableRatherThanIdle()
+    {
+        // A pane that closed between enumeration and capture is still a row — it just cannot be graded.
+        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
+            Stream(["%1|night:1|1|1755900000||pr4595", "%2|night:2|1|1755900000||pr4596"],
+                ("%1", null),
+                ("%2", "Round 2 is complete.\n\n> ")),
+            host: null,
+            Nonce);
+
+        Assert.Equal(2, panes.Count);
+        Assert.Equal(PaneActivity.Unreadable, panes[0].Activity);
+        Assert.Equal(PaneActivity.Idle, panes[1].Activity);
+    }
+
+    [Fact]
+    public void ParseCollection_APaneCannotDeclareANeighbourReadable()
+    {
+        // Unreadable is a protective classification, so the marker that lifts it may only name the pane
+        // it closes. Otherwise a neighbour's text could hand an unread pane back to the actionable path.
+        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
+            Stream(["%1|night:1|1|1755900000||pr4595", "%2|night:2|1|1755900000||pr4596"],
+                ("%1", null),
+                ("%2", $"{Nonce}:read %1\n> ")),
+            host: null,
+            Nonce);
+
+        Assert.Equal(PaneActivity.Unreadable, panes[0].Activity);
+        Assert.Empty(panes[0].Capture);
+        Assert.Contains(":read %1", panes[1].Capture, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -327,10 +399,71 @@ public class WaitingScanTests
     }
 
     [Fact]
-    public void ParseCollection_OutputWithoutThisRunsFramingIsNotSalvaged()
+    public void ParseCollection_APaneCannotOpenTheNextWindowsSection()
     {
-        Assert.Empty(TmuxScanner.ParseCollection(
+        // The script closes every capture before heading the next one, so a header arriving mid-capture
+        // is content by definition — and treating it otherwise would let one pane write into another's.
+        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
+            Stream(["%1|night:1|1|1755900000||pr4595", "%2|night:2|1|1755900000||pr4596"],
+                ("%1", $"real first pane\n{Nonce}:pane %2\nsmuggled into the second window"),
+                ("%2", "> ")),
+            host: null,
+            Nonce);
+
+        Assert.Equal(2, panes.Count);
+        Assert.Contains("smuggled", panes[0].Capture, StringComparison.Ordinal);
+        Assert.DoesNotContain("smuggled", panes[1].Capture, StringComparison.Ordinal);
+        Assert.Equal(PaneActivity.Idle, panes[1].Activity);
+    }
+
+    [Fact]
+    public void ParseCollection_OutputWithoutThisRunsFramingIsAFailureNotAQuietHost()
+    {
+        // Wrong nonce means the bytes are not this collection's, whatever they parse as.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
             Stream(["%1|night:1|1|1755900000||pr4595"]), host: null, "a-different-nonce"));
+    }
+
+    [Fact]
+    public void ParseCollection_AnEmptyManifestIsAQuietHostNotAFailure()
+    {
+        // The one exit-0-with-no-rows case that is real: a tmux server with no windows. It has to stay
+        // distinguishable from the framing failures, or the distinction buys nothing.
+        Assert.Empty(TmuxScanner.ParseCollection($"{Nonce}:manifest\n\n{Nonce}:end\n", host: null, Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_ATruncatedManifestIsAFailure()
+    {
+        // A connection dropped mid-manifest yields rows that are real but incomplete. Reporting the ones
+        // that arrived would silently shrink the fleet.
+        TmuxUnavailableException ex = Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:manifest\n%1|night:1|1|1755900000||pr4595\n", host: "fernie", Nonce));
+
+        Assert.StartsWith("fernie:", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ScanAsync_ExitZeroWithoutTheCollectionIsUnavailableNotAQuietFleet()
+    {
+        // What `--host=-V` produced: ssh answered, exited 0, and never ran the script. Reported as a
+        // quiet fleet, that is a sweep that saw nothing claiming there was nothing to see.
+        var scanner = new TmuxScanner(host: "fernie", (_, _) => Task.FromResult(
+            new CommandResult(0, "OpenSSH_9.9p1, LibreSSL 3.3.6\n", string.Empty)));
+
+        TmuxUnavailableException ex = await Assert.ThrowsAsync<TmuxUnavailableException>(
+            () => scanner.ScanAsync(TestContext.Current.CancellationToken));
+
+        Assert.Contains("fernie", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ScanAsync_AnEmptyManifestReportsNoWindowsWithoutFailing()
+    {
+        var scanner = new TmuxScanner(host: null, (script, _) => Task.FromResult(
+            new CommandResult(0, Framed(script, []), string.Empty)));
+
+        Assert.Empty(await scanner.ScanAsync(TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -352,6 +485,84 @@ public class WaitingScanTests
         Assert.Single(calls);
         Assert.All(panes, p => Assert.Equal("fernie", p.Host));
         Assert.Equal("fernie cp:1", panes[0].Where);
+    }
+
+    [Fact]
+    public async Task Collect_RepeatedHostsCostOneConnectionAndOneSetOfRows()
+    {
+        // Naming an alias twice is a typo. Honouring it would buy a second ssh connection and a duplicate
+        // of every row and count that host contributes.
+        var scanned = new List<string?>();
+
+        WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(
+            ["fernie", "banff", "fernie"],
+            (host, _) =>
+            {
+                scanned.Add(host);
+                return Task.FromResult<IReadOnlyList<TmuxPane>>([Pane($"{host}:1", string.Empty, PaneActivity.Idle)]);
+            },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(["fernie", "banff"], scanned);
+        Assert.Equal(["fernie:1", "banff:1"], collected.Panes.Select(p => p.Target));
+        Assert.Equal(2, collected.Targets);
+        Assert.False(collected.AnyFailure);
+    }
+
+    [Fact]
+    public async Task Collect_OneUnreachableHostKeepsEveryOtherHostsRows()
+    {
+        WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(
+            ["fernie", "banff"],
+            (host, _) => host == "fernie"
+                ? throw new TmuxUnavailableException("fernie: no server running")
+                : Task.FromResult<IReadOnlyList<TmuxPane>>([Pane("banff:1", string.Empty, PaneActivity.Idle)]),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal("banff:1", Assert.Single(collected.Panes).Target);
+        Assert.Equal("fernie: no server running", Assert.Single(collected.Unreachable));
+
+        // Partial, so the rows still print — but the sweep was not clean, and the exit code says so.
+        Assert.False(collected.TotalFailure);
+        Assert.True(collected.AnyFailure);
+    }
+
+    [Fact]
+    public async Task Collect_EveryHostFailingIsATotalFailureNotAQuietFleet()
+    {
+        WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(
+            ["fernie", "banff"],
+            (host, _) => throw new TmuxUnavailableException($"{host}: no server running"),
+            TestContext.Current.CancellationToken);
+
+        Assert.True(collected.TotalFailure);
+        Assert.Equal(2, collected.Unreachable.Count);
+    }
+
+    [Fact]
+    public async Task Collect_AHostWithNoWindowsIsQuietRatherThanUnreachable()
+    {
+        WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(
+            ["fernie"],
+            (_, _) => Task.FromResult<IReadOnlyList<TmuxPane>>([]),
+            TestContext.Current.CancellationToken);
+
+        Assert.False(collected.TotalFailure);
+        Assert.False(collected.AnyFailure);
+    }
+
+    [Fact]
+    public async Task Collect_NoHostsMeansThisMachine()
+    {
+        var scanned = new List<string?>();
+
+        await WaitingCommand.CollectAsync([], (host, _) =>
+        {
+            scanned.Add(host);
+            return Task.FromResult<IReadOnlyList<TmuxPane>>([]);
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Null(Assert.Single(scanned));
     }
 
     [Fact]
@@ -413,10 +624,16 @@ public class WaitingScanTests
     }
 
     /// <summary>Replays the nonce out of the script the scanner generated, so fakes frame correctly.</summary>
-    private static string Framed(string script, IEnumerable<string> manifest)
+    private static string NonceOf(string script)
     {
         string nonce = System.Text.RegularExpressions.Regex.Match(script, @"printf '([0-9a-f]{32}):manifest").Groups[1].Value;
         Assert.NotEmpty(nonce);
+        return nonce;
+    }
+
+    private static string Framed(string script, IEnumerable<string> manifest)
+    {
+        string nonce = NonceOf(script);
         return $"{nonce}:manifest\n" + string.Join('\n', manifest) + $"\n{nonce}:end\n";
     }
 

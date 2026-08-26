@@ -43,35 +43,31 @@ internal static class WaitingCommand
         // No --host means this machine. Named hosts are collected over ssh, one command each, and the
         // GitHub half stays here: putting a collector on every host would mean a cache and a rate-limit
         // budget on every host too, which is the condition this tool exists to remove.
-        IReadOnlyList<string?> targets = hosts.Count > 0 ? [.. hosts] : [null];
-
-        var panes = new List<TmuxPane>();
-        var unreachable = new List<string>();
-        foreach (string? host in targets)
+        //
+        // Validated again here rather than trusted from the parser, because every value becomes an ssh
+        // argument and an option-shaped one succeeds quietly.
+        foreach (string host in hosts)
         {
-            try
+            if (HostTarget.Validate(host) is { } invalid)
             {
-                panes.AddRange(await new TmuxScanner(host).ScanAsync(ct));
-            }
-            catch (TmuxUnavailableException ex)
-            {
-                // One unreachable host must not hide the others, and must not be silently absorbed
-                // either — a fleet that is partly invisible looks exactly like a fleet that is quiet.
-                unreachable.Add(ex.Message);
+                Console.Error.WriteLine($"octoshift: {invalid}");
+                return ExitCode.Usage;
             }
         }
 
+        Collection collected = await CollectAsync(hosts, (host, token) => new TmuxScanner(host).ScanAsync(token), ct);
+
         // Total failure keeps its own path. A sweep where nothing could be collected is not a quiet fleet,
         // and printing a QUIET summary above the failure inverts which of the two the reader sees first.
-        if (panes.Count == 0 && unreachable.Count == targets.Count)
+        if (collected.TotalFailure)
         {
             if (json)
             {
-                WriteJsonError(string.Join("; ", unreachable));
+                WriteJsonError(string.Join("; ", collected.Unreachable));
             }
             else
             {
-                foreach (string failure in unreachable)
+                foreach (string failure in collected.Unreachable)
                 {
                     Console.Error.WriteLine($"octoshift: {failure}");
                 }
@@ -85,18 +81,64 @@ internal static class WaitingCommand
             new FileConditionalCache(),
             (args, token) => GhAuthenticatedRunner.RunGhAsync(args, null, token));
         IReadOnlyList<WaitingRow> rows = await BuildRowsAsync(
-            panes, facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, all, ct);
+            collected.Panes, facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, all, ct);
 
         if (json)
         {
-            WriteJson(rows, facts, unreachable);
+            WriteJson(rows, facts, collected.Unreachable);
         }
         else
         {
-            WriteTable(rows, facts, unreachable);
+            WriteTable(rows, facts, collected.Unreachable);
         }
 
-        return unreachable.Count > 0 ? ExitCode.Unavailable : ExitCode.Ok;
+        // A partly invisible fleet is not a clean sweep, so a single failed host still costs the exit
+        // code even though every other host's rows were printed.
+        return collected.AnyFailure ? ExitCode.Unavailable : ExitCode.Ok;
+    }
+
+    /// <summary>What one sweep managed to collect, and from how many targets it tried.</summary>
+    internal readonly record struct Collection(IReadOnlyList<TmuxPane> Panes, IReadOnlyList<string> Unreachable, int Targets)
+    {
+        /// <summary>Nothing was collected anywhere. Reported as a failure, never as a quiet fleet.</summary>
+        public bool TotalFailure => Panes.Count == 0 && Unreachable.Count == Targets;
+
+        /// <summary>At least one target could not be read, whatever the others returned.</summary>
+        public bool AnyFailure => Unreachable.Count > 0;
+    }
+
+    /// <summary>
+    /// Collects from each distinct target in turn. Injectable scan so fan-out, deduplication and partial
+    /// failure are testable without ssh or a tmux server.
+    /// </summary>
+    /// <remarks>
+    /// Repeats are dropped in first-seen order: naming an alias twice is a typo, and honouring it would
+    /// buy a second ssh connection and a duplicate of every row and count that host contributes.
+    /// </remarks>
+    internal static async Task<Collection> CollectAsync(
+        IReadOnlyList<string> hosts,
+        Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> scanAsync,
+        CancellationToken ct)
+    {
+        IReadOnlyList<string?> targets = hosts.Count > 0 ? [.. HostTarget.Distinct(hosts)] : [null];
+
+        var panes = new List<TmuxPane>();
+        var unreachable = new List<string>();
+        foreach (string? host in targets)
+        {
+            try
+            {
+                panes.AddRange(await scanAsync(host, ct));
+            }
+            catch (TmuxUnavailableException ex)
+            {
+                // One unreachable host must not hide the others, and must not be silently absorbed
+                // either — a fleet that is partly invisible looks exactly like a fleet that is quiet.
+                unreachable.Add(ex.Message);
+            }
+        }
+
+        return new Collection(panes, unreachable, targets.Count);
     }
 
     /// <summary>
@@ -127,6 +169,18 @@ internal static class WaitingCommand
             }
 
             AgentState? record = AgentState.Parse(pane.AgentStateOption, pane.WindowName);
+
+            // A pane nobody could read is reported, never resolved. Its window options came from the
+            // manifest and are trustworthy, but whether the agent is mid-turn is exactly what the capture
+            // was for — so this must not fall through to the idle path, where a published record is taken
+            // as a handover and can reach a high-confidence, actionable verdict on unread evidence.
+            if (pane.Activity == PaneActivity.Unreadable)
+            {
+                rows.Add(Row(pane, record, new WaitingVerdict(
+                    WaitingState.Unknown, RowOwner.Operator, "pane could not be captured; its state is unread",
+                    Assurance.Low("the pane could not be read")), now));
+                continue;
+            }
 
             if (pane.Activity == PaneActivity.Blocked)
             {
