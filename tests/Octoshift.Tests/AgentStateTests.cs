@@ -137,6 +137,34 @@ public class AgentStateTests
         Assert.Empty(state.Defects);
     }
 
+    [Theory]
+    [InlineData("issue=")]
+    [InlineData("reviews=")]
+    [InlineData("rec=")]
+    [InlineData("head=")]
+    public void Parse_EmptyScalarFieldsAreDefective(string field)
+    {
+        AgentState? state = AgentState.Parse($"pr=4595 {field} head=722512e25 reviews=2/2 rec=merge", "pr4595");
+
+        Assert.NotNull(state);
+        Assert.Contains(state.Defects, d => d.Contains($"{field} is empty", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(",")]
+    [InlineData("4629,")]
+    [InlineData(",4629")]
+    [InlineData("4629,,4700")]
+    public void Parse_EmptyBlockerEntriesAreDefective(string blocked)
+    {
+        AgentState? state = AgentState.Parse(
+            $"pr=4595 head=722512e25 reviews=2/2 blocked={blocked} rec=merge",
+            "pr4595");
+
+        Assert.NotNull(state);
+        Assert.Contains(state.Defects, d => d.Contains("is not a citable issue or PR number", StringComparison.Ordinal));
+    }
+
     [Fact]
     public void Parse_AcceptsAFullLengthHead()
     {

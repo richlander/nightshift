@@ -305,7 +305,7 @@ internal sealed partial record AgentState
         }
 
         var numbers = new List<int>();
-        foreach (string entry in value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        foreach (string entry in value.Split(',', StringSplitOptions.TrimEntries))
         {
             if (int.TryParse(entry.TrimStart('#'), NumberStyles.None, CultureInfo.InvariantCulture, out int number) && number > 0)
             {
@@ -366,10 +366,18 @@ internal sealed partial record AgentState
                 continue;
             }
 
-            // An empty value (blocked=) is the agent saying "nothing here"; keep it out of the map so it
-            // reads the same as having been omitted.
+            // Exact `blocked=` is the one documented empty sentinel: it says there is no citable blocker.
+            // Every other empty value is malformed state, not an omitted field. Keep the defect even
+            // though there is no value for the field-specific parser to consume.
             string value = token[(eq + 1)..];
-            if (value.Length > 0)
+            if (value.Length == 0)
+            {
+                if (!key.Equals("blocked", StringComparison.OrdinalIgnoreCase))
+                {
+                    defects.Add($"{key}= is empty");
+                }
+            }
+            else
             {
                 fields.Add(key, value);
             }
