@@ -669,4 +669,81 @@ public class AgentStateTests
         Assert.NotNull(state);
         Assert.Contains(state.Defects, d => d.Contains($"rec=merge while waiting on {waiting}", StringComparison.Ordinal));
     }
+
+    [Fact]
+    public void Read_KeepsAnEscalationThatIdentifiesNothing()
+    {
+        // The blocking finding. The same observed value as the `i4613` case above, in a window whose name
+        // cannot rescue the identity: `pr=none` is not a number, `worker` is not `pr####`, and the record
+        // was dropped whole — so an agent asking to be released disappeared from the default report
+        // entirely. There is nothing here to look up, and that is the one thing it must not be silent
+        // about.
+        StateReading reading = AgentState.Read("pr=none head=pending rec=stop", "worker");
+
+        Assert.Null(reading.Identified);
+        UnidentifiedState unusable = Assert.IsType<UnidentifiedState>(reading.Unidentified);
+
+        // The disposition survives the identity that should have named its subject.
+        Assert.Equal(Recommendation.Stop, unusable.Recommendation);
+
+        // And every way the record fails its own grammar is still said, including the missing identity.
+        Assert.Contains(unusable.Defects, d => d.Contains("pr=none", StringComparison.Ordinal));
+        Assert.Contains(unusable.Defects, d => d.Contains("head=pending", StringComparison.Ordinal));
+        Assert.Contains(unusable.Defects, d => d.Contains("neither the record nor the window name identifies", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Read_AnUnidentifiedRecordIsNeverAnIdentifiedOne()
+        // No invented number reaches the type every consumer treats as a thing on GitHub. `Parse` keeps
+        // meaning exactly what it meant: a record with an identity, or nothing.
+        => Assert.Null(AgentState.Parse("pr=none head=pending rec=stop", "worker"));
+
+    [Theory]
+    [InlineData("blocked")]                       // a bare token: not a field at all
+    [InlineData("waiting-ci")]
+    [InlineData("still converging")]
+    [InlineData("pr=0 rec=continue")]             // a number outside the domain
+    [InlineData("issue=none")]
+    [InlineData("blockd=4629")]                   // a misspelling, which loses a real field
+    public void Read_AnythingPublishedThatNamesNothingIsKept(string option)
+    {
+        StateReading reading = AgentState.Read(option, "worker");
+
+        Assert.Null(reading.Identified);
+        Assert.NotNull(reading.Unidentified);
+        Assert.NotEmpty(reading.Unidentified.Defects);
+        Assert.Contains(reading.Unidentified.Defects, d => d.Contains("identifies a PR or an issue", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\t")]
+    public void Read_AnEmptyOptionWithNoIdentityIsAbsentRatherThanDefective(string? option)
+    {
+        // An empty shell published nothing, so there is no record to be wrong about and no agent to say
+        // anything about. Distinct from the case above, and the distinction is what keeps `--all` full of
+        // idle shells rather than the default view.
+        StateReading reading = AgentState.Read(option, "zsh");
+
+        Assert.Null(reading.Identified);
+        Assert.Null(reading.Unidentified);
+        Assert.Empty(reading.Defects);
+    }
+
+    [Fact]
+    public void Read_AMalformedIdentityStillFallsBackToTheWindowName()
+    {
+        // Unchanged by any of the above: where the name can rescue the identity, it still does, and the
+        // record is still read whole.
+        StateReading reading = AgentState.Read("pr=none head=pending round=0 reviews=0/2 rec=stop", "i4613");
+
+        Assert.Null(reading.Unidentified);
+        AgentState state = Assert.IsType<AgentState>(reading.Identified);
+        Assert.Equal(4613, state.PrNumber);
+        Assert.True(state.IsIssue);
+        Assert.Equal(StateSource.WindowName, state.Source);
+        Assert.Equal(Recommendation.Stop, state.Recommendation);
+    }
 }

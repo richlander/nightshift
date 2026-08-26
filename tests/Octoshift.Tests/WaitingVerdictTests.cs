@@ -486,4 +486,51 @@ public class WaitingVerdictTests
         Assert.Equal(WaitingState.Untrustworthy, v.State);
         Assert.False(v.MayAct);
     }
+
+    [Fact]
+    public void Unidentified_AnEscalationWithNoSubjectStillReachesTheOperator()
+    {
+        // The window named `worker` publishing `pr=none head=pending rec=stop`: an agent asking to be
+        // released, about nothing this reader can look up. It is in the default view because the request
+        // is real, and it names no PR because the record did not.
+        UnidentifiedState unusable = AgentState.Read("pr=none head=pending rec=stop", "worker").Unidentified!;
+        WaitingVerdict v = WaitingVerdict.Unidentified(unusable);
+
+        Assert.Equal(WaitingState.NeedsOperator, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
+        Assert.True(v.NeedsAttention);
+        Assert.Contains("stop", v.Reason, StringComparison.Ordinal);
+        Assert.Contains("names no PR or issue", v.Reason, StringComparison.Ordinal);
+
+        // Visible, and never speakable-to: nothing identifies what a tool would be speaking about.
+        Assert.Equal(Confidence.Low, v.Assurance.Level);
+        Assert.False(v.MayAct);
+    }
+
+    [Fact]
+    public void Unidentified_AnApprovalRequestWithNoSubjectIsTheOperatorsToo()
+    {
+        WaitingVerdict v = WaitingVerdict.Unidentified(
+            AgentState.Read("pr=none rec=approve", "worker").Unidentified!);
+
+        Assert.Equal(WaitingState.NeedsOperator, v.State);
+        Assert.Contains("authorise more rounds", v.Reason, StringComparison.Ordinal);
+        Assert.False(v.MayAct);
+    }
+
+    [Theory]
+    [InlineData("pr=none head=pending rec=continue")]
+    [InlineData("blocked")]
+    [InlineData("blockd=4629")]
+    public void Unidentified_AnythingElseIsUntrustworthyRatherThanQuiet(string option)
+    {
+        // No escalation to carry, but a record that named nothing is still an agent that tried to report
+        // and got it wrong. Owned by the operator so it is not filtered out of the default view.
+        WaitingVerdict v = WaitingVerdict.Unidentified(AgentState.Read(option, "worker").Unidentified!);
+
+        Assert.Equal(WaitingState.Untrustworthy, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
+        Assert.Equal(Confidence.Low, v.Assurance.Level);
+        Assert.False(v.MayAct);
+    }
 }

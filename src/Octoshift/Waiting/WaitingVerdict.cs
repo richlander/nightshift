@@ -95,6 +95,35 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
     };
 
     /// <summary>
+    /// Resolves a record that named nothing this reader can look up. There is no GitHub side to join it
+    /// against — no PR to fetch, no head to falsify it with — so this is the whole decision.
+    /// </summary>
+    /// <remarks>
+    /// The row is reported and never actionable, and both halves of that are deliberate. Reported,
+    /// because an agent published something and the one thing certain about it is that it is wrong;
+    /// dropping it is how <c>rec=stop</c> in a window named <c>worker</c> became silence. Never
+    /// actionable, twice over: assurance is low, and neither state a record without an identity can reach
+    /// is one <see cref="MayAct"/> admits. An escalation still reaches the operator as an escalation —
+    /// what it has lost is the subject, so the row says so rather than implying one.
+    /// </remarks>
+    public static WaitingVerdict Unidentified(UnidentifiedState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+
+        Assurance assurance = Assurance.Low($"the record identifies no PR or issue ({state.Defects.Count} defect(s))");
+
+        return state.Recommendation switch
+        {
+            Recommendation.Stop => new(WaitingState.NeedsOperator, RowOwner.Operator,
+                "asking to stop, but the record names no PR or issue", assurance),
+            Recommendation.Approve => new(WaitingState.NeedsOperator, RowOwner.Operator,
+                "asking to authorise more rounds, but the record names no PR or issue", assurance),
+            _ => new(WaitingState.Untrustworthy, RowOwner.Operator,
+                "published state that names no PR or issue", assurance),
+        };
+    }
+
+    /// <summary>
     /// Resolves a window's state against GitHub's account of the same PR. Pure — the whole decision table
     /// is testable without a pane or a network.
     /// </summary>

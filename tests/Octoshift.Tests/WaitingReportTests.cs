@@ -20,6 +20,7 @@ public class WaitingReportTests
         string target = "night:1",
         string windowName = "pr4595",
         AgentState? record = null,
+        UnidentifiedState? unidentified = null,
         string? host = null)
         => new()
         {
@@ -33,6 +34,7 @@ public class WaitingReportTests
                 Activity = PaneActivity.Idle,
             },
             Record = record,
+            Unidentified = unidentified,
             Verdict = verdict,
             StoppedFor = TimeSpan.FromMinutes(5),
         };
@@ -243,4 +245,45 @@ public class WaitingReportTests
     [Fact]
     public void Safe_TreatsAMissingValueAsEmpty()
         => Assert.Equal(string.Empty, DisplayText.Safe(null));
+
+    [Fact]
+    public void WriteTable_ARecordThatNamesNothingIsPrintedWithoutAPrNumber()
+    {
+        // The window named `worker` publishing `pr=none head=pending rec=stop`. It is in the table because
+        // the request is real; its PR column is the same `-` an unidentified row has always printed,
+        // because there is no number and inventing #0 would be a second wrong fact in a row about
+        // wrongness.
+        UnidentifiedState unusable = AgentState.Read("pr=none head=pending rec=stop", "worker").Unidentified!;
+        string text = Render([Row(WaitingVerdict.Unidentified(unusable), windowName: "worker", unidentified: unusable)]);
+
+        string row = Assert.Single(text.Split('\n'), l => l.Contains("worker", StringComparison.Ordinal));
+        Assert.DoesNotContain("#0", row, StringComparison.Ordinal);
+        Assert.Contains("NEEDSOPERATOR", row, StringComparison.Ordinal);
+        Assert.Contains("low", row, StringComparison.Ordinal);
+
+        // The defects are the detail: what it asked for, and every way the record failed to say about what.
+        Assert.Contains("pr=none is not a PR number", row, StringComparison.Ordinal);
+        Assert.Contains("head=pending is not a sha", row, StringComparison.Ordinal);
+        Assert.Contains("ATTENTION 1 of 1", text, StringComparison.Ordinal);
+        Assert.Contains("0 row(s) met the bar to act, 1 did not", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void WriteJson_ARecordThatNamesNothingCarriesNoPrField()
+    {
+        // A consumer reads `pr` as a PR. A `0` or a `-1` there would be one, so the key is absent — and
+        // what can still be said without an identity is still said.
+        UnidentifiedState unusable = AgentState.Read("pr=none head=pending rec=stop", "worker").Unidentified!;
+        string json = RenderJson([Row(WaitingVerdict.Unidentified(unusable), windowName: "worker", unidentified: unusable)]);
+
+        using JsonDocument parsed = JsonDocument.Parse(json);
+        JsonElement row = Assert.Single(parsed.RootElement.GetProperty("rows").EnumerateArray().ToArray());
+
+        Assert.False(row.TryGetProperty("pr", out _));
+        Assert.False(row.TryGetProperty("source", out _));
+        Assert.Equal("stop", row.GetProperty("rec").GetString());
+        Assert.Equal("needsoperator", row.GetProperty("state").GetString());
+        Assert.False(row.GetProperty("mayAct").GetBoolean());
+        Assert.NotEmpty(row.GetProperty("defects").EnumerateArray().ToArray());
+    }
 }

@@ -13,10 +13,20 @@ internal sealed record WaitingRow
     /// <summary>Null when nothing — neither option nor window name — identified a PR.</summary>
     public AgentState? Record { get; init; }
 
+    /// <summary>
+    /// What the window published when it identified nothing. Kept beside <see cref="Record"/> rather than
+    /// folded into it: there is no number to write here, and inventing one would put a PR that does not
+    /// exist into every column and field that carries a real one.
+    /// </summary>
+    public UnidentifiedState? Unidentified { get; init; }
+
     public required WaitingVerdict Verdict { get; init; }
 
     /// <summary>How long the pane has been quiet, from tmux's own activity clock.</summary>
     public TimeSpan? StoppedFor { get; init; }
+
+    /// <summary>Ways whatever was published contradicts its own contract, identified or not.</summary>
+    public IReadOnlyList<string> Defects => Record?.Defects ?? Unidentified?.Defects ?? [];
 }
 
 /// <summary>
@@ -168,7 +178,8 @@ internal static class WaitingCommand
                 continue;
             }
 
-            AgentState? record = AgentState.Parse(pane.AgentStateOption, pane.WindowName);
+            StateReading reading = AgentState.Read(pane.AgentStateOption, pane.WindowName);
+            AgentState? record = reading.Identified;
 
             // A pane nobody could read is reported, never resolved. Its window options came from the
             // manifest and are trustworthy, but whether the agent is mid-turn is exactly what the capture
@@ -176,7 +187,7 @@ internal static class WaitingCommand
             // as a handover and can reach a high-confidence, actionable verdict on unread evidence.
             if (pane.Activity == PaneActivity.Unreadable)
             {
-                rows.Add(Row(pane, record, new WaitingVerdict(
+                rows.Add(Row(pane, reading, new WaitingVerdict(
                     WaitingState.Unknown, RowOwner.Operator, "pane could not be captured; its state is unread",
                     Assurance.Low("the pane could not be read")), now));
                 continue;
@@ -186,18 +197,28 @@ internal static class WaitingCommand
             {
                 // A held-open prompt is answered with a keystroke, not with a GitHub lookup.
                 // The pane itself is the evidence, and it is unambiguous: a prompt is open.
-                rows.Add(Row(pane, record, new WaitingVerdict(
+                rows.Add(Row(pane, reading, new WaitingVerdict(
                     WaitingState.NeedsOperator, RowOwner.Operator, "prompt open; awaiting a keystroke", Assurance.High), now));
                 continue;
             }
 
             if (record is null)
             {
+                if (reading.Unidentified is { } unusable)
+                {
+                    // The window published something and it names nothing this reader can look up. There
+                    // is no number to fetch — asking GitHub would mean inventing one — so the row is
+                    // resolved here, kept in the default view, and left unactionable. Dropping it is how
+                    // `rec=stop` in a window named `worker` became a report of a quiet fleet.
+                    rows.Add(Row(pane, reading, WaitingVerdict.Unidentified(unusable), now));
+                    continue;
+                }
+
                 // Neither a published state nor a pr#### window name. Usually an empty shell, so it is
                 // available under --all rather than mixed into the default view.
                 if (all)
                 {
-                    rows.Add(Row(pane, null, new WaitingVerdict(
+                    rows.Add(Row(pane, reading, new WaitingVerdict(
                         WaitingState.Unknown, RowOwner.Nobody, "no published state and no pr#### window name",
                         Assurance.Low("nothing identifies this window")), now));
                 }
@@ -236,7 +257,11 @@ internal static class WaitingCommand
 
         foreach ((TmuxPane pane, AgentState state) in pending)
         {
-            rows.Add(Row(pane, state, WaitingVerdict.Resolve(state, state.IsIssue ? null : seen.GetValueOrDefault(state.PrNumber)), now));
+            rows.Add(Row(
+                pane,
+                StateReading.For(state),
+                WaitingVerdict.Resolve(state, state.IsIssue ? null : seen.GetValueOrDefault(state.PrNumber)),
+                now));
         }
 
         // Longest wait first among the rows that need you: coming back after hours away, the thing that
@@ -244,18 +269,19 @@ internal static class WaitingCommand
         // The operator's queue first, longest wait at the top: after hours away, the row that has been
         // stuck longest is the one that cost the most.
         return rows
-            .Where(r => all || r.Verdict.NeedsAttention || r.Record?.Defects.Count > 0)
+            .Where(r => all || r.Verdict.NeedsAttention || r.Defects.Count > 0)
             .OrderByDescending(r => r.Verdict.NeedsAttention)
             .ThenBy(r => r.Verdict.Severity)
             .ThenByDescending(r => r.StoppedFor ?? TimeSpan.Zero)
             .ToArray();
     }
 
-    private static WaitingRow Row(TmuxPane pane, AgentState? record, WaitingVerdict verdict, DateTimeOffset now)
+    private static WaitingRow Row(TmuxPane pane, StateReading reading, WaitingVerdict verdict, DateTimeOffset now)
         => new()
         {
             Pane = pane,
-            Record = record,
+            Record = reading.Identified,
+            Unidentified = reading.Unidentified,
             Verdict = verdict,
             StoppedFor = pane.LastActivity is { } at && at <= now ? now - at : null,
         };
@@ -369,7 +395,7 @@ internal static class WaitingCommand
             detail += $"  (~ {caveat})";
         }
 
-        if (row.Record?.Defects is { Count: > 0 } defects)
+        if (row.Defects is { Count: > 0 } defects)
         {
             // Reported, never repaired: a state that contradicts itself is a signal about the agent.
             detail += "  [!] " + string.Join("; ", defects);
@@ -499,6 +525,21 @@ internal static class WaitingCommand
                 writer.WriteEndArray();
                 writer.WriteStartArray("defects");
                 foreach (string d in record.Defects)
+                {
+                    writer.WriteStringValue(d);
+                }
+
+                writer.WriteEndArray();
+            }
+            else if (row.Unidentified is { } unusable)
+            {
+                // No `pr` key, deliberately: this record named nothing, and a `0` or a `-1` there would be
+                // a PR number to every consumer that reads one. Its absence is the fact — what the agent
+                // asked for and how the record fails are still carried, because those are what a reader
+                // needs to answer a `rec=stop` it cannot look up.
+                writer.WriteString("rec", unusable.Recommendation.ToString().ToLowerInvariant());
+                writer.WriteStartArray("defects");
+                foreach (string d in unusable.Defects)
                 {
                     writer.WriteStringValue(d);
                 }

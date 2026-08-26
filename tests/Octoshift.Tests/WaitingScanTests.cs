@@ -424,7 +424,57 @@ public class WaitingScanTests
         WaitingRow row = Assert.Single(await WaitingCommand.BuildRowsAsync(panes, (_, _) => Task.FromResult<PrFacts?>(null),
             (_, _) => Task.FromResult<PrFacts?>(null), DateTimeOffset.UtcNow, all: true, ct: TestContext.Current.CancellationToken));
         Assert.Null(row.Record);
+        Assert.Null(row.Unidentified);
         Assert.Contains("no published state", row.Verdict.Reason, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task BuildRows_AnEmptyOptionIsStillJustAnEmptyShell(string option)
+    {
+        // Publishing an empty string is not publishing a record, so this stays where an idle shell has
+        // always been: out of the default view, available under --all.
+        TmuxPane[] panes = [Pane("night:1", "$ ", PaneActivity.Idle, agentState: option)];
+
+        Assert.Empty(await WaitingCommand.BuildRowsAsync(panes, (_, _) => Task.FromResult<PrFacts?>(null),
+            (_, _) => Task.FromResult<PrFacts?>(null), DateTimeOffset.UtcNow, all: false, ct: TestContext.Current.CancellationToken));
+
+        WaitingRow row = Assert.Single(await WaitingCommand.BuildRowsAsync(panes, (_, _) => Task.FromResult<PrFacts?>(null),
+            (_, _) => Task.FromResult<PrFacts?>(null), DateTimeOffset.UtcNow, all: true, ct: TestContext.Current.CancellationToken));
+        Assert.Null(row.Unidentified);
+        Assert.Equal(WaitingState.Unknown, row.Verdict.State);
+    }
+
+    [Fact]
+    public async Task BuildRows_APublishedStateThatNamesNothingIsSeenWithoutAll()
+    {
+        // The blocking finding, end to end: an idle window named `worker` publishing `pr=none head=pending
+        // rec=stop`. Nothing identifies it, so it used to be filtered to --all along with the empty shells
+        // — an agent asking to be released, reported as a quiet fleet.
+        var fetches = new List<int>();
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [Pane("night:1", "$ ", PaneActivity.Idle, agentState: "pr=none head=pending rec=stop", windowName: "worker")],
+            (pr, _) => { fetches.Add(pr); return Task.FromResult<PrFacts?>(null); },
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            DateTimeOffset.UtcNow,
+            all: false,
+            TestContext.Current.CancellationToken);
+
+        WaitingRow row = Assert.Single(rows);
+        Assert.True(row.Verdict.NeedsAttention);
+        Assert.Equal(WaitingState.NeedsOperator, row.Verdict.State);
+        Assert.Contains("stop", row.Verdict.Reason, StringComparison.Ordinal);
+
+        // No identity, so no number was invented and nothing was asked of GitHub about one.
+        Assert.Null(row.Record);
+        Assert.Equal(Recommendation.Stop, row.Unidentified?.Recommendation);
+        Assert.Empty(fetches);
+
+        // And the grammar defects travel with it rather than being repaired away.
+        Assert.Contains(row.Defects, d => d.Contains("pr=none", StringComparison.Ordinal));
+        Assert.Contains(row.Defects, d => d.Contains("head=pending", StringComparison.Ordinal));
+        Assert.False(row.Verdict.MayAct);
     }
 
     [Fact]
