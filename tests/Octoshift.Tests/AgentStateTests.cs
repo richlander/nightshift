@@ -53,6 +53,19 @@ public class AgentStateTests
     }
 
     [Fact]
+    public void Parse_FlagsMergeRecommendedOnAnIssueWindow()
+    {
+        // An issue window has no PR, so `merge` names something that cannot exist yet. Recorded as a
+        // defect so the row grades low and reaches the operator rather than resolving to a quiet Holding.
+        AgentState? state = AgentState.Parse("issue=4611 head=8d5f22a22 reviews=2/2 rec=merge", "i4611");
+
+        Assert.NotNull(state);
+        Assert.True(state.IsIssue);
+        Assert.Equal(Recommendation.Merge, state.Recommendation);
+        Assert.Contains(state.Defects, d => d.Contains("rec=merge on issue #4611", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void Parse_AcceptsContinue()
     {
         // The fleet's contract added `continue` after this reader was first written; it is a real value.

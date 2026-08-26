@@ -239,6 +239,15 @@ internal sealed partial record AgentState
             defects.Add($"rec=merge while blocked on {string.Join(", ", blocked.Select(b => "#" + b))}");
         }
 
+        // A window tracking an issue has no PR, so `merge` names something that cannot exist yet. Reported
+        // so the row grades low and reaches the operator as untrustworthy instead of resolving to a quiet
+        // Holding that hides the impossible request — the same failure the merge-while-waiting defect
+        // above closes for a PR window.
+        if (rec == Recommendation.Merge && isIssue)
+        {
+            defects.Add($"rec=merge on issue #{number} which has no PR to merge");
+        }
+
         // The same contradiction through the other channel. `blocked` and `waiting` differ only in who can
         // act on them; either one is the record still asserting something is outstanding, which is not a
         // thing that can be true at the same time as "merge this". Without this the pair resolved through

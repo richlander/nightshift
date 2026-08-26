@@ -202,6 +202,19 @@ public class WaitingVerdictTests
     }
 
     [Fact]
+    public void Confidence_AnInferredIdentityCaveatDoesNotClaimNoStateWasPublished()
+    {
+        // The window name only rescued the identity; the record published other fields. The caveat must
+        // say the identity was missing, not that nothing at all was published.
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            AgentState.Parse("head=722512e25 reviews=1/2 rec=continue", "pr4595")!, Facts());
+
+        Assert.Equal(Confidence.Medium, v.Assurance.Level);
+        Assert.Contains("no identity", v.Assurance.Caveat!, StringComparison.Ordinal);
+        Assert.DoesNotContain("no state", v.Assurance.Caveat!, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Confidence_AClearedWaitOnACleanRecordMayBeActedOn()
     {
         WaitingVerdict v = WaitingVerdict.Resolve(
@@ -305,6 +318,86 @@ public class WaitingVerdictTests
     {
         Assert.Equal(WaitingState.NeedsOperator, WaitingVerdict.Resolve(State("pr=4595 head=722512e25 rec=stop"), Facts()).State);
         Assert.Equal(WaitingState.NeedsOperator, WaitingVerdict.Resolve(State("pr=4595 head=722512e25 rec=approve"), Facts()).State);
+    }
+
+    [Theory]
+    [InlineData("stop", "stop")]
+    [InlineData("approve", "authorise more rounds")]
+    public void Resolve_AnEscalationOutranksAMergedBranch(string rec, string reasonFragment)
+    {
+        // An explicit escalation is the agent asking a person to decide, and a merged PR does not retract
+        // that ask. It outranks the branch state rather than being swallowed by the Merged return.
+        WaitingVerdict v = WaitingVerdict.Resolve(State($"pr=4595 head=722512e25 rec={rec}"), Facts(merged: true, state: "closed"));
+
+        Assert.Equal(WaitingState.NeedsOperator, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
+        Assert.Contains(reasonFragment, v.Reason, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("stop", "stop")]
+    [InlineData("approve", "authorise more rounds")]
+    public void Resolve_AnEscalationOutranksAClosedBranch(string rec, string reasonFragment)
+    {
+        WaitingVerdict v = WaitingVerdict.Resolve(State($"pr=4595 head=722512e25 rec={rec}"), Facts(state: "closed"));
+
+        Assert.Equal(WaitingState.NeedsOperator, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
+        Assert.Contains(reasonFragment, v.Reason, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("stop", "stop")]
+    [InlineData("approve", "authorise more rounds")]
+    public void Resolve_AnEscalationOutranksAStaleRecord(string rec, string reasonFragment)
+    {
+        // The record describes a head GitHub has moved past, but the ask to stop or approve is about the
+        // window's work, not the code, so it still reaches the operator. Assurance stays whatever the
+        // facts and defects earn.
+        WaitingVerdict v = WaitingVerdict.Resolve(State($"pr=4595 head=aaaaaaa11 reviews=1/2 rec={rec}"), Facts());
+
+        Assert.Equal(WaitingState.NeedsOperator, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
+        Assert.Contains(reasonFragment, v.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Resolve_AContinueBesideAClearedPredicateIsNotActionable()
+    {
+        // `continue` says the window is still working, not parked behind the predicate, so a cleared
+        // `waiting=` cannot wake a window that never stopped. Evaluating the predicate first would have
+        // returned an actionable Unblocked; continue denies readiness, so this stays a quiet Holding.
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 waiting=check:ci rec=continue"),
+            Facts(checks: [new CheckRunFact("ci", "completed", "success")]));
+
+        Assert.NotEqual(WaitingState.Unblocked, v.State);
+        Assert.Equal(RowOwner.Nobody, v.Owner);
+        Assert.False(v.MayAct);
+    }
+
+    [Fact]
+    public void Resolve_AnIssueWindowAskingToMergeIsUntrustworthy()
+    {
+        // An issue window has no PR, so `merge` names something that cannot exist. It surfaces to the
+        // operator as untrustworthy rather than resolving to the quiet Holding an issue window otherwise
+        // gets, which would have filtered the impossible request out of view.
+        WaitingVerdict v = WaitingVerdict.Resolve(AgentState.Parse("issue=4611 head=8d5f22a22 rec=merge", "i4611")!, null);
+
+        Assert.Equal(WaitingState.Untrustworthy, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
+        Assert.Equal(Confidence.Low, v.Assurance.Level);
+        Assert.False(v.MayAct);
+        Assert.Contains("no PR", v.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Resolve_AnIssueWindowStillEscalatesStopAndApprove()
+    {
+        Assert.Equal(WaitingState.NeedsOperator,
+            WaitingVerdict.Resolve(AgentState.Parse("issue=4611 head=8d5f22a22 rec=stop", "i4611")!, null).State);
+        Assert.Equal(WaitingState.NeedsOperator,
+            WaitingVerdict.Resolve(AgentState.Parse("issue=4611 head=8d5f22a22 rec=approve", "i4611")!, null).State);
     }
 
     [Fact]

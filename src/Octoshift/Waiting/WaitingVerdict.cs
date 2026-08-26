@@ -143,6 +143,13 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
             {
                 Recommendation.Stop => new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to stop; grant or decline", assurance),
                 Recommendation.Approve => new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to authorise more rounds", assurance),
+
+                // `merge` on an issue window is impossible — there is no PR to merge — and the parser
+                // records it as a defect. Surfaced as untrustworthy and operator-owned rather than falling
+                // to the quiet Holding below, so the impossible request is not filtered out of view.
+                Recommendation.Merge => new(WaitingState.Untrustworthy, RowOwner.Operator,
+                    $"asking to merge issue #{state.PrNumber}, which has no PR to merge", assurance),
+
                 _ => new(WaitingState.Holding, RowOwner.Nobody, $"tracking issue #{state.PrNumber}; no PR yet", assurance),
             };
         }
@@ -167,6 +174,21 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
             };
         }
 
+        // Stop and Approve both need an answer before anything moves, and an explicit escalation outranks
+        // whatever the branch looks like — a merged, closed, or stale PR does not retract the agent's ask,
+        // and a person is already required. Placed before the branch-state gates so the escalation is not
+        // swallowed by a Merged/Closed/Stale return. Assurance is still whatever the facts and defects
+        // earn, so a stale or contradictory record's escalation reaches the operator graded low.
+        if (state.Recommendation == Recommendation.Stop)
+        {
+            return new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to stop; grant or decline", assurance);
+        }
+
+        if (state.Recommendation == Recommendation.Approve)
+        {
+            return new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to authorise more rounds", assurance);
+        }
+
         if (facts.Merged)
         {
             return new(WaitingState.Merged, RowOwner.Operator, $"PR #{facts.Number} merged; the window is done", assurance);
@@ -183,18 +205,6 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         {
             return new(WaitingState.Stale, RowOwner.Operator,
                 $"record describes {Short(state.Head)}, GitHub head is {Short(facts.HeadSha)}", assurance);
-        }
-
-        // Stop and Approve both need an answer before anything moves, and an escalation outranks whatever
-        // the branch looks like — a person is already required.
-        if (state.Recommendation == Recommendation.Stop)
-        {
-            return new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to stop; grant or decline", assurance);
-        }
-
-        if (state.Recommendation == Recommendation.Approve)
-        {
-            return new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to authorise more rounds", assurance);
         }
 
         // Everything below decides whether a window is finished, so every one of these gates fails closed.
@@ -245,10 +255,14 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
                 : new(WaitingState.Conflicting, RowOwner.Agent, "CONFLICTING; integrate a later main", assurance);
         }
 
-        // The declared predicate is evaluated before the generic gates, because it is the agent's own
-        // statement of what would make it interesting again — including `merge`, which is precisely the
-        // uncomputed-mergeability case.
-        if (state.Waiting.Kind != WaitKind.None)
+        // The declared predicate is the agent's own statement of what would make it interesting again —
+        // including `merge`, the uncomputed-mergeability case — so it is evaluated before the generic
+        // gates, but only when the agent is actually parked on it. `continue` says the window is still
+        // working, not idle behind a predicate, so a cleared `waiting=` cannot wake a window that never
+        // stopped: evaluating it turned "still working" into an actionable Unblocked, observed as
+        // `waiting=check:ci rec=continue` on a branch whose ci had gone green. Continue denies readiness
+        // exactly as it denies done-ness, so it falls through to the in-progress gate below instead.
+        if (state.Recommendation != Recommendation.Continue && state.Waiting.Kind != WaitKind.None)
         {
             WaitingVerdict? predicate = EvaluateWait(state, facts, assurance);
             if (predicate is { } resolved)
@@ -384,7 +398,7 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
 
         if (state.Source == StateSource.WindowName)
         {
-            return Assurance.Medium("identity read from the window name; the agent published no state");
+            return Assurance.Medium("agent published no identity; identity read from the window name");
         }
 
         // Without a head nothing ties the claims to a revision, so they can be neither confirmed nor
