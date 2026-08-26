@@ -86,7 +86,7 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         WaitingState.Contradicted => 1,    // said done, demonstrably is not
         WaitingState.Stale => 2,
         WaitingState.Closed => 3,
-        WaitingState.Ready => 4,           // the merge queue: actionable
+        WaitingState.Ready or WaitingState.Unblocked => 4, // actionable merge/resume queue
         WaitingState.Merged => 5,          // window is finished, can be reclaimed
         WaitingState.Conflicting => 6,
         WaitingState.MergeUnverified => 7, // GitHub has not answered yet

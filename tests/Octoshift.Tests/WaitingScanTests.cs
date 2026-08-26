@@ -505,6 +505,8 @@ public class WaitingScanTests
     [Theory]
     [InlineData("9223372036854775808")]
     [InlineData("-1")]
+    [InlineData("")]
+    [InlineData("00")]
     [InlineData("not-a-timestamp")]
     public void ParseCollection_RejectsAnUnparseableActivityTimestamp(string activity)
     {

@@ -285,6 +285,11 @@ internal sealed partial record AgentState
             && int.TryParse(parts[0], NumberStyles.None, CultureInfo.InvariantCulture, out int clean)
             && int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out int required))
         {
+            if (clean < 0 || required < RequiredCleanReviews || clean > required)
+            {
+                defects.Add($"reviews={value} must satisfy 0 <= clean <= required and required >= {RequiredCleanReviews}");
+            }
+
             return (clean, required);
         }
 

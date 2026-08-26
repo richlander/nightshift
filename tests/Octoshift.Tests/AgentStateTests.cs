@@ -455,6 +455,18 @@ public class AgentStateTests
         Assert.Contains(state.Defects, d => d.Contains("rec=merge while blocked on #4629", StringComparison.Ordinal));
     }
 
+    [Theory]
+    [InlineData("3/2")]
+    [InlineData("0/1")]
+    [InlineData("-1/2")]
+    public void Parse_ReviewCountsOutsideTheContractAreDefective(string reviews)
+    {
+        AgentState? state = AgentState.Parse($"pr=4595 head=722512e25 reviews={reviews} rec=continue", "pr4595");
+
+        Assert.NotNull(state);
+        Assert.Contains(state.Defects, d => d.Contains($"reviews={reviews}", StringComparison.Ordinal));
+    }
+
     [Fact]
     public void Parse_ACoherentPrRecordStaysClean()
     {

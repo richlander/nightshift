@@ -86,6 +86,18 @@ public class WaitingVerdictTests
     }
 
     [Fact]
+    public void Severity_UnblockedRanksWithTheActionableQueue()
+    {
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=1/2 waiting=check:ci-required rec=wait"),
+            Facts(checks: [new CheckRunFact("ci-required", "completed", "success")]));
+
+        Assert.Equal(WaitingState.Unblocked, v.State);
+        Assert.Equal(4, v.Severity);
+        Assert.True(v.Severity < new WaitingVerdict(WaitingState.Unknown, RowOwner.Operator, "unknown", Assurance.Low("unknown")).Severity);
+    }
+
+    [Fact]
     public void Resolve_AFailedCheckAlsoClearsTheWait()
     {
         // "Concluded" is the condition, not "passed": a red result is news the agent needs just as much.
