@@ -18,13 +18,25 @@ internal readonly record struct CommandResult(int ExitCode, string Stdout, strin
 internal static class ShellRunner
 {
     /// <summary>Builds a runner for a host, or for this machine when <paramref name="host"/> is null.</summary>
+    /// <exception cref="ArgumentException">
+    /// The host is empty or option-shaped. Callers validate with <see cref="HostTarget.Validate"/> and
+    /// report a usage error; this guard is here so no future caller can construct ssh arguments from a
+    /// value ssh would read as an option.
+    /// </exception>
     public static Func<string, CancellationToken, Task<CommandResult>> For(string? host)
-        => host is null
+    {
+        if (host is not null && HostTarget.Validate(host) is { } error)
+        {
+            throw new ArgumentException(error, nameof(host));
+        }
+
+        return host is null
             ? (script, ct) => RunAsync("/bin/sh", ["-c", script], ct)
 
             // BatchMode so a host needing a passphrase fails fast instead of hanging the sweep, and a
             // short connect timeout so one unreachable box cannot stall the others.
-            : (script, ct) => RunAsync("ssh", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, script], ct);
+            : (script, ct) => RunAsync("ssh", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", host, script], ct);
+    }
 
     internal static async Task<CommandResult> RunAsync(string file, IReadOnlyList<string> args, CancellationToken ct)
     {

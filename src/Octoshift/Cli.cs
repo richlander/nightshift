@@ -2,6 +2,7 @@ namespace Octoshift;
 
 using System.CommandLine;
 using Octoshift.Commands;
+using Octoshift.Waiting;
 
 /// <summary>Entry dispatch for the <c>octoshift</c> GitHub-membrane CLI.</summary>
 public static class Cli
@@ -151,6 +152,21 @@ public static class Cli
             Arity = ArgumentArity.OneOrMore,
             AllowMultipleArgumentsPerToken = false,
         };
+
+        // Every value here becomes an ssh argument, so a value that is empty or option-shaped is rejected
+        // at the parse rather than handed to ssh: `--host=-V` otherwise succeeds with no output and reads
+        // as a quiet fleet, and bare `--host --json` otherwise swallows the flag as a hostname.
+        host.Validators.Add(result =>
+        {
+            foreach (var token in result.Tokens)
+            {
+                if (HostTarget.Validate(token.Value) is { } error)
+                {
+                    result.AddError(error);
+                    break;
+                }
+            }
+        });
         var json = new Option<bool>("--json") { Description = "Emit the rows as JSON instead of a table." };
         Option<string?> repo = CreateRepoOption();
 
