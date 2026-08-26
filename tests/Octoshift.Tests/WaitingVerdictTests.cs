@@ -352,13 +352,52 @@ public class WaitingVerdictTests
     public void Resolve_AnEscalationOutranksAStaleRecord(string rec, string reasonFragment)
     {
         // The record describes a head GitHub has moved past, but the ask to stop or approve is about the
-        // window's work, not the code, so it still reaches the operator. Assurance stays whatever the
-        // facts and defects earn.
+        // window's work, not the code, so it still reaches the operator. The evidence behind it is stale,
+        // though, so assurance is graded down and the head mismatch is named (see the assurance tests
+        // below); it stays non-actionable throughout.
         WaitingVerdict v = WaitingVerdict.Resolve(State($"pr=4595 head=aaaaaaa11 reviews=1/2 rec={rec}"), Facts());
 
         Assert.Equal(WaitingState.NeedsOperator, v.State);
         Assert.Equal(RowOwner.Operator, v.Owner);
         Assert.Contains(reasonFragment, v.Reason, StringComparison.Ordinal);
+        Assert.False(v.MayAct);
+    }
+
+    [Theory]
+    [InlineData("stop", "stop")]
+    [InlineData("approve", "authorise more rounds")]
+    public void Resolve_AStaleEscalationIsGradedLowAndNamesTheHeadMismatch(string rec, string reasonFragment)
+    {
+        // The exact regression: a clean record whose only flaw is a stale head would otherwise reach the
+        // operator at high confidence with no caveat, because assurance was assessed before staleness was
+        // checked. The escalation must survive, but its assurance is the stale evidence's, not a clean
+        // record's, and the reason exposes the recorded/GitHub head mismatch.
+        WaitingVerdict v = WaitingVerdict.Resolve(State($"pr=4595 head=aaaaaaa11 rec={rec}"), Facts());
+
+        Assert.Equal(WaitingState.NeedsOperator, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
+        Assert.Equal(Confidence.Low, v.Assurance.Level);
+        Assert.Contains(reasonFragment, v.Reason, StringComparison.Ordinal);
+        Assert.Contains("aaaaaaa11", v.Reason, StringComparison.Ordinal);
+        Assert.Contains("722512e25", v.Reason, StringComparison.Ordinal);
+        Assert.Contains("aaaaaaa11", v.Assurance.Caveat!, StringComparison.Ordinal);
+        Assert.False(v.MayAct);
+    }
+
+    [Theory]
+    [InlineData("stop", "stop")]
+    [InlineData("approve", "authorise more rounds")]
+    public void Resolve_AMatchingEscalationKeepsHighAssuranceAndNoMismatch(string rec, string reasonFragment)
+    {
+        // The counterpart: when the recorded head matches GitHub, the escalation is on a clean record and
+        // keeps the high confidence it earns, with no head-mismatch caveat manufactured.
+        WaitingVerdict v = WaitingVerdict.Resolve(State($"pr=4595 head=722512e25 rec={rec}"), Facts());
+
+        Assert.Equal(WaitingState.NeedsOperator, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
+        Assert.Equal(Confidence.High, v.Assurance.Level);
+        Assert.Contains(reasonFragment, v.Reason, StringComparison.Ordinal);
+        Assert.DoesNotContain("GitHub head is", v.Reason, StringComparison.Ordinal);
     }
 
     [Fact]

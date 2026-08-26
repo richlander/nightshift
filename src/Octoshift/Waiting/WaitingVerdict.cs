@@ -181,12 +181,12 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         // earn, so a stale or contradictory record's escalation reaches the operator graded low.
         if (state.Recommendation == Recommendation.Stop)
         {
-            return new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to stop; grant or decline", assurance);
+            return Escalation(state, facts, assurance, "asking to stop; grant or decline");
         }
 
         if (state.Recommendation == Recommendation.Approve)
         {
-            return new(WaitingState.NeedsOperator, RowOwner.Operator, "asking to authorise more rounds", assurance);
+            return Escalation(state, facts, assurance, "asking to authorise more rounds");
         }
 
         if (facts.Merged)
@@ -201,10 +201,10 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
 
         // Head divergence voids the record before anything in it is evaluated: every claim was made about
         // code GitHub is no longer serving.
-        if (state.Head is not null && !ShaMatches(state.Head, facts.HeadSha))
+        if (IsStale(state, facts))
         {
             return new(WaitingState.Stale, RowOwner.Operator,
-                $"record describes {Short(state.Head)}, GitHub head is {Short(facts.HeadSha)}", assurance);
+                $"record describes {Short(state.Head!)}, GitHub head is {Short(facts.HeadSha)}", assurance);
         }
 
         // Everything below decides whether a window is finished, so every one of these gates fails closed.
@@ -415,6 +415,32 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
     {
         int length = Math.Min(recorded.Length, actual.Length);
         return length >= 7 && recorded.AsSpan(0, length).Equals(actual.AsSpan(0, length), StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Whether the record describes a head GitHub has moved past. A record naming no head names no
+    /// revision, so it can never be stale — there is nothing to diverge from.
+    /// </summary>
+    private static bool IsStale(AgentState state, PrFacts facts) =>
+        state.Head is not null && !ShaMatches(state.Head, facts.HeadSha);
+
+    /// <summary>
+    /// Builds a stop or approve escalation once GitHub is readable. The ask to stop or authorise is about
+    /// the window's work, not the code, so it reaches the operator whatever the branch looks like. But a
+    /// record describing a head GitHub has moved past is asking about code that is gone: the escalation
+    /// still stands and stays non-actionable, yet its assurance is graded down to low and the head
+    /// mismatch is named, so a stale escalation cannot reach the operator wearing the high confidence a
+    /// clean record would have earned.
+    /// </summary>
+    private static WaitingVerdict Escalation(AgentState state, PrFacts facts, Assurance assurance, string ask)
+    {
+        if (IsStale(state, facts))
+        {
+            string mismatch = $"record describes {Short(state.Head!)}, GitHub head is {Short(facts.HeadSha)}";
+            return new(WaitingState.NeedsOperator, RowOwner.Operator, $"{ask} — but the {mismatch}", Assurance.Low(mismatch));
+        }
+
+        return new(WaitingState.NeedsOperator, RowOwner.Operator, ask, assurance);
     }
 
     private static string Short(string sha) => sha.Length <= 9 ? sha : sha[..9];
