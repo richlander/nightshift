@@ -57,15 +57,18 @@ public class PrCommandTests
         => new(Path.Combine(Path.GetTempPath(), $"octoshift-prtest-{Guid.NewGuid():N}.json"));
 
     private static Task<PrLocationResult> LocateAsync(int pr, WaitingCommand.Collection collected, PrFacts? facts = null)
-        => LocateInnerAsync(pr, collected, facts);
+        => LocateInnerAsync(pr, collected, facts is null ? PrFetch.Unavailable : PrFetch.Found(facts));
 
-    private static async Task<PrLocationResult> LocateInnerAsync(int pr, WaitingCommand.Collection collected, PrFacts? facts)
+    private static Task<PrLocationResult> LocateAsync(int pr, WaitingCommand.Collection collected, PrFetch fetch)
+        => LocateInnerAsync(pr, collected, fetch);
+
+    private static async Task<PrLocationResult> LocateInnerAsync(int pr, WaitingCommand.Collection collected, PrFetch fetch)
     {
         PrCommand.PrLocation located = await PrCommand.LocateAsync(
             pr,
             collected,
             FreshHistory(),
-            (_, _) => Task.FromResult(facts),
+            (_, _) => Task.FromResult(fetch),
             (_, _) => Task.FromResult<PrFacts?>(null),
             DateTimeOffset.UtcNow,
             TestContext.Current.CancellationToken);
@@ -137,7 +140,7 @@ public class PrCommandTests
                 4448,
                 Collection([Pane("fernie", "%1", "cp:1", agentState: "pr=4448 head=abc1234", windowName: "pr4448", epoch: "2:1")], ["fernie"]),
                 new PaneHistory(path),
-                (_, _) => Task.FromResult<PrFacts?>(Ready),
+                (_, _) => Task.FromResult(PrFetch.Found(Ready)),
                 (_, _) => Task.FromResult<PrFacts?>(null),
                 DateTimeOffset.UtcNow,
                 TestContext.Current.CancellationToken);
@@ -156,14 +159,36 @@ public class PrCommandTests
     [Fact]
     public async Task Locate_AcompleteViewWithNeitherClaimNorPrLeadsWithNotFound()
     {
-        // A complete view that turned up no claiming window and no GitHub PR: NOTFOUND, exit unavailable.
+        // A complete view that turned up no claiming window, and GitHub affirmatively 404s: NOTFOUND, exit
+        // unavailable. The 404 is what earns NOTFOUND — an unreadable GitHub would be PARTIAL instead.
         PrLocationResult result = await LocateAsync(4999, Collection(
             [Pane("fernie", "%1", "cp:1", agentState: "pr=4448 head=abc1234", windowName: "pr4448")],
-            ["fernie"]), facts: null);
+            ["fernie"]), PrFetch.NotFound);
 
         Assert.Equal(PrCommand.PrDisposition.NotFound, result.Located.Disposition);
         Assert.Equal(ExitCode.Unavailable, result.Located.ExitCode);
         Assert.StartsWith("NOTFOUND PR #4999", result.FirstLine(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Locate_AcompleteViewWithNoClaimAndUnreadableGithubLeadsWithPartialNotNotFound()
+    {
+        // The round-8 blocker: a complete, fully-reached view with no claiming window, and GitHub could
+        // not be read (auth, rate limit, transport, 5xx, malformed all reduce to Unavailable at the source).
+        // Existence is unknown, so this must lead PARTIAL and fail — never NOTFOUND, which would assert
+        // GitHub has no such PR off an outage. The JSON names the outcome truthfully.
+        PrLocationResult result = await LocateAsync(4999, Collection(
+            [Pane("fernie", "%1", "cp:1", agentState: "pr=4448 head=abc1234", windowName: "pr4448")],
+            ["fernie"]), PrFetch.Unavailable);
+
+        Assert.Equal(PrCommand.PrDisposition.Unavailable, result.Located.Disposition);
+        Assert.Equal(ExitCode.Unavailable, result.Located.ExitCode);
+        Assert.StartsWith("PARTIAL PR #4999", result.FirstLine(), StringComparison.Ordinal);
+        Assert.DoesNotContain("NOTFOUND", result.Report(), StringComparison.Ordinal);
+        Assert.Contains("could not be read", result.Report(), StringComparison.Ordinal);
+
+        using JsonDocument doc = JsonDocument.Parse(result.Json());
+        Assert.Equal("unavailable", doc.RootElement.GetProperty("github").GetString());
     }
 
     [Fact]
@@ -285,7 +310,7 @@ public class PrCommandTests
                 4448,
                 Collection([onBanff], ["fernie", "banff"]),
                 new PaneHistory(path),
-                (_, _) => Task.FromResult<PrFacts?>(Ready),
+                (_, _) => Task.FromResult(PrFetch.Found(Ready)),
                 (_, _) => Task.FromResult<PrFacts?>(null),
                 DateTimeOffset.UtcNow,
                 TestContext.Current.CancellationToken);
@@ -295,7 +320,7 @@ public class PrCommandTests
                 4448,
                 Collection([onBanff], ["banff"]),
                 new PaneHistory(path),
-                (_, _) => Task.FromResult<PrFacts?>(Ready),
+                (_, _) => Task.FromResult(PrFetch.Found(Ready)),
                 (_, _) => Task.FromResult<PrFacts?>(null),
                 DateTimeOffset.UtcNow,
                 TestContext.Current.CancellationToken);
@@ -322,6 +347,7 @@ public class PrCommandTests
             4448,
             [(pane, state, Claim.Sole)],
             Ready,
+            PrFetchStatus.Found,
             true,
             Collection([pane], ["fernie"]),
             new Dictionary<string, TimeSpan?>());
@@ -356,7 +382,7 @@ public class PrCommandTests
                 4448,
                 Collection([onBanff], ["banff"]),
                 new PaneHistory(path),
-                (_, _) => Task.FromResult<PrFacts?>(Ready),
+                (_, _) => Task.FromResult(PrFetch.Found(Ready)),
                 (_, _) => Task.FromResult<PrFacts?>(null),
                 DateTimeOffset.UtcNow,
                 TestContext.Current.CancellationToken);
@@ -376,13 +402,14 @@ public class PrCommandTests
     [Fact]
     public async Task Locate_JsonIsValidEvenWhenThePrIsNotFound()
     {
-        // Nothing claims 4448 and GitHub could not be read: the not-found failure still produces a single
-        // valid JSON document rather than a bare error line.
-        PrLocationResult result = await LocateAsync(4448, Collection([], [null]), facts: null);
+        // Nothing claims 4448 and GitHub affirmatively 404s: the not-found failure still produces a single
+        // valid JSON document rather than a bare error line, and it names the outcome truthfully.
+        PrLocationResult result = await LocateAsync(4448, Collection([], [null]), PrFetch.NotFound);
 
         Assert.Equal(ExitCode.Unavailable, result.Located.ExitCode);
         using JsonDocument doc = JsonDocument.Parse(result.Json());
         Assert.Empty(doc.RootElement.GetProperty("claims").EnumerateArray());
+        Assert.Equal("notfound", doc.RootElement.GetProperty("github").GetString());
     }
 
     // Serializes the few tests that must capture the process-wide Console streams, and restores them.

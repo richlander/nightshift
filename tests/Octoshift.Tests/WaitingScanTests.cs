@@ -523,6 +523,78 @@ public class WaitingScanTests
     }
 
     [Fact]
+    public async Task FetchDetailed_FoundReturnsTheFacts()
+    {
+        // The happy path through the three-outcome seam: a 200 with a head yields Found and the facts.
+        var gh = new FakeGh
+        {
+            ["repos/o/r/pulls/4595"] = Response(200, """
+                {"number":4595,"state":"open","mergeable_state":"clean","head":{"sha":"722512e25f0c1d4a9b8e7360a1c2d3e4f5061728"}}
+                """),
+            [$"repos/o/r/commits/{Head}/check-runs?per_page=100"] = Response(200, """{"check_runs":[]}"""),
+        };
+
+        PrFetch fetch = await new GhPrFactsSource("o/r", new FakeCache(), gh.RunAsync)
+            .FetchDetailedAsync(4595, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.Found, fetch.Status);
+        Assert.NotNull(fetch.Facts);
+        Assert.Equal(Head, fetch.Facts.HeadSha);
+    }
+
+    [Fact]
+    public async Task FetchDetailed_AnAffirmative404IsNotFound()
+    {
+        // The one negative answer to trust: GitHub looked and there is no such PR. This — and only this —
+        // is NotFound, which is what lets `pr` reserve NOTFOUND for a real 404.
+        var gh = new FakeGh { ["repos/o/r/pulls/4595"] = Response(404, """{"message":"Not Found"}""") };
+
+        PrFetch fetch = await new GhPrFactsSource("o/r", new FakeCache(), gh.RunAsync)
+            .FetchDetailedAsync(4595, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.NotFound, fetch.Status);
+        Assert.Null(fetch.Facts);
+    }
+
+    [Theory]
+    [InlineData(401, "", "")]                                    // authentication failure
+    [InlineData(403, "", "x-ratelimit-remaining: 0")]            // rate limit / forbidden
+    [InlineData(429, "", "")]                                    // too many requests
+    [InlineData(500, "", "")]                                    // server error
+    [InlineData(502, "", "")]                                    // bad gateway
+    [InlineData(200, "{ not json", "")]                          // a 200 body that cannot be parsed
+    [InlineData(200, """{"state":"open"}""", "")]                // a 200 with no head sha
+    public async Task FetchDetailed_UnreadableOutcomesAreUnavailableNotNotFound(int status, string body, string header)
+    {
+        // Every read that is not an affirmative 404 and not a usable body is Unavailable — auth, rate
+        // limit, a 5xx, or a body that cannot be trusted. None of these may collapse to NotFound, or an
+        // outage reads as "no such PR".
+        string[] extra = header.Length == 0 ? [] : [header];
+        var gh = new FakeGh { ["repos/o/r/pulls/4595"] = Response(status, body, extra) };
+
+        PrFetch fetch = await new GhPrFactsSource("o/r", new FakeCache(), gh.RunAsync)
+            .FetchDetailedAsync(4595, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.Unavailable, fetch.Status);
+        Assert.Null(fetch.Facts);
+    }
+
+    [Fact]
+    public async Task FetchDetailed_ANonzeroExitWithNoStatusIsUnavailable()
+    {
+        // A transport failure: gh exits nonzero and there is no HTTP status line to read. The existence of
+        // the PR is unknown, so this is Unavailable — never a not-found inferred from silence.
+        Task<GhResult> Gh(IReadOnlyList<string> args, CancellationToken ct)
+            => Task.FromResult(new GhResult(1, string.Empty, "dial tcp: connection refused"));
+
+        PrFetch fetch = await new GhPrFactsSource("o/r", new FakeCache(), Gh)
+            .FetchDetailedAsync(4595, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.Unavailable, fetch.Status);
+        Assert.Null(fetch.Facts);
+    }
+
+    [Fact]
     public async Task BuildRows_SkipsWorkingPanesAndFetchesEachPrOnce()
     {
         // Two windows claiming one PR is a measured condition (#159), and the second window's question

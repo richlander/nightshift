@@ -1,5 +1,33 @@
 namespace Octoshift.GitHub;
 
+/// <summary>
+/// The three distinguishable outcomes of reading one PR from GitHub. Kept apart because collapsing them
+/// is exactly the defect: an affirmative <see cref="NotFound"/> (GitHub looked and there is no such PR)
+/// must never be confused with an <see cref="Unavailable"/> read (auth, rate limit, transport, a 5xx, a
+/// nonzero <c>gh</c> exit, or a body that cannot be parsed), where the PR's existence is simply unknown.
+/// </summary>
+internal enum PrFetchStatus
+{
+    /// <summary>GitHub answered and the PR exists; the facts are attached.</summary>
+    Found,
+
+    /// <summary>GitHub answered 404: the PR affirmatively does not exist.</summary>
+    NotFound,
+
+    /// <summary>GitHub could not be read, or answered something that cannot be trusted as "no such PR".</summary>
+    Unavailable,
+}
+
+/// <summary>One PR read reduced to its outcome and, when <see cref="PrFetchStatus.Found"/>, its facts.</summary>
+internal readonly record struct PrFetch(PrFetchStatus Status, PrFacts? Facts)
+{
+    public static readonly PrFetch NotFound = new(PrFetchStatus.NotFound, null);
+
+    public static readonly PrFetch Unavailable = new(PrFetchStatus.Unavailable, null);
+
+    public static PrFetch Found(PrFacts facts) => new(PrFetchStatus.Found, facts);
+}
+
 /// <summary>One check run on a head sha, reduced to the fields a verdict turns on.</summary>
 /// <param name="Name">The check's name. Not unique: a rerun adds another run under the same name.</param>
 /// <param name="Status">queued, in_progress, or completed.</param>

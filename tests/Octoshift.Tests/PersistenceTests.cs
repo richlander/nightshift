@@ -31,6 +31,8 @@ public sealed class PersistenceTests
 
     private static Task<PrFacts?> None(int _, CancellationToken __) => Task.FromResult<PrFacts?>(null);
 
+    private static Task<PrFetch> NoneFetch(int _, CancellationToken __) => Task.FromResult(PrFetch.Unavailable);
+
     // A window on the given host with the given claim ("pr=NNNN …") or no state at all, sharing one pane
     // id and server epoch so a later observation of the same window replaces the earlier one. The window
     // name defaults to a claiming one; pass a non-PR name for a window that identifies nothing.
@@ -137,7 +139,7 @@ public sealed class PersistenceTests
             };
 
             Task<PrCommand.PrLocation> run = PrCommand.CollectAndLocateAsync(
-                4448, ["shared"], scan, None, None, t, ct, historyPath: path);
+                4448, ["shared"], scan, NoneFetch, None, t, ct, historyPath: path);
 
             await Task.Delay(250, ct);
             Assert.False(run.IsCompleted);
@@ -298,7 +300,7 @@ public sealed class PersistenceTests
         {
             var collected = new WaitingCommand.Collection([Pane(null)], [], 1, [null]);
             await Assert.ThrowsAsync<HistoryUnavailableException>(() => PrCommand.LocateAsync(
-                4448, collected, history, None, None, DateTimeOffset.UtcNow, TestContext.Current.CancellationToken));
+                4448, collected, history, NoneFetch, None, DateTimeOffset.UtcNow, TestContext.Current.CancellationToken));
         }
         finally
         {
@@ -532,7 +534,7 @@ public sealed class PersistenceTests
 
             var collected = new WaitingCommand.Collection([Pane(null)], [], 1, [null]);
             await Assert.ThrowsAsync<HistoryUnavailableException>(() => PrCommand.LocateAsync(
-                4448, collected, history: null, None, None, DateTimeOffset.UtcNow, ct, historyPath: path));
+                4448, collected, history: null, NoneFetch, None, DateTimeOffset.UtcNow, ct, historyPath: path));
             Assert.Equal(content, File.ReadAllText(path));
         }
         finally
@@ -636,7 +638,7 @@ public sealed class PersistenceTests
         {
             var collected = new WaitingCommand.Collection([Pane(null)], [], 1, [null]);
             await Assert.ThrowsAsync<HistoryUnavailableException>(() => PrCommand.LocateAsync(
-                4448, collected, history: null, None, None, DateTimeOffset.UtcNow, TestContext.Current.CancellationToken, historyPath: path));
+                4448, collected, history: null, NoneFetch, None, DateTimeOffset.UtcNow, TestContext.Current.CancellationToken, historyPath: path));
             Assert.Equal("{ bad ]", File.ReadAllText(path));
         }
         finally

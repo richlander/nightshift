@@ -49,7 +49,7 @@ internal static class PrCommand
         {
             PrLocation located = await CollectAndLocateAsync(
                 prNumber, hosts, (host, token) => new TmuxScanner(host).ScanAsync(token),
-                facts.FetchAsync, facts.RefreshMergeabilityAsync, now: null, ct, historyPath: historyPath);
+                facts.FetchDetailedAsync, facts.RefreshMergeabilityAsync, now: null, ct, historyPath: historyPath);
 
             if (json)
             {
@@ -99,7 +99,7 @@ internal static class PrCommand
         int prNumber,
         IReadOnlyList<string> hosts,
         Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> scanAsync,
-        Func<int, CancellationToken, Task<PrFacts?>> fetchAsync,
+        Func<int, CancellationToken, Task<PrFetch>> fetchAsync,
         Func<int, CancellationToken, Task<PrFacts?>> refreshMergeabilityAsync,
         DateTimeOffset? now,
         CancellationToken ct,
@@ -128,7 +128,8 @@ internal static class PrCommand
     /// <summary>Where a PR was found, and everything the report and the exit code are computed from.</summary>
     /// <param name="PrNumber">The PR asked about.</param>
     /// <param name="Claims">This PR's claimants, owner first.</param>
-    /// <param name="Facts">What GitHub said, or null when it could not be read.</param>
+    /// <param name="Facts">What GitHub said, or null when it had no such PR or could not be read.</param>
+    /// <param name="Github">Which of the three GitHub outcomes this was — found, an affirmative 404, or unavailable.</param>
     /// <param name="ViewComplete">Whether the whole fleet was seen — every host answered, none dropped.</param>
     /// <param name="Collected">The sweep, for its unreachable hosts and window count.</param>
     /// <param name="Silence">Per-window silence, keyed by host and pane id.</param>
@@ -136,6 +137,7 @@ internal static class PrCommand
         int PrNumber,
         IReadOnlyList<(TmuxPane Pane, AgentState State, Claim Claim)> Claims,
         PrFacts? Facts,
+        PrFetchStatus Github,
         bool ViewComplete,
         WaitingCommand.Collection Collected,
         IReadOnlyDictionary<string, TimeSpan?> Silence)
@@ -146,15 +148,18 @@ internal static class PrCommand
         /// previously-collected host this run omitted) means the PR may be claimed somewhere this sweep
         /// could not see, so a success-shaped result would assert a completeness the sweep did not have:
         /// <see cref="PrDisposition.Partial"/> when a host was unreachable, <see cref="PrDisposition.Narrowed"/>
-        /// when the view was merely narrower than before. A complete view that turned up neither a claim
-        /// nor a GitHub PR is <see cref="PrDisposition.NotFound"/>. Anything else — a claim, a PR, or both,
-        /// under a complete view — is <see cref="PrDisposition.Found"/>.
+        /// when the view was merely narrower than before. Under a complete, fully-reached view: a claim or a
+        /// GitHub PR is <see cref="PrDisposition.Found"/>; neither, with GitHub answering an affirmative 404,
+        /// is <see cref="PrDisposition.NotFound"/>; neither, with GitHub merely unreadable, is
+        /// <see cref="PrDisposition.Unavailable"/> — the one case a prior head wrongly called NotFound, since
+        /// an outage cannot prove a PR does not exist.
         /// </summary>
         public PrDisposition Disposition
             => Collected.Unreachable.Count > 0 ? PrDisposition.Partial
                 : !ViewComplete ? PrDisposition.Narrowed
-                : Facts is null && Claims.Count == 0 ? PrDisposition.NotFound
-                : PrDisposition.Found;
+                : Claims.Count > 0 || Github == PrFetchStatus.Found ? PrDisposition.Found
+                : Github == PrFetchStatus.Unavailable ? PrDisposition.Unavailable
+                : PrDisposition.NotFound;
 
         /// <summary>Only a found PR succeeds; every other disposition is unavailable, matching the token
         /// the first line leads with.</summary>
@@ -175,8 +180,12 @@ internal static class PrCommand
         /// <summary>Fewer hosts than have been collected before, so the view is narrower than it has been. Leads with <c>NARROWED</c>.</summary>
         Narrowed,
 
-        /// <summary>A complete view with neither a claiming window nor a GitHub PR. Leads with <c>NOTFOUND</c>.</summary>
+        /// <summary>A complete view with neither a claiming window nor a GitHub PR, GitHub affirmatively 404. Leads with <c>NOTFOUND</c>.</summary>
         NotFound,
+
+        /// <summary>A complete view with no claim, and GitHub could not be read — so existence is unknown, never
+        /// a not-found. Leads with the same <c>PARTIAL</c> token the other unavailable results use.</summary>
+        Unavailable,
     }
 
 
@@ -188,7 +197,7 @@ internal static class PrCommand
         int prNumber,
         WaitingCommand.Collection collected,
         PaneHistory? history,
-        Func<int, CancellationToken, Task<PrFacts?>> fetchAsync,
+        Func<int, CancellationToken, Task<PrFetch>> fetchAsync,
         Func<int, CancellationToken, Task<PrFacts?>> refreshMergeabilityAsync,
         DateTimeOffset now,
         CancellationToken ct,
@@ -301,7 +310,8 @@ internal static class PrCommand
             .ThenBy(m => m.Pane.Host ?? string.Empty, StringComparer.Ordinal)
             .ThenBy(m => m.Pane.PaneId, StringComparer.Ordinal)];
 
-        PrFacts? prFacts = await fetchAsync(prNumber, ct);
+        PrFetch fetched = await fetchAsync(prNumber, ct);
+        PrFacts? prFacts = fetched.Facts;
         if (prFacts is not null && !prFacts.MergeabilityKnown && !prFacts.Merged)
         {
             prFacts = await refreshMergeabilityAsync(prNumber, ct) is { MergeabilityKnown: true } refreshed
@@ -310,7 +320,7 @@ internal static class PrCommand
                     : prFacts;
         }
 
-        return new PrLocation(prNumber, mine, prFacts, viewComplete, collected, silence);
+        return new PrLocation(prNumber, mine, prFacts, fetched.Status, viewComplete, collected, silence);
         }
         finally
         {
@@ -339,6 +349,7 @@ internal static class PrCommand
             PrDisposition.Partial => $"PARTIAL PR #{prNumber}{titleSuffix} — fleet partly unreachable; a claim may be on a host not swept",
             PrDisposition.Narrowed => $"NARROWED PR #{prNumber}{titleSuffix} — fewer hosts than collected before; a claim may be on a host not swept this run",
             PrDisposition.NotFound => $"NOTFOUND PR #{prNumber}{titleSuffix} — no window claims it and GitHub has no such PR",
+            PrDisposition.Unavailable => $"PARTIAL PR #{prNumber}{titleSuffix} — no window claims it and GitHub could not be read; existence unknown",
             _ => $"PR #{prNumber}{titleSuffix}",
         };
         output.WriteLine(headline);
@@ -387,7 +398,7 @@ internal static class PrCommand
             }
         }
 
-        output.WriteLine($"  github    {Github(facts, now)}");
+        output.WriteLine($"  github    {Github(facts, located.Github, now)}");
 
         // One verdict per claim when contested: the disagreement between them is the finding, and
         // collapsing it to a single row would hide which window the answer came from.
@@ -481,11 +492,13 @@ internal static class PrCommand
         return string.Join(", ", parts);
     }
 
-    private static string Github(PrFacts? facts, DateTimeOffset now)
+    private static string Github(PrFacts? facts, PrFetchStatus outcome, DateTimeOffset now)
     {
         if (facts is null)
         {
-            return "could not be read";
+            // Keep the body honest about which of the two null outcomes this was: GitHub looked and there
+            // is no such PR, versus GitHub could not be read at all. Only the first is an assertion.
+            return outcome == PrFetchStatus.NotFound ? "no such PR" : "could not be read";
         }
 
         if (facts.Merged)
@@ -594,6 +607,16 @@ internal static class PrCommand
         }
 
         writer.WriteEndArray();
+
+        // The GitHub outcome, kept truthful and distinct: a null read is either an affirmative 404 or an
+        // unavailable read, and JSON that omitted the difference (only the facts block below, absent in
+        // both) would let a consumer read an outage as "no such PR". Mirrors the human first-line token.
+        writer.WriteString("github", located.Github switch
+        {
+            PrFetchStatus.Found => "found",
+            PrFetchStatus.NotFound => "notfound",
+            _ => "unavailable",
+        });
 
         if (facts is not null)
         {
