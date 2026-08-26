@@ -37,7 +37,9 @@
    SoleClaimantIsAlwaysOwner; and dropping the regWitnessed clause from Observed -- or
    recomputing witness from the current sweep's coverage, the fleet-expansion laundering
    where the third sweep of a full fleet promotes a claim first recorded under a narrow
-   view -- violates NoOwnerFromUnwitnessedRegistration. The corresponding code is covered
+   view -- violates NoOwnerFromUnwitnessedRegistration, and doing the same recomputation
+   while the claim continues violates the RegWitnessedStableStep temporal property. The
+   corresponding code is covered
    by InvariantTests, ModelCorrespondenceTests and WaitingScanTests against the real
    implementation, not just this model. *)
 
@@ -367,7 +369,8 @@ NoOwnerFromUnwitnessedRegistration ==
 \* Registrations are only ever renewed or dropped by a sweep that actually looked.
 NoPhantomDepartureStep ==
     [][ \A w \in Windows :
-          (regTime'[w] # regTime[w] \/ regPr'[w] # regPr[w] \/ regFleet'[w] # regFleet[w])
+          (regTime'[w] # regTime[w] \/ regPr'[w] # regPr[w] \/ regFleet'[w] # regFleet[w]
+             \/ regWitnessed'[w] # regWitnessed[w])
             => HostOf(w) \in lastCollected' ]_vars
 
 RegistrationStableStep ==
@@ -377,6 +380,24 @@ RegistrationStableStep ==
            /\ epoch' = epoch
            /\ Registered(w) # NoTime)
              => regTime'[w] = regTime[w] ]_vars
+
+\* Invariant 13: a registration's witness is as stable as its time. While one claim
+\* continues under one server, regWitnessed must not move -- this is the temporal half of
+\* the fleet-expansion fix. The registration stability step keeps the PLACE in the queue
+\* fixed; this keeps the TRUST fixed, so a later sweep that finally sees the whole fleet
+\* cannot flip a first look's witness from FALSE to TRUE while it keeps claiming. The
+\* antecedent is RegistrationStableStep's exactly, because the two facts travel together:
+\* a registration whose time may not drift is one whose witness may not drift either.
+\* A deliberate mutation recomputing regWitnessed from the current sweep's coverage while
+\* the same claim continues -- the laundering NoOwnerFromUnwitnessedRegistration rules out
+\* at a state -- is refuted here as a step.
+RegWitnessedStableStep ==
+    [][ \A w \in Windows :
+          (/\ w \in live /\ w \in live'
+           /\ claims[w] # NoPr /\ claims'[w] = claims[w]
+           /\ epoch' = epoch
+           /\ Registered(w) # NoTime)
+             => regWitnessed'[w] = regWitnessed[w] ]_vars
 
 \* Invariant 9: if nothing observable changes, ownership does not change. Stated over
 \* a Sweep specifically, because that is the step that rewrites memory: sweeping an

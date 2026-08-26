@@ -161,8 +161,12 @@ because several of them were violated by code that passed its unit tests.
     queue.
 13. A window's silence duration never decreases while its body digest is
     unchanged.
-14. A claim's registration time is stable for as long as the window keeps
-    claiming the same PR.
+14. A claim's registration time — and its witness — are stable for as long as the
+    window keeps claiming the same PR. *(The place in the queue and the trust in
+    it travel together: a later sweep that finally sees the whole fleet cannot
+    flip a continuing first look's witness from false to true, which is the
+    temporal half of the fleet-expansion fix. Modelled as the
+    `RegistrationStableStep` and `RegWitnessedStableStep` step properties.)*
 
 **Liveness — the tool does not go quiet by accident.**
 
