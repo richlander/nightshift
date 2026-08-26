@@ -133,7 +133,7 @@ internal static class WaitingCommand
 
         if (rename)
         {
-            await RenameAsync(resolved, ct);
+            await RenameAsync(resolved, ShellRunner.For, Console.Error, ct);
         }
 
         IReadOnlyList<WaitingRow> shown = Present(resolved, all);
@@ -496,27 +496,37 @@ internal static class WaitingCommand
     /// <remarks>
     /// Works over the complete resolved fleet, not the shown subset: a quiet or working window with a
     /// stale suffix is exactly the one the presentation filter drops, and it still needs correcting.
-    /// Diagnostics go to stderr, never stdout, so <c>--json --rename</c> leaves a single valid JSON
-    /// document on stdout rather than a run of <c>RENAMED</c> lines before it.
+    /// Diagnostics go to <paramref name="diagnostics"/> — stderr in production — never stdout, so
+    /// <c>--json --rename</c> leaves a single valid JSON document on stdout rather than a run of
+    /// <c>RENAMED</c> lines before it. The shell runner and the diagnostics sink are injected so the whole
+    /// decision is testable without a tmux server.
     /// </remarks>
-    private static async Task RenameAsync(IReadOnlyList<WaitingRow> rows, CancellationToken ct)
+    internal static async Task RenameAsync(
+        IReadOnlyList<WaitingRow> rows,
+        Func<string?, Func<string, CancellationToken, Task<CommandResult>>> shellFor,
+        TextWriter diagnostics,
+        CancellationToken ct)
     {
         foreach (IGrouping<string?, WaitingRow> host in rows.GroupBy(r => r.Pane.Host))
         {
-            (TmuxPane Pane, string Desired)[] renames = [.. host
-                .Select(r => (r.Pane, Desired: WindowNaming.Apply(r.Pane.WindowName, WindowNaming.SuffixFor(r.Verdict, r.Claim))))
-                .Where(r => !string.Equals(r.Desired, r.Pane.WindowName, StringComparison.Ordinal))];
+            (TmuxPane Pane, string Desired)[] renames = [.. RenamePlan(host)];
 
             if (WindowNaming.BuildRenameScript(renames) is { } script)
             {
-                await ShellRunner.For(host.Key)(script, ct);
+                await shellFor(host.Key)(script, ct);
                 foreach ((TmuxPane pane, string desired) in renames)
                 {
-                    Console.Error.WriteLine($"RENAMED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)} -> {DisplayText.Safe(desired)}");
+                    diagnostics.WriteLine($"RENAMED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)} -> {DisplayText.Safe(desired)}");
                 }
             }
         }
     }
+
+    /// <summary>The windows whose current name differs from the one the tool would give them.</summary>
+    internal static IEnumerable<(TmuxPane Pane, string Desired)> RenamePlan(IEnumerable<WaitingRow> rows)
+        => rows
+            .Select(r => (r.Pane, Desired: WindowNaming.Apply(r.Pane.WindowName, WindowNaming.SuffixFor(r.Verdict, r.Claim))))
+            .Where(r => !string.Equals(r.Desired, r.Pane.WindowName, StringComparison.Ordinal));
 
     private static WaitingRow Row(TmuxPane pane, StateReading reading, WaitingVerdict verdict, DateTimeOffset now)
         => new()

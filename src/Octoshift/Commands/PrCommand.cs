@@ -46,9 +46,60 @@ internal static class PrCommand
         WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(
             hosts, (host, token) => new TmuxScanner(host).ScanAsync(token), ct);
 
-        var history = new PaneHistory();
-        DateTimeOffset now = DateTimeOffset.UtcNow;
+        var facts = new GhPrFactsSource(repo, new FileConditionalCache(), (args, token) => GhAuthenticatedRunner.RunGhAsync(args, null, token));
+        PrLocation located = await LocateAsync(
+            prNumber, collected, new PaneHistory(), facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, ct);
 
+        if (json)
+        {
+            WriteJson(Console.OpenStandardOutput(), located, DateTimeOffset.UtcNow);
+        }
+        else
+        {
+            WriteReport(Console.Out, located, DateTimeOffset.UtcNow);
+        }
+
+        return located.ExitCode;
+    }
+
+    /// <summary>Where a PR was found, and everything the report and the exit code are computed from.</summary>
+    /// <param name="PrNumber">The PR asked about.</param>
+    /// <param name="Claims">This PR's claimants, owner first.</param>
+    /// <param name="Facts">What GitHub said, or null when it could not be read.</param>
+    /// <param name="ViewComplete">Whether the whole fleet was seen — every host answered, none dropped.</param>
+    /// <param name="Collected">The sweep, for its unreachable hosts and window count.</param>
+    /// <param name="Silence">Per-window silence, keyed by host and pane id.</param>
+    internal readonly record struct PrLocation(
+        int PrNumber,
+        IReadOnlyList<(TmuxPane Pane, AgentState State, Claim Claim)> Claims,
+        PrFacts? Facts,
+        bool ViewComplete,
+        WaitingCommand.Collection Collected,
+        IReadOnlyDictionary<string, TimeSpan?> Silence)
+    {
+        /// <summary>
+        /// A partly invisible fleet cannot produce success-shaped output: the PR may well be claimed on a
+        /// host that did not answer, so a partial sweep fails even when this run happened to find it.
+        /// Otherwise, finding neither a claim nor a PR is the not-found failure.
+        /// </summary>
+        public int ExitCode => Collected.AnyFailure
+            ? Octoshift.ExitCode.Unavailable
+            : Facts is null && Claims.Count == 0 ? Octoshift.ExitCode.Unavailable : Octoshift.ExitCode.Ok;
+    }
+
+    /// <summary>
+    /// Locates a PR across an already-collected fleet. Injectable collection, history and fetch so the
+    /// whole ownership, view-completeness and partial-fleet policy is testable without ssh or a network.
+    /// </summary>
+    internal static async Task<PrLocation> LocateAsync(
+        int prNumber,
+        WaitingCommand.Collection collected,
+        PaneHistory history,
+        Func<int, CancellationToken, Task<PrFacts?>> fetchAsync,
+        Func<int, CancellationToken, Task<PrFacts?>> refreshMergeabilityAsync,
+        DateTimeOffset now,
+        CancellationToken ct)
+    {
         // Window names that appear twice on one host. A duplicate is a rename that went where it did not
         // belong, so the name identifies nothing — the same safeguard `waiting` applies, so `pr` cannot
         // report a claim `waiting` rejects as defective.
@@ -130,60 +181,43 @@ internal static class PrCommand
             .ThenBy(m => m.Pane.Host ?? string.Empty, StringComparer.Ordinal)
             .ThenBy(m => m.Pane.PaneId, StringComparer.Ordinal)];
 
-        var facts = new GhPrFactsSource(repo, new FileConditionalCache(), (args, token) => GhAuthenticatedRunner.RunGhAsync(args, null, token));
-        PrFacts? prFacts = await facts.FetchAsync(prNumber, ct);
+        PrFacts? prFacts = await fetchAsync(prNumber, ct);
         if (prFacts is not null && !prFacts.MergeabilityKnown && !prFacts.Merged)
         {
-            prFacts = await facts.RefreshMergeabilityAsync(prNumber, ct) is { MergeabilityKnown: true } refreshed
+            prFacts = await refreshMergeabilityAsync(prNumber, ct) is { MergeabilityKnown: true } refreshed
                 && string.Equals(refreshed.HeadSha, prFacts.HeadSha, StringComparison.OrdinalIgnoreCase)
                     ? prFacts with { MergeableState = refreshed.MergeableState }
                     : prFacts;
         }
 
-        if (json)
-        {
-            WriteJson(prNumber, mine, prFacts, collected, viewComplete, now);
-        }
-        else
-        {
-            WriteReport(prNumber, mine, prFacts, collected, viewComplete, now, silence);
-        }
-
-        // A partly invisible fleet cannot produce success-shaped output: the PR may well be claimed on a
-        // host that did not answer, so a partial sweep fails even when this run happened to find it.
-        if (collected.AnyFailure)
-        {
-            return ExitCode.Unavailable;
-        }
-
-        return prFacts is null && mine.Length == 0 ? ExitCode.Unavailable : ExitCode.Ok;
+        return new PrLocation(prNumber, mine, prFacts, viewComplete, collected, silence);
     }
 
-    private static void WriteReport(
-        int prNumber,
-        IReadOnlyList<(TmuxPane Pane, AgentState State, Claim Claim)> claims,
-        PrFacts? facts,
-        WaitingCommand.Collection collected,
-        bool viewComplete,
-        DateTimeOffset now,
-        IReadOnlyDictionary<string, TimeSpan?> silence)
+    private static void WriteReport(TextWriter output, PrLocation located, DateTimeOffset now)
     {
-        Console.WriteLine($"PR #{prNumber}{(facts?.Title is { Length: > 0 } title ? $"  {DisplayText.Safe(title)}" : string.Empty)}");
+        int prNumber = located.PrNumber;
+        IReadOnlyList<(TmuxPane Pane, AgentState State, Claim Claim)> claims = located.Claims;
+        PrFacts? facts = located.Facts;
+        WaitingCommand.Collection collected = located.Collected;
+        IReadOnlyDictionary<string, TimeSpan?> silence = located.Silence;
+        bool viewComplete = located.ViewComplete;
+
+        output.WriteLine($"PR #{prNumber}{(facts?.Title is { Length: > 0 } title ? $"  {DisplayText.Safe(title)}" : string.Empty)}");
 
         if (claims.Count == 0)
         {
             string where = collected.Panes.Count == 0 ? "no windows collected" : "no window claims it";
-            Console.WriteLine($"  where     {where}");
+            output.WriteLine($"  where     {where}");
         }
 
         foreach ((TmuxPane pane, AgentState state, Claim claim) in claims)
         {
             string name = pane.WindowName.Length > 0 ? $" {DisplayText.Safe(pane.WindowName)}" : string.Empty;
             string role = claims.Count > 1 ? (claim.IsFollower ? "  [follows]" : "  [owner]") : string.Empty;
-            Console.WriteLine($"  where     {DisplayText.Safe(pane.Where)}{name}   {Activity(pane, now, silence.GetValueOrDefault(Claim.Key(pane)))}{role}");
+            output.WriteLine($"  where     {DisplayText.Safe(pane.Where)}{name}   {Activity(pane, now, silence.GetValueOrDefault(Claim.Key(pane)))}{role}");
             if (Agent(state) is { Length: > 0 } line)
             {
-                Console.WriteLine($"  agent     {DisplayText.Safe(line)}");
+                output.WriteLine($"  agent     {DisplayText.Safe(line)}");
             }
         }
 
@@ -199,7 +233,7 @@ internal static class PrCommand
                 ClaimBasis.PartialView => " — order unconfirmed while the fleet is partly unseen",
                 _ => " — order inferred, not observed",
             };
-            Console.WriteLine($"  CONTESTED {claims.Count} windows claim this PR"
+            output.WriteLine($"  CONTESTED {claims.Count} windows claim this PR"
                 + (sameHost ? " on one host — they are likely sharing a worktree" : " across hosts")
                 + $"; owner is {DisplayText.Safe(ownerPane.Where)}, the rest are followed and never driven"
                 + order);
@@ -210,11 +244,11 @@ internal static class PrCommand
                 && Claim.IsReleasing(claims[0].State, WaitingVerdict.Resolve(claims[0].State, facts))
                 && claims.Skip(1).Any(c => c.Pane.Activity == PaneActivity.Working))
             {
-                Console.WriteLine("            the owner is disengaging while a follower is active — consider promoting it");
+                output.WriteLine("            the owner is disengaging while a follower is active — consider promoting it");
             }
         }
 
-        Console.WriteLine($"  github    {Github(facts, now)}");
+        output.WriteLine($"  github    {Github(facts, now)}");
 
         // One verdict per claim when contested: the disagreement between them is the finding, and
         // collapsing it to a single row would hide which window the answer came from.
@@ -227,17 +261,17 @@ internal static class PrCommand
 
             WaitingVerdict verdict = WaitingVerdict.Resolve(state, facts);
             string from = claims.Count > 1 ? $" [{DisplayText.Safe(pane.Where)}]" : string.Empty;
-            Console.WriteLine($"  verdict   {verdict.State.ToString().ToUpperInvariant()} ({verdict.Assurance.Label}) — {DisplayText.Safe(verdict.Reason)}{from}");
+            output.WriteLine($"  verdict   {verdict.State.ToString().ToUpperInvariant()} ({verdict.Assurance.Label}) — {DisplayText.Safe(verdict.Reason)}{from}");
         }
 
         if (!viewComplete && collected.Unreachable.Count == 0)
         {
-            Console.WriteLine("  NARROWED  fewer hosts than have been collected before; a claim may be on a host not swept this run");
+            output.WriteLine("  NARROWED  fewer hosts than have been collected before; a claim may be on a host not swept this run");
         }
 
         foreach (string failure in collected.Unreachable)
         {
-            Console.WriteLine($"  UNREACHABLE {DisplayText.Safe(failure)}");
+            output.WriteLine($"  UNREACHABLE {DisplayText.Safe(failure)}");
         }
     }
 
@@ -355,15 +389,15 @@ internal static class PrCommand
         var value => $"{(int)value.TotalDays}d{value.Hours:00}h",
     };
 
-    private static void WriteJson(
-        int prNumber,
-        IReadOnlyList<(TmuxPane Pane, AgentState State, Claim Claim)> claims,
-        PrFacts? facts,
-        WaitingCommand.Collection collected,
-        bool viewComplete,
-        DateTimeOffset now)
+    internal static void WriteJson(Stream output, PrLocation located, DateTimeOffset now)
     {
-        using var writer = new Utf8JsonWriter(Console.OpenStandardOutput(), new JsonWriterOptions { Indented = true });
+        int prNumber = located.PrNumber;
+        IReadOnlyList<(TmuxPane Pane, AgentState State, Claim Claim)> claims = located.Claims;
+        PrFacts? facts = located.Facts;
+        WaitingCommand.Collection collected = located.Collected;
+        bool viewComplete = located.ViewComplete;
+
+        using var writer = new Utf8JsonWriter(output, new JsonWriterOptions { Indented = true });
         writer.WriteStartObject();
         writer.WriteNumber("pr", prNumber);
         if (facts?.Title is { } title)
@@ -430,6 +464,7 @@ internal static class PrCommand
 
         writer.WriteEndObject();
         writer.Flush();
-        Console.WriteLine();
+        output.Write("\n"u8);
+        output.Flush();
     }
 }

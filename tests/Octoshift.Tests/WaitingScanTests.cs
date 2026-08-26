@@ -1111,6 +1111,119 @@ public class WaitingScanTests
     }
 
     [Fact]
+    public async Task BuildRows_EveryActivityClaimantContestsNotOnlyIdleOnes()
+    {
+        // The blocking finding: a working window and a blocked window each claim PR 4448 alongside an idle
+        // one. All three hold the same claim; leaving the two busy ones out of the contest would hand the
+        // idle rival sole, actionable ownership of a PR three agents are on. Distinct names, so identity
+        // comes from the published state rather than the window name.
+        PrFacts ready = new()
+        {
+            Number = 4448,
+            HeadSha = "abc1234ff",
+            State = "open",
+            MergeableState = "clean",
+            Checks = [new CheckRunFact("ci", "completed", "success")],
+        };
+
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [
+                Pane("cp:1", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234 reviews=2/2 rec=merge", windowName: "a"),
+                Pane("cp:2", "mid turn", PaneActivity.Working, agentState: "pr=4448 head=abc1234", windowName: "b"),
+                Pane("cp:3", "answer? (esc to cancel)", PaneActivity.Blocked, agentState: "pr=4448 head=abc1234", windowName: "c"),
+            ],
+            (_, _) => Task.FromResult<PrFacts?>(ready),
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            DateTimeOffset.UtcNow,
+            all: true,
+            ct: TestContext.Current.CancellationToken);
+
+        WaitingRow idle = rows.Single(r => r.Pane.Target == "cp:1");
+        Assert.True(idle.Claim.IsContested);
+
+        // Both the working and the blocked window contest it, so its rivals number two, not zero.
+        Assert.Equal(2, idle.Claim.Others.Count);
+
+        // And it is never acted on, however good its evidence — the fix for three agents on one PR is not
+        // to drive one of them carefully.
+        Assert.False(idle.MayAct);
+    }
+
+    [Fact]
+    public async Task CollectAsync_AHostThatAnswersEmptyIsCollectedNotOmitted()
+    {
+        // A host that answered with no windows is evidence it was observed, not a host that was skipped.
+        // It must appear in CollectedHosts so a quiet host still counts toward a complete view.
+        WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(
+            ["fernie", "banff"],
+            (host, _) => host == "banff"
+                ? Task.FromResult<IReadOnlyList<TmuxPane>>([Pane("banff:1", "", PaneActivity.Idle)])
+                : Task.FromResult<IReadOnlyList<TmuxPane>>([]),
+            TestContext.Current.CancellationToken);
+
+        Assert.False(collected.AnyFailure);
+        Assert.Contains("fernie", collected.CollectedHosts);
+        Assert.Contains("banff", collected.CollectedHosts);
+    }
+
+    [Fact]
+    public void History_PartialSweepPrunesOnlyCollectedHostsAndRetainsTheRest()
+    {
+        // On a partial collection only the successfully collected hosts' partitions are updated. A window
+        // that vanished from a collected host has departed; a window on a host not swept this run is merely
+        // unseen, and its registration must survive rather than being deleted.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-partial-{Guid.NewGuid():N}.json");
+        try
+        {
+            TmuxPane onFernie = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "fernie" };
+            TmuxPane onBanff = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4600") with { Host = "banff" };
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+            var first = new PaneHistory(path);
+            first.Observe(onFernie, t, claimedPr: 4448);
+            first.Observe(onBanff, t, claimedPr: 4600);
+            first.Save([onFernie, onBanff], ["fernie", "banff"]);
+
+            // A later sweep collects only fernie, where the window is now gone. banff was not swept at all.
+            var second = new PaneHistory(path);
+            string gone = Assert.Single(second.Save([], ["fernie"]));
+
+            Assert.Contains("#4448", gone, StringComparison.Ordinal);
+            Assert.NotNull(new PaneHistory(path).ClaimedAt(onBanff));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void History_SamePaneIdOnTwoHostsDoesNotCollide()
+    {
+        // A pane id is unique only within one tmux server, so `%3` on two hosts is two windows. Keyed by
+        // host and pane id together, each keeps its own registration; a host-local key would let one
+        // overwrite the other.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-collide-{Guid.NewGuid():N}.json");
+        try
+        {
+            TmuxPane onFernie = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "fernie", PaneId = "%3" };
+            TmuxPane onBanff = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4600") with { Host = "banff", PaneId = "%3" };
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+            var history = new PaneHistory(path);
+            history.Observe(onFernie, t, claimedPr: 4448);
+            history.Observe(onBanff, t.AddHours(1), claimedPr: 4600);
+
+            Assert.Equal(t, history.ClaimedAt(onFernie));
+            Assert.Equal(t.AddHours(1), history.ClaimedAt(onBanff));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
     public void Claim_OrdersByRegistrationNotByCollectionOrder()
     {
         // An owner that changes identity between sweeps is worse than no owner, so ranking is by when

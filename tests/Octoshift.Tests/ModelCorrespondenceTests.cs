@@ -267,4 +267,34 @@ public class ModelCorrespondenceTests
         Assert.True(ranked[Claim.Key(first)].OwnsClaim);
         Assert.False(ranked[Claim.Key(joined)].OwnsClaim);
     }
+
+    /// <summary>
+    /// TLA+ <c>Observed</c>, fleet-expansion case: a registration only orders a claim if its host was
+    /// under observation before the time was recorded. A rival on a host first seen this run has "now"
+    /// for its registration, which is a first look rather than an appearance — ranking a genuinely
+    /// observed record against it would launder a narrow view into a fleet-wide fact.
+    /// </summary>
+    /// <remarks>
+    /// The exact laundering the review found: host A's window is recorded from an earlier run, host B is
+    /// added this run, and B's window gets "now". Both times are recorded and distinct, so the old rule
+    /// called the order observed and granted A ownership without proving which claim came first.
+    /// </remarks>
+    [Fact]
+    public void ObservedRequiresEveryHostSweptBeforeThisRun()
+    {
+        TmuxPane onA = Window("%1", host: "a");
+        TmuxPane onB = Window("%2", host: "b");
+        DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+        IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
+            [(onA, 4448, null), (onB, 4448, null)],
+            p => p.PaneId == onA.PaneId ? t : t.AddHours(1),
+
+            // Only A was swept in full before this run; B is newly configured, so its recorded time is a
+            // first look, not a witnessed appearance.
+            host => host == "a" ? t.AddHours(-1) : null);
+
+        Assert.Equal(ClaimBasis.Inferred, ranked[Claim.Key(onA)].Basis);
+        Assert.All(ranked.Values, c => Assert.False(c.OwnsClaim));
+    }
 }
