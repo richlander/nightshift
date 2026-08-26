@@ -113,6 +113,17 @@ PublishUntargeted ==
 \* The tool's own --rename. It is a writer into the same namespace it reads identity
 \* from, which is the feedback loop worth checking: renaming must never change what the
 \* tool would conclude about any window, including the one it renamed.
+\*
+\* This action renames to Attributed(w) -- the identity read at the SAME instant the name
+\* is written -- so it models a rename that acts on the window's live attribution, not a
+\* stale one. That correspondence is load-bearing and it is what the round-7 rename guard
+\* enforces in the code: a plan is computed from an earlier sweep, but each mutation is
+\* guarded, in one tmux client, on the live window name, the live @agent_state and the
+\* live server epoch all still equalling the scanned values, and aborts (reporting stale)
+\* otherwise. Without that guard the code could write a name computed from an attribution
+\* that has since moved -- a transition this single-instant action does not contain -- so
+\* the guard is precisely what makes ToolRenames a faithful abstraction rather than an
+\* optimistic one.
 ToolRenames ==
     /\ \E w \in AgentWindows :
          /\ Attributed(w) # None
