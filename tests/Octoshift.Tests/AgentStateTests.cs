@@ -1,5 +1,6 @@
 namespace Octoshift.Tests;
 
+using Octoshift.GitHub;
 using Octoshift.Waiting;
 using Xunit;
 
@@ -311,6 +312,131 @@ public class AgentStateTests
         Assert.NotNull(state);
         Assert.Equal(4560, state.PrNumber);
         Assert.Contains(state.Defects, d => d.Contains("window is named pr4488", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Parse_FlagsAPrRecordInAnIssueWindow()
+    {
+        // The other half of "another window's state, verbatim": the kind can disagree as well as the
+        // number, and while only PR-against-PR numbers were compared this was invisible — a PR record sat
+        // in an issue window looking perfectly coherent.
+        AgentState? state = AgentState.Parse("pr=4626 head=f4a8d1c84 round=1 reviews=2/2 rec=merge", "i4613");
+
+        Assert.NotNull(state);
+        Assert.False(state.IsIssue);
+        Assert.Equal(4626, state.PrNumber);
+        Assert.Contains(state.Defects, d => d.Contains("named i4613", StringComparison.Ordinal) && d.Contains("declares a PR", StringComparison.Ordinal));
+
+        // Both halves disagree here, and both are said.
+        Assert.Contains(state.Defects, d => d.Contains("the record says pr=4626", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Parse_FlagsAnIssueRecordInAPrWindow()
+    {
+        AgentState? state = AgentState.Parse("issue=4611 head=8d5f22a22 round=2 rec=continue", "pr4611");
+
+        Assert.NotNull(state);
+        Assert.True(state.IsIssue);
+        Assert.Equal(4611, state.PrNumber);
+
+        // The numbers agree, so the kind is the only thing wrong and the only thing reported.
+        Assert.Contains(state.Defects, d => d.Contains("named pr4611", StringComparison.Ordinal) && d.Contains("declares an issue", StringComparison.Ordinal));
+        Assert.DoesNotContain(state.Defects, d => d.Contains("the record says", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Parse_FlagsAnIssueWindowNameThatDisagreesWithTheRecord()
+    {
+        // Numbers were only ever compared on the PR side, so one issue window carrying another's state
+        // passed as clean.
+        AgentState? state = AgentState.Parse("issue=4611 head=8d5f22a22 rec=continue", "i4613");
+
+        Assert.NotNull(state);
+        Assert.True(state.IsIssue);
+        Assert.Equal(4611, state.PrNumber);
+        Assert.Contains(state.Defects, d => d.Contains("named i4613", StringComparison.Ordinal) && d.Contains("the record says issue=4611", StringComparison.Ordinal));
+        Assert.DoesNotContain(state.Defects, d => d.Contains("declares", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Parse_AMalformedPrDoesNotSuppressAValidIssue()
+    {
+        // The two identity fields used to be read as one — `issue` was consulted only when no `pr` key was
+        // present — so `pr=none` next to a perfectly good `issue=` threw the issue away and fell back to
+        // the window name. A malformed field is a defect in that field, not evidence about its neighbour.
+        AgentState? state = AgentState.Parse("pr=none issue=4611 head=8d5f22a22 round=3 rec=continue", "i4611");
+
+        Assert.NotNull(state);
+        Assert.True(state.IsIssue);
+        Assert.Equal(4611, state.PrNumber);
+        Assert.Equal(StateSource.Declared, state.Source);
+        Assert.Equal(3, state.Round);
+
+        // Still wrong, and still said.
+        Assert.Contains(state.Defects, d => d.Contains("pr=none", StringComparison.Ordinal));
+        Assert.DoesNotContain(state.Defects, d => d.Contains("window is named", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Parse_FlagsARecordThatDeclaresBothIdentities()
+    {
+        // A window tracks one thing. Two identities is a contradiction in the record, settled by a fixed
+        // rule (`pr` is the later claim about the same work) and reported rather than repaired — so it
+        // cannot come out looking corroborated even when the window name agrees with one of them.
+        AgentState? state = AgentState.Parse("pr=4626 issue=4611 head=f4a8d1c84 reviews=2/2 rec=merge", "i4611");
+
+        Assert.NotNull(state);
+        Assert.False(state.IsIssue);
+        Assert.Equal(4626, state.PrNumber);
+        Assert.Equal(StateSource.Declared, state.Source);
+        Assert.Contains(state.Defects, d => d.Contains("declares both pr=4626 and issue=4611", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Parse_AnIdentityMismatchIsNotActionable()
+    {
+        // The defect has to reach the confidence logic, or the row is still something a tool would speak
+        // to unattended on the strength of a number that belongs to another window.
+        AgentState state = AgentState.Parse("pr=4626 head=f4a8d1c84 round=1 reviews=2/2 rec=merge", "i4613")!;
+
+        WaitingVerdict verdict = WaitingVerdict.Resolve(state, new PrFacts
+        {
+            Number = 4626,
+            HeadSha = "f4a8d1c84000000000000000000000000000000a",
+            State = "open",
+            Merged = false,
+            MergeableState = "clean",
+            Checks = [],
+        });
+
+        Assert.Equal(Confidence.Low, verdict.Assurance.Level);
+        Assert.False(verdict.MayAct);
+        Assert.Equal(WaitingState.Untrustworthy, verdict.State);
+    }
+
+    [Fact]
+    public void Parse_ACoherentPrRecordStaysClean()
+    {
+        AgentState? state = AgentState.Parse("pr=4626 head=f4a8d1c84 round=1 reviews=2/2 rec=merge", "pr4626");
+
+        Assert.NotNull(state);
+        Assert.False(state.IsIssue);
+        Assert.Equal(4626, state.PrNumber);
+        Assert.Equal(StateSource.Declared, state.Source);
+        Assert.Empty(state.Defects);
+    }
+
+    [Fact]
+    public void Parse_ACoherentIssueRecordStaysClean()
+    {
+        AgentState? state = AgentState.Parse("issue=4611 head=8d5f22a22 round=2 reviews=1/2 waiting=review rec=wait", "i4611");
+
+        Assert.NotNull(state);
+        Assert.True(state.IsIssue);
+        Assert.Equal(4611, state.PrNumber);
+        Assert.Equal(StateSource.Declared, state.Source);
+        Assert.Empty(state.Defects);
     }
 
     [Fact]

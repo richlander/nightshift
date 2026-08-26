@@ -123,31 +123,36 @@ internal sealed partial record AgentState
         bool isIssue = false;
         StateSource source = StateSource.Declared;
 
+        // Each identity field is read on its own. They used to be read as one — `issue` was consulted
+        // only when no `pr` key was present at all — so a window publishing `pr=none issue=4611` had a
+        // perfectly good issue number suppressed by the broken field beside it. That is the same mistake
+        // as discarding the record: a malformed field is a defect in that field and says nothing about
+        // the field next to it.
+        //
         // A worker branch is local until the coordinator pushes it, so early round boundaries have an
         // issue and no PR. Requiring `pr` there is what produces invented values.
-        if (!fields.ContainsKey("pr") && fields.TryGetValue("issue", out string? issueValue))
-        {
-            if (TryNumber(issueValue, out int issueNumber))
-            {
-                number = issueNumber;
-                isIssue = true;
-            }
-            else
-            {
-                defects.Add($"issue={issueValue} is not an issue number");
-            }
-        }
+        int? declaredPr = ReadIdentity(fields, "pr", defects);
+        int? declaredIssue = ReadIdentity(fields, "issue", defects);
 
-        if (number is null && fields.TryGetValue("pr", out string? prValue))
+        if (declaredPr is { } prNumber && declaredIssue is { } issueNumber)
         {
-            if (TryNumber(prValue, out int parsed))
-            {
-                number = parsed;
-            }
-            else
-            {
-                defects.Add($"pr={prValue} is not a PR number");
-            }
+            // A window tracks one thing, so two identities is a contradiction in the record itself. It is
+            // reported and then settled by a fixed rule — `pr` wins, because the contract's own progression
+            // is issue-then-PR, so the PR is the later claim about the same work. Deliberately not settled
+            // by whichever one the window name agrees with: that would repair the contradiction into a
+            // record that then looks corroborated. The defect stands either way, which keeps assurance low
+            // and the row out of anything that acts unattended.
+            defects.Add($"record declares both pr={prNumber} and issue={issueNumber}");
+            number = prNumber;
+        }
+        else if (declaredPr is { } onlyPr)
+        {
+            number = onlyPr;
+        }
+        else if (declaredIssue is { } onlyIssue)
+        {
+            number = onlyIssue;
+            isIssue = true;
         }
 
         if (number is null)
@@ -167,9 +172,23 @@ internal sealed partial record AgentState
             // record, and any defect that got us here is kept rather than forgotten.
             source = StateSource.WindowName;
         }
-        else if (!isIssue && fromName is { IsIssue: false } window && window.Number != number)
+        else if (fromName is { } window)
         {
-            defects.Add($"window is named pr{window.Number} but the record says pr={number}");
+            // The record identified itself, so the window name is corroboration rather than a source. Both
+            // halves of the identity are compared: a state carrying `pr=` in a window named `i4613` is as
+            // much a mismatch as one carrying another window's number, and it was invisible while only
+            // PR-against-PR numbers were checked. Neither is repaired — four windows on one host once
+            // carried a neighbour's state verbatim, and the disagreement is the only way to see it from
+            // outside.
+            if (window.IsIssue != isIssue)
+            {
+                defects.Add($"window is named {WindowLabel(window)} but the record declares {(isIssue ? "an issue" : "a PR")}");
+            }
+
+            if (window.Number != number)
+            {
+                defects.Add($"window is named {WindowLabel(window)} but the record says {(isIssue ? "issue" : "pr")}={number}");
+            }
         }
 
         (int? clean, int? required) = ParseReviews(fields.GetValueOrDefault("reviews"), defects);
@@ -225,6 +244,29 @@ internal sealed partial record AgentState
 
     private static bool TryNumber(string value, out int number)
         => int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out number) && number > 0;
+
+    /// <summary>
+    /// Reads one identity field, reporting a malformed value as a defect in that field alone and
+    /// returning null so the caller can fall back without having lost the account of what was wrong.
+    /// </summary>
+    private static int? ReadIdentity(Dictionary<string, string> fields, string key, List<string> defects)
+    {
+        if (!fields.TryGetValue(key, out string? value))
+        {
+            return null;
+        }
+
+        if (TryNumber(value, out int number))
+        {
+            return number;
+        }
+
+        defects.Add($"{key}={value} is not {(key == "issue" ? "an issue" : "a PR")} number");
+        return null;
+    }
+
+    private static string WindowLabel((int Number, bool IsIssue) window)
+        => $"{(window.IsIssue ? "i" : "pr")}{window.Number}";
 
     private static (int? Clean, int? Required) ParseReviews(string? value, List<string> defects)
     {
