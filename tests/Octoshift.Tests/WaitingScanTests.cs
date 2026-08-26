@@ -857,6 +857,98 @@ public class WaitingScanTests
     }
 
     [Fact]
+    public async Task Collect_CallerCancellationDominatesAConcurrentTmuxFailure()
+    {
+        // The caller cancels and the very same scan loses tmux — a real race at shutdown. Cancellation
+        // dominates: the sweep must escape as an OperationCanceledException, never fold the loss into a
+        // quietly completed collection where an unreachable host stands in for a cancelled run.
+        using var cts = new CancellationTokenSource();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => WaitingCommand.CollectAsync(
+            ["fernie", "banff"],
+            (host, token) =>
+            {
+                cts.Cancel();
+                throw new TmuxUnavailableException($"{host}: no server running");
+            },
+            cts.Token,
+            perTargetTimeout: TimeSpan.FromSeconds(30)));
+    }
+
+    [Fact]
+    public async Task Collect_CallerCancellationEscapesCarryingTheCallersOwnToken()
+    {
+        // Each target runs under a linked token, so an OperationCanceledException raised inside the scan
+        // carries that linked token. The caller is owed exactly the token it passed in — the escaping
+        // exception must carry ct, not the internal linked token, or a `when (e.CancellationToken == ct)`
+        // handler upstream would fail to recognise its own cancellation.
+        using var cts = new CancellationTokenSource();
+
+        OperationCanceledException oce = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => WaitingCommand.CollectAsync(
+                ["fernie", "banff"],
+                async (host, token) =>
+                {
+                    cts.Cancel();
+                    await Task.Delay(Timeout.Infinite, token);
+                    return [Pane("fernie:1", string.Empty, PaneActivity.Idle)];
+                },
+                cts.Token,
+                perTargetTimeout: TimeSpan.FromSeconds(30)));
+
+        Assert.Equal(cts.Token, oce.CancellationToken);
+    }
+
+    [Fact]
+    public async Task Collect_CancellationAfterTheFinalCallbackButBeforeReturnStillPropagates()
+    {
+        // The last scan completes cleanly, then the caller cancels before CollectAsync returns. A report
+        // that finished a hair before the token fired is still a cancelled run — surface it rather than
+        // hand back a completed collection assembled under a token that is now cancelled.
+        using var cts = new CancellationTokenSource();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => WaitingCommand.CollectAsync(
+            ["banff"],
+            (host, token) =>
+            {
+                cts.Cancel();
+                return Task.FromResult<IReadOnlyList<TmuxPane>>(
+                    [Pane("banff:1", string.Empty, PaneActivity.Idle)]);
+            },
+            cts.Token,
+            perTargetTimeout: TimeSpan.FromSeconds(30)));
+    }
+
+    [Fact]
+    public async Task Collect_ATargetTimeoutStaysUnreachableWhileTheCallerTokenIsUntouched()
+    {
+        // The per-target deadline — never the caller — ends the first target. With ct never cancelled,
+        // that OperationCanceledException must stay laundered into an unreachable host, and the later
+        // target must still run: caller-cancellation handling must not swallow a plain timeout.
+        var scanned = new List<string?>();
+
+        WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(
+            ["fernie", "banff"],
+            async (host, token) =>
+            {
+                scanned.Add(host);
+                if (host == "fernie")
+                {
+                    await Task.Delay(Timeout.Infinite, token);
+                }
+
+                return [Pane("banff:1", string.Empty, PaneActivity.Idle)];
+            },
+            TestContext.Current.CancellationToken,
+            perTargetTimeout: TimeSpan.FromMilliseconds(20));
+
+        Assert.Equal(["fernie", "banff"], scanned);
+        Assert.Equal("banff:1", Assert.Single(collected.Panes).Target);
+        Assert.Contains("fernie", Assert.Single(collected.Unreachable));
+        Assert.Contains("timed out", Assert.Single(collected.Unreachable));
+    }
+
+    [Fact]
     public async Task Collect_EveryTargetTimingOutIsATotalFailureNamingEachTarget()
     {
         WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(

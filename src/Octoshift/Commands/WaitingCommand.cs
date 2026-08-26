@@ -140,8 +140,10 @@ internal static class WaitingCommand
     /// Each target runs under a linked token that also fires after <paramref name="perTargetTimeout"/>
     /// (default <see cref="DefaultTargetTimeout"/>). A target that trips its own deadline is recorded as
     /// unreachable and the sweep moves on, so one hung host cannot hold the others hostage. The caller's
-    /// <paramref name="ct"/> is different in kind: when it is what cancelled, the exception propagates
-    /// rather than being laundered into an unreachable host. <paramref name="perTargetTimeout"/> is an
+    /// <paramref name="ct"/> is different in kind: when it is what cancelled, the cancellation propagates
+    /// rather than being laundered into an unreachable host — and it escapes carrying exactly
+    /// <paramref name="ct"/>, never the internal linked token, so the caller sees its own token back.
+    /// <paramref name="perTargetTimeout"/> is an
     /// internal seam so a test can drive the deadline in milliseconds without a wall-clock wait.
     /// </remarks>
     internal static async Task<Collection> CollectAsync(
@@ -167,17 +169,33 @@ internal static class WaitingCommand
             }
             catch (TmuxUnavailableException ex)
             {
+                // Caller cancellation dominates a target failure: if the outer token is already
+                // cancelled, a scanner/process/parsing loss racing it must not launder the cancellation
+                // into an unreachable host — escape with the caller's token instead.
+                ct.ThrowIfCancellationRequested();
+
                 // One unreachable host must not hide the others, and must not be silently absorbed
                 // either — a fleet that is partly invisible looks exactly like a fleet that is quiet.
                 unreachable.Add(ex.Message);
             }
-            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Real cancellation, not a per-target deadline. The exception was raised on the linked
+                // token, but the caller is owed exactly the token it passed in — re-throw on ct so the
+                // escaping OperationCanceledException carries ct, not the internal linked token.
+                ct.ThrowIfCancellationRequested();
+            }
+            catch (OperationCanceledException)
             {
                 // The per-target deadline fired, not the caller. Same rule as an unreachable host: record
                 // it and keep going, so a host that connected and then hung cannot bury the partial report.
                 unreachable.Add(TimedOut(host, timeout));
             }
         }
+
+        // A cancellation that lands after the final scan and catch — between the last callback and this
+        // return — is still the caller's, and must surface rather than yield a quietly completed report.
+        ct.ThrowIfCancellationRequested();
 
         return new Collection(panes, unreachable, targets.Count);
     }
