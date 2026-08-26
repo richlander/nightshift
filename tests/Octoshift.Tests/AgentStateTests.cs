@@ -528,4 +528,145 @@ public class AgentStateTests
         Assert.Null(state.Head);
         Assert.Contains(state.Defects, d => d.Contains("head=HEAD", StringComparison.Ordinal));
     }
+
+    [Fact]
+    public void Parse_ASpaceInAValueSplitsIntoAFragmentAndIsDefective()
+    {
+        // The one that inverts a record's meaning: whitespace is the field separator and values carry no
+        // spaces, so `blocked= 4629` arrives as the accepted empty sentinel plus a stray token. Read
+        // leniently that is "nothing is blocking me" — the opposite of what was typed — with the number
+        // silently gone. There is deliberately no quoting to rescue it; the record is malformed.
+        AgentState? state = AgentState.Parse("pr=4595 head=722512e25 reviews=2/2 blocked= 4629 rec=merge", "pr4595");
+
+        Assert.NotNull(state);
+        Assert.Empty(state.Blocked);
+        Assert.Contains(state.Defects, d => d.Contains("'4629' is not a key=value field", StringComparison.Ordinal));
+
+        // And the point of saying so: it can no longer be a high-confidence, actionable claim of done.
+        WaitingVerdict verdict = WaitingVerdict.Resolve(state, new PrFacts
+        {
+            Number = 4595,
+            HeadSha = "722512e25f0c1d4a9b8e7360a1c2d3e4f5061728",
+            State = "open",
+            MergeableState = "clean",
+        });
+
+        Assert.Equal(WaitingState.Untrustworthy, verdict.State);
+        Assert.Equal(Confidence.Low, verdict.Assurance.Level);
+        Assert.False(verdict.MayAct);
+    }
+
+    [Fact]
+    public void Parse_AMisspelledFieldIsDefectiveRatherThanIgnored()
+    {
+        // Dropped silently, `blockd=4629` is a coherent record with no blocker at all — which is the
+        // opposite of what the agent wrote, and coherent enough to be acted on.
+        AgentState? state = AgentState.Parse("pr=4595 head=722512e25 reviews=2/2 blockd=4629 rec=merge", "pr4595");
+
+        Assert.NotNull(state);
+        Assert.Empty(state.Blocked);
+        Assert.Contains(state.Defects, d => d.Contains("field 'blockd' is not one of", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("next=round-3")]
+    [InlineData("next=")]
+    [InlineData("NEXT=round-3")]
+    public void Parse_AFieldOutsideTheSchemaIsDefectiveEvenWhenEmpty(string field)
+    {
+        AgentState? state = AgentState.Parse($"pr=4595 head=722512e25 reviews=2/2 {field} rec=merge", "pr4595");
+
+        Assert.NotNull(state);
+        Assert.Contains(state.Defects, d => d.Contains("is not one of", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Parse_TheKnownKeysAreExactlyTheSchema()
+    {
+        // The list in the message is the contract an agent is being held to, so it is asserted rather
+        // than left to drift from the fields the reader actually consumes.
+        AgentState? state = AgentState.Parse("pr=4595 head=722512e25 reviews=2/2 unknown=x rec=merge", "pr4595");
+
+        Assert.NotNull(state);
+        string defect = Assert.Single(state.Defects);
+        Assert.Equal("field 'unknown' is not one of pr|issue|head|round|reviews|blocked|waiting|rec", defect);
+    }
+
+    [Theory]
+    [InlineData("=4629")]
+    [InlineData("=")]
+    public void Parse_AFieldWithNoNameIsDefective(string token)
+    {
+        AgentState? state = AgentState.Parse($"pr=4595 head=722512e25 reviews=2/2 {token} rec=merge", "pr4595");
+
+        Assert.NotNull(state);
+        Assert.Contains(state.Defects, d => d.Contains("declares no field name", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Parse_ProseInTheRecordIsDefective()
+    {
+        AgentState? state = AgentState.Parse("pr=4595 head=722512e25 reviews=2/2 rec=merge still converging", "pr4595");
+
+        Assert.NotNull(state);
+        Assert.Contains(state.Defects, d => d.Contains("'still' is not a key=value field", StringComparison.Ordinal));
+        Assert.Contains(state.Defects, d => d.Contains("'converging' is not a key=value field", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("0", 0)]
+    [InlineData("1", 1)]
+    [InlineData("27", 27)]
+    public void Parse_ReadsARoundNumber(string value, int expected)
+    {
+        AgentState? state = AgentState.Parse($"pr=4595 head=722512e25 round={value} reviews=1/2", "pr4595");
+
+        Assert.NotNull(state);
+        Assert.Equal(expected, state.Round);
+        Assert.Empty(state.Defects);
+    }
+
+    [Theory]
+    [InlineData("-1")]              // a round before the first one
+    [InlineData("next")]
+    [InlineData("1.5")]
+    [InlineData("3rd")]
+    [InlineData(" 3")]              // trimmed to a bare fragment, so never a value at all
+    [InlineData("99999999999999")]  // past int, and a bare TryParse read this as "no round declared"
+    [InlineData("01")]              // one value, one spelling: the tmux zero sentinel rule
+    public void Parse_ARoundOutsideItsDomainIsDefective(string value)
+    {
+        AgentState? state = AgentState.Parse($"pr=4595 head=722512e25 round={value} reviews=1/2", "pr4595");
+
+        Assert.NotNull(state);
+        Assert.Null(state.Round);
+        Assert.NotEmpty(state.Defects);
+    }
+
+    [Fact]
+    public void Parse_MergeRecommendationWhileWaitingIsDefective()
+    {
+        // `blocked` and `waiting` differ only in who can act on them; either one is the record still
+        // asserting something is outstanding, which cannot be true beside "merge this".
+        AgentState? state = AgentState.Parse(
+            "pr=4595 head=722512e25 reviews=2/2 waiting=review rec=merge",
+            "pr4595");
+
+        Assert.NotNull(state);
+        Assert.Contains(state.Defects, d => d.Contains("rec=merge while waiting on review", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("checks")]
+    [InlineData("merge")]
+    [InlineData("check:ci-required")]
+    public void Parse_EveryWaitPredicateContradictsAMergeRecommendation(string waiting)
+    {
+        AgentState? state = AgentState.Parse(
+            $"pr=4595 head=722512e25 reviews=2/2 waiting={waiting} rec=merge",
+            "pr4595");
+
+        Assert.NotNull(state);
+        Assert.Contains(state.Defects, d => d.Contains($"rec=merge while waiting on {waiting}", StringComparison.Ordinal));
+    }
 }

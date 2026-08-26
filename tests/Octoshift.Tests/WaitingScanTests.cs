@@ -335,8 +335,8 @@ public class WaitingScanTests
         var fetches = new List<int>();
         IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
             [
-                Pane("night:1", "", PaneActivity.Idle, agentState: "pr=4595 head=722512e25 waiting=none next=round-3"),
-                Pane("night:2", "", PaneActivity.Idle, agentState: "pr=4595 head=722512e25 waiting=none next=round-3"),
+                Pane("night:1", "", PaneActivity.Idle, agentState: "pr=4595 head=722512e25 waiting=review"),
+                Pane("night:2", "", PaneActivity.Idle, agentState: "pr=4595 head=722512e25 waiting=review"),
                 Pane("night:3", "Working on PR 4600\n(esc to interrupt)", PaneActivity.Working),
             ],
             (pr, _) => { fetches.Add(pr); return Task.FromResult<PrFacts?>(null); },
@@ -405,7 +405,7 @@ public class WaitingScanTests
             Checks = [new CheckRunFact("ci-required", "in_progress", null)],
         };
 
-        TmuxPane[] panes = [Pane("night:1", "", PaneActivity.Idle, agentState: "pr=4595 head=722512e25 waiting=check:ci-required next=round-3")];
+        TmuxPane[] panes = [Pane("night:1", "", PaneActivity.Idle, agentState: "pr=4595 head=722512e25 waiting=check:ci-required")];
 
         Assert.Empty(await WaitingCommand.BuildRowsAsync(panes, (_, _) => Task.FromResult<PrFacts?>(holding),
             (_, _) => Task.FromResult<PrFacts?>(null), DateTimeOffset.UtcNow, all: false, ct: TestContext.Current.CancellationToken));
@@ -433,9 +433,9 @@ public class WaitingScanTests
         DateTimeOffset now = DateTimeOffset.UtcNow;
         IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
             [
-                Pane("night:1", "", PaneActivity.Idle, now.AddMinutes(-20), agentState: "pr=1 waiting=none next=x"),
-                Pane("night:2", "", PaneActivity.Idle, now.AddHours(-6), agentState: "pr=2 waiting=none next=x"),
-                Pane("night:3", "", PaneActivity.Idle, now.AddMinutes(-90), agentState: "pr=3 waiting=none next=x"),
+                Pane("night:1", "", PaneActivity.Idle, now.AddMinutes(-20), agentState: "pr=1 waiting=review"),
+                Pane("night:2", "", PaneActivity.Idle, now.AddHours(-6), agentState: "pr=2 waiting=review"),
+                Pane("night:3", "", PaneActivity.Idle, now.AddMinutes(-90), agentState: "pr=3 waiting=review"),
             ],
             (_, _) => Task.FromResult<PrFacts?>(null),
             (_, _) => Task.FromResult<PrFacts?>(null),

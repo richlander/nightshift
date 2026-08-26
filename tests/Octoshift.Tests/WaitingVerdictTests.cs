@@ -458,4 +458,32 @@ public class WaitingVerdictTests
         Assert.Equal(WaitingState.Holding, v.State);
         Assert.Equal(RowOwner.Nobody, v.Owner);
     }
+
+    [Fact]
+    public void Resolve_AMergeRecommendationBesideAWaitIsVisibleRatherThanQuietlyHolding()
+    {
+        // The mirror of the blocked case, and the one that hid: `rec=merge waiting=review` resolved
+        // through the predicate to Holding, owned by nobody, with no defect to keep it in the default
+        // view — so a record asking to merge while saying a review round is outstanding was the one
+        // contradiction the reader never saw.
+        WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e25 reviews=2/2 waiting=review rec=merge"), Facts());
+
+        Assert.Equal(WaitingState.Untrustworthy, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
+        Assert.Equal(Confidence.Low, v.Assurance.Level);
+        Assert.False(v.MayAct);
+    }
+
+    [Fact]
+    public void Resolve_AMergeRecommendationBesideAClearedWaitIsStillUntrustworthy()
+    {
+        // Clearing the predicate is not what makes the pair coherent: the record still published two
+        // statements that cannot both be true, which is a fact about the agent rather than about CI.
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=2/2 waiting=check:ci-required rec=merge"),
+            Facts(checks: [new CheckRunFact("ci-required", "completed", "success")]));
+
+        Assert.Equal(WaitingState.Untrustworthy, v.State);
+        Assert.False(v.MayAct);
+    }
 }

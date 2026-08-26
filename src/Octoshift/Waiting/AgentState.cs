@@ -224,6 +224,17 @@ internal sealed partial record AgentState
             defects.Add($"rec=merge while blocked on {string.Join(", ", blocked.Select(b => "#" + b))}");
         }
 
+        // The same contradiction through the other channel. `blocked` and `waiting` differ only in who can
+        // act on them; either one is the record still asserting something is outstanding, which is not a
+        // thing that can be true at the same time as "merge this". Without this the pair resolved through
+        // the predicate — `rec=merge waiting=review` reported Holding, owned by nobody, and was filtered
+        // out of the default view entirely, so the loudest contradiction a record can carry was the one
+        // nobody saw.
+        if (rec == Recommendation.Merge && waiting.Kind != WaitKind.None)
+        {
+            defects.Add($"rec=merge while waiting on {waiting}");
+        }
+
         string? head = fields.GetValueOrDefault("head");
         if (head is not null && !IsSha(head))
         {
@@ -236,7 +247,7 @@ internal sealed partial record AgentState
             PrNumber = number.Value,
             IsIssue = isIssue,
             Head = head?.ToLowerInvariant(),
-            Round = int.TryParse(fields.GetValueOrDefault("round"), NumberStyles.None, CultureInfo.InvariantCulture, out int round) ? round : null,
+            Round = ParseRound(fields.GetValueOrDefault("round"), defects),
             ReviewsClean = clean,
             ReviewsRequired = required,
             Blocked = blocked,
@@ -249,6 +260,53 @@ internal sealed partial record AgentState
 
     private static bool TryNumber(string value, out int number)
         => int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out number) && number > 0;
+
+    /// <summary>
+    /// Reads <c>round=</c>, which is the round just completed and so a plain non-negative count.
+    /// </summary>
+    /// <remarks>
+    /// Read explicitly rather than through a bare <c>TryParse</c> that fell back to null, because that
+    /// silently accepted every wrong shape as an absent field: <c>round=-1</c>, <c>round=next</c> and a
+    /// value too large for an <c>int</c> all read as "no round declared", and the record then graded as
+    /// though it had simply not said. Noncanonical spellings are rejected for the same reason the tmux
+    /// activity sentinel is: one value has one spelling, so <c>round=01</c> is a record that is not
+    /// tracking the contract and is worth saying so about, and there is no cost to writing <c>1</c>.
+    /// </remarks>
+    private static int? ParseRound(string? value, List<string> defects)
+    {
+        if (value is null)
+        {
+            return null;
+        }
+
+        if (IsCanonicalCount(value)
+            && int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out int round))
+        {
+            return round;
+        }
+
+        defects.Add($"round={value} is not a non-negative round number");
+        return null;
+    }
+
+    /// <summary>Digits only, and no leading zero unless the value is exactly <c>0</c>.</summary>
+    private static bool IsCanonicalCount(string value)
+    {
+        if (value.Length == 0)
+        {
+            return false;
+        }
+
+        foreach (char c in value)
+        {
+            if (!char.IsAsciiDigit(c))
+            {
+                return false;
+            }
+        }
+
+        return value.Length == 1 || value[0] != '0';
+    }
 
     /// <summary>
     /// Reads one identity field, reporting a malformed value as a defect in that field alone and
@@ -342,6 +400,32 @@ internal sealed partial record AgentState
         }
     }
 
+    /// <summary>
+    /// The whole of the published schema. A record is space-separated <c>key=value</c> tokens and nothing
+    /// else, and values carry no spaces — so anything outside this list is not a field this reader is
+    /// silently ignoring, it is a record that is not the contract.
+    /// </summary>
+    private static readonly string[] KnownFields = ["pr", "issue", "head", "round", "reviews", "blocked", "waiting", "rec"];
+
+    private static readonly HashSet<string> KnownFieldNames = new(KnownFields, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Splits a record into its declared fields, reporting everything that is not one.
+    /// </summary>
+    /// <remarks>
+    /// Anything unrecognised used to be dropped without a word, and silence is the wrong answer twice
+    /// over. A misspelling loses a real field: <c>blockd=4629</c> read as a record with no blocker at all,
+    /// which is a coherent, high-confidence, actionable row asserting the opposite of what the agent
+    /// wrote. And a value containing a space arrives as two tokens: <c>blocked= 4629</c> is the accepted
+    /// empty sentinel followed by a fragment, so the record read as "nothing blocking me" — again the
+    /// opposite — while the number the agent typed vanished. Whitespace is the field separator and there
+    /// is deliberately no quoting to rescue it; the fix is to say the record is malformed, not to invent
+    /// a way to carry a space.
+    ///
+    /// So every token must be <c>key=value</c> with a known key, and each failure is a defect. That is
+    /// what carries these into the existing confidence rule — a defective record grades low, never acts,
+    /// and stays visible — rather than a value quietly disappearing before anything grades it.
+    /// </remarks>
     private static Dictionary<string, string> SplitFields(string? text, List<string> defects)
     {
         var fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -354,12 +438,27 @@ internal sealed partial record AgentState
         foreach (string token in text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             int eq = token.IndexOf('=', StringComparison.Ordinal);
-            if (eq <= 0)
+            if (eq < 0)
             {
+                // Prose, or the tail of a value someone put a space in. Either way it is not a field, and
+                // the fields around it were written by whoever wrote this.
+                defects.Add($"'{token}' is not a key=value field");
+                continue;
+            }
+
+            if (eq == 0)
+            {
+                defects.Add($"'{token}' declares no field name");
                 continue;
             }
 
             string key = token[..eq];
+            if (!KnownFieldNames.Contains(key))
+            {
+                defects.Add($"field '{key}' is not one of {string.Join('|', KnownFields)}");
+                continue;
+            }
+
             if (!seen.Add(key))
             {
                 defects.Add($"field '{key}' is declared more than once");
