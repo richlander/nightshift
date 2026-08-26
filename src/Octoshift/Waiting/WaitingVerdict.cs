@@ -204,7 +204,7 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         if (IsStale(state, facts))
         {
             return new(WaitingState.Stale, RowOwner.Operator,
-                $"record describes {Short(state.Head!)}, GitHub head is {Short(facts.HeadSha)}", assurance);
+                DescribeMismatch(state.Head!, facts.HeadSha), assurance);
         }
 
         // Everything below decides whether a window is finished, so every one of these gates fails closed.
@@ -436,12 +436,61 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
     {
         if (IsStale(state, facts))
         {
-            string mismatch = $"record describes {Short(state.Head!)}, GitHub head is {Short(facts.HeadSha)}";
+            string mismatch = DescribeMismatch(state.Head!, facts.HeadSha);
             return new(WaitingState.NeedsOperator, RowOwner.Operator, $"{ask} — but the {mismatch}", Assurance.Low(mismatch));
         }
 
         return new(WaitingState.NeedsOperator, RowOwner.Operator, ask, assurance);
     }
 
-    private static string Short(string sha) => sha.Length <= 9 ? sha : sha[..9];
+    private static string Short(string sha) => sha.Length <= ShortWidth ? sha : sha[..ShortWidth];
+
+    /// <summary>The concise default width a lone sha is displayed at.</summary>
+    private const int ShortWidth = 9;
+
+    /// <summary>
+    /// Renders a stale head mismatch so the recorded sha and the GitHub head are always visibly distinct.
+    /// Ordinary different shas diverge within the first few characters and print at the concise default
+    /// width; two shas that agree past it — the failure this exists for, where both would otherwise clip
+    /// to the same nine characters — are widened by just enough to expose the first differing character.
+    /// Both sides are clipped to one shared width so the reason and the assurance caveat are byte-for-byte
+    /// the same diagnostic.
+    /// </summary>
+    private static string DescribeMismatch(string recorded, string actual)
+    {
+        int width = DistinguishingWidth(recorded, actual);
+        return $"record describes {Clip(recorded, width)}, GitHub head is {Clip(actual, width)}";
+    }
+
+    /// <summary>
+    /// The display width that keeps two shas distinct: the concise default when they differ early, widened
+    /// to one character past a longer shared prefix, and the full length of the longer value when one is an
+    /// abbreviated prefix of the other (no character distinguishes them, so the whole of each is shown).
+    /// </summary>
+    private static int DistinguishingWidth(string recorded, string actual)
+    {
+        int shared = CommonPrefixLength(recorded, actual);
+        int longer = Math.Max(recorded.Length, actual.Length);
+        if (shared >= Math.Min(recorded.Length, actual.Length))
+        {
+            return longer;
+        }
+
+        return Math.Clamp(shared + 1, ShortWidth, longer);
+    }
+
+    /// <summary>Length of the leading run the two shas share, compared case-insensitively as <see cref="ShaMatches"/> does.</summary>
+    private static int CommonPrefixLength(string a, string b)
+    {
+        int length = Math.Min(a.Length, b.Length);
+        int i = 0;
+        while (i < length && char.ToLowerInvariant(a[i]) == char.ToLowerInvariant(b[i]))
+        {
+            i++;
+        }
+
+        return i;
+    }
+
+    private static string Clip(string sha, int width) => sha.Length <= width ? sha : sha[..width];
 }

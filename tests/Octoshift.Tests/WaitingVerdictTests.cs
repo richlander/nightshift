@@ -401,6 +401,61 @@ public class WaitingVerdictTests
     }
 
     [Fact]
+    public void Resolve_StaleHeadsSharingNineCharactersRenderDistinctly()
+    {
+        // The regression the fix targets: two 40-character shas that agree on the first nine characters but
+        // diverge at the tenth would both clip to "722512e25" and print an identical displayed head. The
+        // diagnostic must widen just enough to expose the divergence.
+        const string recorded = "722512e25a0c1d4a9b8e7360a1c2d3e4f5061728";
+        WaitingVerdict v = WaitingVerdict.Resolve(State($"pr=4595 head={recorded} reviews=2/2 rec=merge"), Facts());
+
+        Assert.Equal(WaitingState.Stale, v.State);
+        Assert.Contains("722512e25a", v.Reason, StringComparison.Ordinal);
+        Assert.Contains("722512e25f", v.Reason, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("stop")]
+    [InlineData("approve")]
+    public void Resolve_StaleEscalationSharingNineCharactersDistinguishesHeadsInOneSharedDiagnostic(string rec)
+    {
+        // The same collision reached through the stop/approve escalation path: the widened mismatch must
+        // distinguish the heads, and the reason and the assurance caveat must be the exact same diagnostic.
+        const string recorded = "722512e25a0c1d4a9b8e7360a1c2d3e4f5061728";
+        WaitingVerdict v = WaitingVerdict.Resolve(State($"pr=4595 head={recorded} rec={rec}"), Facts());
+
+        Assert.Equal(WaitingState.NeedsOperator, v.State);
+        Assert.Equal(Confidence.Low, v.Assurance.Level);
+        Assert.Contains("722512e25a", v.Reason, StringComparison.Ordinal);
+        Assert.Contains("722512e25f", v.Reason, StringComparison.Ordinal);
+        Assert.Contains("722512e25a", v.Assurance.Caveat!, StringComparison.Ordinal);
+        Assert.Contains("722512e25f", v.Assurance.Caveat!, StringComparison.Ordinal);
+        Assert.Contains(v.Assurance.Caveat!, v.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Resolve_OrdinaryDifferentHeadsStayConciseAtNineCharacters()
+    {
+        // Heads that diverge in the first character need no widening; the concise nine-character form is
+        // kept and the tenth character of the GitHub head is never shown.
+        WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=aaaaaaa11 reviews=2/2 rec=merge"), Facts());
+
+        Assert.Equal(WaitingState.Stale, v.State);
+        Assert.Contains("record describes aaaaaaa11, GitHub head is 722512e25", v.Reason, StringComparison.Ordinal);
+        Assert.DoesNotContain("722512e25f", v.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Resolve_AnAbbreviatedRecordedHeadThatPrefixesGitHubIsNotStale()
+    {
+        // The recorded head is a seven-character prefix of GitHub's, so it names the same revision: not
+        // stale, and no mismatch diagnostic is produced.
+        WaitingVerdict v = WaitingVerdict.Resolve(State("pr=4595 head=722512e round=2 reviews=2/2 rec=merge"), Facts());
+
+        Assert.NotEqual(WaitingState.Stale, v.State);
+    }
+
+    [Fact]
     public void Resolve_AContinueBesideAClearedPredicateIsNotActionable()
     {
         // `continue` says the window is still working, not parked behind the predicate, so a cleared
