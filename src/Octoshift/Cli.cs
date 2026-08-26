@@ -2,6 +2,7 @@ namespace Octoshift;
 
 using System.CommandLine;
 using Octoshift.Commands;
+using Octoshift.Waiting;
 
 /// <summary>Entry dispatch for the <c>octoshift</c> GitHub-membrane CLI.</summary>
 public static class Cli
@@ -144,16 +145,39 @@ public static class Cli
     {
         var command = new Command("waiting", "Report stopped agent panes and what is actually blocking each one.");
 
-        var all = new Option<bool>("--all") { Description = "Include panes that are holding legitimately, and idle panes with no record." };
+        var all = new Option<bool>("--all") { Description = "Include windows that are holding legitimately, and windows that identify nothing." };
+        var host = new Option<string[]>("--host")
+        {
+            Description = "Collect from this host over ssh; repeatable. Omit to read this machine's tmux.",
+            Arity = ArgumentArity.OneOrMore,
+            AllowMultipleArgumentsPerToken = false,
+        };
+
+        // Every value here becomes an ssh argument, so a value that is empty or option-shaped is rejected
+        // at the parse rather than handed to ssh: `--host=-V` otherwise succeeds with no output and reads
+        // as a quiet fleet, and bare `--host --json` otherwise swallows the flag as a hostname.
+        host.Validators.Add(result =>
+        {
+            foreach (var token in result.Tokens)
+            {
+                if (HostTarget.Validate(token.Value) is { } error)
+                {
+                    result.AddError(error);
+                    break;
+                }
+            }
+        });
         var json = new Option<bool>("--json") { Description = "Emit the rows as JSON instead of a table." };
         Option<string?> repo = CreateRepoOption();
 
         command.Options.Add(all);
+        command.Options.Add(host);
         command.Options.Add(json);
         command.Options.Add(repo);
 
         command.SetAction(async (parseResult, cancellationToken) => await WaitingCommand.RunAsync(
             parseResult.GetValue(repo),
+            parseResult.GetValue(host) ?? [],
             parseResult.GetValue(all),
             parseResult.GetValue(json),
             cancellationToken));
