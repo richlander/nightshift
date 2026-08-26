@@ -121,27 +121,49 @@ internal static class WaitingCommand
     }
 
     /// <summary>
+    /// How long one target gets before it is abandoned as unreachable. Generous on purpose: an entire
+    /// three-host sweep has been observed at roughly four seconds, so a single target that is still
+    /// running after thirty is not slow, it is stuck. ssh's own <c>ConnectTimeout</c> only bounds
+    /// establishing the connection; a host that connects and then hangs inside the remote shell or tmux
+    /// is unbounded without this, and would block every later target and the partial report forever.
+    /// </summary>
+    internal static readonly TimeSpan DefaultTargetTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>
     /// Collects from each distinct target in turn. Injectable scan so fan-out, deduplication and partial
     /// failure are testable without ssh or a tmux server.
     /// </summary>
     /// <remarks>
     /// Repeats are dropped in first-seen order: naming an alias twice is a typo, and honouring it would
     /// buy a second ssh connection and a duplicate of every row and count that host contributes.
+    ///
+    /// Each target runs under a linked token that also fires after <paramref name="perTargetTimeout"/>
+    /// (default <see cref="DefaultTargetTimeout"/>). A target that trips its own deadline is recorded as
+    /// unreachable and the sweep moves on, so one hung host cannot hold the others hostage. The caller's
+    /// <paramref name="ct"/> is different in kind: when it is what cancelled, the exception propagates
+    /// rather than being laundered into an unreachable host. <paramref name="perTargetTimeout"/> is an
+    /// internal seam so a test can drive the deadline in milliseconds without a wall-clock wait.
     /// </remarks>
     internal static async Task<Collection> CollectAsync(
         IReadOnlyList<string> hosts,
         Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> scanAsync,
-        CancellationToken ct)
+        CancellationToken ct,
+        TimeSpan? perTargetTimeout = null)
     {
+        TimeSpan timeout = perTargetTimeout ?? DefaultTargetTimeout;
         IReadOnlyList<string?> targets = hosts.Count > 0 ? [.. HostTarget.Distinct(hosts)] : [null];
 
         var panes = new List<TmuxPane>();
         var unreachable = new List<string>();
         foreach (string? host in targets)
         {
+            // Linked to the caller's token so real cancellation still reaches ShellRunner and takes the
+            // ssh/tmux tree down; CancelAfter adds the per-target deadline on top of it.
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            linked.CancelAfter(timeout);
             try
             {
-                panes.AddRange(await scanAsync(host, ct));
+                panes.AddRange(await scanAsync(host, linked.Token));
             }
             catch (TmuxUnavailableException ex)
             {
@@ -149,9 +171,29 @@ internal static class WaitingCommand
                 // either — a fleet that is partly invisible looks exactly like a fleet that is quiet.
                 unreachable.Add(ex.Message);
             }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                // The per-target deadline fired, not the caller. Same rule as an unreachable host: record
+                // it and keep going, so a host that connected and then hung cannot bury the partial report.
+                unreachable.Add(TimedOut(host, timeout));
+            }
         }
 
         return new Collection(panes, unreachable, targets.Count);
+    }
+
+    /// <summary>
+    /// The unreachable message for a target that ran past its deadline. Names the local machine or the
+    /// remote host so the report says which one hung, and — like every other unreachable message — is
+    /// escaped at the output boundary, so an alias carrying terminal control sequences is reported here
+    /// as text rather than executed.
+    /// </summary>
+    private static string TimedOut(string? host, TimeSpan timeout)
+    {
+        string detail = string.Create(
+            System.Globalization.CultureInfo.InvariantCulture,
+            $"tmux scan timed out after {timeout.TotalSeconds:0.###}s");
+        return host is null ? $"local: {detail}" : $"{host}: {detail}";
     }
 
     /// <summary>

@@ -805,6 +805,97 @@ public class WaitingScanTests
     }
 
     [Fact]
+    public async Task Collect_ATargetThatHangsPastItsDeadlineIsUnreachableAndLaterTargetsStillRun()
+    {
+        // The first target connects and then never answers — the failure ssh's ConnectTimeout cannot see.
+        // Its own deadline, not the whole sweep dying, is what ends it, and the second target is still read.
+        var scanned = new List<string?>();
+
+        WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(
+            ["fernie", "banff"],
+            async (host, token) =>
+            {
+                scanned.Add(host);
+                if (host == "fernie")
+                {
+                    // Completes only when the token fires, so `banff` is reached exactly when the
+                    // per-target deadline trips — no wall-clock race decides the outcome.
+                    await Task.Delay(Timeout.Infinite, token);
+                }
+
+                return [Pane("banff:1", string.Empty, PaneActivity.Idle)];
+            },
+            TestContext.Current.CancellationToken,
+            perTargetTimeout: TimeSpan.FromMilliseconds(20));
+
+        Assert.Equal(["fernie", "banff"], scanned);
+        Assert.Equal("banff:1", Assert.Single(collected.Panes).Target);
+        Assert.Contains("fernie", Assert.Single(collected.Unreachable));
+
+        // A timeout on one host and a good read on another is partial, never total — the rows still print.
+        Assert.False(collected.TotalFailure);
+        Assert.True(collected.AnyFailure);
+    }
+
+    [Fact]
+    public async Task Collect_CallerCancellationPropagatesRatherThanBecomingAnUnreachableHost()
+    {
+        // A generous per-target deadline, so the only thing that ends the scan is the caller's own token.
+        // That is a real cancellation and must surface, not be laundered into an unreachable host.
+        using var cts = new CancellationTokenSource();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => WaitingCommand.CollectAsync(
+            ["fernie", "banff"],
+            async (host, token) =>
+            {
+                cts.Cancel();
+                await Task.Delay(Timeout.Infinite, token);
+                return [Pane("fernie:1", string.Empty, PaneActivity.Idle)];
+            },
+            cts.Token,
+            perTargetTimeout: TimeSpan.FromSeconds(30)));
+    }
+
+    [Fact]
+    public async Task Collect_EveryTargetTimingOutIsATotalFailureNamingEachTarget()
+    {
+        WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(
+            ["fernie", "banff"],
+            async (_, token) =>
+            {
+                await Task.Delay(Timeout.Infinite, token);
+                return (IReadOnlyList<TmuxPane>)[];
+            },
+            TestContext.Current.CancellationToken,
+            perTargetTimeout: TimeSpan.FromMilliseconds(20));
+
+        Assert.True(collected.TotalFailure);
+        Assert.Equal(2, collected.Unreachable.Count);
+        Assert.Contains("fernie", collected.Unreachable[0]);
+        Assert.Contains("banff", collected.Unreachable[1]);
+        Assert.All(collected.Unreachable, m => Assert.Contains("timed out", m));
+    }
+
+    [Fact]
+    public async Task Collect_ALocalScanThatTimesOutNamesTheLocalMachine()
+    {
+        // No hosts means this machine, and its timeout message has no alias to carry, so it must say so
+        // itself rather than print a bare, sourceless "timed out".
+        WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(
+            [],
+            async (_, token) =>
+            {
+                await Task.Delay(Timeout.Infinite, token);
+                return (IReadOnlyList<TmuxPane>)[];
+            },
+            TestContext.Current.CancellationToken,
+            perTargetTimeout: TimeSpan.FromMilliseconds(20));
+
+        Assert.True(collected.TotalFailure);
+        Assert.Contains("local", Assert.Single(collected.Unreachable));
+    }
+
+    [Fact]
     public async Task FetchAsync_StopsSpendingOnceGitHubHasPushedBack()
     {
         var gh = new FakeGh { ["repos/o/r/pulls/1"] = Response(403, string.Empty, "x-ratelimit-remaining: 0") };
