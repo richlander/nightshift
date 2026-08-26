@@ -71,34 +71,33 @@ internal static partial class WindowNaming
     }
 
     /// <summary>
-    /// Builds one command per host that renames only the windows whose name is wrong. Batched because a
-    /// rename per window would cost an ssh round trip per window, which is what made the collection
-    /// itself unusable before it was batched.
+    /// Builds one shell script per host that renames only the windows whose name is wrong — one local
+    /// <c>tmux if-shell</c> per window inside a single ssh shell, so the whole host still costs one round
+    /// trip rather than one per window, which is what made the collection itself unusable before it was
+    /// batched.
     /// </summary>
     /// <remarks>
     /// <strong>No byte of tmux text enters shell or tmux syntax.</strong> A window's existing name is
     /// agent-controlled arbitrary text, and it flows into <paramref name="renames"/> as the base of the
-    /// desired name. Each desired name is encoded byte-for-byte as a <c>printf %b</c> octal-escape string —
-    /// only backslashes and the digits 0-7, inert in single quotes — decoded back to the exact bytes and
-    /// stashed in a per-window tmux <em>server environment variable</em>. The rename then reads the name
-    /// from that variable inside a shell run under <c>IFS=</c> and <c>set -f</c>, where an unquoted
-    /// expansion is neither word-split nor globbed and is never re-scanned for shell syntax — so a name
-    /// carrying a quote, a semicolon, a newline, backticks or <c>$(...)</c> is data, and it reaches the
-    /// rename as one argument after a <c>--</c> so a leading dash cannot become an option either. The name
-    /// is never part of a tmux command string, which is the injection surface a batched
-    /// <c>rename-window</c> command list would otherwise open.
+    /// desired name. Each desired name is encoded scalar-by-scalar as tmux string escapes — <c>\uXXXX</c>
+    /// for the basic plane, <c>\UXXXXXXXX</c> above it — inside a double-quoted <c>rename-window</c>
+    /// argument, which tmux's own parser decodes back to the exact characters as one argument. The encoded
+    /// form is nothing but a backslash, <c>u</c>/<c>U</c> and hex digits, so it cannot contain a quote, a
+    /// space, a semicolon, a newline or a backslash of its own: a name carrying any of those is data both
+    /// to the surrounding shell single-quotes and to tmux. A <c>--</c> precedes the name so a leading dash
+    /// cannot become an option.
     ///
-    /// <strong>The epoch check and every mutation share one server connection.</strong> The batch is a
-    /// single <c>tmux</c> command list: it sets the name variables, then an <c>if-shell -F</c> compares the
-    /// server's live <c>#{pid}:#{start_time}</c> to the one the sweep saw and runs the renames only on a
-    /// match. Because the comparison and the renames are queued to the same server in one client
-    /// invocation, a restart cannot slip between "checked the epoch" and "renamed the id" the way separate
-    /// <c>display-message</c> and <c>rename-window</c> clients allowed — a restarted server recycles pane
-    /// and window ids, and a stale id could otherwise name a different window. On a mismatch the batch
-    /// prints the epoch marker and renames nothing. Each rename is <em>confirmed</em> individually: it
-    /// echoes an <c>ok</c> marker naming its window id only when <c>rename-window</c> succeeded, so the
-    /// caller reports exactly the renames that happened and names the ones that did not. The name
-    /// variables are unset afterward so a long-lived server does not accumulate them.
+    /// <strong>The epoch check and the mutation share one server connection — per window.</strong> Each
+    /// rename is its own <c>tmux if-shell -F</c> invocation: the format compares the server's live
+    /// <c>#{pid}:#{start_time}</c> to the one the sweep saw, and only on a match does its true branch — a
+    /// tmux command string, run in that same client's command queue, no nested <c>tmux</c> client and no
+    /// <c>run-shell</c> — rename the window and print its confirmation. There is therefore no gap between
+    /// "checked the epoch" and "renamed the id" for a restart to slip into: a restart before the
+    /// invocation makes its guard false, and a restart between two windows makes the next guard false, so
+    /// a recycled id is never renamed. On a mismatch the false branch prints the epoch marker instead.
+    /// The confirmation is a <c>display-message</c> after the <c>rename-window</c> in the same branch;
+    /// tmux abandons the branch if the rename fails (a vanished window), so the marker is printed only for
+    /// a rename that happened. <c>|| :</c> keeps one failed invocation from aborting the rest.
     /// </remarks>
     internal static string? BuildRenameScript(
         IReadOnlyList<(TmuxPane Pane, string Desired)> renames,
@@ -112,74 +111,43 @@ internal static partial class WindowNaming
 
         // The epoch is a structural token (pid:start_time, digits and one colon) validated at collection,
         // so it is safe inside the single-quoted tmux format. Anything that is not one is replaced with a
-        // value no live server can equal, so the guard fails closed and renames nothing rather than
+        // value no live server can equal, so every guard fails closed and renames nothing rather than
         // embedding an unvalidated string into the format.
         string epoch = TmuxScanner.IsEpoch(scannedEpoch) ? scannedEpoch : "0:0";
-
-        // Variable names are safe by construction: NS + the hex nonce + an index, an identifier that
-        // cannot start with a digit and contains nothing a shell or tmux would interpret.
-        string Var(int i) => $"NS{nonce}_{i}";
+        string guard = $"'#{{==:#{{pid}}:#{{start_time}},{epoch}}}'";
 
         var script = new StringBuilder();
-
-        // One tmux command list. First, stash each desired name in a server environment variable as exact
-        // bytes: printf %b decodes the octal to the name, the surrounding "$(...)" hands it to
-        // set-environment as one argument, and set-environment stores it verbatim.
-        script.Append("tmux");
-        for (int i = 0; i < renames.Count; i++)
+        foreach ((TmuxPane pane, string desired) in renames)
         {
-            script.Append(" set-environment -g ").Append(Var(i))
-                  .Append(" \"$(printf %b '").Append(ShellEncode(renames[i].Desired)).Append("')\" \\;");
+            // One if-shell per window. The true branch renames and then confirms, both in this one tmux
+            // client's queue against one server generation; the false branch reports the epoch mismatch.
+            // The window id (@8) is stable across the pane recycling a restart causes, and is a fixed
+            // token; the name is fully escaped, so the single-quoted branch strings carry no raw byte.
+            string windowId = pane.WindowId;
+            script.Append("tmux if-shell -F ").Append(guard)
+                  .Append(" 'rename-window -t ").Append(windowId).Append(" -- \"").Append(TmuxEscape(desired))
+                  .Append("\" ; display-message -p ").Append(nonce).Append(":ok:").Append(windowId)
+                  .Append("' 'display-message -p ").Append(nonce).Append(":epoch' || :\n");
         }
 
-        // Then the atomic gate: the renames run in the then-branch only when the live server generation
-        // still matches the sweep's. run-shell executes them in one shell on the server; IFS= and set -f
-        // make each unquoted $NS... expand to exactly the stored bytes, `--` stops a leading dash becoming
-        // an option, and `&& echo` confirms only a rename tmux accepted. Targeted by window id, which is
-        // stable across the pane splits and joins that recycle pane ids.
-        script.Append(" if-shell -F '#{==:#{pid}:#{start_time},").Append(epoch).Append("}' \"run-shell 'IFS=;set -f;");
-        for (int i = 0; i < renames.Count; i++)
-        {
-            if (i > 0)
-            {
-                script.Append(';');
-            }
-
-            string windowId = renames[i].Pane.WindowId;
-            script.Append("tmux rename-window -t ").Append(windowId).Append(" -- \\$").Append(Var(i))
-                  .Append(" && echo ").Append(nonce).Append(":ok:").Append(windowId);
-        }
-
-        script.Append("'\" \"display-message -p ").Append(nonce).Append(":epoch\"\n");
-
-        // Clean up the name variables so a long-lived server does not accumulate one per rename per run.
-        script.Append("tmux");
-        for (int i = 0; i < renames.Count; i++)
-        {
-            if (i > 0)
-            {
-                script.Append(" \\;");
-            }
-
-            script.Append(" set-environment -gu ").Append(Var(i));
-        }
-
-        script.Append('\n');
         return script.ToString();
     }
 
     /// <summary>
-    /// Encodes arbitrary text as a POSIX <c>printf %b</c> octal-escape string: each UTF-8 byte becomes
-    /// <c>\0ooo</c> with exactly three octal digits. The result contains only backslashes and the digits
-    /// 0-7, all inert inside single quotes, so no byte of the input can reach shell syntax; <c>printf %b</c>
-    /// decodes it back to the exact bytes.
+    /// Encodes arbitrary text for a double-quoted tmux argument: each Unicode scalar becomes a tmux string
+    /// escape — <c>\uXXXX</c> for scalars in the basic multilingual plane, <c>\UXXXXXXXX</c> above it. The
+    /// result is only a backslash, <c>u</c>/<c>U</c> and hex digits, so it contains no quote, space,
+    /// semicolon, newline or backslash of the input; tmux decodes it back to the exact characters as one
+    /// argument, and nothing in it can reach either shell or tmux command syntax.
     /// </summary>
-    internal static string ShellEncode(string value)
+    internal static string TmuxEscape(string value)
     {
-        var sb = new StringBuilder(value.Length * 4);
-        foreach (byte b in Encoding.UTF8.GetBytes(value))
+        var sb = new StringBuilder(value.Length * 6);
+        foreach (System.Text.Rune rune in value.EnumerateRunes())
         {
-            sb.Append("\\0").Append(Convert.ToString(b, 8).PadLeft(3, '0'));
+            sb.Append(rune.Value <= 0xFFFF
+                ? $"\\u{rune.Value:x4}"
+                : $"\\U{rune.Value:x8}");
         }
 
         return sb.ToString();

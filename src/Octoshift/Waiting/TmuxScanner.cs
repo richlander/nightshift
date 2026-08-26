@@ -148,12 +148,13 @@ internal sealed partial class TmuxScanner
     ///
     /// A host with no tmux server running is a <em>success</em>, not a failure: the machine answered, it
     /// simply has no active session, so it is a host observed to hold no windows — the same as a running
-    /// server with none. The listing's failure is inspected rather than trusted: the no-server signatures
-    /// (<c>no server running</c>, <c>error connecting</c>, <c>No such file or directory</c>) yield a
-    /// complete empty manifest with no epoch, so an empty successful sweep is recorded and continuity is
-    /// tracked. Every other failure — a missing binary (127), a permission error, malformed output —
-    /// stays fail-closed as an unreachable host, because those are the machine being unreadable, which
-    /// must never read as an idle fleet.
+    /// server with none. The listing's failure is inspected rather than trusted: only the two complete
+    /// no-server signatures (<c>no server running on …</c>, or <c>error connecting to … (No such file or
+    /// directory)</c>) yield a complete empty manifest with no epoch, so an empty successful sweep is
+    /// recorded and continuity is tracked. Every other failure — a missing binary (127), a permission
+    /// error (including <c>error connecting to … (Permission denied)</c>), an unrelated
+    /// <c>No such file or directory</c>, malformed output — stays fail-closed as an unreachable host,
+    /// because those are the machine being unreadable, which must never read as an idle fleet.
     /// </remarks>
     private static string BuildScript(string nonce) => ScriptTemplate.Replace("NONCE", nonce, StringComparison.Ordinal);
 
@@ -175,7 +176,7 @@ internal sealed partial class TmuxScanner
         o=$(tmux list-windows -a -F '#{pane_id}' 2>&1)
         if [ $? -ne 0 ]; then
           case $o in
-            *'no server running'*|*'error connecting'*|*'No such file or directory'*)
+            *'no server running'*|*'error connecting to '*'(No such file or directory)'*)
               printf 'NONCE:manifest\nNONCE:end\n'; exit 0 ;;
             *) exit 3 ;;
           esac
@@ -409,21 +410,26 @@ internal sealed partial class TmuxScanner
         }
 
         // The epoch binds every pane id to the server that minted it, so it gates AdoptEpoch and the
-        // rename guard. A single duplicate line is invalid even if it repeats the same value — the output
-        // is then not the one this script writes, and trusting either copy is a guess. When any pane was
-        // returned, exactly one well-formed pid:start_time epoch is required, or a pane could carry an
-        // empty or forged epoch straight past AdoptEpoch's continuity and restart checks. A genuinely
-        // empty successful manifest — no server, or a server with no windows — is allowed to carry none.
+        // rename guard. A duplicate line is invalid even if it repeats the same value — the output is then
+        // not the one this script writes, and trusting either copy is a guess. An epoch line that IS
+        // present must be a canonical pid:start_time, whether or not any pane was returned, so an empty or
+        // forged epoch can never reach AdoptEpoch's continuity and restart checks. And when any pane was
+        // returned an epoch is required, since a pane with none would carry an empty epoch past those
+        // checks. A genuinely empty successful manifest — no server, or a server with no windows — is the
+        // one case allowed to carry no epoch at all.
         if (epochCount > 1)
         {
             throw Unavailable(host, $"tmux collection returned {epochCount} server epochs; the output is not this collection's");
         }
 
-        if (order.Count > 0 && (epochCount != 1 || !IsEpoch(epoch)))
+        if (epochCount == 1 && !IsEpoch(epoch))
         {
-            throw Unavailable(host, epochCount == 0
-                ? "tmux collection returned panes with no server epoch"
-                : $"tmux collection returned a malformed server epoch '{epoch}'");
+            throw Unavailable(host, $"tmux collection returned a malformed server epoch '{epoch}'");
+        }
+
+        if (order.Count > 0 && epochCount == 0)
+        {
+            throw Unavailable(host, "tmux collection returned panes with no server epoch");
         }
 
         return [.. order.Select(id => Finish(windows[id], captures[id]))];

@@ -232,6 +232,29 @@ public class WaitingScanTests
         Assert.Empty(panes);
     }
 
+    [Theory]
+    [InlineData("notanepoch")]
+    [InlineData("")]
+    [InlineData("4242:")]
+    public void ParseCollection_RejectsAMalformedEpochEvenOnAnEmptyManifest(string epoch)
+    {
+        // Missing is allowed for an empty manifest, but a present epoch must still be canonical: an empty
+        // or malformed one is not something this script writes, so it is not accepted just because the
+        // manifest carried no windows.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch {epoch}\n{Nonce}:manifest\n{Nonce}:end\n", host: null, Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_AllowsAnEmptyManifestThatCarriesAValidEpoch()
+    {
+        // A running server with no windows is also an empty success, and it does report its epoch.
+        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{Nonce}:end\n", host: null, Nonce);
+
+        Assert.Empty(panes);
+    }
+
     [Fact]
     public void ParseCollection_RejectsARepeatedManifestRow()
     {

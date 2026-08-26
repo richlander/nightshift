@@ -61,9 +61,11 @@ public sealed class TmuxNoServerTests : IDisposable
     }
 
     [Theory]
-    [InlineData(127, "sh: tmux: command not found")]     // a missing binary
-    [InlineData(1, "permission denied")]                  // a locked-down socket
-    [InlineData(1, "some other tmux failure")]            // anything unrecognised
+    [InlineData(127, "sh: tmux: command not found")]                              // a missing binary
+    [InlineData(1, "permission denied")]                                          // a locked-down socket
+    [InlineData(1, "error connecting to /tmp/tmux-501/default (Permission denied)")] // connect error, but denied
+    [InlineData(1, "open terminal failed: No such file or directory")]            // No-such-file, but not the connect signature
+    [InlineData(1, "some other tmux failure")]                                    // anything unrecognised
     public async Task BrokenTmux_StaysUnavailable(int code, string message)
     {
         Wrapper($"printf '%s\\n' '{message}' >&2\nexit {code}\n");
