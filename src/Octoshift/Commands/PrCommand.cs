@@ -43,21 +43,13 @@ internal static class PrCommand
             }
         }
 
-        WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(
-            hosts, (host, token) => new TmuxScanner(host).ScanAsync(token), ct);
-
         var facts = new GhPrFactsSource(repo, new FileConditionalCache(), (args, token) => GhAuthenticatedRunner.RunGhAsync(args, null, token));
 
         try
         {
-            // LocateAsync opens the shared history under its cross-process transaction lock and persists it
-            // as part of locating the PR — including breaking the continuity of every host this run did not
-            // collect, even a total failure where it collected none. The lock is held only across the local
-            // parse/reconcile/save and released by Save before the GitHub read. A load, persistence, or
-            // lock failure surfaces here as the unavailable contract, never a success-shaped answer above a
-            // silent write loss or a history it could not read.
-            PrLocation located = await LocateAsync(
-                prNumber, collected, history: null, facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, ct);
+            PrLocation located = await CollectAndLocateAsync(
+                prNumber, hosts, (host, token) => new TmuxScanner(host).ScanAsync(token),
+                facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, ct);
 
             if (json)
             {
@@ -85,6 +77,41 @@ internal static class PrCommand
         }
     }
 
+    /// <summary>
+    /// The product core of <c>octoshift pr</c>: acquire the history transaction, collect, and locate — in
+    /// that order, so the cross-process lock brackets the whole collect→reconcile→save as one unit and no
+    /// older scan can commit a stale snapshot after a newer one. A concurrent waiting/pr blocks on
+    /// <see cref="PaneHistory.OpenAsync"/> until this transaction commits and releases, so whoever collects
+    /// does so at-or-after the previous committer's snapshot. The scan and GitHub fetchers are injected so
+    /// the ordering is testable without ssh or a network; <paramref name="historyPath"/> and
+    /// <paramref name="perTargetTimeout"/> are internal seams for the same reason. LocateAsync's Save
+    /// releases the lock before its GitHub read, so the network is never held under it; the finally
+    /// disposes the transaction on any early exit.
+    /// </summary>
+    internal static async Task<PrLocation> CollectAndLocateAsync(
+        int prNumber,
+        IReadOnlyList<string> hosts,
+        Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> scanAsync,
+        Func<int, CancellationToken, Task<PrFacts?>> fetchAsync,
+        Func<int, CancellationToken, Task<PrFacts?>> refreshMergeabilityAsync,
+        DateTimeOffset now,
+        CancellationToken ct,
+        string? historyPath = null,
+        TimeSpan? perTargetTimeout = null)
+    {
+        PaneHistory? history = null;
+        try
+        {
+            history = await PaneHistory.OpenAsync(historyPath, ct);
+            WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(hosts, scanAsync, ct, perTargetTimeout);
+            return await LocateAsync(prNumber, collected, history, fetchAsync, refreshMergeabilityAsync, now, ct);
+        }
+        finally
+        {
+            history?.Dispose();
+        }
+    }
+
     /// <summary>Where a PR was found, and everything the report and the exit code are computed from.</summary>
     /// <param name="PrNumber">The PR asked about.</param>
     /// <param name="Claims">This PR's claimants, owner first.</param>
@@ -101,15 +128,44 @@ internal static class PrCommand
         IReadOnlyDictionary<string, TimeSpan?> Silence)
     {
         /// <summary>
-        /// Any incompleteness in the view fails: a host that did not answer, or a previously-collected
-        /// host this run omitted, both mean the PR may be claimed somewhere this sweep could not see, so a
-        /// success-shaped exit would assert a completeness the sweep did not have. Otherwise, finding
-        /// neither a claim nor a PR is the not-found failure.
+        /// The single word this location reduces to, which the human report leads its first line with and
+        /// the exit code follows. A partly invisible fleet (a host that did not answer, or a
+        /// previously-collected host this run omitted) means the PR may be claimed somewhere this sweep
+        /// could not see, so a success-shaped result would assert a completeness the sweep did not have:
+        /// <see cref="PrDisposition.Partial"/> when a host was unreachable, <see cref="PrDisposition.Narrowed"/>
+        /// when the view was merely narrower than before. A complete view that turned up neither a claim
+        /// nor a GitHub PR is <see cref="PrDisposition.NotFound"/>. Anything else — a claim, a PR, or both,
+        /// under a complete view — is <see cref="PrDisposition.Found"/>.
         /// </summary>
-        public int ExitCode => !ViewComplete
-            ? Octoshift.ExitCode.Unavailable
-            : Facts is null && Claims.Count == 0 ? Octoshift.ExitCode.Unavailable : Octoshift.ExitCode.Ok;
+        public PrDisposition Disposition
+            => Collected.Unreachable.Count > 0 ? PrDisposition.Partial
+                : !ViewComplete ? PrDisposition.Narrowed
+                : Facts is null && Claims.Count == 0 ? PrDisposition.NotFound
+                : PrDisposition.Found;
+
+        /// <summary>Only a found PR succeeds; every other disposition is unavailable, matching the token
+        /// the first line leads with.</summary>
+        public int ExitCode => Disposition == PrDisposition.Found ? Octoshift.ExitCode.Ok : Octoshift.ExitCode.Unavailable;
     }
+
+    /// <summary>What <c>octoshift pr</c> reduced to, named so the human report's first-line token and the
+    /// exit code stay aligned: a harness greps the token, the shell branches on the exit code, and the two
+    /// can never disagree.</summary>
+    internal enum PrDisposition
+    {
+        /// <summary>A complete view with a claim, a PR, or both. The one success. Leads with <c>PR</c>.</summary>
+        Found,
+
+        /// <summary>A host could not be read, so the PR may be claimed where the sweep could not see. Leads with <c>PARTIAL</c>.</summary>
+        Partial,
+
+        /// <summary>Fewer hosts than have been collected before, so the view is narrower than it has been. Leads with <c>NARROWED</c>.</summary>
+        Narrowed,
+
+        /// <summary>A complete view with neither a claiming window nor a GitHub PR. Leads with <c>NOTFOUND</c>.</summary>
+        NotFound,
+    }
+
 
     /// <summary>
     /// Locates a PR across an already-collected fleet. Injectable collection, history and fetch so the
@@ -125,11 +181,13 @@ internal static class PrCommand
         CancellationToken ct,
         string? historyPath = null)
     {
-        // Own the transaction: open the shared history under its cross-process lock unless a test injected
-        // one. The lock is held only across the local parse and reconcile below and released by Save
-        // before the GitHub read; the finally is the safety net for an early exit. A malformed or
-        // unreadable existing file, or a lock failure, escapes as HistoryUnavailableException, which
-        // RunAsync maps to the unavailable contract.
+        // The shared history transaction. In production RunAsync opens it *before* collection and injects
+        // it here, so the cross-process lock brackets the whole collect→reconcile→save as one unit and no
+        // older scan can commit a stale snapshot after a newer one. A test may inject its own history or a
+        // historyPath to open one here; when this method owns it, the finally is the safety net for an
+        // early exit. The lock is held only across the local parse and reconcile below and released by
+        // Save before the GitHub read. A malformed or unreadable existing file, or a lock failure, escapes
+        // as HistoryUnavailableException, which RunAsync maps to the unavailable contract.
         bool ownsHistory = history is null;
         history ??= await PaneHistory.OpenAsync(historyPath, ct);
         try
@@ -259,7 +317,18 @@ internal static class PrCommand
         IReadOnlyDictionary<string, TimeSpan?> silence = located.Silence;
         bool viewComplete = located.ViewComplete;
 
-        output.WriteLine($"PR #{prNumber}{(facts?.Title is { Length: > 0 } title ? $"  {DisplayText.Safe(title)}" : string.Empty)}");
+        // Lead the first line with a stable token aligned to the exit code, so a harness sees the failure
+        // before the details rather than a success-shaped `PR #…` above a later NARROWED/UNREACHABLE line.
+        // The reasons themselves still follow in the body below; this is the one-line summary.
+        string titleSuffix = facts?.Title is { Length: > 0 } title ? $"  {DisplayText.Safe(title)}" : string.Empty;
+        string headline = located.Disposition switch
+        {
+            PrDisposition.Partial => $"PARTIAL PR #{prNumber}{titleSuffix} — fleet partly unreachable; a claim may be on a host not swept",
+            PrDisposition.Narrowed => $"NARROWED PR #{prNumber}{titleSuffix} — fewer hosts than collected before; a claim may be on a host not swept this run",
+            PrDisposition.NotFound => $"NOTFOUND PR #{prNumber}{titleSuffix} — no window claims it and GitHub has no such PR",
+            _ => $"PR #{prNumber}{titleSuffix}",
+        };
+        output.WriteLine(headline);
 
         if (claims.Count == 0)
         {

@@ -31,6 +31,131 @@ public sealed class PersistenceTests
 
     private static Task<PrFacts?> None(int _, CancellationToken __) => Task.FromResult<PrFacts?>(null);
 
+    // A window on the given host with the given claim ("pr=NNNN …") or no state at all, sharing one pane
+    // id and server epoch so a later observation of the same window replaces the earlier one. The window
+    // name defaults to a claiming one; pass a non-PR name for a window that identifies nothing.
+    private static TmuxPane Window(string? host, string? agentState, string windowName = "pr4448")
+        => new()
+        {
+            PaneId = "%1",
+            WindowId = "@1",
+            Target = "cp:1",
+            Host = host,
+            WindowName = windowName,
+            SessionAttached = false,
+            Activity = PaneActivity.Idle,
+            Epoch = "1:1",
+            AgentStateOption = agentState,
+        };
+
+    [Fact]
+    public async Task CollectAndResolveAsync_BracketsCollectionSoAnOlderScanCannotCommitOverANewerOne()
+    {
+        // Blocker 1: the transaction is acquired BEFORE collection, so a slower older scan holds the lock
+        // across its own collection and a newer sweep cannot even begin — cannot collect, cannot commit —
+        // until the older one commits and releases. Run A opens first and blocks inside its scan (the lock
+        // held); run B cannot start collecting; when A commits its now-older snapshot and releases, B
+        // collects fresh and its newer observation wins. Under the old ordering (lock taken after
+        // collection) B would collect concurrently and could commit first, then A's stale snapshot would
+        // land last and resurrect the released claim — which the invocation-count assertion rules out.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-stale-{Guid.NewGuid():N}.json");
+        DateTimeOffset t = new(2026, 8, 26, 3, 0, 0, TimeSpan.Zero);
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        var aCollecting = new TaskCompletionSource();
+        var releaseA = new TaskCompletionSource();
+        int bScans = 0;
+
+        // A (older): a claim on the shared window. Its scan signals that A is collecting — holding the
+        // lock — then blocks until the test releases it.
+        Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> scanA = async (host, token) =>
+        {
+            aCollecting.TrySetResult();
+            await releaseA.Task.WaitAsync(token);
+            return [Window(host, "pr=4448 head=abc1234 reviews=2/2 rec=merge")];
+        };
+
+        // B (newer): the same window with its claim released. Records that it ran, which must not happen
+        // until A has committed and freed the lock.
+        Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> scanB = (host, token) =>
+        {
+            Interlocked.Increment(ref bScans);
+            return Task.FromResult<IReadOnlyList<TmuxPane>>([Window(host, null, windowName: "shell")]);
+        };
+
+        try
+        {
+            Task<WaitingCommand.FleetResult> aRun = WaitingCommand.CollectAndResolveAsync(
+                ["shared"], scanA, None, None, t, ct, historyPath: path);
+
+            await aCollecting.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+
+            Task<WaitingCommand.FleetResult> bRun = WaitingCommand.CollectAndResolveAsync(
+                ["shared"], scanB, None, None, t.AddMinutes(1), ct, historyPath: path);
+
+            await Task.Delay(250, ct);
+            Assert.False(bRun.IsCompleted);
+            Assert.Equal(0, Volatile.Read(ref bScans)); // B is blocked at OpenAsync, before any collection
+
+            releaseA.TrySetResult();
+            await aRun;
+            await bRun;
+            Assert.Equal(1, bScans); // B collected only after A committed and released
+
+            // The final on-disk state is B's: the shared window released #4448, so no claim survives. Had
+            // A's stale snapshot committed last, the window would still be registered to #4448.
+            var reloaded = new PaneHistory(path);
+            Assert.Null(reloaded.ClaimedAt(Window("shared", null)));
+        }
+        finally
+        {
+            releaseA.TrySetResult();
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task CollectAndLocateAsync_AlsoTakesTheTransactionBeforeCollecting()
+    {
+        // The pr command core has the same ordering: its scan does not run until it holds the lock, so a
+        // concurrent transaction blocks it at OpenAsync rather than letting it collect a snapshot it could
+        // commit out of order.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-prstale-{Guid.NewGuid():N}.json");
+        DateTimeOffset t = new(2026, 8, 26, 3, 0, 0, TimeSpan.Zero);
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        int prScans = 0;
+        try
+        {
+            // Hold the transaction open, then confirm the pr core cannot collect while it is held.
+            PaneHistory holder = await PaneHistory.OpenAsync(path, ct);
+
+            Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> scan = (host, token) =>
+            {
+                Interlocked.Increment(ref prScans);
+                return Task.FromResult<IReadOnlyList<TmuxPane>>([Window(host, "pr=4448 head=abc1234")]);
+            };
+
+            Task<PrCommand.PrLocation> run = PrCommand.CollectAndLocateAsync(
+                4448, ["shared"], scan, None, None, t, ct, historyPath: path);
+
+            await Task.Delay(250, ct);
+            Assert.False(run.IsCompleted);
+            Assert.Equal(0, Volatile.Read(ref prScans)); // blocked at OpenAsync, before collecting
+
+            holder.Save([], []); // commit and release
+            holder.Dispose();
+
+            await run;
+            Assert.Equal(1, prScans);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
     // A history whose file sits under a path that is a regular file, not a directory, so creating the
     // directory for the atomic write fails — a stand-in for any write denial.
     private static (PaneHistory History, string Blocker) UnwritableHistory()
@@ -149,6 +274,104 @@ public sealed class PersistenceTests
         {
             await Assert.ThrowsAsync<HistoryUnavailableException>(
                 () => PaneHistory.OpenAsync(path, TestContext.Current.CancellationToken));
+            Assert.Equal(content, File.ReadAllText(path));
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    private const string ValidHost = "{\"epoch\":\"1:1\",\"sweptAt\":\"2026-01-01T00:00:00+00:00\",\"continuous\":true}";
+    private const string ValidPane = "{\"digest\":\"abc\",\"since\":\"2026-01-01T00:00:00+00:00\",\"pr\":4448,\"claimedAt\":\"2026-01-01T00:00:00+00:00\",\"witnessed\":true}";
+
+    public static IEnumerable<object[]> StrictlyRejectedHistories()
+    {
+        string hostKey = TargetId.ForHost("banff").Key;
+        string paneKey = TargetId.ForHost("banff").ComposeWith("%1");
+
+        // The writer always emits both maps, so a file missing either was not written by this scheme.
+        yield return ["{}"];
+        yield return ["{\"panes\":{}}"];
+        yield return ["{\"hosts\":{}}"];
+        yield return ["{\"panes\":null,\"hosts\":null}"];
+
+        // A null value where a record must be. Deserialization can produce these despite the annotations,
+        // and they crash Save — so a strict load rejects them rather than dropping them.
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":null}}}}"];
+        yield return [$"{{\"panes\":{{\"{paneKey}\":null}},\"hosts\":{{}}}}"];
+
+        // An invalid host key: `RA` is not canonical base64url, so it is not a target this scheme minted.
+        // Dropping it (as the forgiving loader does) would forget the host it was meant to be.
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"RA\":{ValidHost}}}}}"];
+
+        // An impossible pane id in the composite key: `%01` has a leading zero, which tmux never emits.
+        yield return [$"{{\"panes\":{{\"{TargetId.ForHost("banff").ComposeWith("%01")}\":{ValidPane}}},\"hosts\":{{}}}}"];
+
+        // Semantically impossible records this implementation could never have written.
+        // A witness with no claim.
+        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"2026-01-01T00:00:00+00:00\",\"witnessed\":true}}}},\"hosts\":{{}}}}"];
+        // A claim number with no claim time.
+        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"2026-01-01T00:00:00+00:00\",\"pr\":4448}}}},\"hosts\":{{}}}}"];
+        // A default (unset) Since.
+        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"0001-01-01T00:00:00+00:00\"}}}},\"hosts\":{{}}}}"];
+        // A non-positive PR number.
+        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"2026-01-01T00:00:00+00:00\",\"pr\":0,\"claimedAt\":\"2026-01-01T00:00:00+00:00\"}}}},\"hosts\":{{}}}}"];
+        // A host claiming continuity with no sweep time.
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"1:1\",\"continuous\":true}}}}}}"];
+        // A host carrying a non-canonical epoch.
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"0:0\",\"sweptAt\":\"2026-01-01T00:00:00+00:00\",\"continuous\":true}}}}}}"];
+    }
+
+    [Theory]
+    [MemberData(nameof(StrictlyRejectedHistories))]
+    public async Task OpenAsync_RejectsTheWholeFileForAnyRecordThisSchemeCouldNotHaveWritten(string content)
+    {
+        // A strict (product) load treats a single corrupt or impossible record as evidence the whole file
+        // is untrustworthy — a corrupted entry for a known host, if silently dropped, would forget that
+        // host and let a narrowed sweep read complete. So it rejects the file, leaves the bytes for a human
+        // to inspect, and the transaction is unavailable.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-strict-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, content);
+        try
+        {
+            await Assert.ThrowsAsync<HistoryUnavailableException>(
+                () => PaneHistory.OpenAsync(path, TestContext.Current.CancellationToken));
+            Assert.Equal(content, File.ReadAllText(path));
+
+            // The forgiving (test-only) loader keeps its lenient behaviour: it drops the bad entry rather
+            // than rejecting the file, so the sanitisation unit tests still work.
+            Assert.NotNull(new PaneHistory(path));
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task AnAOnlySweepOverACorruptHistoryIsUnavailableAndLeavesTheFileUnchanged()
+    {
+        // The scenario the strict load exists for: host banff's entry is corrupted (an invalid key). If a
+        // run collecting only host A dropped it and read on, banff would be forgotten, the view would read
+        // as complete, and a sole claim would be owned — then the corrupt file overwritten with the empty
+        // -derived snapshot. Instead both waiting and pr fail closed and leave the file exactly as it was.
+        string content = $"{{\"panes\":{{}},\"hosts\":{{\"RA\":{ValidHost}}}}}";
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-aonly-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, content);
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            await Assert.ThrowsAsync<HistoryUnavailableException>(() => WaitingCommand.ResolveAllAsync(
+                [Pane(null)], None, None, DateTimeOffset.UtcNow, ct,
+                collectedHosts: [null], allHostsAnswered: true, history: null, historyPath: path));
+            Assert.Equal(content, File.ReadAllText(path));
+
+            var collected = new WaitingCommand.Collection([Pane(null)], [], 1, [null]);
+            await Assert.ThrowsAsync<HistoryUnavailableException>(() => PrCommand.LocateAsync(
+                4448, collected, history: null, None, None, DateTimeOffset.UtcNow, ct, historyPath: path));
             Assert.Equal(content, File.ReadAllText(path));
         }
         finally

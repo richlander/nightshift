@@ -118,19 +118,27 @@ internal sealed class PaneHistory : IDisposable
         _lock = lockStream;
         (_entries, _hosts) = Load(path, strictLoad);
 
-        // Fail closed on any entry not written by this scheme. A host key must be a valid target id and a
-        // pane key a target id composed with a canonical pane id — validated with the exact IsPaneId the
-        // ids were written under, not merely a non-empty suffix, so an impossible id like `%01` cannot
-        // slip through; anything else is an older, differently-keyed file whose `fernie|%3` could be
-        // misread as some target this scheme would never mint. Dropping it costs a sweep of continuity and
-        // degrades ownership to inferred, never misattributes it.
-        //
-        // The deserializer can also hand back null values, and records this implementation could never
-        // have written — a witnessed claim with no PR, a continuous host never swept. A hostile or
-        // corrupt file must not crash Save (which reads .ClaimedPr and `with`-copies these) or, worse,
-        // confer an observed order. So null values are dropped and every surviving record is normalised to
-        // a shape this scheme could have produced, failing closed: an impossible combination loses its
-        // claim and its witness rather than keeping them.
+        // A strict (product) load has already reconciled its structure in Load — a missing map is a
+        // rejection there. Here it rejects the whole file, bytes untouched, the moment any single record
+        // is one this scheme could not have written: an invalid or null key, a null value, or a
+        // semantically impossible record. Sanitising instead — dropping the bad entry and keeping the
+        // rest — is exactly the laundering the load-bearing history must not do: a corrupted entry for a
+        // known host would be silently forgotten, so a narrowed sweep reads its view as complete and then
+        // overwrites the evidence. Only the forgiving loader below drops key by key, and it is test-only.
+        if (strictLoad)
+        {
+            ValidateStrict(_entries, _hosts);
+            return;
+        }
+
+        // Forgiving (test-only): fail closed on any entry not written by this scheme, but by dropping it
+        // rather than rejecting the file, so the sanitisation unit tests can seed a corrupt file and
+        // observe that the survivors are normalised. A host key must be a valid target id and a pane key a
+        // target id composed with a canonical pane id — validated with the exact IsPaneId the ids were
+        // written under, not merely a non-empty suffix, so an impossible id like `%01` cannot slip
+        // through. The deserializer can also hand back null values and records this implementation could
+        // never have written — a witnessed claim with no PR, a continuous host never swept — which are
+        // dropped or normalised to a shape this scheme could have produced.
         foreach (string key in _hosts.Keys.Where(k => !TargetId.IsValidKey(k) || _hosts[k] is null).ToArray())
         {
             _hosts.Remove(key);
@@ -155,6 +163,94 @@ internal sealed class PaneHistory : IDisposable
         {
             _hosts[key] = SanitizeHost(_hosts[key]);
         }
+    }
+
+    /// <summary>
+    /// Rejects the entire history — bytes untouched — if any record is one this scheme could not have
+    /// written. Unlike the forgiving sanitiser, which drops a bad entry and keeps the rest, a strict load
+    /// treats a single corrupt or impossible record as evidence the whole file is not trustworthy:
+    /// dropping one host's entry would forget that host, letting a run that collects a narrower fleet read
+    /// its view as complete and own a sole claim, then overwrite the evidence with an empty-derived
+    /// snapshot. So it throws, the command reports the unavailable contract, and the file is left as it
+    /// was for a human to inspect. The invariants below are exactly the shapes <see cref="AdoptEpoch"/>,
+    /// <see cref="RecordSweptEmpty"/>, <see cref="Observe"/> and <see cref="Save"/> can produce.
+    /// </summary>
+    private static void ValidateStrict(Dictionary<string, PaneMemory> entries, Dictionary<string, HostMemory> hosts)
+    {
+        foreach ((string key, HostMemory host) in hosts)
+        {
+            if (!TargetId.IsValidKey(key))
+            {
+                throw new HistoryUnavailableException($"pane history has an invalid host key '{key}', so it was not written by this scheme");
+            }
+
+            if (host is null)
+            {
+                throw new HistoryUnavailableException($"pane history has a null record for host '{key}'");
+            }
+
+            if (!IsWriterProducedHost(host))
+            {
+                throw new HistoryUnavailableException($"pane history has an impossible record for host '{key}'");
+            }
+        }
+
+        foreach ((string key, PaneMemory pane) in entries)
+        {
+            if (TargetId.HostOfComposite(key) is null || TargetId.IdOfComposite(key) is not { } id || !TmuxScanner.IsPaneId(id))
+            {
+                throw new HistoryUnavailableException($"pane history has an invalid pane key '{key}', so it was not written by this scheme");
+            }
+
+            if (pane is null)
+            {
+                throw new HistoryUnavailableException($"pane history has a null record for pane '{key}'");
+            }
+
+            if (!IsWriterProducedPane(pane))
+            {
+                throw new HistoryUnavailableException($"pane history has an impossible record for pane '{key}'");
+            }
+        }
+    }
+
+    /// <summary>
+    /// The host shapes the writer can produce: <see cref="AdoptEpoch"/> and <see cref="RecordSweptEmpty"/>
+    /// always stamp a <see cref="HostMemory.SweptAt"/>, and an epoch is either absent (an empty/no-server
+    /// sweep) or the canonical <c>pid:start_time</c>. Both <see cref="HostMemory.Continuous"/> values are
+    /// legitimate — <see cref="Save"/> flips it to false for a host it did not collect — so continuity is
+    /// not constrained here. A record missing its sweep time, or carrying a non-canonical epoch, is one
+    /// this implementation never wrote.
+    /// </summary>
+    private static bool IsWriterProducedHost(HostMemory host)
+        => host.SweptAt is not null && (host.Epoch is null || TmuxScanner.IsEpoch(host.Epoch));
+
+    /// <summary>
+    /// The pane shapes <see cref="Observe"/> can produce: a real <see cref="PaneMemory.Since"/>; a claim
+    /// that is present in both its number and its time or absent in both; a positive PR and a real
+    /// registration time when it claims; and a witness only when it claims. A witnessed record with no
+    /// claim, a claim with only half its fields, a non-positive PR, or a default timestamp is impossible
+    /// and confers an ownership this implementation would never have recorded.
+    /// </summary>
+    private static bool IsWriterProducedPane(PaneMemory pane)
+    {
+        if (pane.Since == default)
+        {
+            return false;
+        }
+
+        bool claims = pane.ClaimedPr is not null;
+        if (claims != (pane.ClaimedAt is not null))
+        {
+            return false;
+        }
+
+        if (claims && (pane.ClaimedPr <= 0 || pane.ClaimedAt == default))
+        {
+            return false;
+        }
+
+        return !pane.Witnessed || claims;
     }
 
     /// <summary>
@@ -197,6 +293,15 @@ internal sealed class PaneHistory : IDisposable
             }
 
             return ([], []);
+        }
+
+        // The writer always emits both maps (an empty first run writes `{"panes":{},"hosts":{}}`), so a
+        // file missing either — `{}`, `{"panes":{}}`, `{"hosts":null}` — was not written by this scheme.
+        // Under a strict load that is a rejection, not an empty history: reading it as empty would forget
+        // whatever the real file held. The forgiving loader treats an absent map as empty.
+        if (strict && (file.Panes is null || file.Hosts is null))
+        {
+            throw new HistoryUnavailableException($"pane history at {path} is missing its panes or hosts map, so it was not written by this scheme");
         }
 
         return (file.Panes ?? [], file.Hosts ?? []);

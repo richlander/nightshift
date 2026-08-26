@@ -166,6 +166,30 @@ annies-mac-mini cp:1 pr4537  UNBLOCKED  high  waited on checks, and they have al
 `UNBLOCKED` means the agent's own stated condition is satisfied and the agent does not know yet. This
 is the case the tool exists for.
 
+## 8. `octoshift pr` when the answer is not a clean find
+
+`octoshift pr` leads its first line with a token that matches its exit code, so a harness sees the
+disposition before the details. A clean find keeps the `PR #…` lead; anything else fails (exit
+`Unavailable`) and says why:
+
+```
+$ octoshift pr 4999
+NOTFOUND PR #4999 — no window claims it and GitHub has no such PR
+
+$ octoshift pr 4537 --host fernie   # fernie answered, but merritt was collected before and is not in this run
+NARROWED PR #4537 — fewer hosts than collected before; a claim may be on a host not swept this run
+  ...
+  NARROWED  fewer hosts than have been collected before; a claim may be on a host not swept this run
+
+$ octoshift pr 4537 --host fernie --host merritt   # merritt was unreachable
+PARTIAL PR #4537 — fleet partly unreachable; a claim may be on a host not swept
+  ...
+  UNREACHABLE merritt: no server running on /tmp/tmux-1000/default
+```
+
+The `--json` form carries the same truth in its `viewComplete` and `unreachable` fields with the same
+unavailable exit, so it stays a single valid JSON document — the token is never prepended to it.
+
 ---
 
 ## What it costs

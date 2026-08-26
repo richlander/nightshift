@@ -80,6 +80,106 @@ public class PrCommandTests
             PrCommand.WriteJson(stream, Located, DateTimeOffset.UtcNow);
             return Encoding.UTF8.GetString(stream.ToArray());
         }
+
+        public string Report()
+        {
+            var writer = new StringWriter();
+            PrCommand.WriteReport(writer, Located, DateTimeOffset.UtcNow);
+            return writer.ToString();
+        }
+
+        public string FirstLine() => Report().Split('\n')[0];
+    }
+
+    [Fact]
+    public async Task Locate_AFoundPrLeadsWithPrAndSucceeds()
+    {
+        // The one success: a complete view with a claim leads with the PR token, unchanged.
+        PrLocationResult result = await LocateAsync(4448, Collection(
+            [Pane("fernie", "%1", "cp:1", agentState: "pr=4448 head=abc1234 reviews=2/2 rec=merge", windowName: "pr4448")],
+            ["fernie"]), Ready);
+
+        Assert.Equal(PrCommand.PrDisposition.Found, result.Located.Disposition);
+        Assert.Equal(ExitCode.Ok, result.Located.ExitCode);
+        Assert.StartsWith("PR #4448", result.FirstLine(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Locate_AnUnreachableHostLeadsWithPartial()
+    {
+        // A host that did not answer: the PR may be claimed where the sweep could not see, so the first
+        // line leads with PARTIAL and the exit fails, aligned.
+        PrLocationResult result = await LocateAsync(4448, Collection(
+            [Pane(null, "%1", "cp:1", agentState: "pr=4448 head=abc1234", windowName: "pr4448")],
+            [null],
+            "fernie: no server running"), Ready);
+
+        Assert.Equal(PrCommand.PrDisposition.Partial, result.Located.Disposition);
+        Assert.Equal(ExitCode.Unavailable, result.Located.ExitCode);
+        Assert.StartsWith("PARTIAL PR #4448", result.FirstLine(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Locate_AWindowsHistoryNarrowerThanBeforeLeadsWithNarrowed()
+    {
+        // A host was collected before but not in this run: no host was unreachable, yet the view is
+        // narrower than it has been, so the first line leads with NARROWED — never PARTIAL, which is
+        // reserved for a host that actually failed.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-prnarrow-{Guid.NewGuid():N}.json");
+        try
+        {
+            // Seed a history that knows about a second host, so this fernie-only run reads as narrowed.
+            var seed = new PaneHistory(path);
+            seed.AdoptEpoch("merritt", "1:1", DateTimeOffset.UtcNow);
+            seed.Save([], ["merritt"]);
+
+            PrCommand.PrLocation located = await PrCommand.LocateAsync(
+                4448,
+                Collection([Pane("fernie", "%1", "cp:1", agentState: "pr=4448 head=abc1234", windowName: "pr4448", epoch: "2:1")], ["fernie"]),
+                new PaneHistory(path),
+                (_, _) => Task.FromResult<PrFacts?>(Ready),
+                (_, _) => Task.FromResult<PrFacts?>(null),
+                DateTimeOffset.UtcNow,
+                TestContext.Current.CancellationToken);
+            var result = new PrLocationResult(located);
+
+            Assert.Equal(PrCommand.PrDisposition.Narrowed, result.Located.Disposition);
+            Assert.Equal(ExitCode.Unavailable, result.Located.ExitCode);
+            Assert.StartsWith("NARROWED PR #4448", result.FirstLine(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Locate_AcompleteViewWithNeitherClaimNorPrLeadsWithNotFound()
+    {
+        // A complete view that turned up no claiming window and no GitHub PR: NOTFOUND, exit unavailable.
+        PrLocationResult result = await LocateAsync(4999, Collection(
+            [Pane("fernie", "%1", "cp:1", agentState: "pr=4448 head=abc1234", windowName: "pr4448")],
+            ["fernie"]), facts: null);
+
+        Assert.Equal(PrCommand.PrDisposition.NotFound, result.Located.Disposition);
+        Assert.Equal(ExitCode.Unavailable, result.Located.ExitCode);
+        Assert.StartsWith("NOTFOUND PR #4999", result.FirstLine(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Locate_AClaimWithUnreadableGithubUnderACompleteViewStillLeadsWithPr()
+    {
+        // A window claims the PR but GitHub could not be read. The view is complete and a claim exists, so
+        // this is a find, not a not-found: it keeps the PR lead and succeeds, and the body still says
+        // GitHub could not be read.
+        PrLocationResult result = await LocateAsync(4448, Collection(
+            [Pane("fernie", "%1", "cp:1", agentState: "pr=4448 head=abc1234 reviews=2/2 rec=merge", windowName: "pr4448")],
+            ["fernie"]), facts: null);
+
+        Assert.Equal(PrCommand.PrDisposition.Found, result.Located.Disposition);
+        Assert.Equal(ExitCode.Ok, result.Located.ExitCode);
+        Assert.StartsWith("PR #4448", result.FirstLine(), StringComparison.Ordinal);
+        Assert.Contains("could not be read", result.Report(), StringComparison.Ordinal);
     }
 
     [Fact]

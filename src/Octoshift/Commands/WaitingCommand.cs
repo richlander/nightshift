@@ -99,43 +99,6 @@ internal static class WaitingCommand
             }
         }
 
-        Collection collected = await CollectAsync(hosts, (host, token) => new TmuxScanner(host).ScanAsync(token), ct);
-
-        // Total failure keeps its own path. A sweep where nothing could be collected is not a quiet fleet,
-        // and printing a QUIET summary above the failure inverts which of the two the reader sees first.
-        if (collected.TotalFailure)
-        {
-            // A totally failed sweep is still a completed sweep: every previously known host went
-            // uncollected, so its continuity must be broken on disk — or a witnessed order would survive a
-            // run that saw nothing and be read as current next time. Persist that before reporting. A
-            // persistence failure only adds to the failure already being reported, so it is folded into
-            // the same unavailable output rather than crashing.
-            var failures = new List<string>(collected.Unreachable);
-            try
-            {
-                using PaneHistory history = await PaneHistory.OpenAsync(null, ct);
-                history.Save([], collected.CollectedHosts);
-            }
-            catch (HistoryUnavailableException ex)
-            {
-                failures.Add(ex.Message);
-            }
-
-            if (json)
-            {
-                WriteJsonError(Console.OpenStandardOutput(), string.Join("; ", failures));
-            }
-            else
-            {
-                foreach (string failure in failures)
-                {
-                    Console.Error.WriteLine($"octoshift: {DisplayText.Safe(failure)}");
-                }
-            }
-
-            return ExitCode.Unavailable;
-        }
-
         var facts = new GhPrFactsSource(
             repo,
             new FileConditionalCache(),
@@ -143,15 +106,33 @@ internal static class WaitingCommand
 
         try
         {
-            // The complete resolved fleet — every pane, before the presentation filter. Rename works on
-            // this set, not the shown subset: a quiet or working window whose name-suffix is wrong is
-            // exactly the one that has been filtered out of the report, and it still needs correcting.
-            // ResolveAllAsync persists the history as its last step, so a persistence failure surfaces
-            // here — before any report is printed — as the unavailable contract rather than success-shaped
-            // output above a silent write loss.
-            IReadOnlyList<WaitingRow> resolved = await ResolveAllAsync(
-                collected.Panes, facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, ct,
-                collected.CollectedHosts, allHostsAnswered: collected.Unreachable.Count == 0);
+            FleetResult result = await CollectAndResolveAsync(
+                hosts, (host, token) => new TmuxScanner(host).ScanAsync(token),
+                facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, ct);
+
+            // Total failure keeps its own path. A sweep where nothing could be collected is not a quiet
+            // fleet, and printing a QUIET summary above the failure inverts which of the two the reader
+            // sees first. CollectAndResolveAsync has already persisted the discontinuity under the
+            // transaction and returns the failure text (including any persistence failure) with null rows.
+            if (result.Rows is null)
+            {
+                if (json)
+                {
+                    WriteJsonError(Console.OpenStandardOutput(), string.Join("; ", result.Failures));
+                }
+                else
+                {
+                    foreach (string failure in result.Failures)
+                    {
+                        Console.Error.WriteLine($"octoshift: {DisplayText.Safe(failure)}");
+                    }
+                }
+
+                return ExitCode.Unavailable;
+            }
+
+            Collection collected = result.Collected;
+            IReadOnlyList<WaitingRow> resolved = result.Rows;
 
             int renameFailures = 0;
             if (rename)
@@ -190,6 +171,74 @@ internal static class WaitingCommand
             }
 
             return ExitCode.Unavailable;
+        }
+    }
+
+    /// <summary>A completed sweep: its collection, its resolved rows (null on total failure), and, on
+    /// total failure, the messages to report.</summary>
+    internal readonly record struct FleetResult(
+        Collection Collected,
+        IReadOnlyList<WaitingRow>? Rows,
+        IReadOnlyList<string> Failures);
+
+    /// <summary>
+    /// The product core of a sweep: acquire the history transaction, collect, and reconcile — in that
+    /// order, so the cross-process lock brackets the whole collect→reconcile→save as one unit. This is
+    /// what stops a slower, older scan from committing its stale snapshot after a newer sweep has already
+    /// recorded fresh state: a concurrent waiting/pr blocks on <see cref="PaneHistory.OpenAsync"/> until
+    /// this transaction commits and releases, so whoever collects does so at-or-after the previous
+    /// committer's snapshot, never before it. The scan and GitHub fetchers are injected so the ordering is
+    /// testable without ssh or a network; <paramref name="historyPath"/> and
+    /// <paramref name="perTargetTimeout"/> are internal seams for the same reason. The lock is released by
+    /// <see cref="ResolveAllAsync"/>'s Save before its GitHub reads (or by the total-failure Save here), so
+    /// the network is never held under it; the finally disposes the transaction on any early exit.
+    /// </summary>
+    internal static async Task<FleetResult> CollectAndResolveAsync(
+        IReadOnlyList<string> hosts,
+        Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> scanAsync,
+        Func<int, CancellationToken, Task<PrFacts?>> fetchAsync,
+        Func<int, CancellationToken, Task<PrFacts?>> refreshMergeabilityAsync,
+        DateTimeOffset now,
+        CancellationToken ct,
+        string? historyPath = null,
+        TimeSpan? perTargetTimeout = null)
+    {
+        PaneHistory? history = null;
+        try
+        {
+            history = await PaneHistory.OpenAsync(historyPath, ct);
+
+            Collection collected = await CollectAsync(hosts, scanAsync, ct, perTargetTimeout);
+
+            if (collected.TotalFailure)
+            {
+                // A totally failed sweep is still a completed sweep: every previously known host went
+                // uncollected, so its continuity must be broken on disk — or a witnessed order would
+                // survive a run that saw nothing and be read as current next time. Persist that, under the
+                // same held transaction, before reporting. A persistence failure only adds to the failure
+                // already being reported, so it is folded into the same unavailable output.
+                var failures = new List<string>(collected.Unreachable);
+                try
+                {
+                    history.Save([], collected.CollectedHosts);
+                }
+                catch (HistoryUnavailableException ex)
+                {
+                    failures.Add(ex.Message);
+                }
+
+                return new FleetResult(collected, null, failures);
+            }
+
+            IReadOnlyList<WaitingRow> resolved = await ResolveAllAsync(
+                collected.Panes, fetchAsync, refreshMergeabilityAsync, now, ct,
+                collected.CollectedHosts, allHostsAnswered: collected.Unreachable.Count == 0, history: history);
+
+            return new FleetResult(collected, resolved, []);
+        }
+        finally
+        {
+            history?.Dispose();
         }
     }
 
@@ -377,10 +426,6 @@ internal static class WaitingCommand
         var readings = new List<(TmuxPane Pane, StateReading Reading)>(panes.Count);
         var claimants = new List<(TmuxPane Pane, int PrNumber, int? Round)>();
 
-        // One fetch per PR, not per pane: #159 measured PRs claimed by two windows at once, and the
-        // second window's question has the same answer as the first's.
-        var seen = new Dictionary<int, PrFacts?>();
-
         foreach (TmuxPane pane in panes)
         {
             StateReading reading = AgentState.Read(
@@ -394,44 +439,20 @@ internal static class WaitingCommand
             {
                 claimants.Add((pane, claimant.PrNumber, claimant.Round));
             }
-
-            // An issue-tracking window has no PR, so spending a call on pulls/{n} would ask GitHub about a
-            // number that means something else entirely. A window that is not idle has handed nothing over,
-            // so there is nothing to resolve against GitHub for it either — it still contests, above.
-            if (pane.Activity == PaneActivity.Idle
-                && reading.Identified is { IsIssue: false } toFetch
-                && !seen.ContainsKey(toFetch.PrNumber))
-            {
-                seen[toFetch.PrNumber] = await fetchAsync(toFetch.PrNumber, ct);
-            }
         }
 
-        // Second pass for mergeability GitHub had not finished computing. Deliberately after every other
-        // PR has been read: the calculation needs a moment, and the time spent on the rest of the fleet
-        // is that moment. Re-reading immediately just collects `unknown` a second time.
-        foreach (int prNumber in seen.Where(e => e.Value is { MergeabilityKnown: false, Merged: false }).Select(e => e.Key).ToArray())
-        {
-            if (await refreshMergeabilityAsync(prNumber, ct) is not { } refreshed || !refreshed.MergeabilityKnown)
-            {
-                continue;
-            }
-
-            // Only graft when the PR has not moved between the two reads. Otherwise the answer belongs to
-            // a different head, and pairing it with the old snapshot would report the agent's head as
-            // mergeable on the strength of a newer one.
-            PrFacts current = seen[prNumber]!;
-            seen[prNumber] = string.Equals(current.HeadSha, refreshed.HeadSha, StringComparison.OrdinalIgnoreCase)
-                ? current with { MergeableState = refreshed.MergeableState }
-                : refreshed with { ChecksKnown = false };
-        }
-
-        // Open the shared history for a serialized transaction: OpenAsync takes a cross-process lock and
-        // then loads, so a concurrent waiting and pr cannot interleave load/reconcile/save and lose an
-        // update. This is placed after the GitHub reads above deliberately, so the lock is not held across
-        // network work; Save releases it, and the finally is the safety net for an early exit. A test that
-        // injects its own history owns its lifetime and keeps the direct, lock-free constructor.
+        // Open the shared history for a serialized transaction and hold it across the whole reconcile.
+        // In production the transaction is acquired by RunAsync *before* collection and injected here, so
+        // the cross-process lock brackets collect→reconcile→save as one unit: a slower, older scan cannot
+        // commit its stale snapshot after a newer sweep, because a concurrent waiting/pr only proceeds once
+        // this transaction commits and releases. The reconcile below — adopt, observe, register, save — is
+        // entirely local; the GitHub reads happen *after* Save releases the lock, so the network is never
+        // under it. A test may inject its own history (owning its lifetime, keeping the direct lock-free
+        // constructor) or a historyPath to open one here; the finally is the safety net for an early exit.
         bool ownsHistory = history is null;
         history ??= await PaneHistory.OpenAsync(historyPath, ct);
+        IReadOnlyDictionary<string, Claim> claims;
+        var silence = new Dictionary<string, TimeSpan?>(StringComparer.Ordinal);
         try
         {
 
@@ -481,7 +502,6 @@ internal static class WaitingCommand
         // queue ahead of a rival that claimed it in between. A new registration is witnessed only when its
         // host was under continuous observation before this run and the view was complete, so a claim seen
         // for the first time under a narrow view is recorded untrusted and stays that way.
-        var silence = new Dictionary<string, TimeSpan?>(StringComparer.Ordinal);
         foreach ((TmuxPane pane, StateReading reading) in readings)
         {
             int? claimedPr = reading.Identified is { IsIssue: false } identified ? identified.PrNumber : null;
@@ -489,11 +509,62 @@ internal static class WaitingCommand
             silence[Claim.Key(pane)] = history.Observe(pane, now, claimedPr, registrationWitnessed);
         }
 
-        IReadOnlyDictionary<string, Claim> claims = Claim.Register(
+        claims = Claim.Register(
             claimants,
             history.ClaimedAt,
             history.IsWitnessed,
             viewComplete);
+
+        // Prune history only for the hosts actually collected. A window on a host that did not answer, or
+        // that this run was not asked about, has not departed — it is merely unseen, and forgetting it
+        // would manufacture a departure and discard its registration on every partial sweep. Save is the
+        // commit: it releases the cross-process lock, so everything above ran under it and everything
+        // below — the GitHub reads — runs after it.
+        Departed = history.Save(panes, collected);
+        }
+        finally
+        {
+            if (ownsHistory)
+            {
+                history.Dispose();
+            }
+        }
+
+        // The transaction has committed and released the lock; only now is GitHub read, so the network is
+        // never held under the cross-process lock. One fetch per PR, not per pane: #159 measured PRs
+        // claimed by two windows at once, and the second window's question has the same answer as the
+        // first's. Only idle claimants are resolved — a window mid-turn has handed nothing over, and an
+        // issue-tracking window has no PR to ask pulls/{n} about — but every claimant already contested
+        // above, under the lock, on the strength of the history alone.
+        var seen = new Dictionary<int, PrFacts?>();
+        foreach ((TmuxPane pane, StateReading reading) in readings)
+        {
+            if (pane.Activity == PaneActivity.Idle
+                && reading.Identified is { IsIssue: false } toFetch
+                && !seen.ContainsKey(toFetch.PrNumber))
+            {
+                seen[toFetch.PrNumber] = await fetchAsync(toFetch.PrNumber, ct);
+            }
+        }
+
+        // Second pass for mergeability GitHub had not finished computing. Deliberately after every other
+        // PR has been read: the calculation needs a moment, and the time spent on the rest of the fleet
+        // is that moment. Re-reading immediately just collects `unknown` a second time.
+        foreach (int prNumber in seen.Where(e => e.Value is { MergeabilityKnown: false, Merged: false }).Select(e => e.Key).ToArray())
+        {
+            if (await refreshMergeabilityAsync(prNumber, ct) is not { } refreshed || !refreshed.MergeabilityKnown)
+            {
+                continue;
+            }
+
+            // Only graft when the PR has not moved between the two reads. Otherwise the answer belongs to
+            // a different head, and pairing it with the old snapshot would report the agent's head as
+            // mergeable on the strength of a newer one.
+            PrFacts current = seen[prNumber]!;
+            seen[prNumber] = string.Equals(current.HeadSha, refreshed.HeadSha, StringComparison.OrdinalIgnoreCase)
+                ? current with { MergeableState = refreshed.MergeableState }
+                : refreshed with { ChecksKnown = false };
+        }
 
         var rows = new List<WaitingRow>(readings.Count);
         foreach ((TmuxPane pane, StateReading reading) in readings)
@@ -544,19 +615,7 @@ internal static class WaitingCommand
             });
         }
 
-        // Prune history only for the hosts actually collected. A window on a host that did not answer, or
-        // that this run was not asked about, has not departed — it is merely unseen, and forgetting it
-        // would manufacture a departure and discard its registration on every partial sweep.
-        Departed = history.Save(panes, collected);
         return rows;
-        }
-        finally
-        {
-            if (ownsHistory)
-            {
-                history.Dispose();
-            }
-        }
     }
 
     /// <summary>The rows a run shows: everything under <c>--all</c>, otherwise what needs a person, is
