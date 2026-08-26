@@ -135,7 +135,12 @@ says nothing about the others, so only that host's epoch advances and only its
 registrations are invalidated. And the restart itself changes nothing on disk: the
 tool cannot rewrite what it has not collected, so a host's remembered claims are
 voided the next time it is swept and its epoch is seen to have changed, not at the
-moment of the restart.
+moment of the restart. An empty observation records **no** epoch (no server was
+running to have one), so the first window that later appears on that host begins
+under a new, unknown server generation — a server *start*, indistinguishable from a
+restart to the tool. Its claim is therefore a fresh, unwitnessed registration until a
+continuous sweep records it, so an empty host cannot launder a first look into a
+witnessed order.
 
 ## 6. Invariants
 

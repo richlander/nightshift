@@ -28,9 +28,11 @@
    switch PRs for reasons this tool neither controls nor predicts.
 
    Status: parsed cleanly with SANY and model-checked with TLC 2.19 against Waiting.cfg --
-   no errors, 4,647,277 states generated, 1,413,314 distinct, depth 9, zero violations
-   (~19s, 12 workers; the per-host epoch and the empty sweep widen the space from the
-   earlier single-epoch model). Re-run TLC after any change here to regenerate the count
+   no errors, 4,102,573 states generated, 1,241,739 distinct, depth 9, zero violations
+   (~13s, 12 workers; the per-host epoch, the empty sweep, and modelling an empty host's
+   first window as a server start widen the space from the earlier single-epoch model, and
+   the server-start advance prunes some by failing more first looks closed). Re-run TLC
+   after any change here to regenerate the count
    and confirm zero violations. Validated by mutation:
    reintroducing the real pane-id-across-restart bug (dropping the epoch check in
    Registered) violates NoCrossEpochMemory; allowing two unwitnessed claimants to be
@@ -73,7 +75,7 @@ VARIABLES
     now,         \* logical clock, advanced by every action
     claims,      \* window -> PR or NoPr: what each window claims RIGHT NOW
     live,        \* set of windows that currently exist
-    epoch,       \* host -> the tmux server generation on that host; changes on its restart
+    epoch,       \* host -> the tmux server generation on that host; advances on its restart AND when its first window opens (a server start); 0 means no server has run
     regEpoch,    \* host -> the epoch the registrations remembered for that host belong to
     regTime,     \* window -> time it was first SEEN claiming its current PR
     regPr,       \* window -> the PR it was seen claiming
@@ -195,6 +197,18 @@ Init ==
 
 \* Agents open windows, close them, and switch PRs on their own schedule. Exogenous:
 \* the tool observes this, it does not cause it.
+\*
+\* Opening the FIRST live window on a host is a server START. Production records no epoch
+\* for a host observed empty (RecordSweptEmpty stores Epoch = null: no tmux server was
+\* running, so no pane-id generation was seen), so the first window to appear there begins
+\* under a new, unknown generation -- exactly like a restart from the tool's point of view.
+\* Modelling that as an epoch advance is what stops an empty sweep from laundering a first
+\* look into a witnessed order: the host's remembered epoch (0 from Init, or whatever an
+\* earlier generation left) no longer matches the live one, so the first window's claim is
+\* unregistered and unwitnessed until a continuous sweep records it under the new epoch.
+\* Opening a window on a host that already has one leaves the generation unchanged -- the
+\* server is already up -- and closing the last window does not advance the epoch, so the
+\* advance happens on the reopen, when the next server starts.
 AgentActs ==
     /\ now < MaxTime
     /\ now' = now + 1
@@ -203,15 +217,20 @@ AgentActs ==
             /\ \E p \in PRs :
                  /\ live' = live \union {w}
                  /\ claims' = [claims EXCEPT ![w] = p]
+                 /\ epoch' = IF \E o \in live : HostOf(o) = HostOf(w)
+                             THEN epoch                                              \* server already up
+                             ELSE [epoch EXCEPT ![HostOf(w)] = epoch[HostOf(w)] + 1] \* first window: server start
          \/ /\ w \in live                           \* a window closes
             /\ live' = live \ {w}
             /\ claims' = [claims EXCEPT ![w] = NoPr]
+            /\ UNCHANGED epoch
          \/ /\ w \in live                           \* a window switches PR
             /\ \E p \in PRs :
                  /\ p # claims[w]
                  /\ live' = live
                  /\ claims' = [claims EXCEPT ![w] = p]
-    /\ UNCHANGED << epoch, regEpoch, regTime, regPr, regFleet, viewComplete, knownHosts, lastCollected, regWitnessed >>
+            /\ UNCHANGED epoch
+    /\ UNCHANGED << regEpoch, regTime, regPr, regFleet, viewComplete, knownHosts, lastCollected, regWitnessed >>
 
 \* One tmux server restarts: pane ids on THAT host restart, so its ids may now name
 \* different windows, while every other host is untouched. Restarts are per host because

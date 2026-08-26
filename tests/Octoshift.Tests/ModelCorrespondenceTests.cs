@@ -533,4 +533,55 @@ public class ModelCorrespondenceTests
             File.Delete(path);
         }
     }
+
+    /// <summary>
+    /// TLA+ <c>AgentActs</c>: opening the first live window on a host advances that host's epoch — a
+    /// server start. Production records no epoch for a host observed empty (<c>RecordSweptEmpty</c> stores
+    /// <c>Epoch = null</c>: no tmux server was running), so the first window that appears there is under a
+    /// new, unknown generation. Its claim therefore cannot be witnessed as continuous from the empty
+    /// sweep, and a contest between the first windows on a just-started server owns nothing until a
+    /// continuous sweep records it.
+    /// </summary>
+    [Fact]
+    public void AnEmptyHostsFirstWindowStartsANewServerSoAContestIsNotWitnessed()
+    {
+        string path = TempPath();
+        try
+        {
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+            var history = new PaneHistory(path);
+
+            // Sweep 1: host "a" collected but EMPTY — no windows, so no server generation was observed.
+            history.RecordSweptEmpty("a", t);
+            history.Save([], ["a"]);
+
+            // Sweep 2: two windows now claim the same PR on "a" — a contest. The server started since the
+            // empty sweep, so AdoptEpoch is not continuous, and registrationWitnessed (computed exactly as
+            // the commands do: viewComplete AND the host was swept in full before) is false even under a
+            // complete view.
+            DateTimeOffset? prior = history.SweptAt("a");
+            bool continuous = history.AdoptEpoch("a", "100:1", t.AddMinutes(10));
+            Assert.False(continuous);
+            bool witnessed = true /* viewComplete */ && (continuous ? prior : null) is not null;
+            Assert.False(witnessed);
+
+            TmuxPane w1 = Window("%1", host: "a", epoch: "100:1");
+            TmuxPane w2 = Window("%2", host: "a", epoch: "100:1");
+            history.Observe(w1, t.AddMinutes(10), claimedPr: 4448, registrationWitnessed: witnessed);
+            history.Observe(w2, t.AddMinutes(10), claimedPr: 4448, registrationWitnessed: witnessed);
+
+            Assert.False(history.IsWitnessed(w1));
+            Assert.False(history.IsWitnessed(w2));
+
+            // With no witnessed order, the contest owns nothing — neither first window on the just-started
+            // server can be driven.
+            IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
+                [(w1, 4448, null), (w2, 4448, null)], history.ClaimedAt, history.IsWitnessed, viewComplete: true);
+            Assert.All(ranked.Values, c => Assert.False(c.OwnsClaim));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
 }

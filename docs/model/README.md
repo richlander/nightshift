@@ -55,10 +55,12 @@ java -cp tla2tools.jar tlc2.TLC -config Waiting.cfg -workers auto Waiting.tla
 ```
 
 Current bounds — 3 windows, 2 hosts, 2 PRs, 8 steps — run in a few seconds: with TLC 2.19
-(12 workers) SANY parses cleanly and TLC reports 4,647,277 states generated, 1,413,314
-distinct, depth 9, zero violations (~19s). Raise `MaxTime` for a
+(12 workers) SANY parses cleanly and TLC reports 4,102,573 states generated, 1,241,739
+distinct, depth 9, zero violations (~13s). Raise `MaxTime` for a
 deeper search; hosts multiply the state space quickly, since every sweep branches over
-the subsets of hosts it might have collected and every host restarts on its own epoch.
+the subsets of hosts it might have collected and every host restarts on its own epoch —
+and opening the first window on an empty host is a server start that advances that host's
+epoch too.
 
 ## What is modelled, and what is not
 
