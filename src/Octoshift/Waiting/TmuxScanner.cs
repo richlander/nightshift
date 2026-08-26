@@ -145,6 +145,15 @@ internal sealed partial class TmuxScanner
     /// <c>list-windows</c> for the host. They are all local to the host being swept — the sweep still
     /// costs exactly one connection — and a sweep runs on a human timescale, so paying a few hundred
     /// forks to make a fleet impossible to hide from is the right trade.
+    ///
+    /// A host with no tmux server running is a <em>success</em>, not a failure: the machine answered, it
+    /// simply has no active session, so it is a host observed to hold no windows — the same as a running
+    /// server with none. The listing's failure is inspected rather than trusted: the no-server signatures
+    /// (<c>no server running</c>, <c>error connecting</c>, <c>No such file or directory</c>) yield a
+    /// complete empty manifest with no epoch, so an empty successful sweep is recorded and continuity is
+    /// tracked. Every other failure — a missing binary (127), a permission error, malformed output —
+    /// stays fail-closed as an unreachable host, because those are the machine being unreadable, which
+    /// must never read as an idle fleet.
     /// </remarks>
     private static string BuildScript(string nonce) => ScriptTemplate.Replace("NONCE", nonce, StringComparison.Ordinal);
 
@@ -163,7 +172,15 @@ internal sealed partial class TmuxScanner
     private const string ScriptTemplate = """
         set -f
         e() { printf %s "$1" | od -v -An -tx1 | tr -d '[:space:]'; }
-        w=$(tmux list-windows -a -F '#{pane_id}') || exit 3
+        o=$(tmux list-windows -a -F '#{pane_id}' 2>&1)
+        if [ $? -ne 0 ]; then
+          case $o in
+            *'no server running'*|*'error connecting'*|*'No such file or directory'*)
+              printf 'NONCE:manifest\nNONCE:end\n'; exit 0 ;;
+            *) exit 3 ;;
+          esac
+        fi
+        w=$o
         printf 'NONCE:epoch %s\n' "$(tmux display-message -p '#{pid}:#{start_time}')"
         r=''
         p=''
@@ -254,6 +271,7 @@ internal sealed partial class TmuxScanner
         bool manifestOpened = false;
         bool manifestClosed = false;
         string epoch = string.Empty;
+        int epochCount = 0;
 
         // The open frame, and the capture it has produced so far. A frame is HEADER, one encoded body
         // line, then the matching close — so `body` distinguishes "waiting for the capture" from
@@ -274,6 +292,7 @@ internal sealed partial class TmuxScanner
                     if (line.StartsWith(epochPrefix, StringComparison.Ordinal))
                     {
                         epoch = line[epochPrefix.Length..].Trim();
+                        epochCount++;
                     }
 
                     manifestOpened = line == manifestOpen;
@@ -387,6 +406,24 @@ internal sealed partial class TmuxScanner
         if (order.FirstOrDefault(id => !captures.ContainsKey(id)) is { } missing)
         {
             throw Unavailable(host, $"tmux collection never captured pane {missing}");
+        }
+
+        // The epoch binds every pane id to the server that minted it, so it gates AdoptEpoch and the
+        // rename guard. A single duplicate line is invalid even if it repeats the same value — the output
+        // is then not the one this script writes, and trusting either copy is a guess. When any pane was
+        // returned, exactly one well-formed pid:start_time epoch is required, or a pane could carry an
+        // empty or forged epoch straight past AdoptEpoch's continuity and restart checks. A genuinely
+        // empty successful manifest — no server, or a server with no windows — is allowed to carry none.
+        if (epochCount > 1)
+        {
+            throw Unavailable(host, $"tmux collection returned {epochCount} server epochs; the output is not this collection's");
+        }
+
+        if (order.Count > 0 && (epochCount != 1 || !IsEpoch(epoch)))
+        {
+            throw Unavailable(host, epochCount == 0
+                ? "tmux collection returned panes with no server epoch"
+                : $"tmux collection returned a malformed server epoch '{epoch}'");
         }
 
         return [.. order.Select(id => Finish(windows[id], captures[id]))];
@@ -546,6 +583,41 @@ internal sealed partial class TmuxScanner
         }
 
         foreach (char c in value.AsSpan(1))
+        {
+            if (!char.IsAsciiDigit(c))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// A tmux server epoch: <c>pid:start_time</c>, two positive decimal integers separated by a single
+    /// colon and nothing else. This is the exact shape the collection script prints from
+    /// <c>#{pid}:#{start_time}</c>, so anything else — absent, empty, a bare pid, a negative or non-decimal
+    /// field, extra colons — is not an epoch this scheme produced.
+    /// </summary>
+    internal static bool IsEpoch(string value)
+    {
+        int colon = value.IndexOf(':', StringComparison.Ordinal);
+        if (colon <= 0 || colon != value.LastIndexOf(':') || colon == value.Length - 1)
+        {
+            return false;
+        }
+
+        return IsPositiveDecimal(value.AsSpan(0, colon)) && IsPositiveDecimal(value.AsSpan(colon + 1));
+    }
+
+    private static bool IsPositiveDecimal(ReadOnlySpan<char> value)
+    {
+        if (value.Length == 0)
+        {
+            return false;
+        }
+
+        foreach (char c in value)
         {
             if (!char.IsAsciiDigit(c))
             {

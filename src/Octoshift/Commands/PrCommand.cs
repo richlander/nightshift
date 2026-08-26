@@ -47,19 +47,40 @@ internal static class PrCommand
             hosts, (host, token) => new TmuxScanner(host).ScanAsync(token), ct);
 
         var facts = new GhPrFactsSource(repo, new FileConditionalCache(), (args, token) => GhAuthenticatedRunner.RunGhAsync(args, null, token));
-        PrLocation located = await LocateAsync(
-            prNumber, collected, new PaneHistory(), facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, ct);
 
-        if (json)
+        try
         {
-            WriteJson(Console.OpenStandardOutput(), located, DateTimeOffset.UtcNow);
-        }
-        else
-        {
-            WriteReport(Console.Out, located, DateTimeOffset.UtcNow);
-        }
+            // LocateAsync persists the shared history as part of locating the PR — including breaking the
+            // continuity of every host this run did not collect, even a total failure where it collected
+            // none. A persistence failure surfaces here as the unavailable contract, never a success-shaped
+            // answer above a silent write loss that a later run would read as current.
+            PrLocation located = await LocateAsync(
+                prNumber, collected, new PaneHistory(), facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, ct);
 
-        return located.ExitCode;
+            if (json)
+            {
+                WriteJson(Console.OpenStandardOutput(), located, DateTimeOffset.UtcNow);
+            }
+            else
+            {
+                WriteReport(Console.Out, located, DateTimeOffset.UtcNow);
+            }
+
+            return located.ExitCode;
+        }
+        catch (HistoryPersistException ex)
+        {
+            if (json)
+            {
+                WaitingCommand.WriteJsonError(Console.OpenStandardOutput(), ex.Message);
+            }
+            else
+            {
+                Console.Error.WriteLine($"octoshift: {DisplayText.Safe(ex.Message)}");
+            }
+
+            return ExitCode.Unavailable;
+        }
     }
 
     /// <summary>Where a PR was found, and everything the report and the exit code are computed from.</summary>

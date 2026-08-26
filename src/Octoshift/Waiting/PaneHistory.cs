@@ -114,16 +114,61 @@ internal sealed class PaneHistory
         // pane key a target id composed with a pane id; anything else is an older, differently-keyed file
         // whose `fernie|%3` could be misread as some target this scheme would never mint. Dropping it
         // costs a sweep of continuity and degrades ownership to inferred, never misattributes it.
-        foreach (string key in _hosts.Keys.Where(k => !TargetId.IsValidKey(k)).ToArray())
+        //
+        // The deserializer can also hand back null values, and records this implementation could never
+        // have written — a witnessed claim with no PR, a continuous host never swept. A hostile or
+        // corrupt file must not crash Save (which reads .ClaimedPr and `with`-copies these) or, worse,
+        // confer an observed order. So null values are dropped and every surviving record is normalised to
+        // a shape this scheme could have produced, failing closed: an impossible combination loses its
+        // claim and its witness rather than keeping them.
+        foreach (string key in _hosts.Keys.Where(k => !TargetId.IsValidKey(k) || _hosts[k] is null).ToArray())
         {
             _hosts.Remove(key);
         }
 
-        foreach (string key in _entries.Keys.Where(k => TargetId.HostOfComposite(k) is null || TargetId.IdOfComposite(k) is null).ToArray())
+        foreach (string key in _entries.Keys
+            .Where(k => TargetId.HostOfComposite(k) is null || TargetId.IdOfComposite(k) is null || _entries[k] is null)
+            .ToArray())
         {
             _entries.Remove(key);
         }
+
+        foreach (string key in _entries.Keys.ToArray())
+        {
+            _entries[key] = SanitizePane(_entries[key]);
+        }
+
+        foreach (string key in _hosts.Keys.ToArray())
+        {
+            _hosts[key] = SanitizeHost(_hosts[key]);
+        }
     }
+
+    /// <summary>
+    /// Normalises a pane record to a shape this scheme could have written, failing closed. A claim is
+    /// well-formed only when both the PR and the time it was first claimed are present; a witness only
+    /// when there is a claim to witness. Any other combination — a witnessed record with no PR, a PR with
+    /// no claim time, a time with no PR — is a record this implementation never wrote, so its claim and
+    /// witness are cleared rather than trusted, keeping only the body digest and silence, which cannot
+    /// confer ownership.
+    /// </summary>
+    private static PaneMemory SanitizePane(PaneMemory pane)
+        => pane.ClaimedPr is not null && pane.ClaimedAt is not null
+            ? pane
+            : pane with { ClaimedPr = null, ClaimedAt = null, Witnessed = false };
+
+    /// <summary>
+    /// Normalises a host record, failing closed. Continuity is a claim that the host was collected in the
+    /// immediately preceding sweep, which is meaningless without a sweep time — so a record claiming
+    /// continuity with no <see cref="HostMemory.SweptAt"/>, or carrying an epoch that is not the canonical
+    /// <c>pid:start_time</c> this scheme writes, is not one this implementation produced and cannot be
+    /// trusted to preserve a registration across a gap. Its continuity is dropped so the next collection
+    /// invalidates rather than trusts whatever it remembered.
+    /// </summary>
+    private static HostMemory SanitizeHost(HostMemory host)
+        => host.Continuous && host.SweptAt is not null && (host.Epoch is null || TmuxScanner.IsEpoch(host.Epoch))
+            ? host
+            : host with { Continuous = false };
 
     /// <summary>
     /// Reconciles a host at the start of a sweep: adopts its current tmux epoch, invalidates whatever the
@@ -317,20 +362,51 @@ internal sealed class PaneHistory
             }
         }
 
+        // The history is load-bearing: it is where a witnessed order lives between runs, so a sweep whose
+        // memory does not reach disk has not narrowed the hosts it failed to see, and a later run could
+        // read a stale witnessed ownership as current. A write failure is therefore a real failure that
+        // the command surfaces as unavailable, not something to swallow. The write is atomic — a fresh
+        // temp file in the same directory, then a rename over the target — so a failure mid-write leaves
+        // the previous valid history intact rather than a truncated one. Only the specific I/O exceptions
+        // are caught, so a cancellation is never laundered into a persistence error.
+        string dir = Path.GetDirectoryName(_path)!;
+        string tmp = _path + "." + Environment.ProcessId + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
-            File.WriteAllText(_path, JsonSerializer.Serialize(
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(tmp, JsonSerializer.Serialize(
                 new HistoryFile { Panes = _entries, Hosts = _hosts },
                 PaneHistoryJsonContext.Default.HistoryFile));
+            File.Move(tmp, _path, overwrite: true);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            TryDelete(tmp);
+            throw new HistoryPersistException(_path, ex);
         }
 
         return departed;
     }
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+        }
+    }
 }
+
+/// <summary>
+/// The pane history could not be written. Persistence is load-bearing — stale witnessed ownership left on
+/// disk by a sweep whose memory did not land would be read as current next run — so this surfaces as the
+/// unavailable contract rather than being swallowed into a success-shaped report.
+/// </summary>
+internal sealed class HistoryPersistException(string path, Exception inner)
+    : Exception($"could not persist pane history to {path}: {inner.Message}", inner);
 
 /// <summary>The on-disk shape: what is known per window, and per host.</summary>
 internal sealed record HistoryFile

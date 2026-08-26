@@ -105,13 +105,28 @@ internal static class WaitingCommand
         // and printing a QUIET summary above the failure inverts which of the two the reader sees first.
         if (collected.TotalFailure)
         {
+            // A totally failed sweep is still a completed sweep: every previously known host went
+            // uncollected, so its continuity must be broken on disk — or a witnessed order would survive a
+            // run that saw nothing and be read as current next time. Persist that before reporting. A
+            // persistence failure only adds to the failure already being reported, so it is folded into
+            // the same unavailable output rather than crashing.
+            var failures = new List<string>(collected.Unreachable);
+            try
+            {
+                new PaneHistory().Save([], collected.CollectedHosts);
+            }
+            catch (HistoryPersistException ex)
+            {
+                failures.Add(ex.Message);
+            }
+
             if (json)
             {
-                WriteJsonError(Console.OpenStandardOutput(), string.Join("; ", collected.Unreachable));
+                WriteJsonError(Console.OpenStandardOutput(), string.Join("; ", failures));
             }
             else
             {
-                foreach (string failure in collected.Unreachable)
+                foreach (string failure in failures)
                 {
                     Console.Error.WriteLine($"octoshift: {DisplayText.Safe(failure)}");
                 }
@@ -125,36 +140,56 @@ internal static class WaitingCommand
             new FileConditionalCache(),
             (args, token) => GhAuthenticatedRunner.RunGhAsync(args, null, token));
 
-        // The complete resolved fleet — every pane, before the presentation filter. Rename works on this
-        // set, not the shown subset: a quiet or working window whose name-suffix is wrong is exactly the
-        // one that has been filtered out of the report, and it still needs correcting.
-        IReadOnlyList<WaitingRow> resolved = await ResolveAllAsync(
-            collected.Panes, facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, ct,
-            collected.CollectedHosts, allHostsAnswered: collected.Unreachable.Count == 0);
-
-        int renameFailures = 0;
-        if (rename)
+        try
         {
-            // Diagnostics (RENAMED, and the failure/skip lines) go to stderr, never stdout, so a
-            // --json --rename run leaves a single valid JSON document on stdout.
-            renameFailures = await RenameAsync(resolved, ShellRunner.For, Console.Error, ct);
-        }
+            // The complete resolved fleet — every pane, before the presentation filter. Rename works on
+            // this set, not the shown subset: a quiet or working window whose name-suffix is wrong is
+            // exactly the one that has been filtered out of the report, and it still needs correcting.
+            // ResolveAllAsync persists the history as its last step, so a persistence failure surfaces
+            // here — before any report is printed — as the unavailable contract rather than success-shaped
+            // output above a silent write loss.
+            IReadOnlyList<WaitingRow> resolved = await ResolveAllAsync(
+                collected.Panes, facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, ct,
+                collected.CollectedHosts, allHostsAnswered: collected.Unreachable.Count == 0);
 
-        IReadOnlyList<WaitingRow> shown = Present(resolved, all);
-        if (json)
-        {
-            WriteJson(Console.OpenStandardOutput(), shown, Budget.From(facts), collected.Unreachable, Omitted, Departed);
-        }
-        else
-        {
-            WriteTable(Console.Out, shown, Budget.From(facts), collected.Unreachable, Omitted, Departed);
-        }
+            int renameFailures = 0;
+            if (rename)
+            {
+                // Diagnostics (RENAMED, and the failure/skip lines) go to stderr, never stdout, so a
+                // --json --rename run leaves a single valid JSON document on stdout.
+                renameFailures = await RenameAsync(resolved, ShellRunner.For, Console.Error, ct);
+            }
 
-        // A partly invisible fleet is not a clean sweep, so a single failed host — or a previously
-        // collected host this run omitted — still costs the exit code even though every other host's rows
-        // were printed. A rename that could not be confirmed does too, so a harness is not told everything
-        // was corrected when some of it was not. Omitted is set by ResolveAllAsync and reflects this run.
-        return collected.AnyFailure || Omitted.Count > 0 || renameFailures > 0 ? ExitCode.Unavailable : ExitCode.Ok;
+            IReadOnlyList<WaitingRow> shown = Present(resolved, all);
+            if (json)
+            {
+                WriteJson(Console.OpenStandardOutput(), shown, Budget.From(facts), collected.Unreachable, Omitted, Departed);
+            }
+            else
+            {
+                WriteTable(Console.Out, shown, Budget.From(facts), collected.Unreachable, Omitted, Departed);
+            }
+
+            // A partly invisible fleet is not a clean sweep, so a single failed host — or a previously
+            // collected host this run omitted — still costs the exit code even though every other host's
+            // rows were printed. A rename that could not be confirmed does too, so a harness is not told
+            // everything was corrected when some of it was not. Omitted is set by ResolveAllAsync and
+            // reflects this run.
+            return collected.AnyFailure || Omitted.Count > 0 || renameFailures > 0 ? ExitCode.Unavailable : ExitCode.Ok;
+        }
+        catch (HistoryPersistException ex)
+        {
+            if (json)
+            {
+                WriteJsonError(Console.OpenStandardOutput(), ex.Message);
+            }
+            else
+            {
+                Console.Error.WriteLine($"octoshift: {DisplayText.Safe(ex.Message)}");
+            }
+
+            return ExitCode.Unavailable;
+        }
     }
 
     /// <summary>What one sweep managed to collect, and from how many targets it tried.</summary>
@@ -618,7 +653,7 @@ internal static class WaitingCommand
 
             // Only the renames tmux confirmed, matched by window id. A window whose rename failed (it
             // vanished mid-batch) prints no marker, so it is named as failed rather than reported renamed.
-            string okPrefix = nonce + ":ok ";
+            string okPrefix = nonce + ":ok:";
             HashSet<string> confirmed = [.. lines
                 .Where(l => l.StartsWith(okPrefix, StringComparison.Ordinal))
                 .Select(l => l[okPrefix.Length..])];

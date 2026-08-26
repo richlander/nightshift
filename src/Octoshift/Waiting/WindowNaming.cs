@@ -76,21 +76,29 @@ internal static partial class WindowNaming
     /// itself unusable before it was batched.
     /// </summary>
     /// <remarks>
-    /// <strong>No byte of tmux text enters shell syntax.</strong> A window's existing name is
+    /// <strong>No byte of tmux text enters shell or tmux syntax.</strong> A window's existing name is
     /// agent-controlled arbitrary text, and it flows into <paramref name="renames"/> as the base of the
-    /// desired name; interpolating it into a quoted string is an injection, since a single quote closes
-    /// the quote and the rest is shell. So every target and desired name is encoded byte-for-byte as a
-    /// <c>printf %b</c> octal-escape string — only backslashes and the digits 0-7, which are inert in
-    /// single quotes — and decoded back to the exact bytes as a command-substitution <em>argument</em>,
-    /// never re-parsed as syntax. A name carrying a quote, a semicolon, a newline, backticks or
-    /// <c>$(...)</c> is data.
+    /// desired name. Each desired name is encoded byte-for-byte as a <c>printf %b</c> octal-escape string —
+    /// only backslashes and the digits 0-7, inert in single quotes — decoded back to the exact bytes and
+    /// stashed in a per-window tmux <em>server environment variable</em>. The rename then reads the name
+    /// from that variable inside a shell run under <c>IFS=</c> and <c>set -f</c>, where an unquoted
+    /// expansion is neither word-split nor globbed and is never re-scanned for shell syntax — so a name
+    /// carrying a quote, a semicolon, a newline, backticks or <c>$(...)</c> is data, and it reaches the
+    /// rename as one argument after a <c>--</c> so a leading dash cannot become an option either. The name
+    /// is never part of a tmux command string, which is the injection surface a batched
+    /// <c>rename-window</c> command list would otherwise open.
     ///
-    /// Two guards make the mutation safe and its result trustworthy. First an <em>epoch guard</em>: the
-    /// host's current tmux server generation is recomputed and compared to the one the sweep saw, and the
-    /// whole batch aborts on a mismatch, because a restarted server recycles pane ids and a stale id could
-    /// name a different window. Then each rename is <em>confirmed</em>: it prints an <c>ok</c> marker only
-    /// when tmux reports success, so the caller reports exactly the renames that happened and names the
-    /// ones that did not.
+    /// <strong>The epoch check and every mutation share one server connection.</strong> The batch is a
+    /// single <c>tmux</c> command list: it sets the name variables, then an <c>if-shell -F</c> compares the
+    /// server's live <c>#{pid}:#{start_time}</c> to the one the sweep saw and runs the renames only on a
+    /// match. Because the comparison and the renames are queued to the same server in one client
+    /// invocation, a restart cannot slip between "checked the epoch" and "renamed the id" the way separate
+    /// <c>display-message</c> and <c>rename-window</c> clients allowed — a restarted server recycles pane
+    /// and window ids, and a stale id could otherwise name a different window. On a mismatch the batch
+    /// prints the epoch marker and renames nothing. Each rename is <em>confirmed</em> individually: it
+    /// echoes an <c>ok</c> marker naming its window id only when <c>rename-window</c> succeeded, so the
+    /// caller reports exactly the renames that happened and names the ones that did not. The name
+    /// variables are unset afterward so a long-lived server does not accumulate them.
     /// </remarks>
     internal static string? BuildRenameScript(
         IReadOnlyList<(TmuxPane Pane, string Desired)> renames,
@@ -102,29 +110,61 @@ internal static partial class WindowNaming
             return null;
         }
 
+        // The epoch is a structural token (pid:start_time, digits and one colon) validated at collection,
+        // so it is safe inside the single-quoted tmux format. Anything that is not one is replaced with a
+        // value no live server can equal, so the guard fails closed and renames nothing rather than
+        // embedding an unvalidated string into the format.
+        string epoch = TmuxScanner.IsEpoch(scannedEpoch) ? scannedEpoch : "0:0";
+
+        // Variable names are safe by construction: NS + the hex nonce + an index, an identifier that
+        // cannot start with a digit and contains nothing a shell or tmux would interpret.
+        string Var(int i) => $"NS{nonce}_{i}";
+
         var script = new StringBuilder();
 
-        // Epoch guard. Recompute the server generation exactly as the collection script did — the server's
-        // pid and its own start time — and abort the batch on a mismatch rather than rename a possibly
-        // recycled id. Skipped only when the sweep recorded no epoch (nothing to compare against).
-        if (scannedEpoch.Length > 0)
+        // One tmux command list. First, stash each desired name in a server environment variable as exact
+        // bytes: printf %b decodes the octal to the name, the surrounding "$(...)" hands it to
+        // set-environment as one argument, and set-environment stores it verbatim.
+        script.Append("tmux");
+        for (int i = 0; i < renames.Count; i++)
         {
-            script.Append("__e=$(tmux display-message -p '#{pid}:#{start_time}' 2>/dev/null)\n");
-            script.Append("if [ \"$__e\" != \"$(printf %b '").Append(ShellEncode(scannedEpoch))
-                  .Append("')\" ]; then printf '").Append(nonce).Append(":epoch\\n'; exit 0; fi\n");
+            script.Append(" set-environment -g ").Append(Var(i))
+                  .Append(" \"$(printf %b '").Append(ShellEncode(renames[i].Desired)).Append("')\" \\;");
         }
 
-        foreach ((TmuxPane pane, string desired) in renames)
+        // Then the atomic gate: the renames run in the then-branch only when the live server generation
+        // still matches the sweep's. run-shell executes them in one shell on the server; IFS= and set -f
+        // make each unquoted $NS... expand to exactly the stored bytes, `--` stops a leading dash becoming
+        // an option, and `&& echo` confirms only a rename tmux accepted. Targeted by window id, which is
+        // stable across the pane splits and joins that recycle pane ids.
+        script.Append(" if-shell -F '#{==:#{pid}:#{start_time},").Append(epoch).Append("}' \"run-shell 'IFS=;set -f;");
+        for (int i = 0; i < renames.Count; i++)
         {
-            // Targeted by window id (@8), not pane id: the window id is stable for the life of the window,
-            // so the rename lands on the window the sweep saw even if its active pane has since changed.
-            // The confirmation echoes the same window id so the caller can match it back.
-            script.Append("if tmux rename-window -t \"$(printf %b '").Append(ShellEncode(pane.WindowId))
-                  .Append("')\" \"$(printf %b '").Append(ShellEncode(desired))
-                  .Append("')\" 2>/dev/null; then printf '").Append(nonce).Append(":ok %s\\n' \"$(printf %b '")
-                  .Append(ShellEncode(pane.WindowId)).Append("')\"; fi\n");
+            if (i > 0)
+            {
+                script.Append(';');
+            }
+
+            string windowId = renames[i].Pane.WindowId;
+            script.Append("tmux rename-window -t ").Append(windowId).Append(" -- \\$").Append(Var(i))
+                  .Append(" && echo ").Append(nonce).Append(":ok:").Append(windowId);
         }
 
+        script.Append("'\" \"display-message -p ").Append(nonce).Append(":epoch\"\n");
+
+        // Clean up the name variables so a long-lived server does not accumulate one per rename per run.
+        script.Append("tmux");
+        for (int i = 0; i < renames.Count; i++)
+        {
+            if (i > 0)
+            {
+                script.Append(" \\;");
+            }
+
+            script.Append(" set-environment -gu ").Append(Var(i));
+        }
+
+        script.Append('\n');
         return script.ToString();
     }
 
