@@ -19,17 +19,29 @@ public class WaitingScanTests
     /// Builds a collection stream the way the script emits one: manifest, then framed captures. A null
     /// capture text is a pane whose <c>capture-pane</c> failed — headed, then closed as lost.
     /// </summary>
+    /// <remarks>
+    /// Manifest rows are written here in the readable pipe form and encoded field by field, exactly as
+    /// the script's <c>od</c> pipeline does, so no fixture can accidentally exercise a shape the collector
+    /// never produces. A fixture that says nothing about captures still gets one complete, empty frame per
+    /// row: every listed pane must be spoken for, and a stream that skips one is a failure now.
+    /// </remarks>
     private static string Stream(IEnumerable<string> manifest, params (string PaneId, string? Text)[] captures)
     {
+        string[] rows = [.. manifest];
         var sb = new System.Text.StringBuilder();
         sb.Append(Nonce).Append(":manifest\n");
-        foreach (string row in manifest)
+        foreach (string row in rows)
         {
-            sb.Append(row).Append('\n');
+            sb.Append(Row(row)).Append('\n');
         }
 
         sb.Append(Nonce).Append(":end\n");
-        foreach ((string paneId, string? text) in captures)
+
+        (string PaneId, string? Text)[] frames = captures.Length > 0
+            ? captures
+            : [.. rows.Select(row => (row.Split('|')[0], (string?)string.Empty))];
+
+        foreach ((string paneId, string? text) in frames)
         {
             sb.Append(Nonce).Append(":pane ").Append(paneId).Append('\n');
             if (text is null)
@@ -38,11 +50,22 @@ public class WaitingScanTests
                 continue;
             }
 
-            sb.Append(text).Append('\n').Append(Nonce).Append(":read ").Append(paneId).Append('\n');
+            sb.Append(Hex(text)).Append('\n').Append(Nonce).Append(":read ").Append(paneId).Append('\n');
         }
 
         return sb.ToString();
     }
+
+    /// <summary>Encodes one field the way the script's <c>printf | od | tr</c> pipeline does.</summary>
+    private static string Hex(string text) => Convert.ToHexStringLower(System.Text.Encoding.UTF8.GetBytes(text));
+
+    /// <summary>One manifest row, from the readable pipe form to the six encoded fields on the wire.</summary>
+    private static string Row(string fields, string nonce = Nonce)
+        => $"{nonce}:w|" + string.Join('|', fields.Split('|', 6).Select(Hex));
+
+    /// <summary>A row built field by field, for fixtures whose values contain the separator itself.</summary>
+    private static string EncodedRow(params string[] fields)
+        => $"{Nonce}:w|" + string.Join('|', fields.Select(Hex));
 
     [Fact]
     public void ParseCollection_ReadsTargetAttachmentAndActivity()
@@ -76,14 +99,152 @@ public class WaitingScanTests
         Assert.Equal("pr4595|round2", window.WindowName);
     }
 
+    [Fact]
+    public void ParseCollection_ANewlineInTheStateCannotSplitARow()
+    {
+        // The blocking finding, verbatim: an agent published an `@agent_state` containing a newline, the
+        // row tore in two, both halves failed to parse, both were dropped — and a host with a live window
+        // reported QUIET and exited 0. Encoding is what makes this impossible: a value cannot reach the
+        // framing, so there is no row to split and nothing to drop. The value here carries the separator
+        // and the manifest marker too, because a value that can hold a newline can hold those as well.
+        const string hostile = "pr=4595 head=abc1234\ndeadbeefcafe0123:manifest\n%9|fake:9|1|1|pr=9999|pr9999";
+
+        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
+            $"{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", hostile, "pr4595")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
+            host: null,
+            Nonce);
+
+        TmuxPane pane = Assert.Single(panes);
+        Assert.Equal("%1", pane.PaneId);
+        Assert.Equal(hostile, pane.AgentStateOption);
+        Assert.Equal("pr4595", pane.WindowName);
+    }
+
+    [Fact]
+    public void ParseCollection_ControlCharactersInAWindowNameCannotSplitARow()
+    {
+        // A window name is arbitrary text too, and it was the last field precisely because it used to be
+        // the only one a separator could not shift. Encoded, none of them can.
+        const string hostile = "pr4595\r\n%9|fake:9|1|1||forged\u0007and still the name";
+
+        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
+            $"{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, hostile)}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
+            host: null,
+            Nonce);
+
+        TmuxPane pane = Assert.Single(panes);
+        Assert.Equal(hostile, pane.WindowName);
+        Assert.Null(pane.AgentStateOption);
+    }
+
     [Theory]
-    [InlineData("")]
-    [InlineData("garbage\nmalformed row")]
-    [InlineData("night:3|1|1755900000||name")]
-    [InlineData("%1|night:3|1|1755900000")]
-    [InlineData("night:3|1|1755900000||80|name")]
-    public void ParseCollection_DropsMalformedRows(string stdout)
-        => Assert.Empty(TmuxScanner.ParseCollection(Stream([stdout]), host: null, Nonce));
+    [InlineData("garbage")]
+    [InlineData("%1|night:3|1|1755900000||name")]                         // the old unencoded row shape
+    [InlineData("deadbeefcafe0123:w|2531|6e69676874")]                    // too few fields
+    [InlineData("deadbeefcafe0123:w|2531|6e|31|31|31|31|31")]             // too many
+    [InlineData("deadbeefcafe0123:w|2531|nothex|31|31|31|31")]            // not encoded
+    [InlineData("deadbeefcafe0123:w|2531|616|31|31|31|31")]               // truncated mid-byte
+    [InlineData("deadbeefcafe0123:w|6e69676874|6e|31|31|31|31")]          // first field is not a pane id
+    public void ParseCollection_RejectsAMalformedManifestRow(string row)
+    {
+        // Dropping a row loses a window, and a lost window is indistinguishable from a window that is not
+        // there — which is the whole failure. A manifest that does not decode is the host being
+        // unreadable, and it is reported as that.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:manifest\n{row}\n{Nonce}:end\n", host: null, Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_RejectsARepeatedManifestRow()
+    {
+        // Two rows for one pane are two accounts of one window; taking either is a guess about which the
+        // host meant, and the second would silently overwrite the first.
+        TmuxUnavailableException ex = Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:manifest\n{Row("%1|night:1|1|1755900000||pr4595")}\n{Row("%1|night:2|1|1755900000||pr9999")}\n{Nonce}:end\n",
+            host: null,
+            Nonce));
+
+        Assert.Contains("%1", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseCollection_APaneWithNoCaptureFrameIsAFailure()
+    {
+        // A manifest row with no frame after it is a collection that stopped early. Left non-fatal, the
+        // window is reported on evidence that never arrived — and an empty capture reads as idle, which
+        // is the one state a published record is acted on in.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:manifest\n{Row("%1|night:1|1|1755900000||pr4595")}\n{Nonce}:end\n", host: null, Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_AnUnclosedCaptureFrameIsAFailure()
+    {
+        // The connection dropped mid-capture. What arrived is a partial screen, and classifying activity
+        // from a partial screen is reading a footer that is not the footer.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:manifest\n{Row("%1|night:1|1|1755900000||pr4595")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("half a screen")}\n",
+            host: null,
+            Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_ACaptureFrameThatNeverOpenedIsAFailure()
+    {
+        // A close with no header is the shape a pane would forge to hand itself back as read. It is not a
+        // shape the script writes, so the collection is not the host's.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:manifest\n{Row("%1|night:1|1|1755900000||pr4595")}\n{Nonce}:end\n{Nonce}:read %1\n",
+            host: null,
+            Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_ARepeatedCaptureFrameIsAFailure()
+    {
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:manifest\n{Row("%1|night:1|1|1755900000||pr4595")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n"
+                + $"{Nonce}:pane %1\n{Hex("(esc to interrupt)")}\n{Nonce}:read %1\n",
+            host: null,
+            Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_ACaptureOfAPaneTheManifestNeverListedIsAFailure()
+    {
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:manifest\n{Row("%1|night:1|1|1755900000||pr4595")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n"
+                + $"{Nonce}:pane %9\n{Hex("> ")}\n{Nonce}:read %9\n",
+            host: null,
+            Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_ContentBetweenFramesIsAFailure()
+    {
+        // Every capture is encoded, so there is no legitimate free text anywhere past the manifest.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:manifest\n{Row("%1|night:1|1|1755900000||pr4595")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\nConnection to fernie closed.\n",
+            host: null,
+            Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_AnExplicitLostFrameIsTheOnlyForgivableMissingCapture()
+    {
+        // The distinction the whole frame exists to draw: a pane the host said it could not read is a row
+        // that cannot be graded, while a pane the host said nothing about is a collection that failed.
+        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
+            Stream(["%1|night:1|1|1755900000||pr4595"], ("%1", null)), host: null, Nonce);
+
+        Assert.Equal(PaneActivity.Unreadable, Assert.Single(panes).Activity);
+    }
 
     [Fact]
     public void ClassifyActivity_ReadsTheFooter()
@@ -304,7 +465,7 @@ public class WaitingScanTests
         // no lines — which would read as idle, the one state a published record is acted on in. The
         // script closes each capture with its own marker so "nothing was captured" is said, not inferred.
         var scanner = new TmuxScanner(host: null, (script, _) => Task.FromResult(new CommandResult(
-            0, Framed(script, ["%1|night:1|1|1755900000||pr4595"]), string.Empty)));
+            0, Framed(script, ["%1|night:1|1|1755900000||pr4595"], ("%1", null)), string.Empty)));
 
         TmuxPane pane = Assert.Single(await scanner.ScanAsync(TestContext.Current.CancellationToken));
 
@@ -332,8 +493,9 @@ public class WaitingScanTests
     [Fact]
     public void ParseCollection_APaneCannotDeclareANeighbourReadable()
     {
-        // Unreadable is a protective classification, so the marker that lifts it may only name the pane
-        // it closes. Otherwise a neighbour's text could hand an unread pane back to the actionable path.
+        // Unreadable is a protective classification, so nothing in a capture may lift it from another
+        // pane. Encoding settles it outright — a marker in pane text is bytes inside one field — and the
+        // marker that does close a frame may only name the pane it closes.
         IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
             Stream(["%1|night:1|1|1755900000||pr4595", "%2|night:2|1|1755900000||pr4596"],
                 ("%1", null),
@@ -438,7 +600,7 @@ public class WaitingScanTests
         // A connection dropped mid-manifest yields rows that are real but incomplete. Reporting the ones
         // that arrived would silently shrink the fleet.
         TmuxUnavailableException ex = Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
-            $"{Nonce}:manifest\n%1|night:1|1|1755900000||pr4595\n", host: "fernie", Nonce));
+            $"{Nonce}:manifest\n{Row("%1|night:1|1|1755900000||pr4595")}\n", host: "fernie", Nonce));
 
         Assert.StartsWith("fernie:", ex.Message, StringComparison.Ordinal);
     }
@@ -631,10 +793,32 @@ public class WaitingScanTests
         return nonce;
     }
 
-    private static string Framed(string script, IEnumerable<string> manifest)
+    /// <summary>A whole collection, framed with the nonce the scanner actually generated.</summary>
+    private static string Framed(string script, IEnumerable<string> manifest, params (string PaneId, string? Text)[] captures)
     {
         string nonce = NonceOf(script);
-        return $"{nonce}:manifest\n" + string.Join('\n', manifest) + $"\n{nonce}:end\n";
+        string[] rows = [.. manifest];
+        var sb = new System.Text.StringBuilder();
+        sb.Append(nonce).Append(":manifest\n");
+        foreach (string row in rows)
+        {
+            sb.Append(Row(row, nonce)).Append('\n');
+        }
+
+        sb.Append(nonce).Append(":end\n");
+
+        (string PaneId, string? Text)[] frames = captures.Length > 0
+            ? captures
+            : [.. rows.Select(row => (row.Split('|')[0], (string?)string.Empty))];
+
+        foreach ((string paneId, string? text) in frames)
+        {
+            sb.Append(nonce).Append(":pane ").Append(paneId).Append('\n');
+            sb.Append(text is null ? string.Empty : Hex(text) + "\n")
+              .Append(nonce).Append(text is null ? ":lost " : ":read ").Append(paneId).Append('\n');
+        }
+
+        return sb.ToString();
     }
 
     private static TmuxPane Pane(string target, string capture, PaneActivity activity, DateTimeOffset? lastActivity = null, string? agentState = null, string windowName = "w")
