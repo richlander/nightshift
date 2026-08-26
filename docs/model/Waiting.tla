@@ -27,10 +27,10 @@
    `AgentActs` is exogenous and nondeterministic: agents open windows, close them, and
    switch PRs for reasons this tool neither controls nor predicts.
 
-   Status: parsed with SANY and model-checked with TLC against Waiting.cfg -- run TLC
-   after any change here to regenerate the state count and confirm zero violations
-   (the `regWitnessed` variable added for the fleet-expansion invariant widens the state
-   space, so the earlier count is stale until re-run). Validated by mutation:
+   Status: parsed cleanly with SANY and model-checked with TLC 2.19 against Waiting.cfg --
+   no errors, 2,415,121 states generated, 798,712 distinct, depth 9, zero violations
+   (~5s, 12 workers). Re-run TLC after any change here to regenerate the count and confirm
+   zero violations. Validated by mutation:
    reintroducing the real pane-id-across-restart bug (dropping the epoch check in
    Registered) violates NoCrossEpochMemory; allowing two unwitnessed claimants to be
    ordered violates NeverActOnUnwitnessedOrder; making a sole claimant unownable violates

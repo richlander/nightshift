@@ -54,8 +54,9 @@ java -cp tla2tools.jar tla2sany.SANY Waiting.tla                     # parse
 java -cp tla2tools.jar tlc2.TLC -config Waiting.cfg -workers auto Waiting.tla
 ```
 
-Current bounds — 3 windows, 2 hosts, 2 PRs, 8 steps — run in about a minute: 1,742,181
-states generated, 527,638 distinct, depth 9, zero violations. Raise `MaxTime` for a
+Current bounds — 3 windows, 2 hosts, 2 PRs, 8 steps — run in a few seconds: with TLC 2.19
+(12 workers) SANY parses cleanly and TLC reports 2,415,121 states generated, 798,712
+distinct, depth 9, zero violations (~5s). Raise `MaxTime` for a
 deeper search; hosts multiply the state space quickly, since every sweep branches over
 the subsets of hosts it might have collected.
 
