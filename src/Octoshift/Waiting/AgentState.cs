@@ -382,6 +382,7 @@ internal sealed partial record AgentState
 
         Match match = WindowPr().Match(windowName);
         return match.Success && int.TryParse(match.Groups[2].Value, NumberStyles.None, CultureInfo.InvariantCulture, out int number)
+            && number > 0
             ? (number, match.Groups[1].Value.Equals("i", StringComparison.OrdinalIgnoreCase))
             : null;
     }

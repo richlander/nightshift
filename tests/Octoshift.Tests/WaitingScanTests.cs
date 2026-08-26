@@ -502,6 +502,19 @@ public class WaitingScanTests
         Assert.Contains("fernie", error.Message, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("9223372036854775808")]
+    [InlineData("-1")]
+    [InlineData("not-a-timestamp")]
+    public void ParseCollection_RejectsAnUnparseableActivityTimestamp(string activity)
+    {
+        string row = $"%1|night:1|1|{activity}||pr4595";
+        TmuxUnavailableException error = Assert.Throws<TmuxUnavailableException>(
+            () => TmuxScanner.ParseCollection(Stream([row], ("%1", "> ")), host: "fernie", Nonce));
+
+        Assert.Contains("out-of-range window activity", error.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void ParseCollection_APaneCannotDeclareANeighbourReadable()
     {

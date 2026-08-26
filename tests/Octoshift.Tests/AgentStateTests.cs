@@ -438,6 +438,12 @@ public class AgentStateTests
         Assert.Contains(state.Defects, d => d.Contains(expected, StringComparison.Ordinal) && d.Contains("declares a PR", StringComparison.Ordinal));
     }
 
+    [Theory]
+    [InlineData("pr0")]
+    [InlineData("i0")]
+    public void Parse_RejectsZeroWindowIdentity(string window)
+        => Assert.Null(AgentState.Parse(null, window));
+
     [Fact]
     public void Parse_MergeRecommendationWhileBlockedIsDefective()
     {

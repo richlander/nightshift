@@ -428,12 +428,14 @@ internal sealed class TmuxScanner
 
     private static DateTimeOffset? ParseActivity(string value, string? host)
     {
-        if (!long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out long epoch) || epoch <= 0)
+        if (value == "0" || value.Length == 0)
         {
             return null;
         }
 
-        if (epoch > DateTimeOffset.MaxValue.ToUnixTimeSeconds())
+        if (!long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out long epoch)
+            || epoch < 0
+            || epoch > DateTimeOffset.MaxValue.ToUnixTimeSeconds())
         {
             throw Unavailable(host, $"tmux collection returned out-of-range window activity '{value}'");
         }
