@@ -242,6 +242,62 @@ public class WaitingReportTests
     public void Safe_EscapesWhatATerminalActsOnAndNothingElse(string value, string expected)
         => Assert.Equal(expected, DisplayText.Safe(value));
 
+    [Theory]
+    [InlineData("pr\u202e4595", @"pr\u202e4595")]                       // RIGHT-TO-LEFT OVERRIDE
+    [InlineData("pr\u202d4595", @"pr\u202d4595")]                       // LEFT-TO-RIGHT OVERRIDE
+    [InlineData("pr\u202a4595\u202c", @"pr\u202a4595\u202c")]           // embedding and its pop
+    [InlineData("pr\u2066ready\u2069", @"pr\u2066ready\u2069")]         // first-strong isolate
+    [InlineData("\u2067rtl\u2069", @"\u2067rtl\u2069")]
+    [InlineData("\u2068n\u2069", @"\u2068n\u2069")]
+    [InlineData("a\u200eb\u200fc", @"a\u200eb\u200fc")]                 // LRM / RLM
+    [InlineData("a\u061cb", @"a\u061cb")]                               // ARABIC LETTER MARK
+    [InlineData("\ufeffnight:1", @"\ufeffnight:1")]                     // BOM, invisible where it lands
+    [InlineData("a\u200bb", @"a\u200bb")]                               // zero width space
+    [InlineData("a\u00adb", @"a\xadb")]                                 // soft hyphen, spelled like any other latin-1 code point
+    public void Safe_EscapesTheFormatCharactersThatReorderARow(string value, string expected)
+        // None of these are control characters, so all of them printed verbatim — and a terminal
+        // implements bidi, so a single U+202E prints the rest of the line reversed. A row an operator
+        // reads as its own opposite is worse than one they cannot read.
+        => Assert.Equal(expected, DisplayText.Safe(value));
+
+    [Theory]
+    [InlineData("caf\u00e9")]                                           // ordinary non-ASCII
+    [InlineData("\u65e5\u672c\u8a9e")]
+    [InlineData("\u2014 \u2192 \u00b1")]                                // punctuation and symbols
+    [InlineData("done \ud83c\udf89")]                                   // U+1F389, a supplementary emoji
+    [InlineData("\ud83d\udc68\ud83c\udffd")]                            // emoji plus a skin-tone modifier
+    public void Safe_LeavesPrintableTextAloneIncludingSupplementaryCharacters(string value)
+        // Escaping is for what a terminal executes or lays out. A surrogate pair is one code point, so it
+        // is judged whole: judging its halves would spell an emoji out as two lone surrogates.
+        => Assert.Equal(value, DisplayText.Safe(value));
+
+    [Theory]
+    [InlineData("a\U000e0001b", @"a\U000e0001b")]                       // LANGUAGE TAG
+    [InlineData("a\U000e0065b", @"a\U000e0065b")]                       // TAG LATIN SMALL LETTER E
+    [InlineData("a\U0001d173b", @"a\U0001d173b")]                       // MUSICAL SYMBOL BEGIN BEAM
+    public void Safe_SpellsOutASupplementaryFormatCodePointAsOne(string value, string expected)
+        // The other half of walking by code point: these are format characters above the BMP, and each
+        // arrives as a surrogate pair whose halves look like ordinary unassigned chars on their own.
+        => Assert.Equal(expected, DisplayText.Safe(value));
+
+    [Fact]
+    public void Safe_AnUnpairedSurrogateIsNotACharacterAndIsSpelledOut()
+    {
+        // A lone half of a pair can arrive from a truncated capture. It is not text, and printing it
+        // leaves the reader with a replacement box in a column that is supposed to be legible.
+        Assert.Equal(@"a\ud83cb", DisplayText.Safe("a\ud83cb"));
+        Assert.Equal(@"a\udf89", DisplayText.Safe("a\udf89"));
+    }
+
+    [Fact]
+    public void WriteTable_ABidiOverrideInAWindowNameCannotReorderTheRow()
+    {
+        string text = Render([Row(Ready(), windowName: "pr4595\u202eyduaerton")]);
+
+        Assert.DoesNotContain('\u202e', text);
+        Assert.Contains(@"pr4595\u202eyduaerton", text, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void Safe_TreatsAMissingValueAsEmpty()
         => Assert.Equal(string.Empty, DisplayText.Safe(null));
