@@ -84,7 +84,13 @@ internal static partial class WindowNaming
     /// characters as one argument. The encoded form is nothing but a backslash, <c>u</c>/<c>U</c> and hex
     /// digits, so it cannot contain a quote, a space, a semicolon, a newline or a backslash of its own: a
     /// value carrying any of those is data both to the surrounding shell single-quotes and to tmux. A
-    /// <c>--</c> precedes the desired name so a leading dash cannot become an option.
+    /// <c>--</c> precedes the desired name so a leading dash cannot become an option. The desired name gets
+    /// one extra hazard the staged values do not: <c>rename-window</c> subjects its argument to a second,
+    /// format-expansion pass after the lexer decodes the escapes, so a literal <c>#</c> would still open
+    /// <c>#{…}</c>/<c>#(…)</c>/<c>#[…]</c>/shorthands (and the <c>#[…]</c> style exceptions defeat any
+    /// <c>#</c>-doubling scheme). So the desired name is staged into a user option too and the rename reads
+    /// it back as <c>#{@…}</c>: an option value is substituted but not re-expanded, so the name lands
+    /// byte-for-byte with no second pass to escape.
     ///
     /// <strong>Each mutation is guarded on the whole scanned identity, atomically.</strong> A rename is
     /// planned against a sweep that is already stale by the time it runs: the history lock is released and
@@ -129,38 +135,45 @@ internal static partial class WindowNaming
         const string ServerGen = "#{pid}:#{start_time}";
         string epochEq = $"#{{==:{ServerGen},{epoch}}}";
 
-        // Per-run, per-window user option keys the scanned name and state are staged under. The nonce is
-        // hex, so the names are valid option identifiers, and keying by it means a second rename process
-        // running concurrently on the same host stages under different names — it cannot read this run's
-        // expectations or have this run read its.
+        // Per-run, per-window user option keys the scanned name, scanned state, and the desired name are
+        // staged under. The nonce is hex, so the names are valid option identifiers, and keying by it means
+        // a second rename process running concurrently on the same host stages under different names — it
+        // cannot read this run's expectations or have this run read its.
         string nameKey = $"@o{nonce}n";
         string stateKey = $"@o{nonce}s";
+        string descKey = $"@o{nonce}d";
 
         var script = new StringBuilder();
         foreach ((TmuxPane pane, string desired) in renames)
         {
             string id = pane.WindowId;
 
-            // 1. Stage the scanned name and raw state into this window's option, escaped so no raw byte
-            //    reaches shell or tmux syntax. if-shell -F 1 is only a way to have tmux lex the command
-            //    string, which is what decodes the escapes; there is no false branch.
+            // 1. Stage the scanned name, raw state, and desired name into this window's options, escaped so
+            //    no raw byte reaches shell or tmux syntax. if-shell -F 1 is only a way to have tmux lex the
+            //    command string, which is what decodes the escapes; there is no false branch.
             script.Append("tmux if-shell -F 1 'set-option -w -t ").Append(id).Append(' ').Append(nameKey)
                   .Append(" \"").Append(TmuxEscape(pane.WindowName)).Append("\" ; set-option -w -t ").Append(id).Append(' ').Append(stateKey)
-                  .Append(" \"").Append(TmuxEscape(pane.AgentStateRaw)).Append("\"'\n");
+                  .Append(" \"").Append(TmuxEscape(pane.AgentStateRaw)).Append("\" ; set-option -w -t ").Append(id).Append(' ').Append(descKey)
+                  .Append(" \"").Append(TmuxEscape(desired)).Append("\"'\n");
 
-            // 2. Guard on epoch AND name AND state, and mutate in the same client's queue. The false branch
-            //    reports whether the server moved (epoch) or only the window's identity did (stale).
+            // 2. Guard on epoch AND name AND state, and mutate in the same client's queue. The rename reads
+            //    the desired name from its staged option (#{@descKey}) rather than an inline literal:
+            //    rename-window subjects its argument to a *second*, format-expansion pass, so any inline
+            //    literal #{…}/#(…)/#[…]/shorthand in an agent-chosen name would be evaluated. A staged
+            //    option value is substituted but not itself re-expanded, so the name lands byte-for-byte.
+            //    The false branch reports whether the server moved (epoch) or only the identity did (stale).
             string guard = $"#{{&&:{epochEq},#{{&&:#{{==:#{{window_name}},#{{{nameKey}}}}},#{{==:#{{@agent_state}},#{{{stateKey}}}}}}}}}";
             string falseReport = $"#{{?{epochEq},{nonce}:stale:{id},{nonce}:epoch:{id}}}";
             script.Append("tmux if-shell -F -t ").Append(id).Append(" '").Append(guard)
-                  .Append("' 'rename-window -t ").Append(id).Append(" -- \"").Append(TmuxEscape(desired))
-                  .Append("\" ; display-message -p -t ").Append(id).Append(' ').Append(nonce).Append(":ok:").Append(id)
+                  .Append("' 'rename-window -t ").Append(id).Append(" -- \"#{").Append(descKey).Append("}\"")
+                  .Append(" ; display-message -p -t ").Append(id).Append(' ').Append(nonce).Append(":ok:").Append(id)
                   .Append("' 'display-message -p -t ").Append(id).Append(" \"").Append(falseReport).Append("\"' || :\n");
 
             // 3. Unset the staged options so no run leaves them behind. Tolerant of a vanished window or a
             //    restarted server, which has already discarded them.
             script.Append("tmux set-option -w -t ").Append(id).Append(" -u ").Append(nameKey).Append(" 2>/dev/null; ")
-                  .Append("tmux set-option -w -t ").Append(id).Append(" -u ").Append(stateKey).Append(" 2>/dev/null; :\n");
+                  .Append("tmux set-option -w -t ").Append(id).Append(" -u ").Append(stateKey).Append(" 2>/dev/null; ")
+                  .Append("tmux set-option -w -t ").Append(id).Append(" -u ").Append(descKey).Append(" 2>/dev/null; :\n");
         }
 
         return script.ToString();
@@ -173,6 +186,14 @@ internal static partial class WindowNaming
     /// semicolon, newline or backslash of the input; tmux decodes it back to the exact characters as one
     /// argument, and nothing in it can reach either shell or tmux command syntax.
     /// </summary>
+    /// <remarks>
+    /// This protects only the command lexer. It is deliberately <em>not</em> relied on to make the desired
+    /// name safe on the <c>rename-window</c> line: that argument gets a second, format-expansion pass, which
+    /// this encoding does not neutralise (a decoded literal <c>#</c> is still a format introducer, and the
+    /// exceptions around <c>#[…]</c> styles make any doubling scheme brittle). The desired name is instead
+    /// staged into a user option and referenced as <c>#{@…}</c>, whose value is substituted but not
+    /// re-expanded — see <see cref="BuildRenameScript"/> — so it lands byte-for-byte.
+    /// </remarks>
     internal static string TmuxEscape(string value)
     {
         var sb = new StringBuilder(value.Length * 6);

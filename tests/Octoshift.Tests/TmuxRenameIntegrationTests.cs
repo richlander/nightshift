@@ -98,6 +98,44 @@ public sealed class TmuxRenameIntegrationTests : IDisposable
         Assert.Equal(desired, renamed.WindowName);
     }
 
+    [Theory]
+    [InlineData("#{window_name}")]                         // a format variable that would expand to the name
+    [InlineData("#{session_name}")]                        // a different variable
+    [InlineData("pr#{window_index}-ready")]                // format embedded in a realistic base+suffix
+    [InlineData("#(touch INJECTED)")]                      // #(...) runs a shell command when expanded
+    [InlineData("x#(touch INJECTED)y-ready")]              // the same, embedded, with a tool suffix
+    [InlineData("#H")]                                     // single-letter shorthand: the host name
+    [InlineData("#S #W #T #D")]                            // several shorthands in one name
+    [InlineData("#[fg=red]styled#[default]")]              // a style directive (defeats any #-doubling scheme)
+    [InlineData("pr#4448")]                                // a bare '#' before an ordinary character
+    [InlineData("##literal-hashes##")]                     // '#' that must survive as itself, not collapse
+    [InlineData("a#{x}#(y)#Z#[w]b")]                        // every hostile form in one name
+    public async Task Rename_PreservesTmuxFormatSyntaxLiterally(string desired)
+    {
+        // Blocker 1 (round 8): rename-window subjects its argument to a second, format-expansion pass after
+        // the command lexer decodes the escapes. A name an agent chose that carries #{...}, #(...), a style
+        // #[...] or a single-letter shorthand must survive byte-for-byte, not be evaluated — and #(...) must
+        // never run a command. The fix stages the desired name into an option the rename reads as #{@…},
+        // whose value is substituted but not re-expanded. Verified against a live tmux: the name is applied,
+        // read back through the encoded scanner byte-for-byte, and no INJECTED marker is produced.
+        if (_tmux is null)
+        {
+            Assert.Skip("tmux is not installed");
+        }
+
+        NewServer("s");
+        (string epoch, TmuxPane pane) = await FirstWindowAsync();
+
+        string nonce = Nonce();
+        string script = WindowNaming.BuildRenameScript([(pane, desired)], epoch, nonce)!;
+        CommandResult result = await RunAsync(script, TestContext.Current.CancellationToken);
+
+        Assert.Empty(Directory.GetFiles(_workDir, "INJECTED*"));
+        Assert.Contains($"{nonce}:ok:{pane.WindowId}", result.Stdout, StringComparison.Ordinal);
+        (_, TmuxPane renamed) = await FirstWindowAsync();
+        Assert.Equal(desired, renamed.WindowName);
+    }
+
     [Fact]
     public async Task Rename_AbortsWhenTheServerRestartedAndRecycledTheWindowId()
     {
