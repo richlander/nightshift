@@ -102,34 +102,21 @@ internal sealed class PaneHistory : IDisposable
     /// Loads the history <em>without</em> the cross-process transaction lock. For tests only: product code
     /// must use <see cref="OpenAsync"/>, so a concurrent <c>waiting</c> and <c>pr</c> cannot interleave one
     /// process's load-reconcile-save with another's and lose an update. Kept as the public constructor so
-    /// the unit tests that new one up directly do not each have to acquire a real lock, but every product
-    /// call site goes through the factory.
+    /// the unit tests that new one up directly do not each have to acquire a real lock; it loads
+    /// forgivingly (a malformed or unreadable existing file becomes empty) because those tests seed
+    /// partial and corrupt files on purpose. Every product call site goes through <see cref="OpenAsync"/>,
+    /// which loads strictly.
     /// </summary>
     public PaneHistory(string? path = null)
-        : this(path ?? DefaultPath, null)
+        : this(path ?? DefaultPath, null, strictLoad: false)
     {
     }
 
-    private PaneHistory(string path, FileStream? lockStream)
+    private PaneHistory(string path, FileStream? lockStream, bool strictLoad)
     {
         _path = path;
         _lock = lockStream;
-
-        try
-        {
-            HistoryFile? file = File.Exists(_path)
-                ? JsonSerializer.Deserialize(File.ReadAllText(_path), PaneHistoryJsonContext.Default.HistoryFile)
-                : null;
-
-            _entries = file?.Panes ?? [];
-            _hosts = file?.Hosts ?? [];
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
-        {
-            // Losing the history costs one sweep of silence measurements, never correctness.
-            _entries = [];
-            _hosts = [];
-        }
+        (_entries, _hosts) = Load(path, strictLoad);
 
         // Fail closed on any entry not written by this scheme. A host key must be a valid target id and a
         // pane key a target id composed with a canonical pane id — validated with the exact IsPaneId the
@@ -171,13 +158,58 @@ internal sealed class PaneHistory : IDisposable
     }
 
     /// <summary>
+    /// Reads the two dictionaries off disk. Absence of the file is a first run — a genuinely empty
+    /// history. An existing file that cannot be read or parsed, or that is a null JSON document, is NOT
+    /// empty: it is a history whose contents are unknown, and treating it as empty would forget the known
+    /// hosts and witnessed orders it held — letting a narrowed sweep read as complete and then overwrite
+    /// the evidence. So under a strict (product) load that case throws and the transaction is unavailable;
+    /// the forgiving loader used by unit tests tolerates it, since those seed corrupt files deliberately.
+    /// A well-formed file with entries this scheme never wrote is not a load failure — it parses — and is
+    /// left to the sanitiser above to drop key by key.
+    /// </summary>
+    private static (Dictionary<string, PaneMemory>, Dictionary<string, HostMemory>) Load(string path, bool strict)
+    {
+        if (!File.Exists(path))
+        {
+            return ([], []);
+        }
+
+        HistoryFile? file;
+        try
+        {
+            file = JsonSerializer.Deserialize(File.ReadAllText(path), PaneHistoryJsonContext.Default.HistoryFile);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            if (strict)
+            {
+                throw new HistoryUnavailableException($"could not read pane history from {path}: {ex.Message}", ex);
+            }
+
+            return ([], []);
+        }
+
+        if (file is null)
+        {
+            if (strict)
+            {
+                throw new HistoryUnavailableException($"pane history at {path} is a null document, not an empty history");
+            }
+
+            return ([], []);
+        }
+
+        return (file.Panes ?? [], file.Hosts ?? []);
+    }
+
+    /// <summary>
     /// Opens the history for a serialized transaction: acquires a cross-process lock — a sidecar file no
-    /// other process can share — and only then loads, so one process's load-reconcile-save cannot
-    /// interleave with another's and lose an update. The lock is released by <see cref="Save"/> (the
-    /// commit point) or by <see cref="Dispose"/> (any earlier exit). A lock that cannot be taken within
-    /// the timeout, or a lock I/O failure, surfaces as <see cref="HistoryPersistException"/> — the
-    /// unavailable contract — never as a silent success; a genuine caller cancellation escapes carrying
-    /// the caller's own token.
+    /// other process can share — and only then loads, strictly. The lock is released by <see cref="Save"/>
+    /// (the commit point) or by <see cref="Dispose"/> (any earlier exit). A lock that cannot be taken
+    /// within the timeout, a lock I/O failure, or an existing history file that cannot be read or parsed
+    /// all surface as <see cref="HistoryUnavailableException"/> — the unavailable contract — never as a
+    /// silent success that would forget known hosts and overwrite the file; a genuine caller cancellation
+    /// escapes carrying the caller's own token.
     /// </summary>
     public static async Task<PaneHistory> OpenAsync(string? path, CancellationToken ct)
     {
@@ -185,7 +217,7 @@ internal sealed class PaneHistory : IDisposable
         FileStream lockStream = await AcquireLockAsync(resolved, ct);
         try
         {
-            return new PaneHistory(resolved, lockStream);
+            return new PaneHistory(resolved, lockStream, strictLoad: true);
         }
         catch
         {
@@ -203,7 +235,7 @@ internal sealed class PaneHistory : IDisposable
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            throw new HistoryPersistException(path, ex);
+            throw new HistoryUnavailableException($"could not lock pane history at {path}: {ex.Message}", ex);
         }
 
         DateTimeOffset deadline = DateTimeOffset.UtcNow + LockTimeout;
@@ -227,7 +259,7 @@ internal sealed class PaneHistory : IDisposable
             {
                 // The deadline passed with the lock still unavailable, or a non-transient failure: the
                 // transaction cannot be serialized, so it is unavailable rather than a bypassed write.
-                throw new HistoryPersistException(path, ex);
+                throw new HistoryUnavailableException($"could not lock pane history at {path}: {ex.Message}", ex);
             }
         }
     }
@@ -478,7 +510,7 @@ internal sealed class PaneHistory : IDisposable
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             TryDelete(tmp);
-            throw new HistoryPersistException(_path, ex);
+            throw new HistoryUnavailableException($"could not persist pane history to {_path}: {ex.Message}", ex);
         }
 
         // Save is the commit: the write has landed, so the transaction lock is released here rather than
@@ -503,12 +535,14 @@ internal sealed class PaneHistory : IDisposable
 }
 
 /// <summary>
-/// The pane history could not be written. Persistence is load-bearing — stale witnessed ownership left on
-/// disk by a sweep whose memory did not land would be read as current next run — so this surfaces as the
-/// unavailable contract rather than being swallowed into a success-shaped report.
+/// The pane history transaction could not proceed — its lock could not be taken, an existing file could
+/// not be read or parsed, or a write did not land. The history is load-bearing (a stale witnessed order
+/// left on disk, or a known host forgotten because the file was unreadable, would be believed next run),
+/// so any of these surfaces as the unavailable contract rather than being swallowed into a success-shaped
+/// report.
 /// </summary>
-internal sealed class HistoryPersistException(string path, Exception inner)
-    : Exception($"could not persist pane history to {path}: {inner.Message}", inner);
+internal sealed class HistoryUnavailableException(string message, Exception? inner = null)
+    : Exception(message, inner);
 
 /// <summary>The on-disk shape: what is known per window, and per host.</summary>
 internal sealed record HistoryFile

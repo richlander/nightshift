@@ -46,7 +46,7 @@ public sealed class PersistenceTests
         (PaneHistory history, string blocker) = UnwritableHistory();
         try
         {
-            await Assert.ThrowsAsync<HistoryPersistException>(() => WaitingCommand.ResolveAllAsync(
+            await Assert.ThrowsAsync<HistoryUnavailableException>(() => WaitingCommand.ResolveAllAsync(
                 [Pane(null)], None, None, DateTimeOffset.UtcNow, TestContext.Current.CancellationToken,
                 collectedHosts: [null], allHostsAnswered: true, history: history));
         }
@@ -63,7 +63,7 @@ public sealed class PersistenceTests
         try
         {
             var collected = new WaitingCommand.Collection([Pane(null)], [], 1, [null]);
-            await Assert.ThrowsAsync<HistoryPersistException>(() => PrCommand.LocateAsync(
+            await Assert.ThrowsAsync<HistoryUnavailableException>(() => PrCommand.LocateAsync(
                 4448, collected, history, None, None, DateTimeOffset.UtcNow, TestContext.Current.CancellationToken));
         }
         finally
@@ -100,7 +100,7 @@ public sealed class PersistenceTests
             {
                 var history = new PaneHistory(path);
                 history.Observe(w, t.AddMinutes(5), claimedPr: 4448, registrationWitnessed: true);
-                Assert.Throws<HistoryPersistException>(() => history.Save([w], ["fernie"]));
+                Assert.Throws<HistoryUnavailableException>(() => history.Save([w], ["fernie"]));
             }
             finally
             {
@@ -132,6 +132,134 @@ public sealed class PersistenceTests
         Assert.Equal("could not persist pane history to /x/panes.json: denied", doc.RootElement.GetProperty("error").GetString());
         Assert.Equal(JsonValueKind.Array, doc.RootElement.GetProperty("rows").ValueKind);
         Assert.Empty(doc.RootElement.GetProperty("rows").EnumerateArray());
+    }
+
+    [Theory]
+    [InlineData("{ this is not valid json ]")]  // malformed
+    [InlineData("null")]                          // a null root is an existing file, not a first run
+    public async Task OpenAsync_FailsClosedOnAMalformedExistingHistoryWithoutOverwritingIt(string content)
+    {
+        // The load side is load-bearing too: an existing file that cannot be parsed is a history whose
+        // known hosts and witnessed orders are unknown, not an empty one. Treating it as empty would let a
+        // narrowed sweep read complete and then overwrite the evidence. So a product transaction fails
+        // closed and leaves the bytes untouched.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-badload-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, content);
+        try
+        {
+            await Assert.ThrowsAsync<HistoryUnavailableException>(
+                () => PaneHistory.OpenAsync(path, TestContext.Current.CancellationToken));
+            Assert.Equal(content, File.ReadAllText(path));
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task OpenAsync_FailsClosedOnAnUnreadableExistingHistory()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-unreadable-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, "{\"panes\":{},\"hosts\":{}}");
+        File.SetUnixFileMode(path, UnixFileMode.None);
+        try
+        {
+            await Assert.ThrowsAsync<HistoryUnavailableException>(
+                () => PaneHistory.OpenAsync(path, TestContext.Current.CancellationToken));
+        }
+        finally
+        {
+            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task OpenAsync_TreatsAMissingFileAsAnEmptyFirstRun()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-firstrun-{Guid.NewGuid():N}", "panes.json");
+        try
+        {
+            using PaneHistory history = await PaneHistory.OpenAsync(path, TestContext.Current.CancellationToken);
+            Assert.Empty(history.KnownHosts);
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(Path.GetDirectoryName(path)!, recursive: true);
+            }
+            catch (IOException)
+            {
+            }
+        }
+    }
+
+    [Fact]
+    public void TheDirectConstructorLoadsAMalformedHistoryForgivinglyForUnitTests()
+    {
+        // The test-only constructor tolerates a malformed file (returns empty) so the sanitization unit
+        // tests can seed corrupt files without each acquiring a lock; product code never uses it.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-forgiving-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, "{ not json ]");
+        try
+        {
+            Assert.Empty(new PaneHistory(path).KnownHosts);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task ResolveAllAsync_SurfacesAMalformedHistoryAsUnavailable()
+    {
+        // The waiting command path: a malformed history makes ResolveAllAsync fail closed with the same
+        // exception RunAsync maps to the unavailable JSON/human contract, rather than owning a sole claim
+        // off a forgotten fleet.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-waitbad-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, "{ bad ]");
+        try
+        {
+            await Assert.ThrowsAsync<HistoryUnavailableException>(() => WaitingCommand.ResolveAllAsync(
+                [Pane(null)], None, None, DateTimeOffset.UtcNow, TestContext.Current.CancellationToken,
+                collectedHosts: [null], allHostsAnswered: true, history: null, historyPath: path));
+            Assert.Equal("{ bad ]", File.ReadAllText(path));
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task LocateAsync_SurfacesAMalformedHistoryAsUnavailable()
+    {
+        // The pr command path, symmetrically.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-prbad-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, "{ bad ]");
+        try
+        {
+            var collected = new WaitingCommand.Collection([Pane(null)], [], 1, [null]);
+            await Assert.ThrowsAsync<HistoryUnavailableException>(() => PrCommand.LocateAsync(
+                4448, collected, history: null, None, None, DateTimeOffset.UtcNow, TestContext.Current.CancellationToken, historyPath: path));
+            Assert.Equal("{ bad ]", File.ReadAllText(path));
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
     }
 
     [Fact]

@@ -50,15 +50,14 @@ internal static class PrCommand
 
         try
         {
-            // LocateAsync persists the shared history as part of locating the PR — including breaking the
-            // continuity of every host this run did not collect, even a total failure where it collected
-            // none. It runs under the cross-process transaction lock OpenAsync takes, held only across the
-            // local parse/reconcile/save and released by Save before the GitHub read. A persistence or lock
-            // failure surfaces here as the unavailable contract, never a success-shaped answer above a
-            // silent write loss that a later run would read as current.
-            using PaneHistory history = await PaneHistory.OpenAsync(null, ct);
+            // LocateAsync opens the shared history under its cross-process transaction lock and persists it
+            // as part of locating the PR — including breaking the continuity of every host this run did not
+            // collect, even a total failure where it collected none. The lock is held only across the local
+            // parse/reconcile/save and released by Save before the GitHub read. A load, persistence, or
+            // lock failure surfaces here as the unavailable contract, never a success-shaped answer above a
+            // silent write loss or a history it could not read.
             PrLocation located = await LocateAsync(
-                prNumber, collected, history, facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, ct);
+                prNumber, collected, history: null, facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, ct);
 
             if (json)
             {
@@ -71,7 +70,7 @@ internal static class PrCommand
 
             return located.ExitCode;
         }
-        catch (HistoryPersistException ex)
+        catch (HistoryUnavailableException ex)
         {
             if (json)
             {
@@ -119,12 +118,23 @@ internal static class PrCommand
     internal static async Task<PrLocation> LocateAsync(
         int prNumber,
         WaitingCommand.Collection collected,
-        PaneHistory history,
+        PaneHistory? history,
         Func<int, CancellationToken, Task<PrFacts?>> fetchAsync,
         Func<int, CancellationToken, Task<PrFacts?>> refreshMergeabilityAsync,
         DateTimeOffset now,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? historyPath = null)
     {
+        // Own the transaction: open the shared history under its cross-process lock unless a test injected
+        // one. The lock is held only across the local parse and reconcile below and released by Save
+        // before the GitHub read; the finally is the safety net for an early exit. A malformed or
+        // unreadable existing file, or a lock failure, escapes as HistoryUnavailableException, which
+        // RunAsync maps to the unavailable contract.
+        bool ownsHistory = history is null;
+        history ??= await PaneHistory.OpenAsync(historyPath, ct);
+        try
+        {
+
         // Window names that appear twice on one host. A duplicate is a rename that went where it did not
         // belong, so the name identifies nothing — the same safeguard `waiting` applies, so `pr` cannot
         // report a claim `waiting` rejects as defective.
@@ -230,6 +240,14 @@ internal static class PrCommand
         }
 
         return new PrLocation(prNumber, mine, prFacts, viewComplete, collected, silence);
+        }
+        finally
+        {
+            if (ownsHistory)
+            {
+                history.Dispose();
+            }
+        }
     }
 
     internal static void WriteReport(TextWriter output, PrLocation located, DateTimeOffset now)

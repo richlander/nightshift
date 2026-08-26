@@ -116,7 +116,7 @@ internal static class WaitingCommand
                 using PaneHistory history = await PaneHistory.OpenAsync(null, ct);
                 history.Save([], collected.CollectedHosts);
             }
-            catch (HistoryPersistException ex)
+            catch (HistoryUnavailableException ex)
             {
                 failures.Add(ex.Message);
             }
@@ -178,7 +178,7 @@ internal static class WaitingCommand
             // reflects this run.
             return collected.AnyFailure || Omitted.Count > 0 || renameFailures > 0 ? ExitCode.Unavailable : ExitCode.Ok;
         }
-        catch (HistoryPersistException ex)
+        catch (HistoryUnavailableException ex)
         {
             if (json)
             {
@@ -355,7 +355,8 @@ internal static class WaitingCommand
         CancellationToken ct,
         IReadOnlyList<string?>? collectedHosts,
         bool allHostsAnswered,
-        PaneHistory? history = null)
+        PaneHistory? history = null,
+        string? historyPath = null)
     {
         Departed = [];
         Omitted = [];
@@ -430,7 +431,7 @@ internal static class WaitingCommand
         // network work; Save releases it, and the finally is the safety net for an early exit. A test that
         // injects its own history owns its lifetime and keeps the direct, lock-free constructor.
         bool ownsHistory = history is null;
-        history ??= await PaneHistory.OpenAsync(null, ct);
+        history ??= await PaneHistory.OpenAsync(historyPath, ct);
         try
         {
 
