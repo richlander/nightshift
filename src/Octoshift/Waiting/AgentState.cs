@@ -116,8 +116,8 @@ internal sealed partial record AgentState
     public static AgentState? Parse(string? agentState, string? windowName)
     {
         (int Number, bool IsIssue)? fromName = PrFromWindowName(windowName);
-        Dictionary<string, string> fields = SplitFields(agentState);
         var defects = new List<string>();
+        Dictionary<string, string> fields = SplitFields(agentState, defects);
 
         int? number = null;
         bool isIssue = false;
@@ -332,9 +332,10 @@ internal sealed partial record AgentState
         }
     }
 
-    private static Dictionary<string, string> SplitFields(string? text)
+    private static Dictionary<string, string> SplitFields(string? text, List<string> defects)
     {
         var fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (string.IsNullOrWhiteSpace(text))
         {
             return fields;
@@ -348,12 +349,19 @@ internal sealed partial record AgentState
                 continue;
             }
 
+            string key = token[..eq];
+            if (!seen.Add(key))
+            {
+                defects.Add($"field '{key}' is declared more than once");
+                continue;
+            }
+
             // An empty value (blocked=) is the agent saying "nothing here"; keep it out of the map so it
             // reads the same as having been omitted.
             string value = token[(eq + 1)..];
             if (value.Length > 0)
             {
-                fields.TryAdd(token[..eq], value);
+                fields.Add(key, value);
             }
         }
 

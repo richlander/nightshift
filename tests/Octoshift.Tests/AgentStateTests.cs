@@ -416,6 +416,18 @@ public class AgentStateTests
     }
 
     [Fact]
+    public void Parse_RepeatedIdentityFieldsAreDefective()
+    {
+        AgentState? state = AgentState.Parse(
+            "pr=4595 pr=4626 head=722512e25 reviews=2/2 rec=merge",
+            "pr4595");
+
+        Assert.NotNull(state);
+        Assert.Equal(4595, state.PrNumber);
+        Assert.Contains(state.Defects, d => d.Contains("field 'pr' is declared more than once", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void Parse_ACoherentPrRecordStaysClean()
     {
         AgentState? state = AgentState.Parse("pr=4626 head=f4a8d1c84 round=1 reviews=2/2 rec=merge", "pr4626");

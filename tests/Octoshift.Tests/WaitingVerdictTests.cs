@@ -47,6 +47,18 @@ public class WaitingVerdictTests
     }
 
     [Fact]
+    public void Resolve_AClearedPredicateDoesNotOverrideANamedBlocker()
+    {
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=1/2 blocked=4629 waiting=check:ci-required rec=wait"),
+            Facts(checks: [new CheckRunFact("ci-required", "completed", "success")]));
+
+        Assert.Equal(WaitingState.Holding, v.State);
+        Assert.False(v.MayAct);
+        Assert.Contains("#4629", v.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Resolve_AFailedCheckAlsoClearsTheWait()
     {
         // "Concluded" is the condition, not "passed": a red result is news the agent needs just as much.

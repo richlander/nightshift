@@ -187,6 +187,16 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
                 : new(WaitingState.Conflicting, RowOwner.Agent, "CONFLICTING; integrate a later main", assurance);
         }
 
+        // A named blocker is an explicit unresolved dependency. A predicate beside it can add another
+        // reason to wait, but clearing that predicate cannot clear the issue or PR the record still names.
+        // Keep this ahead of predicate evaluation so one completed check cannot make a multiply-blocked
+        // window actionable.
+        if (state.Recommendation == Recommendation.Wait && state.Blocked.Count > 0)
+        {
+            return new(WaitingState.Holding, RowOwner.Nobody,
+                $"parked behind {string.Join(", ", state.Blocked.Select(b => "#" + b))}", assurance);
+        }
+
         // The declared predicate is evaluated before the generic gates, because it is the agent's own
         // statement of what would make it interesting again — including `merge`, which is precisely the
         // uncomputed-mergeability case.
@@ -204,14 +214,6 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
             return declaredDone
                 ? new(WaitingState.MergeUnverified, RowOwner.Operator, "reported done, but GitHub has not computed mergeability", assurance)
                 : new(WaitingState.MergeUnverified, RowOwner.Nobody, "mergeability not yet computed", assurance);
-        }
-
-        // Wait is the one recommendation that needs no decision — the agent resumes itself when the
-        // numbers it named close. It stays quiet, and becomes interesting again exactly then.
-        if (state.Recommendation == Recommendation.Wait && state.Blocked.Count > 0)
-        {
-            return new(WaitingState.Holding, RowOwner.Nobody,
-                $"parked behind {string.Join(", ", state.Blocked.Select(b => "#" + b))}", assurance);
         }
 
         if (!declaredDone)
