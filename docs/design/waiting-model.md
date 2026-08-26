@@ -117,12 +117,16 @@ The machine advances on a sweep. Between sweeps, the world moves on its own:
 | agent stops | activity → Idle; nothing else changes |
 | window created / destroyed | claims re-ranked |
 | PR merges, head moves, checks report | verdicts change under an unchanged record |
-| **tmux server restarts** | pane ids restart at `%0`; all remembered claims for that host are void |
+| **tmux server restarts** | pane ids restart at `%0`; all remembered claims for that host are void once it is next collected under the new epoch |
+| host has no tmux server | a successful empty observation — the machine answered, it just holds no windows |
 | host unreachable | that host contributes no rows; others are unaffected |
 
 The last two are why the tool records an epoch per host. A restarted server makes
 remembered pane ids name different windows, so the memory is not merely stale —
-it is actively misleading, and confidence would launder it.
+it is actively misleading, and confidence would launder it. The restart itself
+changes nothing on disk: the tool cannot rewrite what it has not collected, so a
+host's remembered claims are voided the next time it is swept and the epoch is
+seen to have changed, not at the moment of the restart.
 
 ## 6. Invariants
 
@@ -177,8 +181,17 @@ because several of them were violated by code that passed its unit tests.
 
 **Liveness — the tool does not go quiet by accident.**
 
-15. An unreachable host is reported, never absorbed into an empty result.
+15. An unreachable host is reported, never absorbed into an empty result. A host
+    with no running tmux server is the exception that proves the rule: it *did*
+    answer, so it is a successful empty observation — recorded as a host seen to
+    hold no windows, distinct from one that could not be read. Only a missing or
+    broken tmux (a missing binary, a permission error, malformed output) is
+    unreachable.
 16. A sweep that collects nothing reports failure rather than an idle fleet.
+17. A completed sweep persists its memory — including breaking the continuity of
+    every host it did not collect, even a total failure. Persistence is
+    load-bearing, so a write that fails is reported as unavailable rather than
+    left as a success a later run would read as current.
 
 Invariants 9–14 are the ones unit tests cover least well, because they are
 statements about *sequences* of sweeps interleaved with fleet events rather than

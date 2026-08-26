@@ -223,11 +223,15 @@ ServerRestarts ==
     /\ epoch' = epoch + 1
     /\ live' = {}
     /\ claims' = [w \in Windows |-> NoPr]
-    \* A restart voids every registration's provenance: pane ids restart, so nothing seen
-    \* under the old server witnessed anything under the new one. regWitnessed empties for
-    \* the same reason regEpoch stops matching -- both say "what came before does not count".
-    /\ regWitnessed' = [w \in Windows |-> FALSE]
-    /\ UNCHANGED << regEpoch, regTime, regPr, regFleet, sweptAt, viewComplete, knownHosts, lastCollected >>
+    \* regWitnessed is NOT touched here, and that is deliberate. The production tool cannot
+    \* alter persisted provenance for a host it did not collect: a restart is a fact about
+    \* the server, learned only when a later sweep reaches the host and AdoptEpoch sees the
+    \* epoch mismatch, which is what clears or freshens the witness on disk. Clearing it
+    \* here would be a change to a host that may be absent from lastCollected, which
+    \* NoPhantomDepartureStep forbids -- and it is unnecessary, because Registered already
+    \* fails the instant regEpoch # epoch, so a stale witness confers nothing until the next
+    \* collecting Sweep rewrites it under the new epoch.
+    /\ UNCHANGED << regEpoch, regTime, regPr, regFleet, sweptAt, viewComplete, knownHosts, lastCollected, regWitnessed >>
 
 \* A sweep over some set of hosts. The set is nondeterministic because it is chosen by
 \* whoever ran the tool -- and because a host may fail to answer. Those two are the same

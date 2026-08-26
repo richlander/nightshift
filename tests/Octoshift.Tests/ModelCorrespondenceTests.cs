@@ -115,6 +115,44 @@ public class ModelCorrespondenceTests
     }
 
     /// <summary>
+    /// TLA+ <c>ServerRestarts</c> leaves <c>regWitnessed</c> unchanged: the tool cannot alter persisted
+    /// provenance for a host it did not collect, so a witness survives a restart on disk until the next
+    /// sweep reaches the host and <c>AdoptEpoch</c> sees the epoch mismatch and invalidates it. Clearing
+    /// it eagerly would be a phantom change to an uncollected host, which <c>NoPhantomDepartureStep</c>
+    /// forbids — and it is unnecessary, because a cross-epoch registration confers nothing anyway.
+    /// </summary>
+    [Fact]
+    public void ARestartDoesNotClearWitnessUntilTheHostIsCollectedAgain()
+    {
+        string path = TempPath();
+        try
+        {
+            TmuxPane w = Window("%1", host: "fernie", epoch: "100:1");
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+            var first = new PaneHistory(path);
+            first.AdoptEpoch("fernie", "100:1", t);
+            first.Observe(w, t, claimedPr: 4448, registrationWitnessed: true);
+            first.Save([w], ["fernie"]);
+            Assert.True(new PaneHistory(path).IsWitnessed(w));
+
+            // A server restart happens, but this run does not collect fernie: its witness is untouched on
+            // disk, exactly as the model leaves regWitnessed alone on ServerRestarts.
+            var reloaded = new PaneHistory(path);
+            Assert.True(reloaded.IsWitnessed(w));
+
+            // Only when fernie is collected under the new epoch does AdoptEpoch invalidate the stale
+            // registration — the next collecting Sweep, not the restart itself.
+            reloaded.AdoptEpoch("fernie", "999:9", t.AddHours(1));
+            Assert.False(reloaded.IsWitnessed(w));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    /// <summary>
     /// TLA+ <c>RegistrationStableStep</c>: a window's registration is unchanged while it keeps claiming
     /// the same PR, and is renewed when it switches. TLC refuted the first phrasing of this property
     /// because it missed the switching case.
