@@ -10,7 +10,10 @@ internal sealed record WaitingRow
 {
     public required TmuxPane Pane { get; init; }
 
-    /// <summary>Null when nothing — neither option nor window name — identified a PR.</summary>
+    /// <summary>
+    /// Null when nothing — neither option nor window name — identified a PR. A window that published
+    /// something anyway is carried by <see cref="Unidentified"/> instead.
+    /// </summary>
     public AgentState? Record { get; init; }
 
     /// <summary>

@@ -110,7 +110,10 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
     {
         ArgumentNullException.ThrowIfNull(state);
 
-        Assurance assurance = Assurance.Low($"the record identifies no PR or issue ({state.Defects.Count} defect(s))");
+        // The same words the empty-shell row uses, because it is the same missing fact — and said once
+        // here rather than restated from the reason, which already carries what the record asked for and
+        // is followed in the detail column by every defect verbatim.
+        Assurance assurance = Assurance.Low("nothing identifies this window");
 
         return state.Recommendation switch
         {
