@@ -177,6 +177,17 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
             return new(WaitingState.Untrustworthy, RowOwner.Operator, "reported done without a head to check it against", assurance);
         }
 
+        // A named blocker is an explicit unresolved dependency. A predicate beside it can add another
+        // reason to wait, but clearing that predicate cannot clear the issue or PR the record still names.
+        // It also outranks a conflict against today's main: waking the agent before its dependency lands
+        // buys a conflict pass that the dependency is likely to invalidate. Stop/approve escalations were
+        // handled above, while a contradictory merge recommendation was already made untrustworthy.
+        if (state.Blocked.Count > 0)
+        {
+            return new(WaitingState.Holding, RowOwner.Nobody,
+                $"parked behind {string.Join(", ", state.Blocked.Select(b => "#" + b))}", assurance);
+        }
+
         if (facts.IsConflicting)
         {
             // The agent believes it is finished and the branch does not merge. Do NOT send it back round:
@@ -185,16 +196,6 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
             return declaredDone
                 ? new(WaitingState.Contradicted, RowOwner.Operator, "reported done, but the branch is CONFLICTING", assurance)
                 : new(WaitingState.Conflicting, RowOwner.Agent, "CONFLICTING; integrate a later main", assurance);
-        }
-
-        // A named blocker is an explicit unresolved dependency. A predicate beside it can add another
-        // reason to wait, but clearing that predicate cannot clear the issue or PR the record still names.
-        // Keep this ahead of predicate evaluation so one completed check cannot make a multiply-blocked
-        // window actionable.
-        if (state.Recommendation == Recommendation.Wait && state.Blocked.Count > 0)
-        {
-            return new(WaitingState.Holding, RowOwner.Nobody,
-                $"parked behind {string.Join(", ", state.Blocked.Select(b => "#" + b))}", assurance);
         }
 
         // The declared predicate is evaluated before the generic gates, because it is the agent's own

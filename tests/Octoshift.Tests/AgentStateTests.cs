@@ -427,6 +427,28 @@ public class AgentStateTests
         Assert.Contains(state.Defects, d => d.Contains("field 'pr' is declared more than once", StringComparison.Ordinal));
     }
 
+    [Theory]
+    [InlineData("i1", "pr=1", "named i1")]
+    [InlineData("i1234567", "pr=1234567", "named i1234567")]
+    public void Parse_WindowIdentityRangeMatchesDeclaredIdentity(string window, string declared, string expected)
+    {
+        AgentState? state = AgentState.Parse($"{declared} head=722512e25 reviews=2/2 rec=merge", window);
+
+        Assert.NotNull(state);
+        Assert.Contains(state.Defects, d => d.Contains(expected, StringComparison.Ordinal) && d.Contains("declares a PR", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Parse_MergeRecommendationWhileBlockedIsDefective()
+    {
+        AgentState? state = AgentState.Parse(
+            "pr=4595 head=722512e25 reviews=2/2 blocked=4629 rec=merge",
+            "pr4595");
+
+        Assert.NotNull(state);
+        Assert.Contains(state.Defects, d => d.Contains("rec=merge while blocked on #4629", StringComparison.Ordinal));
+    }
+
     [Fact]
     public void Parse_ACoherentPrRecordStaysClean()
     {

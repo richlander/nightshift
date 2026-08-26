@@ -420,12 +420,25 @@ internal sealed class TmuxScanner
             Target = fields[1],
             Host = host,
             SessionAttached = fields[2].Trim() != "0" && fields[2].Trim().Length > 0,
-            LastActivity = long.TryParse(fields[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out long epoch) && epoch > 0
-                ? DateTimeOffset.FromUnixTimeSeconds(epoch)
-                : null,
+            LastActivity = ParseActivity(fields[3], host),
             AgentStateOption = fields[4].Trim() is { Length: > 0 } option ? option : null,
             WindowName = fields[5].Trim(),
         };
+    }
+
+    private static DateTimeOffset? ParseActivity(string value, string? host)
+    {
+        if (!long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out long epoch) || epoch <= 0)
+        {
+            return null;
+        }
+
+        if (epoch > DateTimeOffset.MaxValue.ToUnixTimeSeconds())
+        {
+            throw Unavailable(host, $"tmux collection returned out-of-range window activity '{value}'");
+        }
+
+        return DateTimeOffset.FromUnixTimeSeconds(epoch);
     }
 
     /// <summary>A tmux pane id: <c>%</c> and digits, which is every id tmux mints and nothing else.</summary>

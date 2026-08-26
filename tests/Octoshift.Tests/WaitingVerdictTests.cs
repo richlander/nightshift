@@ -58,6 +58,33 @@ public class WaitingVerdictTests
         Assert.Contains("#4629", v.Reason, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData(null)]
+    [InlineData("continue")]
+    public void Resolve_ANamedBlockerPreventsPredicateWakeupWithoutWaitRecommendation(string? recommendation)
+    {
+        string rec = recommendation is null ? string.Empty : $" rec={recommendation}";
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State($"pr=4595 head=722512e25 reviews=1/2 blocked=4629 waiting=merge{rec}"),
+            Facts());
+
+        Assert.Equal(WaitingState.Holding, v.State);
+        Assert.False(v.MayAct);
+        Assert.Contains("#4629", v.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Resolve_ANamedBlockerPreventsPrematureConflictWork()
+    {
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=1/2 blocked=4629 rec=wait"),
+            Facts(mergeableState: "dirty"));
+
+        Assert.Equal(WaitingState.Holding, v.State);
+        Assert.Equal(RowOwner.Nobody, v.Owner);
+        Assert.Contains("#4629", v.Reason, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void Resolve_AFailedCheckAlsoClearsTheWait()
     {

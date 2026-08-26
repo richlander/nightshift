@@ -219,6 +219,11 @@ internal sealed partial record AgentState
             defects.Add($"rec=merge with reviews={clean}/{required}");
         }
 
+        if (rec == Recommendation.Merge && blocked.Count > 0)
+        {
+            defects.Add($"rec=merge while blocked on {string.Join(", ", blocked.Select(b => "#" + b))}");
+        }
+
         string? head = fields.GetValueOrDefault("head");
         if (head is not null && !IsSha(head))
         {
@@ -403,6 +408,6 @@ internal sealed partial record AgentState
     /// Matches the <c>pr4595</c> and <c>i4611</c> window-naming conventions, tolerating a trailing state
     /// suffix such as <c>-blocked</c>.
     /// </summary>
-    [GeneratedRegex(@"^(pr|i)(\d{2,6})(?:-|$)", RegexOptions.IgnoreCase)]
+    [GeneratedRegex(@"^(pr|i)(\d+)(?:-|$)", RegexOptions.IgnoreCase)]
     private static partial Regex WindowPr();
 }

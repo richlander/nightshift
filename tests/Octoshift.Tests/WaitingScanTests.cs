@@ -1,5 +1,6 @@
 namespace Octoshift.Tests;
 
+using System.Globalization;
 using Octoshift.Commands;
 using Octoshift.GitHub;
 using Octoshift.Waiting;
@@ -488,6 +489,17 @@ public class WaitingScanTests
         Assert.Equal(2, panes.Count);
         Assert.Equal(PaneActivity.Unreadable, panes[0].Activity);
         Assert.Equal(PaneActivity.Idle, panes[1].Activity);
+    }
+
+    [Fact]
+    public void ParseCollection_RejectsAnOutOfRangeActivityTimestamp()
+    {
+        string row = $"%1|night:1|1|{long.MaxValue.ToString(CultureInfo.InvariantCulture)}||pr4595";
+        TmuxUnavailableException error = Assert.Throws<TmuxUnavailableException>(
+            () => TmuxScanner.ParseCollection(Stream([row], ("%1", "> ")), host: "fernie", Nonce));
+
+        Assert.Contains("out-of-range window activity", error.Message, StringComparison.Ordinal);
+        Assert.Contains("fernie", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
