@@ -47,11 +47,12 @@ internal sealed record TmuxPane
     public string? Host { get; init; }
 
     /// <summary>
-    /// Identifies the tmux server this window belongs to: its pid and its oldest session's creation
-    /// time. Pane ids restart at <c>%0</c> when a server does, so the same id before and after a reboot
-    /// names two different windows — and history keyed on the id alone would hand one window another's
-    /// registration and present it as observed fact. The timestamp guards the pid against reuse across a
-    /// host reboot.
+    /// Identifies the tmux server this window belongs to: its pid and its own start time. Pane ids restart
+    /// at <c>%0</c> when a server does, so the same id before and after a reboot names two different
+    /// windows — and history keyed on the id alone would hand one window another's registration and present
+    /// it as observed fact. The start time guards the pid against reuse across a host reboot, and unlike
+    /// the oldest session's creation time it is a property of the server, not of a session: killing the
+    /// oldest session leaves it unchanged, so ordinary session churn is never mistaken for a restart.
     /// </summary>
     public string Epoch { get; init; } = string.Empty;
 
@@ -59,6 +60,14 @@ internal sealed record TmuxPane
     public string Where => Host is null ? Target : $"{Host} {Target}";
 
     public required string WindowName { get; init; }
+
+    /// <summary>
+    /// The tmux window id (<c>@8</c>): stable for the life of the window across pane splits, joins and
+    /// reindexing, unlike the pane id, which is the active pane and can change when panes come and go.
+    /// This is the rename target, so the mutation lands on the window the sweep saw even if its active
+    /// pane has since changed.
+    /// </summary>
+    public string WindowId { get; init; } = string.Empty;
 
     /// <summary>Whether a client is attached to this window's session right now.</summary>
     public required bool SessionAttached { get; init; }
@@ -152,7 +161,7 @@ internal sealed partial class TmuxScanner
         set -f
         e() { printf %s "$1" | od -v -An -tx1 | tr -d '[:space:]'; }
         w=$(tmux list-windows -a -F '#{pane_id}') || exit 3
-        printf 'NONCE:epoch %s:%s\n' "$(tmux display-message -p '#{pid}')" "$(tmux list-sessions -F '#{session_created}' | sort -n | head -1)"
+        printf 'NONCE:epoch %s\n' "$(tmux display-message -p '#{pid}:#{start_time}')"
         r=''
         p=''
         for i in $w; do
@@ -162,7 +171,8 @@ internal sealed partial class TmuxScanner
           y=$(tmux display-message -p -t "$i" '#{window_activity}' 2>/dev/null) || continue
           s=$(tmux display-message -p -t "$i" '#{@agent_state}' 2>/dev/null) || continue
           n=$(tmux display-message -p -t "$i" '#{window_name}' 2>/dev/null) || continue
-          r="$r NONCE:w|$(e "$i")|$(e "$t")|$(e "$a")|$(e "$y")|$(e "$s")|$(e "$n")"
+          d=$(tmux display-message -p -t "$i" '#{window_id}' 2>/dev/null) || continue
+          r="$r NONCE:w|$(e "$i")|$(e "$t")|$(e "$a")|$(e "$y")|$(e "$s")|$(e "$n")|$(e "$d")"
           p="$p $i"
         done
         printf 'NONCE:manifest\n'
@@ -451,12 +461,12 @@ internal sealed partial class TmuxScanner
         }
 
         string[] parts = line[rowMarker.Length..].Split('|');
-        if (parts.Length != 6)
+        if (parts.Length != 7)
         {
-            throw Unavailable(host, $"tmux collection returned a manifest row of {parts.Length} field(s), not 6");
+            throw Unavailable(host, $"tmux collection returned a manifest row of {parts.Length} field(s), not 7");
         }
 
-        var fields = new string[6];
+        var fields = new string[7];
         for (int i = 0; i < parts.Length; i++)
         {
             if (!TryDecode(parts[i], out fields[i]))
@@ -470,6 +480,11 @@ internal sealed partial class TmuxScanner
             throw Unavailable(host, $"tmux collection returned a manifest row naming '{fields[0]}', which is not a pane id");
         }
 
+        if (!IsWindowId(fields[6]))
+        {
+            throw Unavailable(host, $"tmux collection returned a manifest row naming '{fields[6]}', which is not a window id");
+        }
+
         return new TmuxPane
         {
             PaneId = fields[0],
@@ -479,6 +494,7 @@ internal sealed partial class TmuxScanner
             LastActivity = ParseActivity(fields[3], host),
             AgentStateOption = fields[4].Trim() is { Length: > 0 } option ? option : null,
             WindowName = fields[5].Trim(),
+            WindowId = fields[6],
         };
     }
 
@@ -518,9 +534,25 @@ internal sealed partial class TmuxScanner
         return true;
     }
 
-    /// <summary>
-    /// Signatures of the agent runtime failing, as opposed to the work failing.
-    /// </summary>
+    /// <summary>A tmux window id: <c>@</c> and digits, which is every id tmux mints and nothing else.</summary>
+    private static bool IsWindowId(string value)
+    {
+        if (value.Length < 2 || value[0] != '@')
+        {
+            return false;
+        }
+
+        foreach (char c in value.AsSpan(1))
+        {
+            if (!char.IsAsciiDigit(c))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     /// <remarks>
     /// Read from pane text, which is untrusted for identity and appropriate here: this is not a claim
     /// being believed, it is a symptom being noticed, and the agent cannot publish state about its own

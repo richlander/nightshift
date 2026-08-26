@@ -157,17 +157,16 @@ public class PrCommandTests
     public async Task Locate_SilenceIsKeyedByHostAndPaneIdNotPaneIdAlone()
     {
         // A pane id is unique only within one tmux server, so `%3` on two hosts is two windows. Keyed by
-        // host and pane id together, each has its own silence measurement; a host-local key would let one
-        // overwrite the other and lose a window's output history.
-        PrLocationResult result = await LocateAsync(4448, Collection(
-            [
-                Pane("fernie", "%3", "cp:1", agentState: "pr=4448 head=abc1234", windowName: "pr4448"),
-                Pane("banff", "%3", "cp:1", agentState: "pr=4600 head=abc1234", windowName: "pr4600"),
-            ],
-            ["fernie", "banff"]), Ready);
+        // the structured target id and the pane id, each has its own silence measurement; a host-local key
+        // would let one overwrite the other and lose a window's output history. The two keys are distinct
+        // and neither is a raw `host|pane` an alias could forge.
+        TmuxPane onFernie = Pane("fernie", "%3", "cp:1", agentState: "pr=4448 head=abc1234", windowName: "pr4448");
+        TmuxPane onBanff = Pane("banff", "%3", "cp:1", agentState: "pr=4600 head=abc1234", windowName: "pr4600");
+        PrLocationResult result = await LocateAsync(4448, Collection([onFernie, onBanff], ["fernie", "banff"]), Ready);
 
-        Assert.Contains("fernie|%3", result.Located.Silence.Keys);
-        Assert.Contains("banff|%3", result.Located.Silence.Keys);
+        Assert.Contains(Claim.Key(onFernie), result.Located.Silence.Keys);
+        Assert.Contains(Claim.Key(onBanff), result.Located.Silence.Keys);
+        Assert.NotEqual(Claim.Key(onFernie), Claim.Key(onBanff));
         Assert.Equal(2, result.Located.Silence.Count);
     }
 

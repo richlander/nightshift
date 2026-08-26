@@ -106,7 +106,7 @@ internal static class PrCommand
         // report a claim `waiting` rejects as defective.
         HashSet<string> ambiguousNames = [.. collected.Panes
             .Where(p => p.WindowName.Length > 0)
-            .GroupBy(p => $"{p.Host ?? "local"}|{p.WindowName}", StringComparer.Ordinal)
+            .GroupBy(p => TargetId.ForHost(p.Host).ComposeWith(p.WindowName), StringComparer.Ordinal)
             .Where(g => g.Count() > 1)
             .Select(g => g.Key)];
 
@@ -121,7 +121,7 @@ internal static class PrCommand
             AgentState? state = AgentState.Parse(
                 pane.AgentStateOption,
                 pane.WindowName,
-                nameIsAmbiguous: ambiguousNames.Contains($"{pane.Host ?? "local"}|{pane.WindowName}"),
+                nameIsAmbiguous: ambiguousNames.Contains(TargetId.ForHost(pane.Host).ComposeWith(pane.WindowName)),
                 paneContradictsPr: pr => TmuxScanner.PaneContradictsPr(pane.Capture, pr));
 
             parsed.Add((pane, state));
@@ -134,16 +134,16 @@ internal static class PrCommand
         // A host that did not answer, and a host nobody asked about, both leave windows unseen — so a
         // window that is a follower on the full fleet can look like the sole claimant of its PR. The view
         // is complete only when every asked host answered and no previously-collected host was dropped.
-        var collectedSet = collected.CollectedHosts.Select(h => h ?? "local").ToHashSet(StringComparer.Ordinal);
+        var collectedKeys = collected.CollectedHosts.Select(h => TargetId.ForHost(h).Key).ToHashSet(StringComparer.Ordinal);
         bool viewComplete = collected.Unreachable.Count == 0
-            && !history.KnownHosts.Any(h => !collectedSet.Contains(h));
+            && !history.KnownHosts.Any(k => !collectedKeys.Contains(k));
 
         // Adopt each host's tmux epoch, capturing the prior sweep so a host first seen this run does not
         // hand a genuinely observed rival a witnessed order it never earned.
         var sweptBefore = new Dictionary<string, DateTimeOffset?>(StringComparer.Ordinal);
         foreach (IGrouping<string?, TmuxPane> host in collected.Panes.Where(p => p.Epoch.Length > 0).GroupBy(p => p.Host))
         {
-            string key = host.Key ?? "local";
+            string key = TargetId.ForHost(host.Key).Key;
             DateTimeOffset? prior = history.SweptAt(host.Key);
             bool continuous = history.AdoptEpoch(host.Key, host.First().Epoch, now);
             sweptBefore[key] = continuous ? prior : null;
@@ -153,10 +153,10 @@ internal static class PrCommand
         // saw it. Record it anyway, exactly as `waiting` does: an empty successful sweep is evidence the
         // host was observed, and if it never enters KnownHosts a later run that omits it reads its narrowed
         // view as complete. No epoch is claimed, so continuity is not invented across the empty gap.
-        var hostsWithPanes = collected.Panes.Select(p => p.Host ?? "local").ToHashSet(StringComparer.Ordinal);
+        var hostsWithPanes = collected.Panes.Select(p => TargetId.ForHost(p.Host).Key).ToHashSet(StringComparer.Ordinal);
         foreach (string? host in collected.CollectedHosts)
         {
-            if (!hostsWithPanes.Contains(host ?? "local"))
+            if (!hostsWithPanes.Contains(TargetId.ForHost(host).Key))
             {
                 history.RecordSweptEmpty(host, now);
             }
@@ -166,13 +166,13 @@ internal static class PrCommand
         // that recorded only the claimants would prune the rest and reset their silence. A pane that now
         // identifies no PR — absent, malformed, or an issue — is observed with a null claim, which clears
         // its stale registration and provenance while keeping its digest, so a window that owned this PR,
-        // fell silent, and later reclaimed it cannot inherit its old place in the queue. Keyed by host and
-        // pane id together, because a pane id is unique only within one tmux server.
+        // fell silent, and later reclaimed it cannot inherit its old place in the queue. Keyed by the
+        // structured target id and pane id, because a pane id is unique only within one tmux server.
         var silence = new Dictionary<string, TimeSpan?>(StringComparer.Ordinal);
         foreach ((TmuxPane pane, AgentState? state) in parsed)
         {
             int? claimedPr = state is { IsIssue: false } id ? id.PrNumber : null;
-            bool registrationWitnessed = viewComplete && sweptBefore.GetValueOrDefault(pane.Host ?? "local") is not null;
+            bool registrationWitnessed = viewComplete && sweptBefore.GetValueOrDefault(TargetId.ForHost(pane.Host).Key) is not null;
             silence[Claim.Key(pane)] = history.Observe(pane, now, claimedPr, registrationWitnessed);
         }
 

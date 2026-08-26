@@ -17,6 +17,19 @@ internal sealed record HostMemory
     /// </summary>
     [JsonPropertyName("sweptAt")]
     public DateTimeOffset? SweptAt { get; init; }
+
+    /// <summary>
+    /// Whether this host was collected in the immediately preceding sweep — so observation is continuous
+    /// up to it, with no gap in which a window could have released and reclaimed a PR unseen.
+    /// </summary>
+    /// <remarks>
+    /// Defaults to <c>false</c>, which is the fail-closed answer: a host with no continuity recorded (a
+    /// new host, or one from an older history file that never wrote this field) is treated as though it
+    /// had a gap, so its remembered registrations are invalidated on the next collection rather than
+    /// trusted for ordering. Only a host actually collected last run carries <c>true</c>.
+    /// </remarks>
+    [JsonPropertyName("continuous")]
+    public bool Continuous { get; init; }
 }
 
 /// <summary>What a window's body looked like last time, and when it last differed.</summary>
@@ -96,35 +109,70 @@ internal sealed class PaneHistory
             _entries = [];
             _hosts = [];
         }
+
+        // Fail closed on any entry not written by this scheme. A host key must be a valid target id and a
+        // pane key a target id composed with a pane id; anything else is an older, differently-keyed file
+        // whose `fernie|%3` could be misread as some target this scheme would never mint. Dropping it
+        // costs a sweep of continuity and degrades ownership to inferred, never misattributes it.
+        foreach (string key in _hosts.Keys.Where(k => !TargetId.IsValidKey(k)).ToArray())
+        {
+            _hosts.Remove(key);
+        }
+
+        foreach (string key in _entries.Keys.Where(k => TargetId.HostOfComposite(k) is null || TargetId.IdOfComposite(k) is null).ToArray())
+        {
+            _entries.Remove(key);
+        }
     }
 
     /// <summary>
-    /// Discards everything remembered about a host whose tmux server has restarted, and reports whether
-    /// the host was swept under this same server before.
+    /// Reconciles a host at the start of a sweep: adopts its current tmux epoch, invalidates whatever the
+    /// tool can no longer trust, and reports whether the host was under <em>continuous</em> observation up
+    /// to and including the last sweep.
     /// </summary>
     /// <remarks>
-    /// Pane ids restart at <c>%0</c> with the server, so after a reboot the remembered ids name different
-    /// windows. Keeping them would not merely be unhelpful — it would hand one window another's
-    /// registration time and present the result as observed fact. Dropping them costs a sweep of
-    /// measurements and degrades ownership to inferred, which is the honest state to be in.
+    /// Two things break continuity, and each invalidates a different amount. A <em>restarted server</em>
+    /// (a different epoch) recycles pane ids, so the remembered ids name different windows: everything for
+    /// the host is dropped. A <em>gap</em> (the same server, but the host was not collected last sweep)
+    /// leaves the pane ids valid but means a window could have released and reclaimed a PR while unseen —
+    /// so the digests and silence are kept, but every registration's claim, time and witness are cleared,
+    /// and this sweep records them fresh. Only a host with no restart and no gap is continuous; its
+    /// registrations, and their witnessed order, survive. This is what stops an owner from being preserved
+    /// across a stretch the tool did not watch.
     /// </remarks>
     public bool AdoptEpoch(string? host, string epoch, DateTimeOffset now)
     {
-        string key = host ?? "local";
+        string key = TargetId.ForHost(host).Key;
         _hosts.TryGetValue(key, out HostMemory? known);
 
-        bool continuous = known?.Epoch is { Length: > 0 } && known.Epoch == epoch && known.SweptAt is not null;
-        if (!continuous && known?.Epoch != epoch)
+        bool sameEpoch = known?.Epoch is { Length: > 0 } && known.Epoch == epoch;
+        bool seenLastSweep = known?.Continuous ?? false;
+        bool continuous = sameEpoch && known!.SweptAt is not null && seenLastSweep;
+
+        if (!sameEpoch)
         {
-            foreach (string pane in _entries.Keys.Where(k => k.StartsWith(key + "|", StringComparison.Ordinal)).ToArray())
+            // A restart (or a host never seen under an epoch): recycled ids, drop everything.
+            foreach (string pane in PaneKeysOn(key))
             {
                 _entries.Remove(pane);
             }
         }
+        else if (!seenLastSweep)
+        {
+            // Same server, but a gap since the last collection: keep the body/silence, clear the claim
+            // registration and its provenance so this sweep records a fresh one.
+            foreach (string pane in PaneKeysOn(key))
+            {
+                _entries[pane] = _entries[pane] with { ClaimedPr = null, ClaimedAt = null, Witnessed = false };
+            }
+        }
 
-        _hosts[key] = new HostMemory { Epoch = epoch, SweptAt = now };
+        _hosts[key] = new HostMemory { Epoch = epoch, SweptAt = now, Continuous = true };
         return continuous;
     }
+
+    private IEnumerable<string> PaneKeysOn(string hostKey)
+        => _entries.Keys.Where(k => TargetId.HostOfComposite(k)?.Key == hostKey).ToArray();
 
     /// <summary>
     /// Records that a host was successfully collected this sweep even though it produced no windows. An
@@ -142,19 +190,19 @@ internal sealed class PaneHistory
     /// so they are reported departed there rather than swallowed here.
     /// </remarks>
     public void RecordSweptEmpty(string? host, DateTimeOffset now)
-        => _hosts[host ?? "local"] = new HostMemory { Epoch = null, SweptAt = now };
+        => _hosts[TargetId.ForHost(host).Key] = new HostMemory { Epoch = null, SweptAt = now, Continuous = true };
 
     /// <summary>
-    /// Hosts this tool has collected before. A run that does not include one of them is looking at less
-    /// of the fleet than it has already seen — which is not something the run can work out from its own
-    /// arguments, because a host it was not told about is indistinguishable from a host that does not
-    /// exist.
+    /// Hosts this tool has collected before, by target key. A run that does not include one of them is
+    /// looking at less of the fleet than it has already seen — which is not something the run can work out
+    /// from its own arguments, because a host it was not told about is indistinguishable from a host that
+    /// does not exist.
     /// </summary>
     public IReadOnlyCollection<string> KnownHosts => _hosts.Keys;
 
     /// <summary>When this host was last collected in full under the current server, if it was.</summary>
     public DateTimeOffset? SweptAt(string? host)
-        => _hosts.TryGetValue(host ?? "local", out HostMemory? known) ? known.SweptAt : null;
+        => _hosts.TryGetValue(TargetId.ForHost(host).Key, out HostMemory? known) ? known.SweptAt : null;
 
     /// <summary>
     /// Records the current digest and returns how long the body has been unchanged, or null the first
@@ -215,7 +263,7 @@ internal sealed class PaneHistory
     public bool IsWitnessed(TmuxPane pane)
         => _entries.TryGetValue(Key(pane), out PaneMemory? entry) && entry.Witnessed;
 
-    private static string Key(TmuxPane pane) => $"{pane.Host ?? "local"}|{pane.PaneId}";
+    private static string Key(TmuxPane pane) => TargetId.ForHost(pane.Host).ComposeWith(pane.PaneId);
 
     /// <summary>
     /// Drops windows that no longer exist and reports which they were.
@@ -227,32 +275,46 @@ internal sealed class PaneHistory
     /// </remarks>
     /// <param name="live">Windows collected this sweep.</param>
     /// <param name="hosts">
-    /// Hosts collected this sweep. A window on a host that did not answer has not departed; it is merely
-    /// unseen, and forgetting it would manufacture a departure on every unreachable sweep.
+    /// Hosts collected this sweep, by raw alias (null local). A window on a host that did not answer has
+    /// not departed; it is merely unseen, and forgetting it would manufacture a departure on every
+    /// unreachable sweep. A previously-known host absent from this set has a gap recorded against it, so
+    /// its registrations are invalidated when it is next collected.
     /// </param>
     public IReadOnlyList<string> Save(IEnumerable<TmuxPane> live, IEnumerable<string?>? hosts = null)
     {
         var seen = live.ToArray();
-        var keep = seen.Select(p => $"{p.Host ?? "local"}|{p.PaneId}").ToHashSet(StringComparer.Ordinal);
+        var keep = seen.Select(Key).ToHashSet(StringComparer.Ordinal);
         HashSet<string>? collected = hosts is null
             ? null
-            : hosts.Select(h => h ?? "local").ToHashSet(StringComparer.Ordinal);
+            : hosts.Select(h => TargetId.ForHost(h).Key).ToHashSet(StringComparer.Ordinal);
 
         var departed = new List<string>();
         foreach (string gone in _entries.Keys.Where(k => !keep.Contains(k)).ToArray())
         {
-            string host = gone[..gone.IndexOf('|', StringComparison.Ordinal)];
-            if (collected is not null && !collected.Contains(host))
+            TargetId? host = TargetId.HostOfComposite(gone);
+            if (host is null || (collected is not null && !collected.Contains(host.Value.Key)))
             {
                 continue;
             }
 
             if (_entries[gone].ClaimedPr is { } pr)
             {
-                departed.Add($"{gone.Replace("|", " ", StringComparison.Ordinal)} (was on #{pr})");
+                string paneId = TargetId.IdOfComposite(gone) ?? gone;
+                departed.Add($"{host.Value.Display} {paneId} (was on #{pr})");
             }
 
             _entries.Remove(gone);
+        }
+
+        // Record a gap against every previously known host not collected this sweep — an omitted host or
+        // an unreachable one. Its windows are unseen, not departed (skipped above), but the tool has lost
+        // continuity, so the next collection under the same epoch invalidates their registrations.
+        if (collected is not null)
+        {
+            foreach (string key in _hosts.Keys.Where(k => !collected.Contains(k)).ToArray())
+            {
+                _hosts[key] = _hosts[key] with { Continuous = false };
+            }
         }
 
         try

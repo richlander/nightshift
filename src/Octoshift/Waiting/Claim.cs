@@ -169,5 +169,5 @@ internal readonly record struct Claim(
         return ranked;
     }
 
-    internal static string Key(TmuxPane pane) => $"{pane.Host ?? "local"}|{pane.PaneId}";
+    internal static string Key(TmuxPane pane) => TargetId.ForHost(pane.Host).ComposeWith(pane.PaneId);
 }

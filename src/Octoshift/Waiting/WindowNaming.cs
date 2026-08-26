@@ -104,22 +104,25 @@ internal static partial class WindowNaming
 
         var script = new StringBuilder();
 
-        // Epoch guard. Recompute the server generation exactly as the collection script did — pid, and the
-        // oldest session's creation time — and abort the batch on a mismatch rather than rename a possibly
+        // Epoch guard. Recompute the server generation exactly as the collection script did — the server's
+        // pid and its own start time — and abort the batch on a mismatch rather than rename a possibly
         // recycled id. Skipped only when the sweep recorded no epoch (nothing to compare against).
         if (scannedEpoch.Length > 0)
         {
-            script.Append("__e=$(printf '%s:%s' \"$(tmux display-message -p '#{pid}' 2>/dev/null)\" \"$(tmux list-sessions -F '#{session_created}' 2>/dev/null | sort -n | head -1)\")\n");
+            script.Append("__e=$(tmux display-message -p '#{pid}:#{start_time}' 2>/dev/null)\n");
             script.Append("if [ \"$__e\" != \"$(printf %b '").Append(ShellEncode(scannedEpoch))
                   .Append("')\" ]; then printf '").Append(nonce).Append(":epoch\\n'; exit 0; fi\n");
         }
 
         foreach ((TmuxPane pane, string desired) in renames)
         {
-            script.Append("if tmux rename-window -t \"$(printf %b '").Append(ShellEncode(pane.PaneId))
+            // Targeted by window id (@8), not pane id: the window id is stable for the life of the window,
+            // so the rename lands on the window the sweep saw even if its active pane has since changed.
+            // The confirmation echoes the same window id so the caller can match it back.
+            script.Append("if tmux rename-window -t \"$(printf %b '").Append(ShellEncode(pane.WindowId))
                   .Append("')\" \"$(printf %b '").Append(ShellEncode(desired))
                   .Append("')\" 2>/dev/null; then printf '").Append(nonce).Append(":ok %s\\n' \"$(printf %b '")
-                  .Append(ShellEncode(pane.PaneId)).Append("')\"; fi\n");
+                  .Append(ShellEncode(pane.WindowId)).Append("')\"; fi\n");
         }
 
         return script.ToString();

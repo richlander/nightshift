@@ -55,8 +55,7 @@ public sealed class RenameTests : IDisposable
         sub=$1
         shift
         case "$sub" in
-          display-message) printf '%s\n' "$FAKE_PID" ;;
-          list-sessions) printf '%s\n' "$FAKE_CREATED" ;;
+          display-message) printf '%s:%s\n' "$FAKE_PID" "$FAKE_CREATED" ;;
           rename-window)
             # The script always emits: rename-window -t TARGET NAME
             target=$2
@@ -131,13 +130,15 @@ public sealed class RenameTests : IDisposable
 
     private bool Injected => File.Exists(Path.Combine(_dir, "INJECTED"));
 
-    private static WaitingRow Row(string paneId, string windowName, string epoch = ScannedEpoch)
+    private static WaitingRow Row(string paneId, string windowName, string epoch = ScannedEpoch, string? windowId = null, string? host = null)
         => new()
         {
             Pane = new TmuxPane
             {
                 PaneId = paneId,
+                WindowId = windowId ?? ("@" + paneId.TrimStart('%')),
                 Target = "cp:1",
+                Host = host,
                 WindowName = windowName,
                 SessionAttached = false,
                 Activity = PaneActivity.Idle,
@@ -167,7 +168,7 @@ public sealed class RenameTests : IDisposable
         Assert.False(Injected);
         Assert.Equal(0, failures);
         (string target, string name) = Assert.Single(RecordedRenames());
-        Assert.Equal("%1", target);
+        Assert.Equal("@1", target);
         Assert.Equal(desired, name);
         Assert.Contains("RENAMED", diagnostics.ToString(), StringComparison.Ordinal);
     }
@@ -221,17 +222,17 @@ public sealed class RenameTests : IDisposable
     [Fact]
     public async Task Rename_ReportsAPartialBatchWhereOneWindowFailed()
     {
-        // %2 has vanished, so its rename fails while %1 succeeds. Only the confirmed one is RENAMED; the
+        // @2 has vanished, so its rename fails while @1 succeeds. Only the confirmed one is RENAMED; the
         // other is named as failed and counted, so the exit code can reflect it.
         var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
         IReadOnlyList<WaitingRow> rows = [Row("%1", "pr4448-blocked"), Row("%2", "pr4600-stale")];
 
         int failures = await WaitingCommand.RenameAsync(
-            rows, ShellFor(failTarget: "%2"), diagnostics, TestContext.Current.CancellationToken);
+            rows, ShellFor(failTarget: "@2"), diagnostics, TestContext.Current.CancellationToken);
 
         Assert.Equal(1, failures);
         (string target, _) = Assert.Single(RecordedRenames());
-        Assert.Equal("%1", target);
+        Assert.Equal("@1", target);
         string text = diagnostics.ToString();
         Assert.Single(text.Split('\n'), l => l.StartsWith("RENAMED", StringComparison.Ordinal));
         Assert.Single(text.Split('\n'), l => l.StartsWith("RENAME-FAILED", StringComparison.Ordinal));
@@ -253,4 +254,141 @@ public sealed class RenameTests : IDisposable
         Assert.Contains(recorded, r => r.Name == "pr4448");
         Assert.Contains(recorded, r => r.Name == "pr4600");
     }
+
+    [Fact]
+    public async Task Rename_TargetsTheWindowIdNotThePaneId()
+    {
+        // Blocker 4: pane ids are recycled by break/join, so the rename target is the window id the sweep
+        // saw. Even when the pane id and window id disagree, the command tmux runs names the window id.
+        var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
+        WaitingRow row = Row("%77", "pr4448-blocked", windowId: "@5");
+
+        int failures = await WaitingCommand.RenameAsync([row], ShellFor(), diagnostics, TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, failures);
+        (string target, _) = Assert.Single(RecordedRenames());
+        Assert.Equal("@5", target);
+        Assert.NotEqual("%77", target);
+        Assert.NotEqual("@77", target);
+    }
+
+    [Fact]
+    public async Task Rename_SkipsAnAmbiguousDuplicateWindowId()
+    {
+        // One-row-per-window collection should never produce two rows with the same window id; if it does,
+        // renaming by that id could rename the wrong window, so both are skipped and counted, and nothing
+        // is renamed.
+        var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
+        IReadOnlyList<WaitingRow> rows =
+        [
+            Row("%1", "pr4448-blocked", windowId: "@7"),
+            Row("%2", "pr4600-stale", windowId: "@7"),
+        ];
+
+        int failures = await WaitingCommand.RenameAsync(rows, ShellFor(), diagnostics, TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, failures);
+        Assert.Empty(RecordedRenames());
+        string text = diagnostics.ToString();
+        Assert.Equal(2, text.Split('\n').Count(l => l.StartsWith("RENAME-SKIPPED", StringComparison.Ordinal)));
+        Assert.DoesNotContain("RENAMED", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Rename_SkipsARowWithNoWindowId()
+    {
+        // A row whose window id was not captured cannot be a safe rename target, so it is skipped rather
+        // than guessed; a sibling with a good id is still renamed.
+        var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
+        IReadOnlyList<WaitingRow> rows =
+        [
+            Row("%1", "pr4448-blocked", windowId: string.Empty),
+            Row("%2", "pr4600-stale", windowId: "@2"),
+        ];
+
+        int failures = await WaitingCommand.RenameAsync(rows, ShellFor(), diagnostics, TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, failures);
+        (string target, _) = Assert.Single(RecordedRenames());
+        Assert.Equal("@2", target);
+        Assert.Contains("RENAME-SKIPPED", diagnostics.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Rename_OneHungHostDoesNotHoldUpTheOthers()
+    {
+        // Blocker 6: a per-host deadline, so a host that hangs during its rename batch is timed out and its
+        // renames counted failed, while a later reachable host still runs to completion.
+        var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
+        IReadOnlyList<WaitingRow> rows =
+        [
+            Row("%1", "pr4448-blocked", windowId: "@1", host: "slow"),
+            Row("%2", "pr4600-stale", windowId: "@2", host: "fast"),
+        ];
+
+        int failures = await WaitingCommand.RenameAsync(
+            rows, ShellHangingOn("slow"), diagnostics, TestContext.Current.CancellationToken, perHostTimeout: TimeSpan.FromMilliseconds(200));
+
+        Assert.Equal(1, failures);
+        (string target, _) = Assert.Single(RecordedRenames());
+        Assert.Equal("@2", target);
+        string text = diagnostics.ToString();
+        Assert.Contains("RENAME-TIMEOUT", text, StringComparison.Ordinal);
+        Assert.Single(text.Split('\n'), l => l.StartsWith("RENAMED", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Rename_AllHostsHangingAllTimeOutAndNothingIsRenamed()
+    {
+        var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
+        IReadOnlyList<WaitingRow> rows =
+        [
+            Row("%1", "pr4448-blocked", windowId: "@1", host: "a"),
+            Row("%2", "pr4600-stale", windowId: "@2", host: "b"),
+        ];
+
+        int failures = await WaitingCommand.RenameAsync(
+            rows, HangingShell, diagnostics, TestContext.Current.CancellationToken, perHostTimeout: TimeSpan.FromMilliseconds(150));
+
+        Assert.Equal(2, failures);
+        Assert.Empty(RecordedRenames());
+        Assert.Equal(2, diagnostics.ToString().Split('\n').Count(l => l.StartsWith("RENAME-TIMEOUT", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task Rename_GenuineCallerCancellationEscapesCarryingTheCallersToken()
+    {
+        // Blocker 6: a real caller cancellation must dominate the per-host deadline and propagate the
+        // caller's own token, mirroring CollectAsync, so the run stops rather than being mistaken for a
+        // timeout.
+        var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        OperationCanceledException oce = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => WaitingCommand.RenameAsync([Row("%1", "pr4448-blocked")], HangingShell, diagnostics, cts.Token));
+
+        Assert.Equal(cts.Token, oce.CancellationToken);
+        Assert.Empty(RecordedRenames());
+    }
+
+    // A shell whose call never returns until its token fires — a host stuck mid-rename.
+    private static Func<string?, Func<string, CancellationToken, Task<CommandResult>>> HangingShell
+        => _ => async (_, ct) =>
+        {
+            await Task.Delay(Timeout.Infinite, ct);
+            return new CommandResult(0, string.Empty, string.Empty);
+        };
+
+    // Hangs only the named host; every other host runs the real fake-tmux shell.
+    private Func<string?, Func<string, CancellationToken, Task<CommandResult>>> ShellHangingOn(string? hangHost)
+        => host => async (script, ct) =>
+        {
+            if (string.Equals(host, hangHost, StringComparison.Ordinal))
+            {
+                await Task.Delay(Timeout.Infinite, ct);
+            }
+
+            return await RunShellAsync(script, EpochPid, null, ct);
+        };
 }

@@ -326,9 +326,11 @@ internal static class WaitingCommand
 
         // Window names that appear twice on one host. A tmux name is not unique by construction, and a
         // duplicate is evidence that a rename went somewhere it did not belong rather than a coincidence.
+        // Keyed by the structured target id so an alias containing the composite separator cannot forge or
+        // mask an ambiguity across hosts.
         HashSet<string> ambiguousNames = [.. panes
             .Where(p => p.WindowName.Length > 0)
-            .GroupBy(p => $"{p.Host ?? "local"}|{p.WindowName}", StringComparer.Ordinal)
+            .GroupBy(p => TargetId.ForHost(p.Host).ComposeWith(p.WindowName), StringComparer.Ordinal)
             .Where(g => g.Count() > 1)
             .Select(g => g.Key)];
 
@@ -347,7 +349,7 @@ internal static class WaitingCommand
             StateReading reading = AgentState.Read(
                 pane.AgentStateOption,
                 pane.WindowName,
-                nameIsAmbiguous: ambiguousNames.Contains($"{pane.Host ?? "local"}|{pane.WindowName}"),
+                nameIsAmbiguous: ambiguousNames.Contains(TargetId.ForHost(pane.Host).ComposeWith(pane.WindowName)),
                 paneContradictsPr: pr => TmuxScanner.PaneContradictsPr(pane.Capture, pr));
             readings.Add((pane, reading));
 
@@ -394,8 +396,8 @@ internal static class WaitingCommand
         // have been collected before and noticing when a run covers fewer of them. The collected set is
         // the exact successful target set, so a host that answered empty still counts as seen.
         IReadOnlyList<string?> collected = collectedHosts ?? [.. panes.Select(p => p.Host).Distinct()];
-        var collectedSet = collected.Select(h => h ?? "local").ToHashSet(StringComparer.Ordinal);
-        string[] omitted = [.. history.KnownHosts.Where(h => !collectedSet.Contains(h))];
+        var collectedKeys = collected.Select(h => TargetId.ForHost(h).Key).ToHashSet(StringComparer.Ordinal);
+        string[] omitted = [.. history.KnownHosts.Where(k => !collectedKeys.Contains(k)).Select(k => TargetId.FromKey(k).Display)];
         bool viewComplete = allHostsAnswered && omitted.Length == 0;
         Omitted = omitted;
 
@@ -408,7 +410,7 @@ internal static class WaitingCommand
         var sweptBefore = new Dictionary<string, DateTimeOffset?>(StringComparer.Ordinal);
         foreach (IGrouping<string?, TmuxPane> host in panes.Where(p => p.Epoch.Length > 0).GroupBy(p => p.Host))
         {
-            string key = host.Key ?? "local";
+            string key = TargetId.ForHost(host.Key).Key;
             DateTimeOffset? prior = history.SweptAt(host.Key);
             bool continuous = history.AdoptEpoch(host.Key, host.First().Epoch, now);
             sweptBefore[key] = continuous ? prior : null;
@@ -418,10 +420,10 @@ internal static class WaitingCommand
         // saw it. Record it anyway: an empty successful sweep is evidence the host was observed, and if it
         // never enters KnownHosts a later run that omits it cannot tell the fleet narrowed. No epoch is
         // claimed, so a window reappearing on it next run is not treated as continuous across the gap.
-        var hostsWithPanes = panes.Select(p => p.Host ?? "local").ToHashSet(StringComparer.Ordinal);
+        var hostsWithPanes = panes.Select(p => TargetId.ForHost(p.Host).Key).ToHashSet(StringComparer.Ordinal);
         foreach (string? host in collected)
         {
-            if (!hostsWithPanes.Contains(host ?? "local"))
+            if (!hostsWithPanes.Contains(TargetId.ForHost(host).Key))
             {
                 history.RecordSweptEmpty(host, now);
             }
@@ -438,7 +440,7 @@ internal static class WaitingCommand
         foreach ((TmuxPane pane, StateReading reading) in readings)
         {
             int? claimedPr = reading.Identified is { IsIssue: false } identified ? identified.PrNumber : null;
-            bool registrationWitnessed = viewComplete && sweptBefore.GetValueOrDefault(pane.Host ?? "local") is not null;
+            bool registrationWitnessed = viewComplete && sweptBefore.GetValueOrDefault(TargetId.ForHost(pane.Host).Key) is not null;
             silence[Claim.Key(pane)] = history.Observe(pane, now, claimedPr, registrationWitnessed);
         }
 
@@ -529,13 +531,39 @@ internal static class WaitingCommand
         IReadOnlyList<WaitingRow> rows,
         Func<string?, Func<string, CancellationToken, Task<CommandResult>>> shellFor,
         TextWriter diagnostics,
-        CancellationToken ct)
+        CancellationToken ct,
+        TimeSpan? perHostTimeout = null)
     {
+        TimeSpan timeout = perHostTimeout ?? DefaultTargetTimeout;
         int failures = 0;
         foreach (IGrouping<string?, WaitingRow> host in rows.GroupBy(r => r.Pane.Host))
         {
-            (TmuxPane Pane, string Desired)[] renames = [.. RenamePlan(host)];
-            if (renames.Length == 0)
+            string label = TargetId.ForHost(host.Key).Display;
+
+            // Window ids duplicated across this host's rows are ambiguous. One-row-per-window collection
+            // should never produce them, so a duplicate is a defect — and renaming by an id that names two
+            // windows could rename the wrong one, so those are skipped conservatively, as is a row whose
+            // window id was not captured.
+            HashSet<string> duplicateWindowIds = [.. host
+                .Where(r => r.Pane.WindowId.Length > 0)
+                .GroupBy(r => r.Pane.WindowId, StringComparer.Ordinal)
+                .Where(g => g.Count() > 1)
+                .Select(g => g.Key)];
+
+            var renames = new List<(TmuxPane Pane, string Desired)>();
+            foreach ((TmuxPane pane, string desired) in RenamePlan(host))
+            {
+                if (pane.WindowId.Length == 0 || duplicateWindowIds.Contains(pane.WindowId))
+                {
+                    failures++;
+                    diagnostics.WriteLine($"RENAME-SKIPPED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)}: window id is missing or ambiguous");
+                    continue;
+                }
+
+                renames.Add((pane, desired));
+            }
+
+            if (renames.Count == 0)
             {
                 continue;
             }
@@ -544,17 +572,36 @@ internal static class WaitingCommand
             string scannedEpoch = renames[0].Pane.Epoch;
             string nonce = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(8));
             string script = WindowNaming.BuildRenameScript(renames, scannedEpoch, nonce)!;
-            CommandResult result = await shellFor(host.Key)(script, ct);
 
-            string label = host.Key ?? "local";
+            // A linked deadline per host, mirroring CollectAsync: one hung host cannot hold up the rest,
+            // and genuine caller cancellation dominates and escapes carrying the caller's own token.
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            linked.CancelAfter(timeout);
+            CommandResult result;
+            try
+            {
+                result = await shellFor(host.Key)(script, linked.Token);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                ct.ThrowIfCancellationRequested();
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                failures += renames.Count;
+                string secs = timeout.TotalSeconds.ToString("0.###", CultureInfo.InvariantCulture);
+                diagnostics.WriteLine($"RENAME-TIMEOUT {DisplayText.Safe(label)}: rename timed out after {secs}s; {renames.Count} window(s) not renamed");
+                continue;
+            }
 
             // A nonzero exit is the shell or ssh transport failing before anything was confirmed: nothing
             // renamed, so nothing is reported as renamed.
             if (result.ExitCode != 0)
             {
-                failures += renames.Length;
+                failures += renames.Count;
                 string detail = result.Stderr.Trim() is { Length: > 0 } stderr ? stderr : $"exited {result.ExitCode}";
-                diagnostics.WriteLine($"RENAME-FAILED {DisplayText.Safe(label)}: {DisplayText.Safe(detail)}; {renames.Length} window(s) not renamed");
+                diagnostics.WriteLine($"RENAME-FAILED {DisplayText.Safe(label)}: {DisplayText.Safe(detail)}; {renames.Count} window(s) not renamed");
                 continue;
             }
 
@@ -564,13 +611,13 @@ internal static class WaitingCommand
             // windows, so the batch aborted itself. Reported, and counted as not done.
             if (Array.Exists(lines, l => l == nonce + ":epoch"))
             {
-                failures += renames.Length;
-                diagnostics.WriteLine($"RENAME-SKIPPED {DisplayText.Safe(label)}: tmux server changed since the sweep; {renames.Length} window(s) not renamed");
+                failures += renames.Count;
+                diagnostics.WriteLine($"RENAME-SKIPPED {DisplayText.Safe(label)}: tmux server changed since the sweep; {renames.Count} window(s) not renamed");
                 continue;
             }
 
-            // Only the renames tmux confirmed. A window whose rename failed (a pane that vanished
-            // mid-batch) prints no marker, so it is named as failed rather than reported renamed.
+            // Only the renames tmux confirmed, matched by window id. A window whose rename failed (it
+            // vanished mid-batch) prints no marker, so it is named as failed rather than reported renamed.
             string okPrefix = nonce + ":ok ";
             HashSet<string> confirmed = [.. lines
                 .Where(l => l.StartsWith(okPrefix, StringComparison.Ordinal))
@@ -578,7 +625,7 @@ internal static class WaitingCommand
 
             foreach ((TmuxPane pane, string desired) in renames)
             {
-                if (confirmed.Contains(pane.PaneId))
+                if (confirmed.Contains(pane.WindowId))
                 {
                     diagnostics.WriteLine($"RENAMED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)} -> {DisplayText.Safe(desired)}");
                 }
@@ -590,6 +637,8 @@ internal static class WaitingCommand
             }
         }
 
+        // A cancellation landing between the last shell call and here is still the caller's.
+        ct.ThrowIfCancellationRequested();
         return failures;
     }
 

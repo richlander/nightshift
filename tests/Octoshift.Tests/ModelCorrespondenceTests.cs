@@ -148,6 +148,46 @@ public class ModelCorrespondenceTests
     }
 
     /// <summary>
+    /// TLA+ <c>RegWitnessedStableStep</c>: a registration's witness is as stable as its time. While one
+    /// claim continues under one server, a later sweep that finally sees the whole fleet cannot flip a
+    /// first look's witness from false to true — the temporal half of the fleet-expansion fix. Only a
+    /// genuine re-registration takes a fresh witness.
+    /// </summary>
+    [Fact]
+    public void RegWitnessedStableStep()
+    {
+        string path = TempPath();
+        try
+        {
+            TmuxPane w = Window("%1");
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+            var history = new PaneHistory(path);
+            history.AdoptEpoch("fernie", "100:1", t);
+
+            // First look: recorded unwitnessed because a narrow view could not corroborate it.
+            history.Observe(w, t, claimedPr: 4448, registrationWitnessed: false);
+            Assert.False(history.IsWitnessed(w));
+
+            // Later sweeps of the same claim offer witness = true (the fleet is now complete), but the
+            // persisted first look does not move: the same registration keeps its trust across every
+            // subsequent sweep, which is what stops fleet expansion from laundering it.
+            history.Observe(w, t.AddMinutes(10), claimedPr: 4448, registrationWitnessed: true);
+            Assert.False(history.IsWitnessed(w));
+            history.Observe(w, t.AddMinutes(20), claimedPr: 4448, registrationWitnessed: true);
+            Assert.False(history.IsWitnessed(w));
+
+            // Only a genuine re-registration — switching PRs — takes a fresh, witnessed provenance.
+            history.Observe(w, t.AddMinutes(30), claimedPr: 4600, registrationWitnessed: true);
+            Assert.True(history.IsWitnessed(w));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    /// <summary>
     /// TLA+ <c>OwnerStableAcrossSweepStep</c>: sweeping an unchanged fleet does not change who owns what.
     /// An owner whose identity flips between runs is worse than no owner at all.
     /// </summary>
@@ -237,8 +277,8 @@ public class ModelCorrespondenceTests
 
             // A later run that collects only merritt is looking at less than it has already seen.
             var narrowed = new PaneHistory(path);
-            Assert.Contains("fernie", narrowed.KnownHosts);
-            Assert.Contains("merritt", narrowed.KnownHosts);
+            Assert.Contains(TargetId.ForHost("fernie").Key, narrowed.KnownHosts);
+            Assert.Contains(TargetId.ForHost("merritt").Key, narrowed.KnownHosts);
         }
         finally
         {

@@ -61,9 +61,14 @@ public class WaitingScanTests
     /// <summary>Encodes one field the way the script's <c>printf | od | tr</c> pipeline does.</summary>
     private static string Hex(string text) => Convert.ToHexStringLower(System.Text.Encoding.UTF8.GetBytes(text));
 
-    /// <summary>One manifest row, from the readable pipe form to the six encoded fields on the wire.</summary>
+    /// <summary>One manifest row, from the readable pipe form to the seven encoded fields on the wire.</summary>
     private static string Row(string fields, string nonce = Nonce)
-        => $"{nonce}:w|" + string.Join('|', fields.Split('|', 6).Select(Hex));
+    {
+        string[] parts = fields.Split('|', 6);
+        // Synthesise a window id from the pane id, so a readable six-field fixture yields a valid row.
+        string windowId = "@" + (parts[0].StartsWith('%') ? parts[0][1..] : parts[0]);
+        return $"{nonce}:w|" + string.Join('|', parts.Append(windowId).Select(Hex));
+    }
 
     /// <summary>A row built field by field, for fixtures whose values contain the separator itself.</summary>
     private static string EncodedRow(params string[] fields)
@@ -91,6 +96,22 @@ public class WaitingScanTests
     }
 
     [Fact]
+    public void ParseCollection_ReadsAndValidatesTheWindowId()
+    {
+        // Blocker 4: the window id is the stable rename target, so it is scanned and validated like the
+        // pane id. A well-formed `@8` is kept verbatim.
+        IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseCollection(
+            $"{Nonce}:manifest\n{EncodedRow("%1", "night:3", "1", "1755900000", "pr=4595 head=abc1234", "pr4595", "@8")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
+            host: null,
+            Nonce);
+
+        TmuxPane window = Assert.Single(windows);
+        Assert.Equal("%1", window.PaneId);
+        Assert.Equal("@8", window.WindowId);
+    }
+
+    [Fact]
     public void ParseCollection_KeepsAPipeInTheWindowName()
     {
         // Window name is formatted last precisely so a separator inside it cannot shift earlier fields.
@@ -112,7 +133,7 @@ public class WaitingScanTests
         const string hostile = "pr=4595 head=abc1234\ndeadbeefcafe0123:manifest\n%9|fake:9|1|1|pr=9999|pr9999";
 
         IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
-            $"{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", hostile, "pr4595")}\n{Nonce}:end\n"
+            $"{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", hostile, "pr4595", "@1")}\n{Nonce}:end\n"
                 + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
             host: null,
             Nonce);
@@ -131,7 +152,7 @@ public class WaitingScanTests
         const string hostile = "pr4595\r\n%9|fake:9|1|1||forged\u0007and still the name";
 
         IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
-            $"{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, hostile)}\n{Nonce}:end\n"
+            $"{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, hostile, "@1")}\n{Nonce}:end\n"
                 + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
             host: null,
             Nonce);
@@ -149,6 +170,7 @@ public class WaitingScanTests
     [InlineData("deadbeefcafe0123:w|2531|nothex|31|31|31|31")]            // not encoded
     [InlineData("deadbeefcafe0123:w|2531|616|31|31|31|31")]               // truncated mid-byte
     [InlineData("deadbeefcafe0123:w|6e69676874|6e|31|31|31|31")]          // first field is not a pane id
+    [InlineData("deadbeefcafe0123:w|2531|6e|31|31|31|31|6e69676874")]     // last field is not a window id
     public void ParseCollection_RejectsAMalformedManifestRow(string row)
     {
         // Dropping a row loses a window, and a lost window is indistinguishable from a window that is not
@@ -1224,6 +1246,37 @@ public class WaitingScanTests
     }
 
     [Fact]
+    public void History_LocalAndAnAliasNamedLocalDoNotShareMemory()
+    {
+        // Blocker 3: the real local machine and an ssh alias literally named `local` are distinct targets,
+        // so the same pane id on each keeps its own registration and both are known separately.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-local-{Guid.NewGuid():N}.json");
+        try
+        {
+            TmuxPane localPane = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = null, PaneId = "%3" };
+            TmuxPane aliasPane = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4600") with { Host = "local", PaneId = "%3" };
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+            var history = new PaneHistory(path);
+            history.AdoptEpoch(null, "1:1", t);
+            history.AdoptEpoch("local", "2:2", t);
+            history.Observe(localPane, t, claimedPr: 4448);
+            history.Observe(aliasPane, t.AddHours(1), claimedPr: 4600);
+
+            Assert.Equal(t, history.ClaimedAt(localPane));
+            Assert.Equal(t.AddHours(1), history.ClaimedAt(aliasPane));
+
+            Assert.Contains(TargetId.Local.Key, history.KnownHosts);
+            Assert.Contains(TargetId.ForHost("local").Key, history.KnownHosts);
+            Assert.Equal(2, history.KnownHosts.Count);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
     public void History_AnEmptySuccessfulHostIsRememberedSoALaterOmissionNarrows()
     {
         // Finding 3, across runs: a host that answered with no windows must still enter KnownHosts, or a
@@ -1240,13 +1293,15 @@ public class WaitingScanTests
             first.RecordSweptEmpty("fernie", t);
             first.Save([onBanff], ["fernie", "banff"]);
 
-            // A later run reads the same history: fernie is remembered even though it had no windows.
+            // A later run reads the same history: fernie is remembered even though it had no windows. Its
+            // key is the structured target id, not the raw alias.
             var second = new PaneHistory(path);
-            Assert.Contains("fernie", second.KnownHosts);
+            string fernieKey = TargetId.ForHost("fernie").Key;
+            Assert.Contains(fernieKey, second.KnownHosts);
 
             // The omitted set both commands compute -- KnownHosts not collected this run -- flags it.
-            var collectedThisRun = new HashSet<string>(["banff"], StringComparer.Ordinal);
-            Assert.Contains("fernie", second.KnownHosts.Where(h => !collectedThisRun.Contains(h)));
+            var collectedThisRun = new HashSet<string>([TargetId.ForHost("banff").Key], StringComparer.Ordinal);
+            Assert.Contains(fernieKey, second.KnownHosts.Where(k => !collectedThisRun.Contains(k)));
         }
         finally
         {
@@ -1340,6 +1395,85 @@ public class WaitingScanTests
 
             // The silence measurement survives the claim being cleared: the digest is unchanged.
             Assert.Equal(TimeSpan.FromMinutes(30), silence);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task BuildRows_AGapBreaksAWitnessedOrderSoAnUnseenReclaimIsNotTheObservedOwner()
+    {
+        // Blocker 2: A and B both claim 4448, witnessed, A first — so A is the observed owner. A's host is
+        // then omitted for a sweep (a gap), during which A could have released and reclaimed unseen. On the
+        // next full sweep at the same epoch A's remembered order and witness are invalidated, so it is
+        // registered fresh and cannot stay the actionable observed owner. No departure is reported for A
+        // while it is merely unseen.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-gap-{Guid.NewGuid():N}.json");
+        try
+        {
+            var history = new PaneHistory(path);
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+            TmuxPane aQuiet = Pane("ha:1", "", PaneActivity.Idle, agentState: null, windowName: "a") with { Host = "ha", Epoch = "1:1" };
+            TmuxPane aClaims = Pane("ha:1", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234", windowName: "a") with { Host = "ha", Epoch = "1:1" };
+            TmuxPane bQuiet = Pane("hb:1", "", PaneActivity.Idle, agentState: null, windowName: "b") with { Host = "hb", Epoch = "2:1" };
+            TmuxPane bClaims = Pane("hb:1", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234", windowName: "b") with { Host = "hb", Epoch = "2:1" };
+            static Task<PrFacts?> None(int _, CancellationToken __) => Task.FromResult<PrFacts?>(null);
+            CancellationToken ct = TestContext.Current.CancellationToken;
+
+            // Sweep 1: full fleet, no claims — establishes continuous observation of both hosts.
+            await WaitingCommand.BuildRowsAsync([aQuiet, bQuiet], None, None, t, all: true, ct, collectedHosts: ["ha", "hb"], history: history);
+            // Sweep 2: A claims, witnessed (ha was observed before, view complete).
+            await WaitingCommand.BuildRowsAsync([aClaims, bQuiet], None, None, t.AddMinutes(10), all: true, ct, collectedHosts: ["ha", "hb"], history: history);
+            // Sweep 3: B claims, witnessed; A continues. A registered first, so A is the owner.
+            IReadOnlyList<WaitingRow> beforeGap = await WaitingCommand.BuildRowsAsync(
+                [aClaims, bClaims], None, None, t.AddMinutes(20), all: true, ct, collectedHosts: ["ha", "hb"], history: history);
+            Assert.Equal(ClaimRank.Owner, beforeGap.Single(r => r.Pane.PaneId == aClaims.PaneId).Claim.Rank);
+
+            // Sweep 4: omit ha — A is unseen, not departed.
+            await WaitingCommand.BuildRowsAsync([bClaims], None, None, t.AddMinutes(30), all: true, ct, collectedHosts: ["hb"], history: history);
+            Assert.DoesNotContain(WaitingCommand.Departed, d => d.Contains("#4448", StringComparison.Ordinal) && d.Contains(TargetId.ForHost("ha").Display, StringComparison.Ordinal));
+
+            // Sweep 5: full fleet again, same epoch. A reappears; the gap invalidated its order and witness.
+            IReadOnlyList<WaitingRow> afterGap = await WaitingCommand.BuildRowsAsync(
+                [aClaims, bClaims], None, None, t.AddMinutes(40), all: true, ct, collectedHosts: ["ha", "hb"], history: history);
+
+            WaitingRow aRow = afterGap.Single(r => r.Pane.PaneId == aClaims.PaneId);
+            WaitingRow bRow = afterGap.Single(r => r.Pane.PaneId == bClaims.PaneId);
+            Assert.Equal(ClaimRank.Follower, aRow.Claim.Rank);
+            Assert.Equal(ClaimRank.Owner, bRow.Claim.Rank);
+            Assert.False(aRow.MayAct);
+            Assert.False(bRow.MayAct);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void History_AnOlderHistoryFileFailsClosedRatherThanTrustingItsRegistrations()
+    {
+        // Blocker 2/3, backward compatibility: an older, differently-keyed history file — a pane keyed by
+        // the raw `fernie|%3`, a host keyed by the raw alias — is not this scheme's, so its entries are
+        // dropped on load. Nothing it recorded can become a witnessed order.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-oldfile-{Guid.NewGuid():N}.json");
+        try
+        {
+            File.WriteAllText(path, """
+                {
+                  "panes": { "fernie|%3": { "digest": "d", "since": "2026-08-25T12:00:00+00:00", "pr": 4448, "claimedAt": "2026-08-25T12:00:00+00:00", "witnessed": true } },
+                  "hosts": { "fernie": { "epoch": "1:1", "sweptAt": "2026-08-25T12:00:00+00:00" } }
+                }
+                """);
+
+            var history = new PaneHistory(path);
+            TmuxPane onFernie = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "fernie", PaneId = "%3" };
+
+            Assert.Empty(history.KnownHosts);
+            Assert.Null(history.ClaimedAt(onFernie));
+            Assert.False(history.IsWitnessed(onFernie));
         }
         finally
         {
