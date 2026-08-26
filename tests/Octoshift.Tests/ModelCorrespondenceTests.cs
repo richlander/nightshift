@@ -462,4 +462,75 @@ public class ModelCorrespondenceTests
             File.Delete(path);
         }
     }
+
+    /// <summary>
+    /// TLA+ <c>ServerRestarts</c> advances one host's epoch and resets only its windows; every other host
+    /// and its registrations remain. Production: <c>AdoptEpoch</c> under a new epoch invalidates only that
+    /// host, while a sibling collected under an unchanged epoch keeps its witnessed registration.
+    /// </summary>
+    [Fact]
+    public void ARestartOnOneHostLeavesTheOtherHostsRegistrationIntact()
+    {
+        string path = TempPath();
+        try
+        {
+            TmuxPane a = Window("%1", host: "a", epoch: "1:1");
+            TmuxPane b = Window("%1", host: "b", epoch: "2:1");
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+            var history = new PaneHistory(path);
+
+            history.AdoptEpoch("a", "1:1", t);
+            history.AdoptEpoch("b", "2:1", t);
+            history.AdoptEpoch("a", "1:1", t.AddMinutes(10));
+            history.AdoptEpoch("b", "2:1", t.AddMinutes(10));
+            history.Observe(a, t.AddMinutes(10), claimedPr: 4448, registrationWitnessed: true);
+            history.Observe(b, t.AddMinutes(10), claimedPr: 4600, registrationWitnessed: true);
+            Assert.True(history.IsWitnessed(a));
+            Assert.True(history.IsWitnessed(b));
+
+            // Host a's server restarts (a new epoch); host b is collected unchanged.
+            Assert.False(history.AdoptEpoch("a", "9:9", t.AddMinutes(20)));
+            Assert.True(history.AdoptEpoch("b", "2:1", t.AddMinutes(20)));
+
+            // a's registration is gone with its old server; b's is untouched.
+            Assert.Null(history.ClaimedAt(a));
+            Assert.False(history.IsWitnessed(a));
+            Assert.Equal(t.AddMinutes(10), history.ClaimedAt(b));
+            Assert.True(history.IsWitnessed(b));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    /// <summary>
+    /// TLA+ <c>Sweep</c> ranges over every subset of hosts, the empty set included: a total failure
+    /// records <c>lastCollected = {}</c>, so the next return of any host is a gap that resets its
+    /// continuity. Production: Save with no collected hosts marks every known host discontinuous.
+    /// </summary>
+    [Fact]
+    public void AnEmptySweepBreaksEveryKnownHostsContinuity()
+    {
+        string path = TempPath();
+        try
+        {
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+            var history = new PaneHistory(path);
+            history.AdoptEpoch("a", "1:1", t);
+            history.AdoptEpoch("b", "2:1", t);
+            history.Save([], ["a", "b"]);
+            Assert.True(history.AdoptEpoch("a", "1:1", t.AddMinutes(10)));
+
+            // A total failure: nothing collected this sweep.
+            history.Save([], []);
+
+            // The next return of a is a gap — its continuity was broken by the empty sweep.
+            Assert.False(history.AdoptEpoch("a", "1:1", t.AddMinutes(20)));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
 }

@@ -28,9 +28,10 @@
    switch PRs for reasons this tool neither controls nor predicts.
 
    Status: parsed cleanly with SANY and model-checked with TLC 2.19 against Waiting.cfg --
-   no errors, 2,415,121 states generated, 798,712 distinct, depth 9, zero violations
-   (~5s, 12 workers). Re-run TLC after any change here to regenerate the count and confirm
-   zero violations. Validated by mutation:
+   no errors, 4,647,277 states generated, 1,413,314 distinct, depth 9, zero violations
+   (~19s, 12 workers; the per-host epoch and the empty sweep widen the space from the
+   earlier single-epoch model). Re-run TLC after any change here to regenerate the count
+   and confirm zero violations. Validated by mutation:
    reintroducing the real pane-id-across-restart bug (dropping the epoch check in
    Registered) violates NoCrossEpochMemory; allowing two unwitnessed claimants to be
    ordered violates NeverActOnUnwitnessedOrder; making a sole claimant unownable violates
@@ -72,30 +73,28 @@ VARIABLES
     now,         \* logical clock, advanced by every action
     claims,      \* window -> PR or NoPr: what each window claims RIGHT NOW
     live,        \* set of windows that currently exist
-    epoch,       \* the tmux server generation; changes on restart
-    regEpoch,    \* the epoch the remembered registrations belong to
+    epoch,       \* host -> the tmux server generation on that host; changes on its restart
+    regEpoch,    \* host -> the epoch the registrations remembered for that host belong to
     regTime,     \* window -> time it was first SEEN claiming its current PR
     regPr,       \* window -> the PR it was seen claiming
     regFleet,    \* window -> the set of hosts known when its registration was made
-    sweptAt,      \* last time the tool collected this host in full, or NoTime
     viewComplete, \* DERIVED by each sweep -- see Sweep
     knownHosts,   \* hosts collected at least once before
     lastCollected, \* hosts the most recent sweep actually looked at
     regWitnessed  \* window -> was the current registration witnessed (recorded under observation)
 
-vars == << now, claims, live, epoch, regEpoch, regTime, regPr, regFleet, sweptAt,
+vars == << now, claims, live, epoch, regEpoch, regTime, regPr, regFleet,
             viewComplete, knownHosts, lastCollected, regWitnessed >>
 
 TypeOK ==
     /\ now \in 0..MaxTime
     /\ claims \in [Windows -> PRs \union {NoPr}]
     /\ live \subseteq Windows
-    /\ epoch \in Nat
-    /\ regEpoch \in Nat
+    /\ epoch \in [Hosts -> Nat]
+    /\ regEpoch \in [Hosts -> Nat]
     /\ regTime \in [Windows -> Int]
     /\ regPr \in [Windows -> PRs \union {NoPr}]
     /\ regFleet \in [Windows -> SUBSET Hosts]
-    /\ sweptAt \in Int
     /\ viewComplete \in BOOLEAN
     /\ knownHosts \subseteq Hosts
     /\ lastCollected \subseteq Hosts
@@ -122,7 +121,7 @@ Claimants(p) == { w \in live : claims[w] = p /\ HostOf(w) \in lastCollected }
 \* host, and ownership flipped. Requiring the fleet to match means an order established
 \* before the tool knew about a host is not an order over the windows on it.
 Registered(w) ==
-    IF /\ regEpoch = epoch
+    IF /\ regEpoch[HostOf(w)] = epoch[HostOf(w)]
        /\ regPr[w] = claims[w]
        /\ regTime[w] # NoTime
        /\ regFleet[w] = knownHosts
@@ -184,12 +183,11 @@ Init ==
     /\ now = 0
     /\ claims = [w \in Windows |-> NoPr]
     /\ live = {}
-    /\ epoch = 0
-    /\ regEpoch = 0
+    /\ epoch = [h \in Hosts |-> 0]
+    /\ regEpoch = [h \in Hosts |-> 0]
     /\ regTime = [w \in Windows |-> NoTime]
     /\ regPr = [w \in Windows |-> NoPr]
     /\ regFleet = [w \in Windows |-> {}]
-    /\ sweptAt = NoTime
     /\ viewComplete = FALSE
     /\ knownHosts = {}
     /\ lastCollected = {}
@@ -213,25 +211,28 @@ AgentActs ==
                  /\ p # claims[w]
                  /\ live' = live
                  /\ claims' = [claims EXCEPT ![w] = p]
-    /\ UNCHANGED << epoch, regEpoch, regTime, regPr, regFleet, sweptAt, viewComplete, knownHosts, lastCollected, regWitnessed >>
+    /\ UNCHANGED << epoch, regEpoch, regTime, regPr, regFleet, viewComplete, knownHosts, lastCollected, regWitnessed >>
 
-\* The tmux server restarts: pane ids restart, so every id may now name a different
-\* window. Everything live is replaced; what the tool remembers is about the old ones.
+\* One tmux server restarts: pane ids on THAT host restart, so its ids may now name
+\* different windows, while every other host is untouched. Restarts are per host because
+\* the fleet is many independent servers -- one machine rebooting says nothing about the
+\* others -- so only the chosen host's epoch advances and only its windows are replaced.
 ServerRestarts ==
     /\ now < MaxTime
     /\ now' = now + 1
-    /\ epoch' = epoch + 1
-    /\ live' = {}
-    /\ claims' = [w \in Windows |-> NoPr]
+    /\ \E h \in Hosts :
+         /\ epoch' = [epoch EXCEPT ![h] = epoch[h] + 1]
+         /\ live' = { w \in live : HostOf(w) # h }
+         /\ claims' = [w \in Windows |-> IF HostOf(w) = h THEN NoPr ELSE claims[w]]
     \* regWitnessed is NOT touched here, and that is deliberate. The production tool cannot
     \* alter persisted provenance for a host it did not collect: a restart is a fact about
     \* the server, learned only when a later sweep reaches the host and AdoptEpoch sees the
     \* epoch mismatch, which is what clears or freshens the witness on disk. Clearing it
     \* here would be a change to a host that may be absent from lastCollected, which
     \* NoPhantomDepartureStep forbids -- and it is unnecessary, because Registered already
-    \* fails the instant regEpoch # epoch, so a stale witness confers nothing until the next
-    \* collecting Sweep rewrites it under the new epoch.
-    /\ UNCHANGED << regEpoch, regTime, regPr, regFleet, sweptAt, viewComplete, knownHosts, lastCollected, regWitnessed >>
+    \* fails the instant regEpoch[HostOf(w)] # epoch[HostOf(w)], so a stale witness confers
+    \* nothing until the next collecting Sweep rewrites it under the new epoch.
+    /\ UNCHANGED << regEpoch, regTime, regPr, regFleet, viewComplete, knownHosts, lastCollected, regWitnessed >>
 
 \* A sweep over some set of hosts. The set is nondeterministic because it is chosen by
 \* whoever ran the tool -- and because a host may fail to answer. Those two are the same
@@ -248,19 +249,25 @@ ServerRestarts ==
 Sweep ==
     /\ now < MaxTime
     /\ now' = now + 1
-    /\ \E collected \in (SUBSET Hosts) \ {{}} :
+    \* The collected set ranges over EVERY subset of Hosts, the empty set included. An
+    \* empty sweep is a total failure -- nothing answered -- and it must be representable:
+    \* it records lastCollected = {}, so the next return of any host is a gap that resets
+    \* that host's continuity and witness, exactly as a run that collected nothing leaves
+    \* the fleet.
+    /\ \E collected \in SUBSET Hosts :
          \* Registrations are renewed or dropped only by a sweep that looked at the host.
          \* A window on an uncollected host is unseen, not gone -- forgetting it would
          \* manufacture a departure and re-register it as new on the next full sweep.
-         \* A registration is preserved only across CONTINUOUS observation: the host must
-         \* have been in the PREVIOUS sweep too (HostOf(w) \in lastCollected, unprimed). A
-         \* host collected now but absent last sweep is a gap -- it may have released and
-         \* reclaimed unseen -- so its window is freshened (regTime = now) even when the
-         \* epoch and claim are unchanged, exactly as the code's HostMemory.Continuous does.
+         \* A registration is preserved only across CONTINUOUS observation on an UNCHANGED
+         \* server: the host's remembered epoch must still match its live epoch
+         \* (regEpoch[HostOf(w)] = epoch[HostOf(w)], so no restart since the last sweep of
+         \* it) AND the host must have been in the PREVIOUS sweep (HostOf(w) \in
+         \* lastCollected). A host collected now but restarted, or absent last sweep, is a
+         \* gap -- its window is freshened (regTime = now) even when the claim is unchanged.
          /\ regTime' = [w \in Windows |->
                           IF HostOf(w) \notin collected THEN regTime[w]
                           ELSE IF w \in live /\ claims[w] # NoPr
-                               THEN IF regEpoch = epoch /\ regPr[w] = claims[w] /\ regTime[w] # NoTime /\ HostOf(w) \in lastCollected
+                               THEN IF regEpoch[HostOf(w)] = epoch[HostOf(w)] /\ regPr[w] = claims[w] /\ regTime[w] # NoTime /\ HostOf(w) \in lastCollected
                                     THEN regTime[w]
                                     ELSE now
                                ELSE NoTime]
@@ -276,27 +283,28 @@ Sweep ==
          \* exist -- only from this memory.
          /\ viewComplete' = (knownHosts \subseteq collected)
          \* Provenance, persisted with the registration. A window unseen this sweep keeps
-         \* whatever it had. One that keeps the same claim ACROSS CONTINUOUS OBSERVATION
-         \* keeps its witness -- so a first look stays a first look no matter how many
-         \* later sweeps see it. A fresh registration is witnessed only when the tool's
-         \* memory is continuous with the current server (regEpoch = epoch, so no restart
-         \* since the last sweep), its host was in the PREVIOUS sweep (HostOf(w) \in
-         \* lastCollected, so there is no gap to have released across), AND this run's view
-         \* is complete; otherwise it is a first look, recorded FALSE. Dropping a claim, or
-         \* a gap on the host, clears it. This is what stops the three-sweep promotion AND
-         \* the gap-return promotion: the witness is never recomputed to TRUE for a claim
-         \* whose host was not under continuous observation when it was registered.
+         \* whatever it had. One that keeps the same claim ACROSS CONTINUOUS OBSERVATION on
+         \* an UNCHANGED server keeps its witness -- so a first look stays a first look no
+         \* matter how many later sweeps see it. A fresh registration is witnessed only when
+         \* the host's remembered epoch still matches its live one (no restart since the
+         \* last sweep of it), its host was in the PREVIOUS sweep (no gap to have released
+         \* across), AND this run's view is complete; otherwise it is a first look, recorded
+         \* FALSE. Dropping a claim, a restart, or a gap on the host clears it. This is what
+         \* stops the three-sweep promotion AND the gap/restart-return promotion.
          /\ regWitnessed' = [w \in Windows |->
                                IF HostOf(w) \notin collected THEN regWitnessed[w]
                                ELSE IF w \in live /\ claims[w] # NoPr
-                                    THEN IF regEpoch = epoch /\ regPr[w] = claims[w] /\ regTime[w] # NoTime /\ HostOf(w) \in lastCollected
+                                    THEN IF regEpoch[HostOf(w)] = epoch[HostOf(w)] /\ regPr[w] = claims[w] /\ regTime[w] # NoTime /\ HostOf(w) \in lastCollected
                                          THEN regWitnessed[w]
-                                         ELSE (regEpoch = epoch /\ HostOf(w) \in lastCollected /\ knownHosts \subseteq collected)
+                                         ELSE (regEpoch[HostOf(w)] = epoch[HostOf(w)] /\ HostOf(w) \in lastCollected /\ knownHosts \subseteq collected)
                                     ELSE FALSE]
+         \* Each collected host adopts its live epoch, so a restart it has not yet been
+         \* swept under is noticed the next time it is; an uncollected host keeps whatever
+         \* it remembered, because the tool cannot learn a restart on a host it did not look
+         \* at.
+         /\ regEpoch' = [h \in Hosts |-> IF h \in collected THEN epoch[h] ELSE regEpoch[h]]
          /\ knownHosts' = knownHosts \union collected
          /\ lastCollected' = collected
-    /\ regEpoch' = epoch
-    /\ sweptAt' = now
     /\ UNCHANGED << claims, live, epoch >>
 
 Next == AgentActs \/ ServerRestarts \/ Sweep
@@ -327,9 +335,12 @@ NeverActOnUnwitnessedOrder ==
 
 \* Invariant 10: a registration recorded under a previous tmux server never counts.
 \* Without this, a restarted server hands a new window a departed one's place in the
-\* queue -- and labels the result observed, which is what gates action.
+\* queue -- and labels the result observed, which is what gates action. Per host now: a
+\* window whose host's remembered epoch has fallen behind that host's live epoch (its
+\* server restarted since the last sweep of it) is not registered, whatever other hosts
+\* did.
 NoCrossEpochMemory ==
-    regEpoch # epoch => \A w \in live : Registered(w) = NoTime
+    \A w \in live : regEpoch[HostOf(w)] # epoch[HostOf(w)] => Registered(w) = NoTime
 
 \* Anti-degenerate. Every property above is satisfied by a tool that never acts at all,
 \* so one of them has to require that it DOES. A window that is the only claimant of
@@ -395,7 +406,7 @@ RegistrationStableStep ==
     [][ \A w \in Windows :
           (/\ w \in live /\ w \in live'
            /\ claims[w] # NoPr /\ claims'[w] = claims[w]
-           /\ epoch' = epoch
+           /\ epoch'[HostOf(w)] = epoch[HostOf(w)]
            /\ HostOf(w) \in lastCollected
            /\ Registered(w) # NoTime)
              => regTime'[w] = regTime[w] ]_vars
@@ -416,7 +427,7 @@ RegWitnessedStableStep ==
     [][ \A w \in Windows :
           (/\ w \in live /\ w \in live'
            /\ claims[w] # NoPr /\ claims'[w] = claims[w]
-           /\ epoch' = epoch
+           /\ epoch'[HostOf(w)] = epoch[HostOf(w)]
            /\ HostOf(w) \in lastCollected
            /\ Registered(w) # NoTime)
              => regWitnessed'[w] = regWitnessed[w] ]_vars

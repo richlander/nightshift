@@ -29,6 +29,12 @@ window first claimed a PR, when its output last changed, and which tmux server
 its pane ids belonged to. Everything in it is a memory of an observation, and an
 observation cannot be recovered after the fact — which is why it is persisted at
 all, and why it must be discarded rather than repaired when its basis is gone.
+Because a `waiting` and a `pr` can run at once and share this one file, each takes
+a cross-process lock for the whole load-reconcile-save transaction: a run reads,
+updates and writes under the lock so a concurrent run cannot interleave and lose
+an update, and the write itself is atomic (temp file then rename). A lock that
+cannot be taken, or a write that fails, is surfaced as unavailable — never a
+success that leaves a stale witnessed order on disk.
 
 ---
 
@@ -117,16 +123,19 @@ The machine advances on a sweep. Between sweeps, the world moves on its own:
 | agent stops | activity → Idle; nothing else changes |
 | window created / destroyed | claims re-ranked |
 | PR merges, head moves, checks report | verdicts change under an unchanged record |
-| **tmux server restarts** | pane ids restart at `%0`; all remembered claims for that host are void once it is next collected under the new epoch |
+| **tmux server restarts** | that host's pane ids restart at `%0`; only its remembered claims are void, once it is next collected under its new epoch, and other hosts are untouched |
 | host has no tmux server | a successful empty observation — the machine answered, it just holds no windows |
 | host unreachable | that host contributes no rows; others are unaffected |
 
-The last two are why the tool records an epoch per host. A restarted server makes
-remembered pane ids name different windows, so the memory is not merely stale —
-it is actively misleading, and confidence would launder it. The restart itself
-changes nothing on disk: the tool cannot rewrite what it has not collected, so a
-host's remembered claims are voided the next time it is swept and the epoch is
-seen to have changed, not at the moment of the restart.
+The last two are why the tool records an epoch **per host**. A restarted server
+makes remembered pane ids name different windows, so the memory is not merely
+stale — it is actively misleading, and confidence would launder it. Restarts are
+per host because the fleet is many independent tmux servers: one machine rebooting
+says nothing about the others, so only that host's epoch advances and only its
+registrations are invalidated. And the restart itself changes nothing on disk: the
+tool cannot rewrite what it has not collected, so a host's remembered claims are
+voided the next time it is swept and its epoch is seen to have changed, not at the
+moment of the restart.
 
 ## 6. Invariants
 
