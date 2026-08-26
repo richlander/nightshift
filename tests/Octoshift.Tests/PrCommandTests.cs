@@ -384,4 +384,146 @@ public class PrCommandTests
         using JsonDocument doc = JsonDocument.Parse(result.Json());
         Assert.Empty(doc.RootElement.GetProperty("claims").EnumerateArray());
     }
+
+    // Serializes the few tests that must capture the process-wide Console streams, and restores them.
+    private static readonly SemaphoreSlim ConsoleGate = new(1, 1);
+
+    private static async Task<(int Exit, string Out, string Err)> RunWithCapturedConsoleAsync(Func<CancellationToken, Task<int>> run, CancellationToken ct)
+    {
+        await ConsoleGate.WaitAsync(ct);
+        TextWriter savedOut = Console.Out;
+        TextWriter savedErr = Console.Error;
+        var outWriter = new StringWriter();
+        var errWriter = new StringWriter();
+        try
+        {
+            Console.SetOut(outWriter);
+            Console.SetError(errWriter);
+            int exit = await run(ct);
+            return (exit, outWriter.ToString(), errWriter.ToString());
+        }
+        finally
+        {
+            Console.SetOut(savedOut);
+            Console.SetError(savedErr);
+            ConsoleGate.Release();
+        }
+    }
+
+    [Fact]
+    public async Task RunAsync_LeadsWithAPartialTokenWhenTheHistoryIsMalformed()
+    {
+        // Blocker 4: a history failure leaves fleet ownership unknown, so the human output leads its first
+        // stdout line with an aligned failure token — not only a stderr line — matching the unavailable
+        // exit. The detail goes to stderr. The malformed history fails the load before any collection, so
+        // this needs no ssh or GitHub.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-prtoken-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, "{ not a history ]");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            (int exit, string stdout, string stderr) = await RunWithCapturedConsoleAsync(
+                token => PrCommand.RunAsync(4448, "owner/name", [], json: false, token, historyPath: path), ct);
+
+            Assert.Equal(ExitCode.Unavailable, exit);
+            Assert.StartsWith("PARTIAL PR #4448", stdout, StringComparison.Ordinal);
+            Assert.Contains("pane history unavailable", stdout, StringComparison.Ordinal);
+            Assert.NotEqual(string.Empty, stderr.Trim());
+            Assert.Equal("{ not a history ]", File.ReadAllText(path));
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task RunAsync_LeadsWithAPartialTokenWhenTheHistoryLockCannotBeTaken()
+    {
+        // The same aligned failure headline for a lock/persistence failure, distinct from the malformed
+        // case: the history path sits under a regular file, so the lock's directory cannot be created.
+        string blocker = Path.Combine(Path.GetTempPath(), $"octoshift-prblock-{Guid.NewGuid():N}");
+        File.WriteAllText(blocker, "not a directory");
+        string path = Path.Combine(blocker, "panes.json");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            (int exit, string stdout, string stderr) = await RunWithCapturedConsoleAsync(
+                token => PrCommand.RunAsync(4448, "owner/name", [], json: false, token, historyPath: path), ct);
+
+            Assert.Equal(ExitCode.Unavailable, exit);
+            Assert.StartsWith("PARTIAL PR #4448", stdout, StringComparison.Ordinal);
+            Assert.NotEqual(string.Empty, stderr.Trim());
+        }
+        finally
+        {
+            File.Delete(blocker);
+        }
+    }
+
+    [Fact]
+    public async Task RunAsync_JsonHistoryFailureReturnsUnavailableWithoutAHumanToken()
+    {
+        // Under --json the failure is one error document (validated by WriteJsonError's own test) written
+        // to the raw stdout stream, and the human PARTIAL token is not emitted through Console.Out.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-prtokenjson-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, "{ not a history ]");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            (int exit, string stdout, _) = await RunWithCapturedConsoleAsync(
+                token => PrCommand.RunAsync(4448, "owner/name", [], json: true, token, historyPath: path), ct);
+
+            Assert.Equal(ExitCode.Unavailable, exit);
+            Assert.DoesNotContain("PARTIAL", stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task RunAsync_GenuineCancellationPropagatesWithoutAFailureToken()
+    {
+        // A caller cancellation is not a history failure: it must escape as an OperationCanceledException,
+        // never be dressed up as a PARTIAL token. The lock is held so RunAsync blocks acquiring the
+        // transaction, then the caller cancels.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-prcancel-{Guid.NewGuid():N}.json");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            using PaneHistory holder = await PaneHistory.OpenAsync(path, ct);
+            using var cts = new CancellationTokenSource();
+
+            await ConsoleGate.WaitAsync(ct);
+            TextWriter savedOut = Console.Out;
+            TextWriter savedErr = Console.Error;
+            var outWriter = new StringWriter();
+            try
+            {
+                Console.SetOut(outWriter);
+                Console.SetError(new StringWriter());
+                Task<int> run = PrCommand.RunAsync(4448, "owner/name", [], json: false, cts.Token, historyPath: path);
+                await Task.Delay(150, ct);
+                await cts.CancelAsync();
+
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+                Assert.DoesNotContain("PARTIAL", outWriter.ToString(), StringComparison.Ordinal);
+            }
+            finally
+            {
+                Console.SetOut(savedOut);
+                Console.SetError(savedErr);
+                ConsoleGate.Release();
+            }
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
 }

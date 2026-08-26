@@ -83,7 +83,7 @@ public sealed class TmuxRenameIntegrationTests : IDisposable
             Assert.Skip("tmux is not installed");
         }
 
-        RunTmux("new-session", "-d", "-s", "s");
+        NewServer("s");
         (string epoch, TmuxPane pane) = await FirstWindowAsync();
 
         string nonce = Nonce();
@@ -142,7 +142,7 @@ public sealed class TmuxRenameIntegrationTests : IDisposable
             Assert.Skip("tmux is not installed");
         }
 
-        RunTmux("new-session", "-d", "-s", "s");
+        NewServer("s");
         RunTmux("new-window");
         string epoch = (await FirstWindowAsync()).Epoch;
         IReadOnlyList<TmuxPane> before = await ScanAsync();
@@ -174,7 +174,7 @@ public sealed class TmuxRenameIntegrationTests : IDisposable
             Assert.Skip("tmux is not installed");
         }
 
-        RunTmux("new-session", "-d", "-s", "s");
+        NewServer("s");
         (string epoch, TmuxPane pane) = await FirstWindowAsync();
 
         string nonce = Nonce();
@@ -205,7 +205,7 @@ public sealed class TmuxRenameIntegrationTests : IDisposable
             Assert.Skip("tmux is not installed");
         }
 
-        RunTmux("new-session", "-d", "-s", "s");
+        NewServer("s");
         RunTmux("new-window");
         IReadOnlyList<TmuxPane> before = await ScanAsync();
         Assert.True(before.Count >= 2);
@@ -213,10 +213,12 @@ public sealed class TmuxRenameIntegrationTests : IDisposable
         TmuxPane w1 = before[0];
         TmuxPane w2 = before[1];
 
-        // A wrapper that, on the second if-shell it sees, tears the server down and starts a fresh one
-        // before forwarding the call — so that if-shell evaluates against a new generation.
+        // A wrapper that, on the second guard if-shell it sees (the guard has `-t` as its third argument —
+        // `if-shell -F -t @id …`; the staging `if-shell -F 1 …` does not, even though its branch string
+        // mentions -t), tears the server down and starts a fresh one before forwarding the call, so the
+        // second window's guard evaluates against a new generation.
         WriteWrapper(
-            $"if [ \"$1\" = if-shell ]; then c=$(cat {_workDir}/n 2>/dev/null || echo 0); c=$((c+1)); echo $c > {_workDir}/n; "
+            $"if [ \"$1\" = if-shell ] && [ \"$3\" = -t ]; then c=$(cat {_workDir}/n 2>/dev/null || echo 0); c=$((c+1)); echo $c > {_workDir}/n; "
             + $"if [ $c = 2 ]; then {_tmux} -L {_socket} kill-server 2>/dev/null; {_tmux} -L {_socket} new-session -d -s recycled 2>/dev/null; fi; fi\n");
 
         string nonce = Nonce();
@@ -246,7 +248,7 @@ public sealed class TmuxRenameIntegrationTests : IDisposable
             Assert.Skip("tmux is not installed");
         }
 
-        RunTmux("new-session", "-d", "-s", "s");
+        NewServer("s");
         (string epoch, TmuxPane pane) = await FirstWindowAsync();
 
         async Task ApplyAsync(string? suffix)
@@ -272,11 +274,133 @@ public sealed class TmuxRenameIntegrationTests : IDisposable
         Assert.Equal("  pr4448  ", (await FirstWindowAsync()).Pane.WindowName);
     }
 
+    [Fact]
+    public async Task Rename_AbortsWhenTheWindowNameChangedSinceTheSweep()
+    {
+        // Blocker 1: the plan is stale by the time it runs — history is unlocked and GitHub read first, and
+        // the agent (or a newer sweep) may have moved the window on. Here the window is renamed after the
+        // sweep but under the same server. The guard sees the live name differs from the scanned one and
+        // refuses, reporting stale, so the older plan does not overwrite the newer identity.
+        if (_tmux is null)
+        {
+            Assert.Skip("tmux is not installed");
+        }
+
+        NewServer("s");
+        RunTmux("rename-window", "-t", "@0", "pr4448");
+        (string epoch, TmuxPane pane) = await FirstWindowAsync();
+
+        // The agent renames the window between the sweep and the rename.
+        RunTmux("rename-window", "-t", pane.WindowId, "pr9999");
+
+        string nonce = Nonce();
+        string script = WindowNaming.BuildRenameScript([(pane, "pr4448-ready")], epoch, nonce)!;
+        CommandResult result = await RunAsync(script, TestContext.Current.CancellationToken);
+
+        Assert.Contains($"{nonce}:stale:{pane.WindowId}", result.Stdout, StringComparison.Ordinal);
+        Assert.DoesNotContain($"{nonce}:ok:", result.Stdout, StringComparison.Ordinal);
+        Assert.Equal("pr9999", (await FirstWindowAsync()).Pane.WindowName);
+    }
+
+    [Fact]
+    public async Task Rename_AbortsWhenThePublishedStateChangedSinceTheSweep()
+    {
+        // The same window, same name, but the agent reassigns its published @agent_state — a PR handoff the
+        // sweep did not see. The guard compares the live state to the scanned one and refuses: an old
+        // plan's suffix would otherwise be applied to a window that now means something else.
+        if (_tmux is null)
+        {
+            Assert.Skip("tmux is not installed");
+        }
+
+        NewServer("s");
+        RunTmux("rename-window", "-t", "@0", "pr4448");
+        RunTmux("set-option", "-w", "-t", "@0", "@agent_state", "pr=4448 reviews=2/2 rec=merge");
+        (string epoch, TmuxPane pane) = await FirstWindowAsync();
+        Assert.Equal("pr=4448 reviews=2/2 rec=merge", pane.AgentStateRaw);
+
+        // The agent reassigns to a different PR without renaming the window.
+        RunTmux("set-option", "-w", "-t", pane.WindowId, "@agent_state", "pr=4600 reviews=0/2");
+
+        string nonce = Nonce();
+        string script = WindowNaming.BuildRenameScript([(pane, "pr4448-ready")], epoch, nonce)!;
+        CommandResult result = await RunAsync(script, TestContext.Current.CancellationToken);
+
+        Assert.Contains($"{nonce}:stale:{pane.WindowId}", result.Stdout, StringComparison.Ordinal);
+        Assert.DoesNotContain($"{nonce}:ok:", result.Stdout, StringComparison.Ordinal);
+        Assert.Equal("pr4448", (await FirstWindowAsync()).Pane.WindowName);
+    }
+
+    [Fact]
+    public async Task Rename_AbortsWhenANewerSweepAlreadyRenamedTheWindow()
+    {
+        // Two sweeps race: the newer one renames the window to its correct suffix first, then the older
+        // one's plan runs. Because the older plan's guard compares against the name it scanned — now
+        // superseded — it refuses rather than reverting the window to a stale suffix.
+        if (_tmux is null)
+        {
+            Assert.Skip("tmux is not installed");
+        }
+
+        NewServer("s");
+        RunTmux("rename-window", "-t", "@0", "pr4448-blocked");
+        (string epoch, TmuxPane stalePane) = await FirstWindowAsync();
+
+        // A newer sweep renames the window to the current-correct name first.
+        RunTmux("rename-window", "-t", stalePane.WindowId, "pr4448-ready");
+
+        // The older sweep's plan — computed from the -blocked name — now runs and would set -blocked again.
+        string nonce = Nonce();
+        string script = WindowNaming.BuildRenameScript([(stalePane, "pr4448")], epoch, nonce)!;
+        CommandResult result = await RunAsync(script, TestContext.Current.CancellationToken);
+
+        Assert.Contains($"{nonce}:stale:{stalePane.WindowId}", result.Stdout, StringComparison.Ordinal);
+        Assert.DoesNotContain($"{nonce}:ok:", result.Stdout, StringComparison.Ordinal);
+        Assert.Equal("pr4448-ready", (await FirstWindowAsync()).Pane.WindowName);
+    }
+
+    [Fact]
+    public async Task Rename_AppliesWhenTheNameAndStateAreUnchangedIncludingHostileBytes()
+    {
+        // The guard does not over-refuse: when the scanned name and state are unchanged — even when the
+        // name carries bytes that are hostile to both shell and tmux — the rename still lands, proving the
+        // staged-option comparison round-trips arbitrary bytes rather than failing closed on them.
+        if (_tmux is null)
+        {
+            Assert.Skip("tmux is not installed");
+        }
+
+        const string hostile = "x'; touch INJECTED; echo '$(whoami)`id`- 日本語";
+        NewServer("s");
+        RunTmux("rename-window", "-t", "@0", hostile);
+        RunTmux("set-option", "-w", "-t", "@0", "@agent_state", "pr=4448 head=$(whoami)");
+        (string epoch, TmuxPane pane) = await FirstWindowAsync();
+        Assert.Equal(hostile, pane.WindowName);
+
+        string nonce = Nonce();
+        string script = WindowNaming.BuildRenameScript([(pane, hostile + "-ready")], epoch, nonce)!;
+        CommandResult result = await RunAsync(script, TestContext.Current.CancellationToken);
+
+        Assert.Empty(Directory.GetFiles(_workDir, "INJECTED*"));
+        Assert.Contains($"{nonce}:ok:{pane.WindowId}", result.Stdout, StringComparison.Ordinal);
+        Assert.Equal(hostile + "-ready", (await FirstWindowAsync()).Pane.WindowName);
+    }
+
     private async Task<(string Epoch, TmuxPane Pane)> FirstWindowAsync()
     {
         IReadOnlyList<TmuxPane> panes = await ScanAsync();
         Assert.NotEmpty(panes);
         return (panes[0].Epoch, panes[0]);
+    }
+
+    // Starts the private server with a session and pins window names: an explicit-name convention is what
+    // real agent windows follow (pr#### suffixes), and disabling automatic-rename keeps a scanned name from
+    // drifting under tmux's own footer updates between the scan and the guarded rename, which the round-7
+    // name guard would otherwise (correctly) treat as an identity change.
+    private void NewServer(string session)
+    {
+        RunTmux("new-session", "-d", "-s", session);
+        RunTmux("set-option", "-g", "automatic-rename", "off");
     }
 
     private async Task<IReadOnlyList<TmuxPane>> ScanAsync()

@@ -197,7 +197,7 @@ internal sealed class PaneHistory : IDisposable
 
         foreach ((string key, PaneMemory pane) in entries)
         {
-            if (TargetId.HostOfComposite(key) is null || TargetId.IdOfComposite(key) is not { } id || !TmuxScanner.IsPaneId(id))
+            if (TargetId.HostOfComposite(key) is not { } host || TargetId.IdOfComposite(key) is not { } id || !TmuxScanner.IsPaneId(id))
             {
                 throw new HistoryUnavailableException($"pane history has an invalid pane key '{key}', so it was not written by this scheme");
             }
@@ -210,6 +210,15 @@ internal sealed class PaneHistory : IDisposable
             if (!IsWriterProducedPane(pane))
             {
                 throw new HistoryUnavailableException($"pane history has an impossible record for pane '{key}'");
+            }
+
+            // Every pane belongs to a host, and the writer records that host in the hosts map on the same
+            // sweep. A pane whose host key is absent is impossible — and dangerous: it carries a
+            // registration for a host that never enters KnownHosts, so a narrowed sweep could not tell the
+            // fleet was wider than it saw. Reject rather than let a pane smuggle in an invisible host.
+            if (!hosts.ContainsKey(host.Key))
+            {
+                throw new HistoryUnavailableException($"pane history has pane '{key}' on host '{host.Key}', which is not in the hosts map");
             }
         }
     }
@@ -270,12 +279,40 @@ internal sealed class PaneHistory : IDisposable
             return ([], []);
         }
 
+        string text;
+        try
+        {
+            text = File.ReadAllText(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            if (strict)
+            {
+                throw new HistoryUnavailableException($"could not read pane history from {path}: {ex.Message}", ex);
+            }
+
+            return ([], []);
+        }
+
+        // A strict (product) load validates the raw JSON shape before deserializing it, because the
+        // source-generated deserializer is deliberately lenient in ways this file must not be: it matches
+        // property names case-insensitively and silently ignores unknown members, so a hand-tampered
+        // `{"panes":{},"hosts":{},"version":2}` or an uppercase `Panes` would be read, its unexpected parts
+        // dropped, and the result rewritten — laundering exactly the corruption the strict load exists to
+        // refuse. Deserialization then enforces value kinds (a bool where a number is written throws), and
+        // the semantic validator enforces the record invariants. The forgiving loader skips this and
+        // tolerates whatever parses.
+        if (strict)
+        {
+            ValidateRawSchema(text, path);
+        }
+
         HistoryFile? file;
         try
         {
-            file = JsonSerializer.Deserialize(File.ReadAllText(path), PaneHistoryJsonContext.Default.HistoryFile);
+            file = JsonSerializer.Deserialize(text, PaneHistoryJsonContext.Default.HistoryFile);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        catch (JsonException ex)
         {
             if (strict)
             {
@@ -298,13 +335,102 @@ internal sealed class PaneHistory : IDisposable
         // The writer always emits both maps (an empty first run writes `{"panes":{},"hosts":{}}`), so a
         // file missing either — `{}`, `{"panes":{}}`, `{"hosts":null}` — was not written by this scheme.
         // Under a strict load that is a rejection, not an empty history: reading it as empty would forget
-        // whatever the real file held. The forgiving loader treats an absent map as empty.
+        // whatever the real file held. The forgiving loader treats an absent map as empty. (Strict never
+        // reaches here with a missing map — ValidateRawSchema already rejected it — but the guard stays as
+        // defence in depth.)
         if (strict && (file.Panes is null || file.Hosts is null))
         {
             throw new HistoryUnavailableException($"pane history at {path} is missing its panes or hosts map, so it was not written by this scheme");
         }
 
         return (file.Panes ?? [], file.Hosts ?? []);
+    }
+
+    private static readonly string[] RootMembers = ["panes", "hosts"];
+    private static readonly string[] HostMembers = ["epoch", "sweptAt", "continuous"];
+    private static readonly string[] PaneMembers = ["digest", "since", "pr", "claimedAt", "witnessed"];
+
+    /// <summary>
+    /// Validates the raw JSON shape of a strict load with <see cref="JsonDocument"/> — AOT-safe, no
+    /// reflection — before the lenient source-generated deserializer sees it. The root must be an object
+    /// with exactly a <c>panes</c> object and a <c>hosts</c> object, exact casing, no unknown or duplicate
+    /// members; each host record exactly <c>epoch</c>/<c>sweptAt</c>/<c>continuous</c> and each pane record
+    /// exactly <c>digest</c>/<c>since</c>/<c>pr</c>/<c>claimedAt</c>/<c>witnessed</c>, again with no
+    /// unknown or duplicate members; and no dictionary key may repeat. Anything else is not a file this
+    /// scheme wrote, so it is rejected here — bytes untouched — rather than deserialized into a rewritten
+    /// approximation of itself.
+    /// </summary>
+    private static void ValidateRawSchema(string json, string path)
+    {
+        JsonDocument doc;
+        try
+        {
+            doc = JsonDocument.Parse(json);
+        }
+        catch (JsonException ex)
+        {
+            throw new HistoryUnavailableException($"could not read pane history from {path}: {ex.Message}", ex);
+        }
+
+        using (doc)
+        {
+            RequireExactMembers(doc.RootElement, RootMembers, path, "the root");
+            ValidateDictionary(doc.RootElement.GetProperty("hosts"), HostMembers, path, "host");
+            ValidateDictionary(doc.RootElement.GetProperty("panes"), PaneMembers, path, "pane");
+        }
+    }
+
+    /// <summary>A dictionary object whose keys must be unique and whose every value is a record with
+    /// exactly the given members.</summary>
+    private static void ValidateDictionary(JsonElement dictionary, string[] recordMembers, string path, string kind)
+    {
+        if (dictionary.ValueKind != JsonValueKind.Object)
+        {
+            throw new HistoryUnavailableException($"pane history at {path} has a {kind} map that is not an object");
+        }
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (JsonProperty entry in dictionary.EnumerateObject())
+        {
+            if (!seen.Add(entry.Name))
+            {
+                throw new HistoryUnavailableException($"pane history at {path} has a duplicate {kind} key '{entry.Name}'");
+            }
+
+            RequireExactMembers(entry.Value, recordMembers, path, $"{kind} '{entry.Name}'");
+        }
+    }
+
+    /// <summary>An object with exactly the allowed members — no unknown member, no duplicate, none
+    /// missing.</summary>
+    private static void RequireExactMembers(JsonElement element, string[] allowed, string path, string what)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+        {
+            throw new HistoryUnavailableException($"pane history at {path}: {what} is not an object");
+        }
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (JsonProperty member in element.EnumerateObject())
+        {
+            if (!seen.Add(member.Name))
+            {
+                throw new HistoryUnavailableException($"pane history at {path}: {what} has a duplicate '{member.Name}' member");
+            }
+
+            if (Array.IndexOf(allowed, member.Name) < 0)
+            {
+                throw new HistoryUnavailableException($"pane history at {path}: {what} has an unexpected '{member.Name}' member");
+            }
+        }
+
+        foreach (string name in allowed)
+        {
+            if (!seen.Contains(name))
+            {
+                throw new HistoryUnavailableException($"pane history at {path}: {what} is missing its '{name}' member");
+            }
+        }
     }
 
     /// <summary>
@@ -481,6 +607,47 @@ internal sealed class PaneHistory : IDisposable
     /// <summary>When this host was last collected in full under the current server, if it was.</summary>
     public DateTimeOffset? SweptAt(string? host)
         => _hosts.TryGetValue(TargetId.ForHost(host).Key, out HostMemory? known) ? known.SweptAt : null;
+
+    /// <summary>
+    /// The timestamp a transaction stamps its observations with: the sampled wall clock, but never
+    /// earlier than the greatest time already persisted in this loaded history. Registration order is the
+    /// whole of contested ownership, so a timestamp that moved backwards would invert it — and two things
+    /// can move it backwards. Lock acquisition is not fair, so a transaction that started waiting first can
+    /// acquire the lock second, and a wall clock read at the wrong moment (or after an NTP step) can be
+    /// earlier than one a prior, already-committed transaction wrote. Both are defended the same way:
+    /// sample after the lock is held (so the read reflects when this transaction actually runs), then clamp
+    /// the sample up to the greatest persisted <see cref="HostMemory.SweptAt"/>, <see
+    /// cref="PaneMemory.ClaimedAt"/> or <see cref="PaneMemory.Since"/>. Because every serialized
+    /// transaction sees the previous one's writes before it stamps, a later sweep can never receive an
+    /// earlier timestamp; equal is allowed, and an equal registration time is an inferred, not observed,
+    /// order — exactly the outcome for two claims the tool cannot distinguish in time.
+    /// </summary>
+    public DateTimeOffset TransactionTime(DateTimeOffset sampled)
+    {
+        DateTimeOffset floor = DateTimeOffset.MinValue;
+        foreach (HostMemory host in _hosts.Values)
+        {
+            if (host.SweptAt is { } swept && swept > floor)
+            {
+                floor = swept;
+            }
+        }
+
+        foreach (PaneMemory pane in _entries.Values)
+        {
+            if (pane.Since > floor)
+            {
+                floor = pane.Since;
+            }
+
+            if (pane.ClaimedAt is { } claimed && claimed > floor)
+            {
+                floor = claimed;
+            }
+        }
+
+        return sampled >= floor ? sampled : floor;
+    }
 
     /// <summary>
     /// Records the current digest and returns how long the body has been unchanged, or null the first

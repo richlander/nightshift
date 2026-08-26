@@ -156,6 +156,115 @@ public sealed class PersistenceTests
         }
     }
 
+    [Fact]
+    public void TransactionTime_ClampsASampleUpToTheGreatestPersistedTime()
+    {
+        // Blocker 2: the registration clock never runs backwards. A sample later than everything on disk is
+        // used as-is; one earlier — a stepped-back wall clock, or a late-committing waiter that read the
+        // clock while queued — is clamped up to the greatest persisted time, so a later transaction can
+        // never stamp before an earlier committed one. Equal is allowed and is an inferred order.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-txntime-{Guid.NewGuid():N}.json");
+        DateTimeOffset t = new(2026, 8, 26, 12, 0, 0, TimeSpan.Zero);
+        try
+        {
+            var history = new PaneHistory(path);
+            history.AdoptEpoch("a", "1:1", t);                              // SweptAt = t
+            history.Observe(Pane("a"), t, claimedPr: 4448, registrationWitnessed: false); // ClaimedAt = Since = t
+            history.Save([Pane("a")], ["a"]);
+
+            var reloaded = new PaneHistory(path);
+            Assert.Equal(t.AddMinutes(5), reloaded.TransactionTime(t.AddMinutes(5))); // later: used as-is
+            Assert.Equal(t, reloaded.TransactionTime(t.AddMinutes(-5)));              // earlier: clamped up to t
+            Assert.Equal(t, reloaded.TransactionTime(t));                            // equal: allowed
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task CollectAndResolveAsync_DoesNotStampALaterSweepBeforeAnEarlierOneUnderASteppedBackClock()
+    {
+        // Two serialized sweeps with the clock running backwards between them. The first registers W1 at
+        // t2; the second, sampling an earlier t1, adds a new claimant W2 of the same PR. W2's registration
+        // is clamped to t2, not t1, so it cannot sort ahead of W1 — the inversion the after-lock sample and
+        // the monotonic clamp exist to prevent.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-monotonic-{Guid.NewGuid():N}.json");
+        DateTimeOffset t2 = new(2026, 8, 26, 12, 0, 0, TimeSpan.Zero);
+        DateTimeOffset t1 = t2.AddHours(-1);
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        TmuxPane W1 = Claiming("a", "%1", "@1", "win1");
+        TmuxPane W2 = Claiming("a", "%2", "@2", "win2");
+        try
+        {
+            await WaitingCommand.CollectAndResolveAsync(
+                ["a"], (_, _) => Task.FromResult<IReadOnlyList<TmuxPane>>([W1]),
+                None, None, now: t2, ct, historyPath: path);
+            Assert.Equal(t2, new PaneHistory(path).ClaimedAt(W1));
+
+            // The clock has stepped back to t1; a second sweep sees W1 still there and W2 newly claiming.
+            await WaitingCommand.CollectAndResolveAsync(
+                ["a"], (_, _) => Task.FromResult<IReadOnlyList<TmuxPane>>([W1, W2]),
+                None, None, now: t1, ct, historyPath: path);
+
+            var reloaded = new PaneHistory(path);
+            Assert.Equal(t2, reloaded.ClaimedAt(W1));                 // unchanged: same claim continues
+            Assert.Equal(t2, reloaded.ClaimedAt(W2));                 // clamped up to t2, never t1
+            Assert.True(reloaded.ClaimedAt(W2) >= reloaded.ClaimedAt(W1));
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task CollectAndResolveAsync_CancellationWhileWaitingForTheLockEscapesWithTheCallersToken()
+    {
+        // The after-lock sampling does not swallow a genuine caller cancellation: a core blocked acquiring
+        // the transaction and then cancelled escapes carrying exactly the caller's token.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-corecancel-{Guid.NewGuid():N}.json");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            using PaneHistory holder = await PaneHistory.OpenAsync(path, ct);
+            using var cts = new CancellationTokenSource();
+            Task<WaitingCommand.FleetResult> blocked = WaitingCommand.CollectAndResolveAsync(
+                ["a"], (_, _) => Task.FromResult<IReadOnlyList<TmuxPane>>([]),
+                None, None, now: null, cts.Token, historyPath: path);
+            await Task.Delay(100, ct);
+            await cts.CancelAsync();
+
+            OperationCanceledException oce = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => blocked);
+            Assert.Equal(cts.Token, oce.CancellationToken);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    // A window that claims a PR through its published state, with a distinct name so a shared name is never
+    // mistaken for an ambiguity.
+    private static TmuxPane Claiming(string? host, string paneId, string windowId, string windowName)
+        => new()
+        {
+            PaneId = paneId,
+            WindowId = windowId,
+            Target = "cp:1",
+            Host = host,
+            WindowName = windowName,
+            SessionAttached = false,
+            Activity = PaneActivity.Idle,
+            Epoch = "1:1",
+            AgentStateOption = "pr=4448 head=abc1234 reviews=2/2 rec=merge",
+            AgentStateRaw = "pr=4448 head=abc1234 reviews=2/2 rec=merge",
+        };
+
     // A history whose file sits under a path that is a regular file, not a directory, so creating the
     // directory for the atomic write fails — a stand-in for any write denial.
     private static (PaneHistory History, string Blocker) UnwritableHistory()
@@ -290,6 +399,9 @@ public sealed class PersistenceTests
     {
         string hostKey = TargetId.ForHost("banff").Key;
         string paneKey = TargetId.ForHost("banff").ComposeWith("%1");
+        string hosts = $"\"hosts\":{{\"{hostKey}\":{ValidHost}}}";
+
+        // --- Raw schema: shapes the source-gen deserializer would leniently accept and rewrite. ---
 
         // The writer always emits both maps, so a file missing either was not written by this scheme.
         yield return ["{}"];
@@ -297,29 +409,45 @@ public sealed class PersistenceTests
         yield return ["{\"hosts\":{}}"];
         yield return ["{\"panes\":null,\"hosts\":null}"];
 
-        // A null value where a record must be. Deserialization can produce these despite the annotations,
-        // and they crash Save — so a strict load rejects them rather than dropping them.
+        // An extra root member, or the wrong casing, which case-insensitive matching would silently drop.
+        yield return ["{\"panes\":{},\"hosts\":{},\"version\":2}"];
+        yield return ["{\"Panes\":{},\"Hosts\":{}}"];
+
+        // A duplicate member at any level: root, a record, or a repeated dictionary key.
+        yield return ["{\"panes\":{},\"hosts\":{},\"panes\":{}}"];
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"1:1\",\"epoch\":\"2:2\",\"sweptAt\":\"2026-01-01T00:00:00+00:00\",\"continuous\":true}}}}}}"];
+        yield return [$"{{\"panes\":{{\"{paneKey}\":{ValidPane},\"{paneKey}\":{ValidPane}}},{hosts}}}"];
+
+        // An unknown nested member, and a record missing a required one.
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"1:1\",\"sweptAt\":\"2026-01-01T00:00:00+00:00\",\"continuous\":true,\"extra\":1}}}}}}"];
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"1:1\",\"continuous\":true}}}}}}"];
+
+        // A null value where a record must be — an object is required.
         yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":null}}}}"];
         yield return [$"{{\"panes\":{{\"{paneKey}\":null}},\"hosts\":{{}}}}"];
 
+        // --- Semantic: full, well-formed records this implementation could never have written. ---
+
+        // A pane whose host is absent from the hosts map — it would carry a registration for a host that
+        // never enters KnownHosts, defeating narrowed-fleet detection.
+        yield return [$"{{\"panes\":{{\"{paneKey}\":{ValidPane}}},\"hosts\":{{}}}}"];
+
         // An invalid host key: `RA` is not canonical base64url, so it is not a target this scheme minted.
-        // Dropping it (as the forgiving loader does) would forget the host it was meant to be.
         yield return [$"{{\"panes\":{{}},\"hosts\":{{\"RA\":{ValidHost}}}}}"];
 
         // An impossible pane id in the composite key: `%01` has a leading zero, which tmux never emits.
         yield return [$"{{\"panes\":{{\"{TargetId.ForHost("banff").ComposeWith("%01")}\":{ValidPane}}},\"hosts\":{{}}}}"];
 
-        // Semantically impossible records this implementation could never have written.
         // A witness with no claim.
-        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"2026-01-01T00:00:00+00:00\",\"witnessed\":true}}}},\"hosts\":{{}}}}"];
+        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"2026-01-01T00:00:00+00:00\",\"pr\":null,\"claimedAt\":null,\"witnessed\":true}}}},\"hosts\":{{}}}}"];
         // A claim number with no claim time.
-        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"2026-01-01T00:00:00+00:00\",\"pr\":4448}}}},\"hosts\":{{}}}}"];
+        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"2026-01-01T00:00:00+00:00\",\"pr\":4448,\"claimedAt\":null,\"witnessed\":false}}}},\"hosts\":{{}}}}"];
         // A default (unset) Since.
-        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"0001-01-01T00:00:00+00:00\"}}}},\"hosts\":{{}}}}"];
+        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"0001-01-01T00:00:00+00:00\",\"pr\":null,\"claimedAt\":null,\"witnessed\":false}}}},\"hosts\":{{}}}}"];
         // A non-positive PR number.
-        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"2026-01-01T00:00:00+00:00\",\"pr\":0,\"claimedAt\":\"2026-01-01T00:00:00+00:00\"}}}},\"hosts\":{{}}}}"];
+        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"2026-01-01T00:00:00+00:00\",\"pr\":0,\"claimedAt\":\"2026-01-01T00:00:00+00:00\",\"witnessed\":false}}}},\"hosts\":{{}}}}"];
         // A host claiming continuity with no sweep time.
-        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"1:1\",\"continuous\":true}}}}}}"];
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"1:1\",\"sweptAt\":null,\"continuous\":true}}}}}}"];
         // A host carrying a non-canonical epoch.
         yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"0:0\",\"sweptAt\":\"2026-01-01T00:00:00+00:00\",\"continuous\":true}}}}}}"];
     }
@@ -343,6 +471,39 @@ public sealed class PersistenceTests
             // The forgiving (test-only) loader keeps its lenient behaviour: it drops the bad entry rather
             // than rejecting the file, so the sanitisation unit tests still work.
             Assert.NotNull(new PaneHistory(path));
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task OpenAsync_AcceptsAHistoryTheWriterActuallyProduced()
+    {
+        // The strict schema does not over-reject: a file the writer itself produced — both maps, exact
+        // members, a real registration and a swept host — loads cleanly and its contents survive the round
+        // trip, so the tightened validation cannot lock the tool out of its own history.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-roundtrip-{Guid.NewGuid():N}.json");
+        DateTimeOffset t = new(2026, 8, 26, 12, 0, 0, TimeSpan.Zero);
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            // Write a genuine history through the product Save path, with a claim and an empty host too.
+            using (PaneHistory seed = await PaneHistory.OpenAsync(path, ct))
+            {
+                seed.AdoptEpoch("fernie", "1:1", t);
+                seed.RecordSweptEmpty("banff", t);
+                seed.Observe(Pane("fernie"), t, claimedPr: 4448, registrationWitnessed: true);
+                seed.Save([Pane("fernie")], ["fernie", "banff"]);
+            }
+
+            using PaneHistory reopened = await PaneHistory.OpenAsync(path, ct);
+            Assert.Contains(TargetId.ForHost("fernie").Key, reopened.KnownHosts);
+            Assert.Contains(TargetId.ForHost("banff").Key, reopened.KnownHosts);
+            Assert.Equal(t, reopened.ClaimedAt(Pane("fernie")));
+            Assert.True(reopened.IsWitnessed(Pane("fernie")));
         }
         finally
         {

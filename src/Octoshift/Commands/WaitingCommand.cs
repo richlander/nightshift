@@ -108,7 +108,7 @@ internal static class WaitingCommand
         {
             FleetResult result = await CollectAndResolveAsync(
                 hosts, (host, token) => new TmuxScanner(host).ScanAsync(token),
-                facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, ct);
+                facts.FetchAsync, facts.RefreshMergeabilityAsync, now: null, ct);
 
             // Total failure keeps its own path. A sweep where nothing could be collected is not a quiet
             // fleet, and printing a QUIET summary above the failure inverts which of the two the reader
@@ -198,7 +198,7 @@ internal static class WaitingCommand
         Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> scanAsync,
         Func<int, CancellationToken, Task<PrFacts?>> fetchAsync,
         Func<int, CancellationToken, Task<PrFacts?>> refreshMergeabilityAsync,
-        DateTimeOffset now,
+        DateTimeOffset? now,
         CancellationToken ct,
         string? historyPath = null,
         TimeSpan? perTargetTimeout = null)
@@ -209,6 +209,14 @@ internal static class WaitingCommand
             history = await PaneHistory.OpenAsync(historyPath, ct);
 
             Collection collected = await CollectAsync(hosts, scanAsync, ct, perTargetTimeout);
+
+            // Sample the registration clock only now — inside the held transaction, after collection.
+            // Sampling it in RunAsync, before the wait for the lock, is the bug: lock acquisition is not
+            // fair, so a transaction that started waiting first can commit second and would stamp its new
+            // claimant with the earlier time it read while queued, inverting a witnessed order. Clamping
+            // against the persisted history closes the same gap for a clock stepped backwards. A test may
+            // inject the sample (still clamped, still after the lock); production reads the wall clock here.
+            DateTimeOffset stamped = history.TransactionTime(now ?? DateTimeOffset.UtcNow);
 
             if (collected.TotalFailure)
             {
@@ -231,7 +239,7 @@ internal static class WaitingCommand
             }
 
             IReadOnlyList<WaitingRow> resolved = await ResolveAllAsync(
-                collected.Panes, fetchAsync, refreshMergeabilityAsync, now, ct,
+                collected.Panes, fetchAsync, refreshMergeabilityAsync, stamped, ct,
                 collected.CollectedHosts, allHostsAnswered: collected.Unreachable.Count == 0, history: history);
 
             return new FleetResult(collected, resolved, []);
@@ -367,8 +375,10 @@ internal static class WaitingCommand
     }
 
     /// <summary>
-    /// Joins panes with GitHub and returns the rows a run would show. Injectable fetch so the whole
-    /// selection and ordering policy is testable without tmux or a network.
+    /// Joins panes with GitHub and returns the rows a run would show. A test helper: injectable fetch so
+    /// the whole selection and ordering policy is testable without tmux or a network. When no history is
+    /// supplied it isolates to a throwaway file rather than the shared default path, so a single-shot row
+    /// test neither pollutes nor reads another run's state.
     /// </summary>
     internal static async Task<IReadOnlyList<WaitingRow>> BuildRowsAsync(
         IReadOnlyList<TmuxPane> panes,
@@ -380,9 +390,36 @@ internal static class WaitingCommand
         IReadOnlyList<string?>? collectedHosts = null,
         bool allHostsAnswered = true,
         PaneHistory? history = null)
-        => Present(
-            await ResolveAllAsync(panes, fetchAsync, refreshMergeabilityAsync, now, ct, collectedHosts, allHostsAnswered, history),
-            all);
+    {
+        string? tempPath = history is null
+            ? Path.Combine(Path.GetTempPath(), $"octoshift-buildrows-{Guid.NewGuid():N}.json")
+            : null;
+        try
+        {
+            return Present(
+                await ResolveAllAsync(panes, fetchAsync, refreshMergeabilityAsync, now, ct, collectedHosts, allHostsAnswered, history, tempPath),
+                all);
+        }
+        finally
+        {
+            if (tempPath is not null)
+            {
+                TryDelete(tempPath);
+                TryDelete(tempPath + ".lock");
+            }
+        }
+    }
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+        }
+    }
 
     /// <summary>
     /// Resolves every pane into a row — the complete fleet, before the presentation filter. Ownership is
@@ -719,48 +756,59 @@ internal static class WaitingCommand
 
             string[] lines = result.Stdout.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
 
-            // Account per window, independently. Each window's if-shell prints exactly one marker naming
-            // that window: `<nonce>:ok:@id` when its own epoch guard held and tmux confirmed the rename, or
-            // `<nonce>:epoch:@id` when the guard found the server had changed. So a restart between windows
-            // leaves the ones renamed before it confirmed and only the later ones skipped — the earlier
-            // success is never discarded. Markers are counted per id and only for ids this host actually
-            // requested; a marker naming an unrequested id, or naming one twice, or naming it both ways is
-            // a shape the script never writes, so it confers nothing and the window falls through to
-            // skipped or failed, fail-closed.
+            // Account per window, independently. Each window's guard prints exactly one marker naming that
+            // window: `<nonce>:ok:@id` when its epoch, name and state all still matched and tmux confirmed
+            // the rename; `<nonce>:stale:@id` when the server was unchanged but the window's name or
+            // published state had moved since the sweep, so the planned rename would overwrite a newer
+            // identity; and `<nonce>:epoch:@id` when the server generation itself changed. A restart or a
+            // reassignment between windows leaves the ones already renamed reported and only the affected
+            // one skipped — the earlier success is never discarded. Markers are counted per id and only for
+            // ids this host actually requested; a marker naming an unrequested id, or naming one more than
+            // once, or naming it in more than one way, is a shape the script never writes, so it confers
+            // nothing and the window falls through to failed, fail-closed.
             string okPrefix = nonce + ":ok:";
-            string mismatchPrefix = nonce + ":epoch:";
+            string epochPrefix = nonce + ":epoch:";
+            string stalePrefix = nonce + ":stale:";
             HashSet<string> requested = [.. renames.Select(r => r.Pane.WindowId)];
             var okCounts = new Dictionary<string, int>(StringComparer.Ordinal);
-            var mismatchCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            var epochCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            var staleCounts = new Dictionary<string, int>(StringComparer.Ordinal);
             foreach (string line in lines)
             {
                 Tally(line, okPrefix, requested, okCounts);
-                Tally(line, mismatchPrefix, requested, mismatchCounts);
+                Tally(line, epochPrefix, requested, epochCounts);
+                Tally(line, stalePrefix, requested, staleCounts);
             }
 
             foreach ((TmuxPane pane, string desired) in renames)
             {
                 int oks = okCounts.GetValueOrDefault(pane.WindowId);
-                int mismatches = mismatchCounts.GetValueOrDefault(pane.WindowId);
-                if (oks == 1 && mismatches == 0)
+                int epochs = epochCounts.GetValueOrDefault(pane.WindowId);
+                int stales = staleCounts.GetValueOrDefault(pane.WindowId);
+                int total = oks + epochs + stales;
+                if (total == 1 && oks == 1)
                 {
                     diagnostics.WriteLine($"RENAMED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)} -> {DisplayText.Safe(desired)}");
                 }
-                else if (oks == 0 && mismatches == 1)
+                else if (total == 1 && epochs == 1)
                 {
                     failures++;
                     diagnostics.WriteLine($"RENAME-SKIPPED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)}: tmux server changed since the sweep");
                 }
-                else if (oks == 0 && mismatches == 0)
+                else if (total == 1 && stales == 1)
+                {
+                    failures++;
+                    diagnostics.WriteLine($"RENAME-SKIPPED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)}: window name or published state changed since the sweep");
+                }
+                else if (total == 0)
                 {
                     failures++;
                     diagnostics.WriteLine($"RENAME-FAILED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)}: tmux did not confirm the rename");
                 }
                 else
                 {
-                    // Duplicate or conflicting markers for one window — impossible from the single
-                    // invocation per window this script writes, so it is a defect: fail closed rather than
-                    // credit the success.
+                    // More than one marker for one window — impossible from the single guard per window this
+                    // script writes, so it is a defect: fail closed rather than credit the success.
                     failures++;
                     diagnostics.WriteLine($"RENAME-FAILED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)}: conflicting confirmations");
                 }

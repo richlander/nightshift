@@ -31,6 +31,36 @@ public class ModelCorrespondenceTests
     private static string TempPath() => Path.Combine(Path.GetTempPath(), $"octoshift-model-{Guid.NewGuid():N}.json");
 
     /// <summary>
+    /// TLA+ every action advances the logical clock (<c>now' = now + 1</c>), so a registration recorded by
+    /// a later transaction never carries an earlier time than one already recorded — which is what keeps a
+    /// witnessed order from inverting. The code realises that monotone clock with
+    /// <see cref="PaneHistory.TransactionTime"/>, sampled inside the held transaction and clamped up to the
+    /// greatest time already on disk: a sample from a stepped-back clock, or from a late-committing waiter,
+    /// is raised to the persisted floor rather than allowed to run backwards.
+    /// </summary>
+    [Fact]
+    public void TheTransactionClockNeverRunsBackwards()
+    {
+        string path = TempPath();
+        DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+        try
+        {
+            var history = new PaneHistory(path);
+            history.AdoptEpoch("a", "1:1", t);
+            history.Observe(Window("%1", host: "a", epoch: "1:1"), t, claimedPr: 4448, registrationWitnessed: false);
+            history.Save([Window("%1", host: "a", epoch: "1:1")], ["a"]);
+
+            var reloaded = new PaneHistory(path);
+            Assert.True(reloaded.TransactionTime(t.AddMinutes(-30)) >= t);
+            Assert.Equal(t.AddMinutes(10), reloaded.TransactionTime(t.AddMinutes(10)));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    /// <summary>
     /// TLA+ <c>SoleClaimantIsAlwaysOwner</c>: a window that is the only claimant of its PR is always
     /// actionable. The anti-degenerate property — every other rule is satisfied by a tool that never
     /// acts, so one of them must require that it does.

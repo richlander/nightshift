@@ -88,6 +88,15 @@ internal sealed record TmuxPane
     /// <summary>The window's <c>@agent_state</c> option: the agent's own account of where it is.</summary>
     public string? AgentStateOption { get; init; }
 
+    /// <summary>
+    /// The <c>@agent_state</c> option exactly as tmux reports it — untrimmed, and empty (never null) when
+    /// the option is unset, so it can be compared byte-for-byte against the live value at rename time. The
+    /// rename guard aborts a mutation whose window has since changed its published state, and the change it
+    /// must catch is any change, so the comparison is against the raw bytes, not the trimmed
+    /// <see cref="AgentStateOption"/> the verdict path interprets.
+    /// </summary>
+    public string AgentStateRaw { get; init; } = string.Empty;
+
     public PaneActivity Activity { get; init; }
 
     public string Capture { get; init; } = string.Empty;
@@ -204,7 +213,8 @@ internal sealed partial class TmuxScanner
           t=$(tmux display-message -p -t "$i" '#{session_name}:#{window_index}' 2>/dev/null) || continue
           a=$(tmux display-message -p -t "$i" '#{session_attached}' 2>/dev/null) || continue
           y=$(tmux display-message -p -t "$i" '#{window_activity}' 2>/dev/null) || continue
-          s=$(tmux display-message -p -t "$i" '#{@agent_state}' 2>/dev/null) || continue
+          s=$(tmux display-message -p -t "$i" '#{@agent_state}' 2>/dev/null && printf x) || continue
+          s=${s%x}; s=${s%"$nl"}
           n=$(tmux display-message -p -t "$i" '#{window_name}' 2>/dev/null && printf x) || continue
           n=${n%x}; n=${n%"$nl"}
           d=$(tmux display-message -p -t "$i" '#{window_id}' 2>/dev/null) || continue
@@ -580,6 +590,7 @@ internal sealed partial class TmuxScanner
             SessionAttached = fields[2].Trim() != "0" && fields[2].Trim().Length > 0,
             LastActivity = ParseActivity(fields[3], host),
             AgentStateOption = fields[4].Trim() is { Length: > 0 } option ? option : null,
+            AgentStateRaw = fields[4],
             WindowName = fields[5],
             WindowId = fields[6],
         };

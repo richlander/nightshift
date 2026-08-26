@@ -23,7 +23,7 @@ using Octoshift.Waiting;
 /// </remarks>
 internal static class PrCommand
 {
-    public static async Task<int> RunAsync(int prNumber, string? repoFlag, IReadOnlyList<string> hosts, bool json, CancellationToken ct)
+    public static async Task<int> RunAsync(int prNumber, string? repoFlag, IReadOnlyList<string> hosts, bool json, CancellationToken ct, string? historyPath = null)
     {
         string? repo = RepoScope.Resolve(repoFlag);
         if (repo is null)
@@ -49,7 +49,7 @@ internal static class PrCommand
         {
             PrLocation located = await CollectAndLocateAsync(
                 prNumber, hosts, (host, token) => new TmuxScanner(host).ScanAsync(token),
-                facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, ct);
+                facts.FetchAsync, facts.RefreshMergeabilityAsync, now: null, ct, historyPath: historyPath);
 
             if (json)
             {
@@ -64,12 +64,19 @@ internal static class PrCommand
         }
         catch (HistoryUnavailableException ex)
         {
+            // A history failure — a malformed or unreadable file, a lock that could not be taken, or a
+            // write that did not land — leaves fleet ownership unknown. The human output leads with an
+            // aligned failure token on the first stdout line so a harness sees the disposition before the
+            // details, matching the unavailable exit; the specific cause goes to stderr. A genuine caller
+            // cancellation is a different exception, not caught here, so it propagates without a token.
+            // JSON stays a single error document, never a token prepended to it.
             if (json)
             {
                 WaitingCommand.WriteJsonError(Console.OpenStandardOutput(), ex.Message);
             }
             else
             {
+                Console.Out.WriteLine($"PARTIAL PR #{prNumber} — pane history unavailable; fleet ownership is unknown");
                 Console.Error.WriteLine($"octoshift: {DisplayText.Safe(ex.Message)}");
             }
 
@@ -94,7 +101,7 @@ internal static class PrCommand
         Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> scanAsync,
         Func<int, CancellationToken, Task<PrFacts?>> fetchAsync,
         Func<int, CancellationToken, Task<PrFacts?>> refreshMergeabilityAsync,
-        DateTimeOffset now,
+        DateTimeOffset? now,
         CancellationToken ct,
         string? historyPath = null,
         TimeSpan? perTargetTimeout = null)
@@ -104,7 +111,13 @@ internal static class PrCommand
         {
             history = await PaneHistory.OpenAsync(historyPath, ct);
             WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(hosts, scanAsync, ct, perTargetTimeout);
-            return await LocateAsync(prNumber, collected, history, fetchAsync, refreshMergeabilityAsync, now, ct);
+
+            // Sample the registration clock inside the held transaction, after collection, and clamp it
+            // above the greatest time already on disk — the same monotonicity waiting uses, so a pr sweep
+            // that acquired the lock late (or ran under a stepped-back clock) cannot stamp a new claimant
+            // before one an already-committed transaction recorded. A test may inject the sample.
+            DateTimeOffset stamped = history.TransactionTime(now ?? DateTimeOffset.UtcNow);
+            return await LocateAsync(prNumber, collected, history, fetchAsync, refreshMergeabilityAsync, stamped, ct);
         }
         finally
         {

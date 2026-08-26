@@ -262,6 +262,46 @@ public sealed class RenameTests
     }
 
     [Fact]
+    public async Task Rename_ReportsAStaleMarkerAsSkippedNotRenamed()
+    {
+        // Round 7: the server is unchanged but the window's name or state moved since the sweep, so its
+        // guard prints a stale marker. That is a skip with its own reason, never a rename, and it costs the
+        // exit code exactly as a server-changed skip does.
+        var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
+        IReadOnlyList<WaitingRow> rows = [Row("%1", "pr4448-blocked", windowId: "@1")];
+
+        int failures = await WaitingCommand.RenameAsync(
+            rows,
+            _ => (script, _) => Task.FromResult(new CommandResult(0, $"{Parse(script).Nonce}:stale:@1", string.Empty)),
+            diagnostics, TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, failures);
+        string text = diagnostics.ToString();
+        Assert.Contains("RENAME-SKIPPED", text, StringComparison.Ordinal);
+        Assert.Contains("changed since the sweep", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("RENAMED ", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Rename_AccountsStaleAndConfirmedWindowsIndependently()
+    {
+        // A mixed batch: one window renamed, another found stale (its identity moved). The confirmed one
+        // stays RENAMED; the stale one is skipped, not discarded because a sibling changed.
+        var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
+        IReadOnlyList<WaitingRow> rows = [Row("%1", "pr4448-blocked", windowId: "@1"), Row("%2", "pr4600-stale", windowId: "@2")];
+
+        int failures = await WaitingCommand.RenameAsync(
+            rows,
+            _ => (script, _) => Task.FromResult(new CommandResult(0, $"{Parse(script).Nonce}:ok:@1\n{Parse(script).Nonce}:stale:@2", string.Empty)),
+            diagnostics, TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, failures);
+        string text = diagnostics.ToString();
+        Assert.Single(text.Split('\n'), l => l.StartsWith("RENAMED", StringComparison.Ordinal));
+        Assert.Single(text.Split('\n'), l => l.StartsWith("RENAME-SKIPPED", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task Rename_IgnoresAMarkerForAnUnrequestedWindow()
     {
         // A marker naming a window this host never requested confers nothing; the requested window still
@@ -281,6 +321,8 @@ public sealed class RenameTests
     [Theory]
     [InlineData(":ok:@1\n{0}:ok:@1")]     // duplicate confirmation
     [InlineData(":ok:@1\n{0}:epoch:@1")]  // both confirmed and mismatched
+    [InlineData(":ok:@1\n{0}:stale:@1")]  // both confirmed and stale
+    [InlineData(":stale:@1\n{0}:epoch:@1")] // both stale and server-changed
     public async Task Rename_FailsClosedOnDuplicateOrConflictingMarkers(string tail)
     {
         var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
