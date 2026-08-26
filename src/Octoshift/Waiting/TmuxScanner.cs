@@ -62,6 +62,13 @@ internal sealed record TmuxPane
     /// <summary>How the window is named in a report: <c>fernie cp:3</c>, or just <c>cp:3</c> locally.</summary>
     public string Where => Host is null ? Target : $"{Host} {Target}";
 
+    /// <summary>
+    /// The tmux window name, verbatim — leading and trailing spaces included. It is neither trimmed here
+    /// nor stripped of its transport newline by a naive command substitution (the scanner uses a sentinel
+    /// so the exact bytes survive), because the rename path must reproduce it byte-for-byte or it would
+    /// churn a name that only looks unchanged. Agent-published <c>@agent_state</c>, by contrast, is
+    /// trimmed, since that is a value to interpret rather than a name to preserve.
+    /// </summary>
     public required string WindowName { get; init; }
 
     /// <summary>
@@ -173,16 +180,23 @@ internal sealed partial class TmuxScanner
     private const string ScriptTemplate = """
         set -f
         e() { printf %s "$1" | od -v -An -tx1 | tr -d '[:space:]'; }
+        nl=$(printf '\nx'); nl=${nl%x}
+        q=$(tmux display-message -p '#{pid}:#{start_time}' 2>/dev/null)
         o=$(tmux list-windows -a -F '#{pane_id}' 2>&1)
         if [ $? -ne 0 ]; then
-          case $o in
-            *'no server running'*|*'error connecting to '*'(No such file or directory)'*)
-              printf 'NONCE:manifest\nNONCE:end\n'; exit 0 ;;
-            *) exit 3 ;;
-          esac
+          cr=$(printf '\r')
+          if [ "$(printf '%s' "$o" | wc -l | tr -d ' ')" = 0 ]; then
+            case $o in
+              *"$cr"*) ;;
+              'no server running on '?*|'error connecting to '?*' (No such file or directory)')
+                printf 'NONCE:manifest\nNONCE:end\n'; exit 0 ;;
+            esac
+          fi
+          printf '%s\n' "$o" >&2
+          exit 3
         fi
         w=$o
-        printf 'NONCE:epoch %s\n' "$(tmux display-message -p '#{pid}:#{start_time}')"
+        printf 'NONCE:epoch %s\n' "$q"
         r=''
         p=''
         for i in $w; do
@@ -191,7 +205,8 @@ internal sealed partial class TmuxScanner
           a=$(tmux display-message -p -t "$i" '#{session_attached}' 2>/dev/null) || continue
           y=$(tmux display-message -p -t "$i" '#{window_activity}' 2>/dev/null) || continue
           s=$(tmux display-message -p -t "$i" '#{@agent_state}' 2>/dev/null) || continue
-          n=$(tmux display-message -p -t "$i" '#{window_name}' 2>/dev/null) || continue
+          n=$(tmux display-message -p -t "$i" '#{window_name}' 2>/dev/null && printf x) || continue
+          n=${n%x}; n=${n%"$nl"}
           d=$(tmux display-message -p -t "$i" '#{window_id}' 2>/dev/null) || continue
           r="$r NONCE:w|$(e "$i")|$(e "$t")|$(e "$a")|$(e "$y")|$(e "$s")|$(e "$n")|$(e "$d")"
           p="$p $i"
@@ -206,6 +221,7 @@ internal sealed partial class TmuxScanner
             printf 'NONCE:pane %s\nNONCE:lost %s\n' "$i" "$i"
           fi
         done
+        printf 'NONCE:epoch %s\n' "$(tmux display-message -p '#{pid}:#{start_time}')"
         """;
 
     private readonly string? _host;
@@ -271,8 +287,11 @@ internal sealed partial class TmuxScanner
 
         bool manifestOpened = false;
         bool manifestClosed = false;
-        string epoch = string.Empty;
-        int epochCount = 0;
+        string startEpoch = string.Empty;
+        int startEpochCount = 0;
+        string endEpoch = string.Empty;
+        int endEpochCount = 0;
+        bool afterEndEpoch = false;
 
         // The open frame, and the capture it has produced so far. A frame is HEADER, one encoded body
         // line, then the matching close — so `body` distinguishes "waiting for the capture" from
@@ -288,12 +307,12 @@ internal sealed partial class TmuxScanner
                 {
                     // Anything before the manifest opens is the transport's, not ours: a login banner, a
                     // motd, whatever an rc file printed. It carries no metadata, so it is skipped — except
-                    // the one line this collection writes there, the server epoch, which binds each pane
-                    // id to the tmux server that minted it.
+                    // the one line this collection writes there, the opening server epoch, which brackets
+                    // the collection and binds each pane id to the tmux server that minted it.
                     if (line.StartsWith(epochPrefix, StringComparison.Ordinal))
                     {
-                        epoch = line[epochPrefix.Length..].Trim();
-                        epochCount++;
+                        startEpoch = line[epochPrefix.Length..].Trim();
+                        startEpochCount++;
                     }
 
                     manifestOpened = line == manifestOpen;
@@ -311,7 +330,7 @@ internal sealed partial class TmuxScanner
                     continue;
                 }
 
-                TmuxPane window = ParseRow(line, rowMarker, host) with { Epoch = epoch };
+                TmuxPane window = ParseRow(line, rowMarker, host) with { Epoch = startEpoch };
                 if (!windows.TryAdd(window.PaneId, window))
                 {
                     // Two rows for one pane means the rows are not a faithful listing, and taking either
@@ -327,6 +346,25 @@ internal sealed partial class TmuxScanner
             {
                 if (line.Length == 0)
                 {
+                    continue;
+                }
+
+                // Nothing may follow the closing epoch: it is the last thing the collection writes, so a
+                // capture frame or a second epoch after it means the stream is not the shape this script
+                // produces.
+                if (afterEndEpoch)
+                {
+                    throw Unavailable(host, "tmux collection carried content after its closing server epoch");
+                }
+
+                // The closing epoch brackets the collection. Read once, after every capture, so a restart
+                // anywhere between the two brackets moves it and the whole account is rejected rather than
+                // parsed across two server generations.
+                if (line.StartsWith(epochPrefix, StringComparison.Ordinal))
+                {
+                    endEpoch = line[epochPrefix.Length..].Trim();
+                    endEpochCount++;
+                    afterEndEpoch = true;
                     continue;
                 }
 
@@ -409,27 +447,30 @@ internal sealed partial class TmuxScanner
             throw Unavailable(host, $"tmux collection never captured pane {missing}");
         }
 
-        // The epoch binds every pane id to the server that minted it, so it gates AdoptEpoch and the
-        // rename guard. A duplicate line is invalid even if it repeats the same value — the output is then
-        // not the one this script writes, and trusting either copy is a guess. An epoch line that IS
-        // present must be a canonical pid:start_time, whether or not any pane was returned, so an empty or
-        // forged epoch can never reach AdoptEpoch's continuity and restart checks. And when any pane was
-        // returned an epoch is required, since a pane with none would carry an empty epoch past those
-        // checks. A genuinely empty successful manifest — no server, or a server with no windows — is the
-        // one case allowed to carry no epoch at all.
-        if (epochCount > 1)
+        // The collection is bracketed by the server's generation — read once before the metadata and once
+        // after the last capture. For any collection a server answered, both brackets must be present,
+        // canonical, and EQUAL. A restart anywhere in between recycles pane and window ids and would let
+        // new-server metadata be recorded under the old generation, preserving a witnessed history that no
+        // longer exists; because the closing epoch is read last, such a restart moves it, and the whole
+        // account is rejected here rather than parsed as a mixed-generation row. The single epoch-free
+        // form is the empty no-server manifest: no server answered, so there is no generation to bracket.
+        bool serverBacked = startEpochCount > 0 || endEpochCount > 0 || order.Count > 0;
+        if (serverBacked)
         {
-            throw Unavailable(host, $"tmux collection returned {epochCount} server epochs; the output is not this collection's");
-        }
+            if (startEpochCount != 1 || endEpochCount != 1)
+            {
+                throw Unavailable(host, "tmux collection was not bracketed by exactly one opening and one closing server epoch");
+            }
 
-        if (epochCount == 1 && !IsEpoch(epoch))
-        {
-            throw Unavailable(host, $"tmux collection returned a malformed server epoch '{epoch}'");
-        }
+            if (!IsEpoch(startEpoch) || !IsEpoch(endEpoch))
+            {
+                throw Unavailable(host, $"tmux collection returned a malformed server epoch '{(!IsEpoch(startEpoch) ? startEpoch : endEpoch)}'");
+            }
 
-        if (order.Count > 0 && epochCount == 0)
-        {
-            throw Unavailable(host, "tmux collection returned panes with no server epoch");
+            if (!string.Equals(startEpoch, endEpoch, StringComparison.Ordinal))
+            {
+                throw Unavailable(host, $"tmux server changed during collection (epoch {startEpoch} -> {endEpoch}); the account spans two generations");
+            }
         }
 
         return [.. order.Select(id => Finish(windows[id], captures[id]))];
@@ -539,7 +580,7 @@ internal sealed partial class TmuxScanner
             SessionAttached = fields[2].Trim() != "0" && fields[2].Trim().Length > 0,
             LastActivity = ParseActivity(fields[3], host),
             AgentStateOption = fields[4].Trim() is { Length: > 0 } option ? option : null,
-            WindowName = fields[5].Trim(),
+            WindowName = fields[5],
             WindowId = fields[6],
         };
     }
@@ -561,49 +602,22 @@ internal sealed partial class TmuxScanner
         return DateTimeOffset.FromUnixTimeSeconds(epoch);
     }
 
-    /// <summary>A tmux pane id: <c>%</c> and digits, which is every id tmux mints and nothing else.</summary>
-    private static bool IsPaneId(string value)
-    {
-        if (value.Length < 2 || value[0] != '%')
-        {
-            return false;
-        }
+    /// <summary>A tmux pane id: <c>%</c> then a canonical non-negative decimal, which is every id tmux
+    /// mints and nothing else. Exposed so the pane-history composite key is validated against the same
+    /// rule its ids were written under.</summary>
+    internal static bool IsPaneId(string value) => IsTmuxId(value, '%');
 
-        foreach (char c in value.AsSpan(1))
-        {
-            if (!char.IsAsciiDigit(c))
-            {
-                return false;
-            }
-        }
+    /// <summary>A tmux window id: <c>@</c> then a canonical non-negative decimal.</summary>
+    private static bool IsWindowId(string value) => IsTmuxId(value, '@');
 
-        return true;
-    }
-
-    /// <summary>A tmux window id: <c>@</c> and digits, which is every id tmux mints and nothing else.</summary>
-    private static bool IsWindowId(string value)
-    {
-        if (value.Length < 2 || value[0] != '@')
-        {
-            return false;
-        }
-
-        foreach (char c in value.AsSpan(1))
-        {
-            if (!char.IsAsciiDigit(c))
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
+    private static bool IsTmuxId(string value, char prefix)
+        => value.Length >= 2 && value[0] == prefix && IsCanonicalNonNegative(value.AsSpan(1));
 
     /// <summary>
-    /// A tmux server epoch: <c>pid:start_time</c>, two positive decimal integers separated by a single
+    /// A tmux server epoch: <c>pid:start_time</c>, two canonical positive decimals separated by a single
     /// colon and nothing else. This is the exact shape the collection script prints from
-    /// <c>#{pid}:#{start_time}</c>, so anything else — absent, empty, a bare pid, a negative or non-decimal
-    /// field, extra colons — is not an epoch this scheme produced.
+    /// <c>#{pid}:#{start_time}</c>, so anything else — absent, empty, a bare pid, a zero or leading-zero
+    /// field, a negative or non-decimal field, extra colons — is not an epoch this scheme produced.
     /// </summary>
     internal static bool IsEpoch(string value)
     {
@@ -613,10 +627,15 @@ internal sealed partial class TmuxScanner
             return false;
         }
 
-        return IsPositiveDecimal(value.AsSpan(0, colon)) && IsPositiveDecimal(value.AsSpan(colon + 1));
+        return IsCanonicalPositive(value.AsSpan(0, colon)) && IsCanonicalPositive(value.AsSpan(colon + 1));
     }
 
-    private static bool IsPositiveDecimal(ReadOnlySpan<char> value)
+    /// <summary>
+    /// A canonical non-negative decimal: one or more ASCII digits with no leading zero, so a lone
+    /// <c>0</c> is allowed but <c>01</c> and <c>00</c> are not — the exact form tmux prints an id or a
+    /// numeric field in, and the form its identity keys were written under.
+    /// </summary>
+    private static bool IsCanonicalNonNegative(ReadOnlySpan<char> value)
     {
         if (value.Length == 0)
         {
@@ -631,8 +650,12 @@ internal sealed partial class TmuxScanner
             }
         }
 
-        return true;
+        return value.Length == 1 || value[0] != '0';
     }
+
+    /// <summary>A canonical positive decimal: a canonical non-negative one that is not zero.</summary>
+    private static bool IsCanonicalPositive(ReadOnlySpan<char> value)
+        => IsCanonicalNonNegative(value) && !(value.Length == 1 && value[0] == '0');
 
     /// <remarks>
     /// Read from pane text, which is untrusted for identity and appropriate here: this is not a claim

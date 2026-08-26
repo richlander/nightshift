@@ -55,6 +55,8 @@ public class WaitingScanTests
             sb.Append(Hex(text)).Append('\n').Append(Nonce).Append(":read ").Append(paneId).Append('\n');
         }
 
+        // The closing epoch bracket, equal to the opening one — a collection that did not restart.
+        sb.Append(Nonce).Append(":epoch 4242:1755900000\n");
         return sb.ToString();
     }
 
@@ -102,7 +104,7 @@ public class WaitingScanTests
         // pane id. A well-formed `@8` is kept verbatim.
         IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseCollection(
             $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:3", "1", "1755900000", "pr=4595 head=abc1234", "pr4595", "@8")}\n{Nonce}:end\n"
-                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n{Nonce}:epoch 4242:1755900000\n",
             host: null,
             Nonce);
 
@@ -134,7 +136,7 @@ public class WaitingScanTests
 
         IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
             $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", hostile, "pr4595", "@1")}\n{Nonce}:end\n"
-                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n{Nonce}:epoch 4242:1755900000\n",
             host: null,
             Nonce);
 
@@ -153,7 +155,7 @@ public class WaitingScanTests
 
         IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
             $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, hostile, "@1")}\n{Nonce}:end\n"
-                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n{Nonce}:epoch 4242:1755900000\n",
             host: null,
             Nonce);
 
@@ -248,11 +250,106 @@ public class WaitingScanTests
     [Fact]
     public void ParseCollection_AllowsAnEmptyManifestThatCarriesAValidEpoch()
     {
-        // A running server with no windows is also an empty success, and it does report its epoch.
+        // A running server with no windows is also an empty success, and it reports its epoch — bracketed
+        // by an equal opening and closing line, since no restart happened during the collection.
         IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
-            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{Nonce}:end\n", host: null, Nonce);
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{Nonce}:end\n{Nonce}:epoch 4242:1755900000\n", host: null, Nonce);
 
         Assert.Empty(panes);
+    }
+
+    [Fact]
+    public void ParseCollection_RejectsACollectionWhoseServerRestartedMidway()
+    {
+        // Blocker 1: the opening and closing epochs differ, so the server restarted somewhere during the
+        // collection — after the opening bracket but before the fields, or during the captures. Its rows
+        // may then mix two generations and preserve a witnessed history that no longer exists, so the
+        // whole account is rejected rather than parsed.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595", "@1")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n{Nonce}:epoch 9999:1755900001\n",
+            host: null,
+            Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_RejectsPanesWithNoClosingEpoch()
+    {
+        // The closing bracket is what proves the server did not restart during the collection, so a
+        // manifest with windows and only an opening epoch is not this collection's complete account.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595", "@1")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
+            host: null,
+            Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_RejectsContentAfterTheClosingEpoch()
+    {
+        // The closing epoch is the last thing the collection writes; anything after it is not the shape
+        // this script produces.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{Nonce}:end\n{Nonce}:epoch 4242:1755900000\n{Nonce}:epoch 4242:1755900000\n",
+            host: null,
+            Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_RejectsTwoOpeningEpochs()
+    {
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{Nonce}:end\n{Nonce}:epoch 4242:1755900000\n",
+            host: null,
+            Nonce));
+    }
+
+    [Theory]
+    [InlineData("%01", "@1")]     // leading-zero pane id
+    [InlineData("%00", "@1")]     // zero with a leading zero
+    [InlineData("%1", "@01")]     // leading-zero window id
+    [InlineData("%1", "@00")]
+    public void ParseCollection_RejectsANonCanonicalId(string paneId, string windowId)
+    {
+        // Blocker 4: tmux mints an id as a canonical non-negative decimal — a lone 0, otherwise no leading
+        // zero — so `%01`, `%00`, `@01` are ids it never prints and are rejected.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow(paneId, "night:1", "1", "1755900000", string.Empty, "pr4595", windowId)}\n{Nonce}:end\n"
+                + $"{Nonce}:pane {paneId}\n{Hex("> ")}\n{Nonce}:read {paneId}\n{Nonce}:epoch 4242:1755900000\n",
+            host: null,
+            Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_AcceptsZeroAsALoneIdForPaneAndWindow()
+    {
+        // A lone 0 IS canonical — `%0` and `@0` are the first ids tmux mints — so they are kept verbatim.
+        IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%0", "night:1", "1", "1755900000", string.Empty, "pr4595", "@0")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %0\n{Hex("> ")}\n{Nonce}:read %0\n{Nonce}:epoch 4242:1755900000\n",
+            host: null,
+            Nonce);
+
+        TmuxPane w = Assert.Single(windows);
+        Assert.Equal("%0", w.PaneId);
+        Assert.Equal("@0", w.WindowId);
+    }
+
+    [Theory]
+    [InlineData("0:0")]    // zero components
+    [InlineData("4242:0")]
+    [InlineData("01:02")]  // leading zeros
+    [InlineData("042:1")]
+    public void ParseCollection_RejectsANonCanonicalEpoch(string epoch)
+    {
+        // Blocker 4: an epoch's pid and start_time are canonical positive decimals — never zero, never a
+        // leading zero — so an impossible pair like `0:0` or `01:02` is rejected even when it brackets the
+        // collection on both sides.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch {epoch}\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595", "@1")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n{Nonce}:epoch {epoch}\n",
+            host: null,
+            Nonce));
     }
 
     [Fact]
@@ -1177,6 +1274,7 @@ public class WaitingScanTests
               .Append(nonce).Append(text is null ? ":lost " : ":read ").Append(paneId).Append('\n');
         }
 
+        sb.Append(nonce).Append(":epoch 4242:1755900000\n");
         return sb.ToString();
     }
 
@@ -1589,6 +1687,41 @@ public class WaitingScanTests
 
             Assert.False(history.IsWitnessed(live) && history.ClaimedAt(live) is null);
             Assert.DoesNotContain(departed, d => d.Contains("4448", StringComparison.Ordinal));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void History_DropsAnEntryWhosePaneIdIsNotCanonical()
+    {
+        // Blocker 4: the composite pane key's suffix is validated with the exact IsPaneId, not merely a
+        // non-empty string, so an entry keyed by `%01` — an id tmux never mints — is dropped on load
+        // rather than kept as a witnessed order.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-canon-{Guid.NewGuid():N}.json");
+        try
+        {
+            string good = TargetId.ForHost("fernie").ComposeWith("%3");
+            string bad = TargetId.ForHost("fernie").ComposeWith("%01");
+            File.WriteAllText(path, $$"""
+                {
+                  "panes": {
+                    "{{good}}": { "digest": "d", "since": "2026-08-25T12:00:00+00:00", "pr": 4448, "claimedAt": "2026-08-25T12:00:00+00:00", "witnessed": true },
+                    "{{bad}}": { "digest": "d", "since": "2026-08-25T12:00:00+00:00", "pr": 4600, "claimedAt": "2026-08-25T12:00:00+00:00", "witnessed": true }
+                  },
+                  "hosts": {}
+                }
+                """);
+
+            var history = new PaneHistory(path);
+            TmuxPane goodPane = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "fernie", PaneId = "%3" };
+            TmuxPane badPane = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4600") with { Host = "fernie", PaneId = "%01" };
+
+            Assert.True(history.IsWitnessed(goodPane));
+            Assert.False(history.IsWitnessed(badPane));
+            Assert.Null(history.ClaimedAt(badPane));
         }
         finally
         {
@@ -2189,7 +2322,7 @@ public class WaitingScanTests
     private static TmuxPane Pane(string target, string capture, PaneActivity activity, DateTimeOffset? lastActivity = null, string? agentState = null, string windowName = "w")
         => new()
         {
-            PaneId = "%" + target.GetHashCode().ToString("x", System.Globalization.CultureInfo.InvariantCulture),
+            PaneId = "%" + ((uint)target.GetHashCode()).ToString(System.Globalization.CultureInfo.InvariantCulture),
             Host = null,
             Target = target,
             AgentStateOption = agentState,

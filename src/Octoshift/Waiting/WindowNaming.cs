@@ -94,10 +94,13 @@ internal static partial class WindowNaming
     /// <c>run-shell</c> — rename the window and print its confirmation. There is therefore no gap between
     /// "checked the epoch" and "renamed the id" for a restart to slip into: a restart before the
     /// invocation makes its guard false, and a restart between two windows makes the next guard false, so
-    /// a recycled id is never renamed. On a mismatch the false branch prints the epoch marker instead.
-    /// The confirmation is a <c>display-message</c> after the <c>rename-window</c> in the same branch;
-    /// tmux abandons the branch if the rename fails (a vanished window), so the marker is printed only for
-    /// a rename that happened. <c>|| :</c> keeps one failed invocation from aborting the rest.
+    /// a recycled id is never renamed. Each invocation prints exactly one marker naming its own window —
+    /// <c>&lt;nonce&gt;:ok:@id</c> on a confirmed rename, <c>&lt;nonce&gt;:epoch:@id</c> on a mismatch — so
+    /// the caller accounts for every window independently and a restart between windows leaves the earlier
+    /// successes reported rather than discarded. The confirmation is a <c>display-message</c> after the
+    /// <c>rename-window</c> in the same branch; tmux abandons the branch if the rename fails (a vanished
+    /// window), so the ok marker is printed only for a rename that happened. <c>|| :</c> keeps one failed
+    /// invocation from aborting the rest.
     /// </remarks>
     internal static string? BuildRenameScript(
         IReadOnlyList<(TmuxPane Pane, string Desired)> renames,
@@ -127,7 +130,7 @@ internal static partial class WindowNaming
             script.Append("tmux if-shell -F ").Append(guard)
                   .Append(" 'rename-window -t ").Append(windowId).Append(" -- \"").Append(TmuxEscape(desired))
                   .Append("\" ; display-message -p ").Append(nonce).Append(":ok:").Append(windowId)
-                  .Append("' 'display-message -p ").Append(nonce).Append(":epoch' || :\n");
+                  .Append("' 'display-message -p ").Append(nonce).Append(":epoch:").Append(windowId).Append("' || :\n");
         }
 
         return script.ToString();
@@ -153,6 +156,6 @@ internal static partial class WindowNaming
         return sb.ToString();
     }
 
-    [GeneratedRegex(@"^(.*)-([A-Za-z]+)$")]
+    [GeneratedRegex(@"^([\s\S]*)-([A-Za-z]+)\z")]
     private static partial Regex Suffixed();
 }

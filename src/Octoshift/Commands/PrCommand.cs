@@ -52,10 +52,13 @@ internal static class PrCommand
         {
             // LocateAsync persists the shared history as part of locating the PR — including breaking the
             // continuity of every host this run did not collect, even a total failure where it collected
-            // none. A persistence failure surfaces here as the unavailable contract, never a success-shaped
-            // answer above a silent write loss that a later run would read as current.
+            // none. It runs under the cross-process transaction lock OpenAsync takes, held only across the
+            // local parse/reconcile/save and released by Save before the GitHub read. A persistence or lock
+            // failure surfaces here as the unavailable contract, never a success-shaped answer above a
+            // silent write loss that a later run would read as current.
+            using PaneHistory history = await PaneHistory.OpenAsync(null, ct);
             PrLocation located = await LocateAsync(
-                prNumber, collected, new PaneHistory(), facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, ct);
+                prNumber, collected, history, facts.FetchAsync, facts.RefreshMergeabilityAsync, DateTimeOffset.UtcNow, ct);
 
             if (json)
             {

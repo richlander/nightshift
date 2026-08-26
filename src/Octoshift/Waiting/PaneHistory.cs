@@ -80,19 +80,40 @@ internal sealed record PaneMemory
 /// tool last ran — which is why this accumulates rather than sampling twice inside one run. A window
 /// with no history yet reports nothing rather than a fabricated zero.
 /// </remarks>
-internal sealed class PaneHistory
+internal sealed class PaneHistory : IDisposable
 {
     private readonly string _path;
     private readonly Dictionary<string, PaneMemory> _entries;
     private readonly Dictionary<string, HostMemory> _hosts;
+    private FileStream? _lock;
 
+    private static readonly TimeSpan LockTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan LockRetry = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>Where the history lives when no path is given: one file per user, shared by every
+    /// octoshift process on the machine, which is why the transaction lock exists.</summary>
+    internal static string DefaultPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".cache",
+        "octoshift",
+        "panes.json");
+
+    /// <summary>
+    /// Loads the history <em>without</em> the cross-process transaction lock. For tests only: product code
+    /// must use <see cref="OpenAsync"/>, so a concurrent <c>waiting</c> and <c>pr</c> cannot interleave one
+    /// process's load-reconcile-save with another's and lose an update. Kept as the public constructor so
+    /// the unit tests that new one up directly do not each have to acquire a real lock, but every product
+    /// call site goes through the factory.
+    /// </summary>
     public PaneHistory(string? path = null)
+        : this(path ?? DefaultPath, null)
     {
-        _path = path ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".cache",
-            "octoshift",
-            "panes.json");
+    }
+
+    private PaneHistory(string path, FileStream? lockStream)
+    {
+        _path = path;
+        _lock = lockStream;
 
         try
         {
@@ -111,9 +132,11 @@ internal sealed class PaneHistory
         }
 
         // Fail closed on any entry not written by this scheme. A host key must be a valid target id and a
-        // pane key a target id composed with a pane id; anything else is an older, differently-keyed file
-        // whose `fernie|%3` could be misread as some target this scheme would never mint. Dropping it
-        // costs a sweep of continuity and degrades ownership to inferred, never misattributes it.
+        // pane key a target id composed with a canonical pane id — validated with the exact IsPaneId the
+        // ids were written under, not merely a non-empty suffix, so an impossible id like `%01` cannot
+        // slip through; anything else is an older, differently-keyed file whose `fernie|%3` could be
+        // misread as some target this scheme would never mint. Dropping it costs a sweep of continuity and
+        // degrades ownership to inferred, never misattributes it.
         //
         // The deserializer can also hand back null values, and records this implementation could never
         // have written — a witnessed claim with no PR, a continuous host never swept. A hostile or
@@ -127,7 +150,10 @@ internal sealed class PaneHistory
         }
 
         foreach (string key in _entries.Keys
-            .Where(k => TargetId.HostOfComposite(k) is null || TargetId.IdOfComposite(k) is null || _entries[k] is null)
+            .Where(k => TargetId.HostOfComposite(k) is null
+                     || TargetId.IdOfComposite(k) is not { } id
+                     || !TmuxScanner.IsPaneId(id)
+                     || _entries[k] is null)
             .ToArray())
         {
             _entries.Remove(key);
@@ -142,6 +168,76 @@ internal sealed class PaneHistory
         {
             _hosts[key] = SanitizeHost(_hosts[key]);
         }
+    }
+
+    /// <summary>
+    /// Opens the history for a serialized transaction: acquires a cross-process lock — a sidecar file no
+    /// other process can share — and only then loads, so one process's load-reconcile-save cannot
+    /// interleave with another's and lose an update. The lock is released by <see cref="Save"/> (the
+    /// commit point) or by <see cref="Dispose"/> (any earlier exit). A lock that cannot be taken within
+    /// the timeout, or a lock I/O failure, surfaces as <see cref="HistoryPersistException"/> — the
+    /// unavailable contract — never as a silent success; a genuine caller cancellation escapes carrying
+    /// the caller's own token.
+    /// </summary>
+    public static async Task<PaneHistory> OpenAsync(string? path, CancellationToken ct)
+    {
+        string resolved = path ?? DefaultPath;
+        FileStream lockStream = await AcquireLockAsync(resolved, ct);
+        try
+        {
+            return new PaneHistory(resolved, lockStream);
+        }
+        catch
+        {
+            lockStream.Dispose();
+            throw;
+        }
+    }
+
+    private static async Task<FileStream> AcquireLockAsync(string path, CancellationToken ct)
+    {
+        string lockPath = path + ".lock";
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(lockPath)!);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new HistoryPersistException(path, ex);
+        }
+
+        DateTimeOffset deadline = DateTimeOffset.UtcNow + LockTimeout;
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                // FileShare.None: while one process holds this handle no other can open it, which is what
+                // serializes the transaction across processes. OpenOrCreate so the first writer makes it.
+                return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException) when (DateTimeOffset.UtcNow < deadline)
+            {
+                // Held by another octoshift process (a sharing violation), or a transient I/O hiccup: wait
+                // and retry until it frees up or the deadline passes. Task.Delay carries the caller's token,
+                // so a cancellation here escapes as the caller's own.
+                await Task.Delay(LockRetry, ct);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // The deadline passed with the lock still unavailable, or a non-transient failure: the
+                // transaction cannot be serialized, so it is unavailable rather than a bypassed write.
+                throw new HistoryPersistException(path, ex);
+            }
+        }
+    }
+
+    /// <summary>Releases the transaction lock if it is still held — the safety net for any path that opened
+    /// the history but did not reach <see cref="Save"/>.</summary>
+    public void Dispose()
+    {
+        _lock?.Dispose();
+        _lock = null;
     }
 
     /// <summary>
@@ -384,6 +480,12 @@ internal sealed class PaneHistory
             TryDelete(tmp);
             throw new HistoryPersistException(_path, ex);
         }
+
+        // Save is the commit: the write has landed, so the transaction lock is released here rather than
+        // held for whatever the caller does next (a report, a rename, a GitHub read). A failed write above
+        // keeps the lock, and the caller's dispose releases it.
+        _lock?.Dispose();
+        _lock = null;
 
         return departed;
     }

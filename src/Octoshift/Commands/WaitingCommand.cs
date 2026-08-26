@@ -113,7 +113,8 @@ internal static class WaitingCommand
             var failures = new List<string>(collected.Unreachable);
             try
             {
-                new PaneHistory().Save([], collected.CollectedHosts);
+                using PaneHistory history = await PaneHistory.OpenAsync(null, ct);
+                history.Save([], collected.CollectedHosts);
             }
             catch (HistoryPersistException ex)
             {
@@ -423,7 +424,15 @@ internal static class WaitingCommand
                 : refreshed with { ChecksKnown = false };
         }
 
-        history ??= new PaneHistory();
+        // Open the shared history for a serialized transaction: OpenAsync takes a cross-process lock and
+        // then loads, so a concurrent waiting and pr cannot interleave load/reconcile/save and lose an
+        // update. This is placed after the GitHub reads above deliberately, so the lock is not held across
+        // network work; Save releases it, and the finally is the safety net for an early exit. A test that
+        // injects its own history owns its lifetime and keeps the direct, lock-free constructor.
+        bool ownsHistory = history is null;
+        history ??= await PaneHistory.OpenAsync(null, ct);
+        try
+        {
 
         // A host that did not answer and a host nobody asked about produce the same thing: a view with
         // windows missing from it. The second is invisible from the arguments alone — a host not named is
@@ -539,6 +548,14 @@ internal static class WaitingCommand
         // would manufacture a departure and discard its registration on every partial sweep.
         Departed = history.Save(panes, collected);
         return rows;
+        }
+        finally
+        {
+            if (ownsHistory)
+            {
+                history.Dispose();
+            }
+        }
     }
 
     /// <summary>The rows a run shows: everything under <c>--all</c>, otherwise what needs a person, is
@@ -642,32 +659,50 @@ internal static class WaitingCommand
 
             string[] lines = result.Stdout.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
 
-            // The server changed between the sweep and the mutation: pane ids may now name different
-            // windows, so the batch aborted itself. Reported, and counted as not done.
-            if (Array.Exists(lines, l => l == nonce + ":epoch"))
-            {
-                failures += renames.Count;
-                diagnostics.WriteLine($"RENAME-SKIPPED {DisplayText.Safe(label)}: tmux server changed since the sweep; {renames.Count} window(s) not renamed");
-                continue;
-            }
-
-            // Only the renames tmux confirmed, matched by window id. A window whose rename failed (it
-            // vanished mid-batch) prints no marker, so it is named as failed rather than reported renamed.
+            // Account per window, independently. Each window's if-shell prints exactly one marker naming
+            // that window: `<nonce>:ok:@id` when its own epoch guard held and tmux confirmed the rename, or
+            // `<nonce>:epoch:@id` when the guard found the server had changed. So a restart between windows
+            // leaves the ones renamed before it confirmed and only the later ones skipped — the earlier
+            // success is never discarded. Markers are counted per id and only for ids this host actually
+            // requested; a marker naming an unrequested id, or naming one twice, or naming it both ways is
+            // a shape the script never writes, so it confers nothing and the window falls through to
+            // skipped or failed, fail-closed.
             string okPrefix = nonce + ":ok:";
-            HashSet<string> confirmed = [.. lines
-                .Where(l => l.StartsWith(okPrefix, StringComparison.Ordinal))
-                .Select(l => l[okPrefix.Length..])];
+            string mismatchPrefix = nonce + ":epoch:";
+            HashSet<string> requested = [.. renames.Select(r => r.Pane.WindowId)];
+            var okCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            var mismatchCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (string line in lines)
+            {
+                Tally(line, okPrefix, requested, okCounts);
+                Tally(line, mismatchPrefix, requested, mismatchCounts);
+            }
 
             foreach ((TmuxPane pane, string desired) in renames)
             {
-                if (confirmed.Contains(pane.WindowId))
+                int oks = okCounts.GetValueOrDefault(pane.WindowId);
+                int mismatches = mismatchCounts.GetValueOrDefault(pane.WindowId);
+                if (oks == 1 && mismatches == 0)
                 {
                     diagnostics.WriteLine($"RENAMED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)} -> {DisplayText.Safe(desired)}");
                 }
-                else
+                else if (oks == 0 && mismatches == 1)
+                {
+                    failures++;
+                    diagnostics.WriteLine($"RENAME-SKIPPED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)}: tmux server changed since the sweep");
+                }
+                else if (oks == 0 && mismatches == 0)
                 {
                     failures++;
                     diagnostics.WriteLine($"RENAME-FAILED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)}: tmux did not confirm the rename");
+                }
+                else
+                {
+                    // Duplicate or conflicting markers for one window — impossible from the single
+                    // invocation per window this script writes, so it is a defect: fail closed rather than
+                    // credit the success.
+                    failures++;
+                    diagnostics.WriteLine($"RENAME-FAILED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)}: conflicting confirmations");
                 }
             }
         }
@@ -675,6 +710,18 @@ internal static class WaitingCommand
         // A cancellation landing between the last shell call and here is still the caller's.
         ct.ThrowIfCancellationRequested();
         return failures;
+    }
+
+    /// <summary>Counts a marker line against the window it names, but only when that id was requested — so
+    /// a marker for an unrequested id can never confer success.</summary>
+    private static void Tally(string line, string prefix, HashSet<string> requested, Dictionary<string, int> counts)
+    {
+        if (line.StartsWith(prefix, StringComparison.Ordinal)
+            && line[prefix.Length..] is { } id
+            && requested.Contains(id))
+        {
+            counts[id] = counts.GetValueOrDefault(id) + 1;
+        }
     }
 
     /// <summary>The windows whose current name differs from the one the tool would give them.</summary>

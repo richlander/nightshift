@@ -133,4 +133,66 @@ public sealed class PersistenceTests
         Assert.Equal(JsonValueKind.Array, doc.RootElement.GetProperty("rows").ValueKind);
         Assert.Empty(doc.RootElement.GetProperty("rows").EnumerateArray());
     }
+
+    [Fact]
+    public async Task OpenAsync_SerializesTheTransactionAcrossConcurrentOpens()
+    {
+        // Blocker 6: the whole transaction is serialized. A holds the lock and adds a host but has not
+        // committed; B cannot even load until A commits; B then sees A's host and adds its own; the final
+        // history retains both. Two OpenAsync in one process stand in for a concurrent waiting and pr,
+        // since FileShare.None excludes even a second handle in the same process.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-lock-{Guid.NewGuid():N}.json");
+        DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            PaneHistory a = await PaneHistory.OpenAsync(path, ct);
+            a.AdoptEpoch("hosta", "1:1", t);
+
+            // B cannot acquire the lock while A holds it, so its OpenAsync does not complete.
+            Task<PaneHistory> bOpen = PaneHistory.OpenAsync(path, ct);
+            await Task.Delay(250, ct);
+            Assert.False(bOpen.IsCompleted);
+
+            // A commits — Save releases the lock — and only now can B load.
+            a.Save([], ["hosta"]);
+            PaneHistory b = await bOpen;
+            Assert.Contains(TargetId.ForHost("hosta").Key, b.KnownHosts);
+            b.AdoptEpoch("hostb", "2:1", t.AddMinutes(1));
+            b.Save([], ["hosta", "hostb"]);
+            a.Dispose();
+            b.Dispose();
+
+            var reloaded = new PaneHistory(path);
+            Assert.Contains(TargetId.ForHost("hosta").Key, reloaded.KnownHosts);
+            Assert.Contains(TargetId.ForHost("hostb").Key, reloaded.KnownHosts);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task OpenAsync_CancellationWhileWaitingForTheLockEscapesWithTheCallersToken()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-lockcancel-{Guid.NewGuid():N}.json");
+        try
+        {
+            using PaneHistory holder = await PaneHistory.OpenAsync(path, TestContext.Current.CancellationToken);
+            using var cts = new CancellationTokenSource();
+            Task<PaneHistory> blocked = PaneHistory.OpenAsync(path, cts.Token);
+            await Task.Delay(100, TestContext.Current.CancellationToken);
+            await cts.CancelAsync();
+
+            OperationCanceledException oce = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => blocked);
+            Assert.Equal(cts.Token, oce.CancellationToken);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
 }

@@ -73,6 +73,7 @@ public sealed class TmuxRenameIntegrationTests : IDisposable
     [InlineData("x; touch INJECTED; :")]                   // bare semicolons
     [InlineData("-leadingdash")]                           // an option-looking name
     [InlineData("plain spaces here")]                      // spaces inside the name
+    [InlineData("  leading and trailing  ")]               // edge spaces must survive verbatim (no trim)
     [InlineData("café-日本語-作業")]                        // multibyte / unicode (BMP)
     [InlineData("🚀 ship it")]                              // an astral scalar (needs \\U escaping)
     public async Task Rename_AppliesAnArbitraryNameExactlyAndExecutesNoCommand(string desired)
@@ -232,6 +233,43 @@ public sealed class TmuxRenameIntegrationTests : IDisposable
         WriteWrapper(string.Empty);
         IReadOnlyList<TmuxPane> after = await ScanAsync();
         Assert.DoesNotContain(after, p => p.WindowName == "second-window");
+    }
+
+    [Fact]
+    public async Task Rename_RepeatedPassesReplaceTheSuffixRatherThanAccumulating()
+    {
+        // Blocker 3: a name read back through the scanner and re-applied replaces the tool's owned suffix
+        // rather than stacking a new one, so repeated waiting --rename passes converge. The base carries
+        // edge spaces, which must survive every round byte-for-byte.
+        if (_tmux is null)
+        {
+            Assert.Skip("tmux is not installed");
+        }
+
+        RunTmux("new-session", "-d", "-s", "s");
+        (string epoch, TmuxPane pane) = await FirstWindowAsync();
+
+        async Task ApplyAsync(string? suffix)
+        {
+            (string e, TmuxPane current) = await FirstWindowAsync();
+            string desired = WindowNaming.Apply(current.WindowName, suffix);
+            if (desired != current.WindowName)
+            {
+                string script = WindowNaming.BuildRenameScript([(current, desired)], e, Nonce())!;
+                await RunAsync(script, TestContext.Current.CancellationToken);
+            }
+        }
+
+        // Start from a base with edge spaces (an explicit rename so tmux's automatic-rename is off).
+        RunTmux("rename-window", "-t", pane.WindowId, "  pr4448  ");
+        await ApplyAsync("blocked");
+        Assert.Equal("  pr4448  -blocked", (await FirstWindowAsync()).Pane.WindowName);
+
+        await ApplyAsync("ready");
+        Assert.Equal("  pr4448  -ready", (await FirstWindowAsync()).Pane.WindowName);
+
+        await ApplyAsync(null);
+        Assert.Equal("  pr4448  ", (await FirstWindowAsync()).Pane.WindowName);
     }
 
     private async Task<(string Epoch, TmuxPane Pane)> FirstWindowAsync()

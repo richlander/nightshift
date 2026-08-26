@@ -73,6 +73,36 @@ public sealed class TmuxEpochIntegrationTests : IDisposable
         Assert.NotEqual(epoch1, epoch3);
     }
 
+    [Fact]
+    public async Task Scan_RejectsACollectionWhoseServerRestartsMidway()
+    {
+        if (_tmux is null)
+        {
+            Assert.Skip("tmux is not installed");
+        }
+
+        RunTmux("new-session", "-d", "-s", "s");
+
+        // A wrapper that restarts the server just after the opening epoch is read — the former guard/mutation
+        // boundary — so the metadata and the closing epoch come from a new generation. The opening and
+        // closing brackets then differ, and the collection is rejected rather than parsed across two
+        // generations. Old code that read a single epoch would have accepted the mixed account.
+        string counter = Path.Combine(_wrapperDir, "n");
+        string wrapper = Path.Combine(_wrapperDir, "tmux");
+        File.WriteAllText(
+            wrapper,
+            $"#!/bin/sh\nc=$(cat {counter} 2>/dev/null || echo 0); c=$((c+1)); echo $c > {counter}\n"
+                + $"if [ $c = 2 ]; then {_tmux} -L {_socket} kill-server 2>/dev/null; {_tmux} -L {_socket} new-session -d -s after 2>/dev/null; fi\n"
+                + $"exec {_tmux} -L {_socket} \"$@\"\n");
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(wrapper, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        var scanner = new TmuxScanner(host: null, runAsync: RunViaWrapperAsync);
+        await Assert.ThrowsAsync<TmuxUnavailableException>(() => scanner.ScanAsync(TestContext.Current.CancellationToken));
+    }
+
     private async Task<string> ScanEpochAsync()
     {
         var scanner = new TmuxScanner(host: null, runAsync: RunViaWrapperAsync);

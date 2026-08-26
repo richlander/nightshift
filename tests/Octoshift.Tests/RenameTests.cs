@@ -51,10 +51,14 @@ public sealed class RenameTests
     private static Func<string?, Func<string, CancellationToken, Task<CommandResult>>> SucceedingShell
         => _ => (script, _) => Task.FromResult(Confirm(script));
 
-    // The server generation moved: the batch's if-shell takes its else branch and only the epoch marker
-    // is printed, so nothing is confirmed.
+    // The server generation moved: each window's if-shell takes its else branch and prints a per-window
+    // epoch marker, so nothing is confirmed.
     private static Func<string?, Func<string, CancellationToken, Task<CommandResult>>> EpochMismatchShell
-        => _ => (script, _) => Task.FromResult(new CommandResult(0, Parse(script).Nonce + ":epoch", string.Empty));
+        => _ => (script, _) =>
+        {
+            (string nonce, string[] ids) = Parse(script);
+            return Task.FromResult(new CommandResult(0, string.Join('\n', ids.Select(id => $"{nonce}:epoch:{id}")), string.Empty));
+        };
 
     // A shell whose call never returns until its token fires — a host stuck mid-rename.
     private static Func<string?, Func<string, CancellationToken, Task<CommandResult>>> HangingShell
@@ -235,5 +239,65 @@ public sealed class RenameTests
             () => WaitingCommand.RenameAsync([Row("%1", "pr4448-blocked")], HangingShell, diagnostics, cts.Token));
 
         Assert.Equal(cts.Token, oce.CancellationToken);
+    }
+
+    [Fact]
+    public async Task Rename_ReportsEachWindowIndependentlyOnAMidBatchRestart()
+    {
+        // Blocker 2: a restart between windows confirms the earlier one and mismatches the later. The
+        // earlier success stays RENAMED even though a later window's guard failed; the later is
+        // RENAME-SKIPPED, not silently discarded because a mismatch appeared elsewhere.
+        var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
+        IReadOnlyList<WaitingRow> rows = [Row("%1", "pr4448-blocked", windowId: "@1"), Row("%2", "pr4600-stale", windowId: "@2")];
+
+        int failures = await WaitingCommand.RenameAsync(
+            rows,
+            _ => (script, _) => Task.FromResult(new CommandResult(0, $"{Parse(script).Nonce}:ok:@1\n{Parse(script).Nonce}:epoch:@2", string.Empty)),
+            diagnostics, TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, failures);
+        string text = diagnostics.ToString();
+        Assert.Single(text.Split('\n'), l => l.StartsWith("RENAMED", StringComparison.Ordinal));
+        Assert.Single(text.Split('\n'), l => l.StartsWith("RENAME-SKIPPED", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Rename_IgnoresAMarkerForAnUnrequestedWindow()
+    {
+        // A marker naming a window this host never requested confers nothing; the requested window still
+        // has no marker of its own, so it is failed rather than credited by the stray one.
+        var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
+        IReadOnlyList<WaitingRow> rows = [Row("%1", "pr4448-blocked", windowId: "@1")];
+
+        int failures = await WaitingCommand.RenameAsync(
+            rows,
+            _ => (script, _) => Task.FromResult(new CommandResult(0, $"{Parse(script).Nonce}:ok:@999", string.Empty)),
+            diagnostics, TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, failures);
+        Assert.Contains("RENAME-FAILED", diagnostics.ToString(), StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(":ok:@1\n{0}:ok:@1")]     // duplicate confirmation
+    [InlineData(":ok:@1\n{0}:epoch:@1")]  // both confirmed and mismatched
+    public async Task Rename_FailsClosedOnDuplicateOrConflictingMarkers(string tail)
+    {
+        var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
+        IReadOnlyList<WaitingRow> rows = [Row("%1", "pr4448-blocked", windowId: "@1")];
+
+        int failures = await WaitingCommand.RenameAsync(
+            rows,
+            _ => (script, _) =>
+            {
+                string nonce = Parse(script).Nonce;
+                return Task.FromResult(new CommandResult(0, nonce + string.Format(System.Globalization.CultureInfo.InvariantCulture, tail, nonce), string.Empty));
+            },
+            diagnostics, TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, failures);
+        string text = diagnostics.ToString();
+        Assert.Contains("RENAME-FAILED", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("RENAMED ", text, StringComparison.Ordinal);
     }
 }
