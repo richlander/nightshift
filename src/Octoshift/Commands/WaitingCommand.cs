@@ -75,7 +75,7 @@ internal static class WaitingCommand
     /// <summary>Hosts collected before but not in this run, so the view is narrower than it has been.</summary>
     internal static IReadOnlyList<string> Omitted { get; private set; } = [];
 
-    public static async Task<int> RunAsync(string? repoFlag, IReadOnlyList<string> hosts, bool all, bool json, bool rename, CancellationToken ct, string? historyPath = null)
+    public static async Task<int> RunAsync(string? repoFlag, IReadOnlyList<string> hosts, bool all, bool json, bool rename, CancellationToken ct, string? historyPath = null, Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>>? scanAsync = null)
     {
         string? repo = RepoScope.Resolve(repoFlag);
         if (repo is null)
@@ -106,8 +106,11 @@ internal static class WaitingCommand
 
         try
         {
+            // The scanner is an internal seam (like historyPath): production scans over ssh/tmux, while a
+            // test injects a scan so the collection dispositions — a quiet fleet, a total-collection
+            // failure and its PARTIAL token — are exercisable without a tmux server.
             FleetResult result = await CollectAndResolveAsync(
-                hosts, (host, token) => new TmuxScanner(host).ScanAsync(token),
+                hosts, scanAsync ?? ((host, token) => new TmuxScanner(host).ScanAsync(token)),
                 facts.FetchAsync, facts.RefreshMergeabilityAsync, now: null, ct, historyPath: historyPath);
 
             // An explicitly empty fleet is its own disposition, not a quiet sweep and not a failure: the
@@ -140,6 +143,13 @@ internal static class WaitingCommand
                 }
                 else
                 {
+                    // A total-collection failure leaves fleet ownership unknown, exactly like a history
+                    // failure, so it owes the shell loop the same first-line stdout disposition: lead with
+                    // the stable PARTIAL token, matching the unavailable exit, and send the per-target
+                    // diagnostics to stderr. Without the token this path returned unavailable with a silent
+                    // stdout, so an agent loop keying on the first stdout word saw nothing to consume (#169).
+                    // JSON keeps its single error document above, never a token prepended to it.
+                    Console.Out.WriteLine("PARTIAL no host could be collected; fleet ownership is unknown");
                     foreach (string failure in result.Failures)
                     {
                         Console.Error.WriteLine($"octoshift: {DisplayText.Safe(failure)}");

@@ -2,6 +2,7 @@ namespace Octoshift.Tests;
 
 using Octoshift;
 using Octoshift.Commands;
+using Octoshift.Waiting;
 using Xunit;
 
 /// <summary>
@@ -135,6 +136,89 @@ public sealed class WaitingCommandTokenTests
 
             Assert.Equal(ExitCode.Ok, exit);
             Assert.StartsWith("EMPTY", stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task RunAsync_LeadsWithAPartialTokenWhenNoHostCouldBeCollected()
+    {
+        // #169: a total-collection failure — every target unreachable, nothing swept — leaves fleet
+        // ownership unknown just like a history failure, so the human path must lead its first stdout line
+        // with the stable PARTIAL token (matching the unavailable exit) rather than returning unavailable
+        // with a silent stdout. The per-target diagnostics still go to stderr. A fresh history means the
+        // fleet defaults to the local machine, whose injected scan fails, so the one target is unreachable.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-totalfail-{Guid.NewGuid():N}.json");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            (int exit, string stdout, string stderr) = await RunWithCapturedConsoleAsync(
+                token => WaitingCommand.RunAsync(
+                    "owner/name", [], all: false, json: false, rename: false, token, historyPath: path,
+                    scanAsync: (_, _) => throw new TmuxUnavailableException("local: tmux is not running")),
+                ct);
+
+            Assert.Equal(ExitCode.Unavailable, exit);
+            Assert.StartsWith("PARTIAL", stdout, StringComparison.Ordinal);
+            Assert.Contains("no host could be collected", stdout, StringComparison.Ordinal);
+            Assert.Contains("tmux is not running", stderr, StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task RunAsync_JsonTotalFailureStaysOneErrorDocumentWithoutAHumanToken()
+    {
+        // Under --json the same total-collection failure is one truthful error document written to the raw
+        // stdout stream — no PARTIAL token prepended to it — and the exit stays unavailable.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-totalfailjson-{Guid.NewGuid():N}.json");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            (int exit, string stdout, _) = await RunWithCapturedConsoleAsync(
+                token => WaitingCommand.RunAsync(
+                    "owner/name", [], all: false, json: true, rename: false, token, historyPath: path,
+                    scanAsync: (_, _) => throw new TmuxUnavailableException("local: tmux is not running")),
+                ct);
+
+            Assert.Equal(ExitCode.Unavailable, exit);
+            Assert.DoesNotContain("PARTIAL", stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task RunAsync_CancellationDuringCollectionIsNotLaunderedIntoAFailureToken()
+    {
+        // A genuine caller cancellation during collection is not a total-collection failure: it must
+        // propagate as an OperationCanceledException carrying the caller's token, never be reported as a
+        // PARTIAL failure with a success-shaped exit. The injected scan cancels the caller's token and then
+        // observes it, so the cancellation is raised inside collection rather than at lock acquisition.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-cancel-{Guid.NewGuid():N}.json");
+        using var cts = new CancellationTokenSource();
+        try
+        {
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => WaitingCommand.RunAsync(
+                    "owner/name", [], all: false, json: false, rename: false, cts.Token, historyPath: path,
+                    scanAsync: (_, token) =>
+                    {
+                        cts.Cancel();
+                        token.ThrowIfCancellationRequested();
+                        return Task.FromResult<IReadOnlyList<TmuxPane>>([]);
+                    }));
         }
         finally
         {
