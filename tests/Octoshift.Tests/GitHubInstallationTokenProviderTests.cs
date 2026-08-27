@@ -10,9 +10,8 @@ using Xunit;
 /// <see cref="GitHubAppInstallationTokenProvider"/> guards a shared, expiring credential. It must mint once
 /// and serve the cache until the token nears expiry, refresh exactly once no matter how many callers arrive
 /// together, surface every exchange failure as the configured auth-config exception, honour cancellation, and
-/// stop serving after disposal. And because the fast path reads the cache without the lock, a caller must only
-/// ever see a whole token — never a new token string beside a stale expiry — which the reference-published
-/// cache guarantees.
+/// stop serving after disposal. And because the fast path reads the cache under the same short state lock that
+/// guards every write, a caller only ever sees a whole token — never a new token string beside a stale expiry.
 /// </summary>
 public class GitHubInstallationTokenProviderTests
 {
@@ -132,14 +131,15 @@ public class GitHubInstallationTokenProviderTests
     [Fact]
     public async Task UnderChurn_EveryReturnedTokenPairsItsOwnExpiry()
     {
-        // Each minted token is paired with a unique expiry; a torn read of the old nullable-struct cache could
-        // hand a caller one token's string beside another's expiry. The reference-published cache cannot, so
-        // every returned pair must be one that was actually minted.
+        // Each minted token is paired with a unique expiry; without synchronisation a torn read of the cache
+        // could hand a caller one token's string beside another's expiry. Reading and writing the cache under
+        // the same state lock makes that impossible, so every returned pair must be one that was actually
+        // minted.
         //
         // The load is a fixed iteration count behind a start barrier, not a wall-clock deadline: every reader
         // contributes exactly the same number of observations no matter how the thread pool schedules it, so a
         // scheduling stall can never leave the observation set empty. Short-lived tokens keep refreshes and
-        // lock-free cache hits interleaving throughout.
+        // cache hits — each a brief, uncontended acquisition of the state lock — interleaving throughout.
         const int readers = 8;
         const int iterationsPerReader = 400;
         var pairs = new ConcurrentDictionary<string, DateTimeOffset>(StringComparer.Ordinal);
