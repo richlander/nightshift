@@ -50,14 +50,14 @@ and its records are ones a writer produced, it is **migrated in memory** — pan
 host memory preserved, and the `attempted` membership *derived* from every persisted
 host key **and every pane's composite host** (the real payload that motivated this
 carries local panes with an empty `hosts` map, so its local membership survives only
-in the pane keys). A legacy file that cannot be migrated safely — one naming a target
-alias this build can no longer represent — is **discarded to a truthful first-run
-state with a stderr warning** rather than bricked; the history is a cache the next
-sweep rebuilds, so losing it costs ownership confidence for one round, the same
-position as a first run on a new machine. Anything else — a foreign member set, a
-hand-edited or impossible record — still fails closed with its bytes preserved: the
-strict load is not relaxed, only taught to tell upgrade skew from a file no version
-ever wrote.
+in the pane keys). Anything else fails closed with its bytes preserved: a foreign
+member set, a hand-edited or impossible record, or a persisted alias this build
+cannot represent — including a NUL, which no real invocation ever produced because a
+NUL cannot be carried through a process argument, so it is a file this scheme never
+wrote rather than upgrade skew. The strict load is not relaxed, only taught to tell
+an ordinary older file from one no version wrote; every unusable persisted alias is
+refused before any scanner is constructed, the same contract the versioned path
+applies.
 
 ---
 

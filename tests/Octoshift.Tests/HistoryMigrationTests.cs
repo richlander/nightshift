@@ -79,14 +79,14 @@ public sealed class HistoryMigrationTests
     public async Task OpenAsync_MigratesAKnownLegacyShapeRatherThanBricking(string content)
     {
         // A structurally-recognised unversioned file, with records a writer produced, loads cleanly: the
-        // old strict loader would have failed every one of these closed. No discard warning is emitted —
-        // the memory is preserved, not thrown away.
+        // old strict loader would have failed every one of these closed. The memory is preserved, not
+        // thrown away.
         string path = TempPath("open");
         File.WriteAllText(path, content);
         try
         {
             using PaneHistory history = await PaneHistory.OpenAsync(path, TestContext.Current.CancellationToken);
-            Assert.Null(history.LoadWarning);
+            Assert.True(history.IsInitialized || history.KnownHosts.Count == 0);
         }
         finally
         {
@@ -98,7 +98,7 @@ public sealed class HistoryMigrationTests
     [Fact]
     public async Task OpenAsync_PreservesTheClaimFromTheRealReportedPayload()
     {
-        // The whole point of migrating rather than discarding this shape: the local pane's claim on #4448,
+        // The whole point of migrating rather than bricking this shape: the local pane's claim on #4448,
         // its registration time, and local's fleet membership all survive, so ownership stays truthful
         // across the upgrade instead of resetting.
         string path = TempPath("real");
@@ -109,7 +109,6 @@ public sealed class HistoryMigrationTests
             TmuxPane pane = LocalPane("%615024358");
             using PaneHistory history = await PaneHistory.OpenAsync(path, ct);
 
-            Assert.Null(history.LoadWarning);
             // Local membership is recovered from the pane's composite host, though the hosts map is empty.
             Assert.Contains(TargetId.Local.Key, history.KnownHosts);
             Assert.True(history.IsInitialized);
@@ -147,7 +146,6 @@ public sealed class HistoryMigrationTests
             }
 
             using PaneHistory reopened = await PaneHistory.OpenAsync(path, ct);
-            Assert.Null(reopened.LoadWarning);
             Assert.Contains(TargetId.Local.Key, reopened.KnownHosts);
             Assert.Equal(new DateTimeOffset(2026, 8, 26, 21, 42, 0, TimeSpan.Zero), reopened.ClaimedAt(pane));
         }
@@ -221,30 +219,39 @@ public sealed class HistoryMigrationTests
         }
     }
 
-    [Fact]
-    public async Task OpenAsync_DiscardsAnUnmigratableLegacyPayloadToFirstRunRatherThanBricking()
+    public static IEnumerable<object[]> LegacyHistoriesWithUnusablePersistedAliases()
     {
-        // A legacy file naming a target alias this build can no longer represent — a NUL alias an earlier
-        // build could persist before the control-character rule existed — cannot be migrated: adding it to
-        // the fleet would hand ssh a truncating argument. Rather than brick, the history discards to a
-        // truthful first-run state (no members, uninitialised, so a bare sweep bootstraps local) and
-        // carries a warning. No ArgumentException or process-start exception escapes.
-        string nulPaneKey = TargetId.ForHost("\0").ComposeWith("%1");
-        string content = $"{{\"panes\":{{\"{nulPaneKey}\":{ValidPane}}},\"hosts\":{{}}}}";
-        string path = TempPath("discard");
+        // A NUL alias, held in each place a legacy file can name a remote: a pane's composite host, the
+        // hosts map, and the attempted array. A NUL cannot be carried through an OS process argument, so no
+        // real invocation ever produced it — it is not upgrade skew — and it fails closed with the bytes
+        // preserved exactly as an option-shaped or whitespace alias does, matching the versioned path.
+        string nulKey = TargetId.ForHost("\0").Key;
+        yield return [$"{{\"panes\":{{\"{TargetId.ForHost("\0").ComposeWith("%1")}\":{ValidPane}}},\"hosts\":{{}}}}"];
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{nulKey}\":{ValidHost}}},\"attempted\":[\"{nulKey}\"]}}"];
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{}},\"attempted\":[\"{nulKey}\"]}}"];
+
+        // A DEL and a C1 control, the same story as a NUL.
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{}},\"attempted\":[\"{TargetId.ForHost("\u007f").Key}\"]}}"];
+
+        // An option-shaped and a whitespace alias: rejected by every past CLI too, so hand-editing.
+        yield return [$"{{\"panes\":{{\"{TargetId.ForHost("-V").ComposeWith("%1")}\":{ValidPane}}},\"hosts\":{{}}}}"];
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{}},\"attempted\":[\"{TargetId.ForHost(" ").Key}\"]}}"];
+    }
+
+    [Theory]
+    [MemberData(nameof(LegacyHistoriesWithUnusablePersistedAliases))]
+    public async Task OpenAsync_FailsClosedOnALegacyShapeWithAnUnusablePersistedAlias(string content)
+    {
+        // #173, unconditional: an invalid persisted alias surfaces HistoryUnavailable and preserves the
+        // original bytes, before any scanner is constructed — a NUL is not treated as valid writer-produced
+        // upgrade skew to migrate-then-overwrite. The file is left for a human to inspect.
+        string path = TempPath("aliaslegacy");
         File.WriteAllText(path, content);
-        CancellationToken ct = TestContext.Current.CancellationToken;
         try
         {
-            using (PaneHistory history = await PaneHistory.OpenAsync(path, ct))
-            {
-                Assert.NotNull(history.LoadWarning);
-                Assert.Empty(history.KnownHosts);
-                Assert.False(history.IsInitialized);
-                // A bare sweep on the discarded-to-first-run history bootstraps local, exactly like a fresh
-                // machine, rather than sweeping the unusable alias.
-                Assert.Equal(new string?[] { null }, history.FleetTargets([]));
-            }
+            await Assert.ThrowsAsync<HistoryUnavailableException>(
+                () => PaneHistory.OpenAsync(path, TestContext.Current.CancellationToken));
+            Assert.Equal(content, File.ReadAllText(path));
         }
         finally
         {
@@ -254,19 +261,22 @@ public sealed class HistoryMigrationTests
     }
 
     [Fact]
-    public async Task OpenAsync_FailsClosedOnALegacyShapeWithAnOptionAliasNoWriterEverProduced()
+    public async Task WaitingCollect_OverALegacyNulAlias_IsUnavailableAndNeverConstructsTheScanner()
     {
-        // An option-shaped alias is different from a NUL: every past CLI rejected a leading dash, so one on
-        // disk is hand-editing, not upgrade skew. It fails closed with the bytes preserved rather than
-        // discarding.
-        string dashPaneKey = TargetId.ForHost("-V").ComposeWith("%1");
-        string content = $"{{\"panes\":{{\"{dashPaneKey}\":{ValidPane}}},\"hosts\":{{}}}}";
-        string path = TempPath("optionlegacy");
+        // The command path: a bare sweep over a legacy history carrying a NUL alias surfaces the unavailable
+        // contract at open — before collection — so the injected scan is never even reached, no
+        // ArgumentException or process-start exception escapes, and the bytes are left untouched.
+        string nulKey = TargetId.ForHost("\0").Key;
+        string content = $"{{\"panes\":{{}},\"hosts\":{{}},\"attempted\":[\"{nulKey}\"]}}";
+        string path = TempPath("aliascollect");
         File.WriteAllText(path, content);
+        CancellationToken ct = TestContext.Current.CancellationToken;
         try
         {
-            await Assert.ThrowsAsync<HistoryUnavailableException>(
-                () => PaneHistory.OpenAsync(path, TestContext.Current.CancellationToken));
+            await Assert.ThrowsAsync<HistoryUnavailableException>(() => WaitingCommand.CollectAndResolveAsync(
+                [],
+                (_, _) => throw new Xunit.Sdk.XunitException("the scanner must never be constructed for an unusable persisted alias"),
+                None, None, new DateTimeOffset(2026, 8, 27, 0, 0, 0, TimeSpan.Zero), ct, historyPath: path));
             Assert.Equal(content, File.ReadAllText(path));
         }
         finally
@@ -303,7 +313,7 @@ public sealed class HistoryMigrationTests
         try
         {
             using PaneHistory history = await PaneHistory.OpenAsync(path, TestContext.Current.CancellationToken);
-            Assert.Null(history.LoadWarning);
+            Assert.True(history.IsInitialized);
         }
         finally
         {
@@ -340,9 +350,9 @@ public sealed class HistoryMigrationTests
         // An impossible record still fails closed under a version.
         yield return [$"{{\"version\":1,\"panes\":{{\"{TargetId.ForHost("banff").ComposeWith("%1")}\":{{\"digest\":\"a\",\"since\":\"2026-01-01T00:00:00+00:00\",\"pr\":null,\"claimedAt\":null,\"witnessed\":true}}}},{banffHost},\"attempted\":[\"{banffKey}\"],\"initialized\":true}}"];
 
-        // A persisted alias that decodes to a NUL is unusable in a current versioned file too — the writer
-        // (post control-character rule) can no longer produce it, so it is tampering and fails closed
-        // rather than discarding.
+        // A persisted alias that decodes to a NUL is unusable in a versioned file, exactly as in a legacy
+        // one: a NUL cannot be carried through a process argument, so no writer produced it and it fails
+        // closed with the bytes preserved.
         yield return [$"{{\"version\":1,\"panes\":{{}},\"hosts\":{{}},\"attempted\":[\"{TargetId.ForHost("\0").Key}\"],\"initialized\":true}}"];
     }
 
@@ -366,42 +376,3 @@ public sealed class HistoryMigrationTests
     }
 }
 
-/// <summary>
-/// Asserts the one migration outcome that surfaces on the console — a discard-to-first-run warning — under
-/// the serialized console-capture collection so its stderr redirect never races another test.
-/// </summary>
-[Collection("ConsoleCapture")]
-public sealed class HistoryMigrationConsoleTests
-{
-    private const string ValidPane = "{\"digest\":\"abc\",\"since\":\"2026-01-01T00:00:00+00:00\",\"pr\":4448,\"claimedAt\":\"2026-01-01T00:00:00+00:00\",\"witnessed\":true}";
-
-    [Fact]
-    public async Task OpenAsync_WritesAVisibleStderrWarningWhenItDiscardsAnUnmigratableLegacyHistory()
-    {
-        string nulPaneKey = TargetId.ForHost("\0").ComposeWith("%1");
-        string content = $"{{\"panes\":{{\"{nulPaneKey}\":{ValidPane}}},\"hosts\":{{}}}}";
-        string path = Path.Combine(Path.GetTempPath(), $"octoshift-migwarn-{Guid.NewGuid():N}.json");
-        File.WriteAllText(path, content);
-        CancellationToken ct = TestContext.Current.CancellationToken;
-
-        TextWriter savedErr = Console.Error;
-        var errWriter = new StringWriter();
-        try
-        {
-            Console.SetError(errWriter);
-            using (await PaneHistory.OpenAsync(path, ct))
-            {
-            }
-        }
-        finally
-        {
-            Console.SetError(savedErr);
-            File.Delete(path);
-            File.Delete(path + ".lock");
-        }
-
-        string stderr = errWriter.ToString();
-        Assert.Contains("octoshift:", stderr, StringComparison.Ordinal);
-        Assert.Contains("starting fresh", stderr, StringComparison.Ordinal);
-    }
-}

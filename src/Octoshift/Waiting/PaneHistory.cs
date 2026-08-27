@@ -112,14 +112,6 @@ internal sealed class PaneHistory : IDisposable
     /// </summary>
     private bool _initialized;
 
-    /// <summary>
-    /// Set when a strict load could not migrate a known older on-disk scheme safely and started fresh
-    /// instead of bricking — surfaced to stderr by <see cref="OpenAsync"/> so the one-time reset is
-    /// visible rather than silent. Null on every ordinary load (a clean current file, or a legacy file
-    /// migrated in memory with its memory preserved).
-    /// </summary>
-    private readonly string? _loadWarning;
-
     private FileStream? _lock;
 
     /// <summary>
@@ -164,14 +156,13 @@ internal sealed class PaneHistory : IDisposable
         _hosts = loaded.Hosts;
         _attempted = loaded.Attempted;
         _initialized = loaded.Initialized;
-        _loadWarning = loaded.Warning;
 
         // A strict (product) load is fully resolved inside Load: a current versioned file is validated
         // exactly, a known unversioned legacy file is migrated in memory (its panes/hosts preserved and its
-        // attempted membership derived), and anything else has already been rejected with its bytes
-        // untouched — or, for a legacy file that cannot be migrated safely, discarded to a truthful
-        // first-run state with the warning above. Nothing further to reconcile here; sanitising a strict
-        // load key by key would be the very laundering the load-bearing history must not do.
+        // attempted membership derived), and anything else — a foreign member set, a hand-edited or
+        // impossible record, or an unusable persisted alias — has already been rejected with its bytes
+        // untouched. Nothing further to reconcile here; sanitising a strict load key by key would be the
+        // very laundering the load-bearing history must not do.
         if (strictLoad)
         {
             return;
@@ -236,18 +227,12 @@ internal sealed class PaneHistory : IDisposable
         _initialized = _initialized || _attempted.Count > 0 || _hosts.Count > 0;
     }
 
-    /// <summary>Whether a strict load discarded a known-but-unmigratable older history and started fresh;
-    /// carries the one-line stderr warning that reset emitted. Null on every ordinary load.</summary>
-    internal string? LoadWarning => _loadWarning;
-
-    /// <summary>The outcome of a load: the three maps and the initialized flag, plus an optional warning
-    /// when a strict load discarded a known-but-unmigratable older history and started fresh.</summary>
+    /// <summary>The outcome of a load: the three maps and the initialized flag.</summary>
     private readonly record struct LoadResult(
         Dictionary<string, PaneMemory> Entries,
         Dictionary<string, HostMemory> Hosts,
         HashSet<string> Attempted,
-        bool Initialized,
-        string? Warning);
+        bool Initialized);
 
     /// <summary>
     /// Rejects the entire history — bytes untouched — if any record in a current <em>versioned</em> file is
@@ -421,7 +406,7 @@ internal sealed class PaneHistory : IDisposable
     {
         if (!File.Exists(path))
         {
-            return new([], [], [], false, null);
+            return new([], [], [], false);
         }
 
         string text;
@@ -436,7 +421,7 @@ internal sealed class PaneHistory : IDisposable
                 throw new HistoryUnavailableException($"could not read pane history from {path}: {ex.Message}", ex);
             }
 
-            return new([], [], [], false, null);
+            return new([], [], [], false);
         }
 
         if (strict)
@@ -453,15 +438,15 @@ internal sealed class PaneHistory : IDisposable
         }
         catch (JsonException)
         {
-            return new([], [], [], false, null);
+            return new([], [], [], false);
         }
 
         if (file is null)
         {
-            return new([], [], [], false, null);
+            return new([], [], [], false);
         }
 
-        return new(file.Panes ?? [], file.Hosts ?? [], [.. file.Attempted ?? []], file.Initialized ?? false, null);
+        return new(file.Panes ?? [], file.Hosts ?? [], [.. file.Attempted ?? []], file.Initialized ?? false);
     }
 
     /// <summary>
@@ -558,7 +543,7 @@ internal sealed class PaneHistory : IDisposable
 
         var attempted = new HashSet<string>(file.Attempted, StringComparer.Ordinal);
         ValidateVersionedSemantics(file.Panes, file.Hosts, attempted);
-        return new(file.Panes, file.Hosts, attempted, true, null);
+        return new(file.Panes, file.Hosts, attempted, true);
     }
 
     /// <summary>
@@ -596,24 +581,25 @@ internal sealed class PaneHistory : IDisposable
     }
 
     /// <summary>
-    /// Migrates a structurally-recognised legacy file forward in memory, or refuses/discards it. Each
-    /// record must still be one a writer produced — a valid key, an exact shape, a possible record — so an
-    /// impossible or hand-edited record fails closed exactly as it would in a versioned file; no version,
-    /// past or present, wrote a witnessed claim with no PR. What migration adds is <em>derivation</em>: the
-    /// attempted membership the current scheme keys completeness on is rebuilt from every persisted host
-    /// key <em>and every pane's composite host</em> — not only the hosts map — because the real pre-
-    /// <c>attempted</c> payload that motivated this carries local panes with an empty hosts map, so its
-    /// local membership survives only in the pane keys. Panes and host memory are preserved as-is where the
-    /// records are valid.
+    /// Migrates a structurally-recognised legacy file forward in memory, or refuses it. Each record must
+    /// still be one a writer produced — a valid key, an exact shape, a possible record — so an impossible or
+    /// hand-edited record fails closed exactly as it would in a versioned file; no version, past or present,
+    /// wrote a witnessed claim with no PR. What migration adds is <em>derivation</em>: the attempted
+    /// membership the current scheme keys completeness on is rebuilt from every persisted host key <em>and
+    /// every pane's composite host</em> — not only the hosts map — because the real pre-<c>attempted</c>
+    /// payload that motivated this carries local panes with an empty hosts map, so its local membership
+    /// survives only in the pane keys. Panes and host memory are preserved as-is where the records are
+    /// valid.
     /// </summary>
     /// <remarks>
-    /// One legacy case cannot be migrated and is not hand-editing either: a target alias an earlier build
-    /// could persist but this one can no longer represent — a control-bearing (NUL) alias, which predates
-    /// the rule that now rejects it. Adding it to the fleet would hand ssh an argument that truncates or
-    /// throws, and keeping the pane without its host would orphan it, so the file is discarded to a
-    /// truthful first-run state with a stderr warning rather than bricked. An option-shaped, whitespace or
-    /// empty alias is different: every past CLI rejected those too, so one on disk is hand-editing and
-    /// fails closed with the bytes preserved.
+    /// Every persisted remote alias is held to the same <see cref="HostTarget.Validate"/> rule the versioned
+    /// path applies, and an unusable one — option-shaped, whitespace, or control-bearing (a NUL) — fails
+    /// closed with the bytes preserved rather than being migrated. A NUL is not upgrade skew even though the
+    /// old validator lacked the check: a NUL cannot be carried through an OS process argument, so no real
+    /// invocation ever produced it, and treating it as a valid older payload would let a later command
+    /// overwrite the file. Refusing it here, before any scanner is constructed, is exactly the versioned
+    /// contract: the unavailable result, the original bytes left for inspection, and ssh never handed the
+    /// alias.
     /// </remarks>
     private static LoadResult MigrateLegacy(
         Dictionary<string, PaneMemory> entries,
@@ -677,27 +663,14 @@ internal sealed class PaneHistory : IDisposable
             }
         }
 
+        // Every derived remote alias must be one this build can hand to ssh, under the same
+        // HostTarget.Validate rule the versioned path enforces on host and attempted keys. An unusable
+        // alias — option-shaped, whitespace, or a NUL — fails closed with the bytes preserved, before any
+        // scanner is constructed. A NUL cannot be represented in an OS process argument, so no real
+        // invocation produced it: it is not upgrade skew to migrate, it is a file this scheme never wrote.
         foreach (string key in attempted)
         {
-            TargetId target = TargetId.FromKey(key);
-            if (target.IsLocal)
-            {
-                continue;
-            }
-
-            string alias = target.Display;
-            if (HostTarget.Validate(alias) is null)
-            {
-                continue;
-            }
-
-            if (IsProducibleLegacyAliasNowUnusable(alias))
-            {
-                return new([], [], [], false,
-                    $"pane history at {path} was written by an earlier version and names a target alias this build can no longer use; starting fresh — the next sweep rebuilds it");
-            }
-
-            throw new HistoryUnavailableException($"pane history at {path} has an unusable target alias '{DisplayText.Safe(alias)}', so it was not written by this scheme");
+            RequireUsableRemote(key, "target");
         }
 
         bool established = shape is LegacyShape.PanesHostsAttemptedInitialized
@@ -705,22 +678,8 @@ internal sealed class PaneHistory : IDisposable
             || hosts.Count > 0
             || entries.Count > 0;
 
-        return new(entries, hosts, attempted, established, null);
+        return new(entries, hosts, attempted, established);
     }
-
-    /// <summary>
-    /// Whether an alias is one an earlier build could have persisted but this build can no longer represent
-    /// as a process argument — the only "cannot migrate safely" case that is upgrade skew rather than
-    /// tampering. It passes every pre-version rule (non-empty, no leading dash, no whitespace) yet trips the
-    /// control-character rule added later, so it is a target a past writer wrote before that rule existed.
-    /// An alias that fails for any other reason was rejected by every past CLI too, so it is hand-editing,
-    /// not skew.
-    /// </summary>
-    private static bool IsProducibleLegacyAliasNowUnusable(string alias)
-        => !string.IsNullOrWhiteSpace(alias)
-            && !alias.StartsWith('-')
-            && !alias.Any(char.IsWhiteSpace)
-            && alias.Any(char.IsControl);
 
     /// <summary>Deserializes an already raw-schema-validated document, turning the residual failure modes
     /// (a value-kind mismatch the source-gen deserializer rejects, or a null root) into the unavailable
@@ -890,9 +849,7 @@ internal sealed class PaneHistory : IDisposable
     /// within the timeout, a lock I/O failure, or an existing history file that cannot be read or parsed
     /// all surface as <see cref="HistoryUnavailableException"/> — the unavailable contract — never as a
     /// silent success that would forget known hosts and overwrite the file; a genuine caller cancellation
-    /// escapes carrying the caller's own token. When a strict load discarded a known-but-unmigratable
-    /// older history and started fresh, the one-line reason is written to stderr here — the single product
-    /// entry point every command shares — so the one-time reset is visible rather than silent.
+    /// escapes carrying the caller's own token.
     /// </summary>
     public static async Task<PaneHistory> OpenAsync(string? path, CancellationToken ct)
     {
@@ -900,13 +857,7 @@ internal sealed class PaneHistory : IDisposable
         FileStream lockStream = await AcquireLockAsync(resolved, ct);
         try
         {
-            var history = new PaneHistory(resolved, lockStream, strictLoad: true);
-            if (history._loadWarning is { } warning)
-            {
-                Console.Error.WriteLine($"octoshift: {warning}");
-            }
-
-            return history;
+            return new PaneHistory(resolved, lockStream, strictLoad: true);
         }
         catch
         {
