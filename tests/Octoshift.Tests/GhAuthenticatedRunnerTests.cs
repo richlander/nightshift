@@ -144,6 +144,44 @@ public class GhAuthenticatedRunnerTests
         }
     }
 
+    [Fact]
+    public async Task RunProcessAsync_WhenTerminationCannotBeConfirmed_FailsPromptlyWithoutHanging()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "The gh runner path starts a POSIX child here; there is nothing to start on Windows.");
+
+        // The injected strategy reports the launched process's termination as unconfirmable, so cleanup must
+        // not await its exit (or the completion task, which begins by awaiting that same exit) — doing so would
+        // deadlock forever, since the process is genuinely still alive and holding its output pipes. The runner
+        // must instead close the streams, observe the drains, and fail promptly with GhProcessCleanupException.
+        // A regression of the deadlock would hang until the timeout turned into a TimeoutException, which is not
+        // a GhProcessCleanupException — so this assertion is exactly the promptness check. The still-live
+        // process is not killed by cleanup on this path, so the test cleans it up itself.
+        string dir = Path.Combine(AppContext.BaseDirectory, $"gh-runner-noterm-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        int pid = 0;
+        try
+        {
+            string script = "echo $$ > \"$0/pid\"; exec sleep 60";
+
+            using var cts = new CancellationTokenSource();
+            Task<GhResult> run = GhAuthenticatedRunner.RunProcessAsync(
+                "/bin/sh", ["-c", script, dir], null, static _ => false, cts.Token);
+
+            pid = await WaitForPidAsync(Path.Combine(dir, "pid"), TestContext.Current.CancellationToken);
+            Assert.True(IsAlive(pid), "launched process was not running before cancellation");
+
+            await cts.CancelAsync();
+
+            await Assert.ThrowsAsync<GhProcessCleanupException>(
+                () => run.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken));
+        }
+        finally
+        {
+            KillIfAlive(pid);
+            try { Directory.Delete(dir, recursive: true); } catch (IOException) { }
+        }
+    }
+
     private static async Task<int> WaitForPidAsync(string path, CancellationToken ct)
     {
         await WaitForFileAsync(path, ct);

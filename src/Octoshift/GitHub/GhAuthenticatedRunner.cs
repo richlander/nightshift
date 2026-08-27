@@ -48,10 +48,24 @@ internal static class GhAuthenticatedRunner
     /// program name is a parameter so this can be exercised against a purpose-built child rather than only the
     /// real <c>gh</c> binary.
     /// </summary>
+    internal static Task<GhResult> RunProcessAsync(
+        string file,
+        IReadOnlyList<string> args,
+        IReadOnlyDictionary<string, string?>? environmentOverrides,
+        CancellationToken ct)
+        => RunProcessAsync(file, args, environmentOverrides, RequestTermination, ct);
+
+    /// <summary>
+    /// Seam for tests: <paramref name="requestTermination"/> decides whether the launched process's exit can
+    /// be requested/confirmed during cancellation cleanup. Injecting it is how the "termination unconfirmed"
+    /// path is exercised deterministically, rather than trying to make the OS refuse a kill. Production passes
+    /// <see cref="RequestTermination"/>.
+    /// </summary>
     internal static async Task<GhResult> RunProcessAsync(
         string file,
         IReadOnlyList<string> args,
         IReadOnlyDictionary<string, string?>? environmentOverrides,
+        Func<Process, bool> requestTermination,
         CancellationToken ct)
     {
         var psi = new ProcessStartInfo(file)
@@ -114,7 +128,7 @@ internal static class GhAuthenticatedRunner
         }
         catch (OperationCanceledException)
         {
-            await TerminateAndDrainAsync(proc, exit, completion, stdout, stderr).ConfigureAwait(false);
+            await TerminateAndDrainAsync(proc, exit, completion, stdout, stderr, requestTermination).ConfigureAwait(false);
             throw;
         }
     }
@@ -126,47 +140,66 @@ internal static class GhAuthenticatedRunner
     }
 
     /// <summary>
-    /// Cancellation cleanup. Requests termination of the tree (falling back to the direct process); if that
-    /// cannot be done it records a controlled cleanup failure instead of waiting on an exit that may never
-    /// come. Either way it closes the read streams to unblock an inherited-pipe drain and observes every task,
-    /// so no read is left faulted-and-forgotten when the process handles are disposed. A recorded cleanup
-    /// failure is thrown only after that observation.
+    /// Cancellation cleanup, split by whether the launched process's termination could be
+    /// requested/confirmed.
+    ///
+    /// When it can: the exit — and therefore <paramref name="completion"/>, which begins by awaiting the same
+    /// exit task — will finish, so it awaits exit, closes the read streams to unblock any inherited-pipe drain,
+    /// and observes completion and both drains.
+    ///
+    /// When it cannot: the exit task may never finish, so awaiting it — or completion, which starts by awaiting
+    /// it — would hang forever and the failure would never surface. Instead it closes the streams, observes the
+    /// two drain tasks synchronously (they finish once their streams are closed), attaches fault-observing
+    /// continuations to exit and completion so a later fault (for example when <see cref="Process.Dispose"/>
+    /// tears the handle down) is never left unobserved, and throws <see cref="GhProcessCleanupException"/>
+    /// promptly.
     /// </summary>
-    private static async Task TerminateAndDrainAsync(Process proc, Task exit, Task completion, Task stdout, Task stderr)
+    private static async Task TerminateAndDrainAsync(
+        Process proc,
+        Task exit,
+        Task completion,
+        Task stdout,
+        Task stderr,
+        Func<Process, bool> requestTermination)
     {
-        Exception? cleanupFailure = null;
-        try
+        if (requestTermination(proc))
         {
-            if (RequestTermination(proc))
-            {
-                // Uncancellable: the launched process must be confirmed gone before control returns.
-                await exit.ConfigureAwait(false);
-            }
-            else
-            {
-                // Termination could neither be requested nor its exit confirmed. Do not wait on an exit that
-                // may never come; record a deterministic cleanup failure and still drain below.
-                cleanupFailure = new GhProcessCleanupException(
-                    "octoshift: could not terminate the gh process on cancellation; refusing to wait on a process that may still be alive.");
-            }
-        }
-        finally
-        {
-            // The tree kill cannot reach a descendant that outlived the root, and such a descendant may still
-            // hold a write end, so a drain could hang forever on EOF. Closing the read streams forces them to
-            // end; their captured output is discarded on this path anyway. Observe every task so nothing is
-            // left faulted-and-forgotten when Process.Dispose closes the handles.
+            // Uncancellable: the launched process is being torn down, so confirm its exit before returning.
+            await exit.ConfigureAwait(false);
+
+            // A descendant that outlived the root may still hold a write end, so a drain could hang on EOF;
+            // closing the read streams forces them to end. Their captured output is discarded on this path.
             CloseStreams(proc);
             await ObserveAsync(completion).ConfigureAwait(false);
             await ObserveAsync(stdout).ConfigureAwait(false);
             await ObserveAsync(stderr).ConfigureAwait(false);
+            return;
         }
 
-        if (cleanupFailure is not null)
-        {
-            throw cleanupFailure;
-        }
+        // Termination could neither be requested nor exit confirmed. The exit task (and completion, which
+        // awaits it first) may never finish, so we must not await either or cleanup would deadlock and the
+        // failure would never surface.
+        CloseStreams(proc);
+        await ObserveAsync(stdout).ConfigureAwait(false);
+        await ObserveAsync(stderr).ConfigureAwait(false);
+        ObserveEventually(exit);
+        ObserveEventually(completion);
+
+        throw new GhProcessCleanupException(
+            "octoshift: could not terminate the gh process on cancellation; refusing to wait on a process that may still be alive.");
     }
+
+    /// <summary>
+    /// Marks a task's eventual fault as observed without blocking on it, so a task that may complete much later
+    /// (or never) cannot surface as an unobserved task exception — including a fault raised when the process
+    /// handle is disposed.
+    /// </summary>
+    private static void ObserveEventually(Task task)
+        => task.ContinueWith(
+            static t => _ = t.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
 
     /// <summary>
     /// Asks the process tree to die, then the direct process, returning true once termination is requested or
