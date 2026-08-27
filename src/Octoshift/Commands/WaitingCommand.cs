@@ -83,7 +83,14 @@ internal static class WaitingCommand
 
     public static async Task<int> RunAsync(IReadOnlyList<string> repoFlags, IReadOnlyList<string> hosts, bool all, bool json, CancellationToken ct, string? historyPath = null, Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>>? scanAsync = null)
     {
-        IReadOnlyList<string> repos = RepoScope.ResolveAll(repoFlags);
+        RepoScope.Resolution scope = RepoScope.Resolve(repoFlags);
+        if (scope.Error is { } scopeError)
+        {
+            Console.Error.WriteLine($"octoshift: {scopeError}");
+            return ExitCode.Usage;
+        }
+
+        IReadOnlyList<string> repos = scope.Repos;
         if (repos.Count == 0)
         {
             Console.Error.WriteLine("octoshift: could not resolve a repo scope; pass --repo owner/name.");

@@ -13,6 +13,7 @@ using Xunit;
 /// let it escape so their command layer can report the unavailable contract, and the JSON error document
 /// they emit is valid.
 /// </summary>
+[Collection("ConsoleCapture")]
 public sealed class PersistenceTests
 {
     private static TmuxPane Pane(string? host)

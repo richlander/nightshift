@@ -14,6 +14,7 @@ using Xunit;
 /// the current serializer, so a build whose reader and writer always agree cannot hide the skew the way
 /// every prior test did.
 /// </summary>
+[Collection("ConsoleCapture")]
 public sealed class HistoryMigrationTests
 {
     private const string ValidHost = "{\"epoch\":\"1:1\",\"sweptAt\":\"2026-01-01T00:00:00+00:00\",\"continuous\":true}";

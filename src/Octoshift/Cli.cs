@@ -183,10 +183,29 @@ public static class Cli
     }
 
     private static Option<string[]> CreateRepoOption()
-        => new("--repo")
+    {
+        var repo = new Option<string[]>("--repo")
         {
             Description = "Repository scope owner/name; repeatable to search several repos. Inferred from the git remote when omitted.",
             Arity = ArgumentArity.OneOrMore,
             AllowMultipleArgumentsPerToken = false,
         };
+
+        // A malformed --repo cannot be silently dropped: it would narrow the scope the operator asked for
+        // and could turn a real collision into a false unique, so it is a usage error at the parser, the
+        // same as an option-shaped --host.
+        repo.Validators.Add(result =>
+        {
+            foreach (var token in result.Tokens)
+            {
+                if (RepoScope.Validate(token.Value) is { } error)
+                {
+                    result.AddError(error);
+                    break;
+                }
+            }
+        });
+
+        return repo;
+    }
 }

@@ -280,16 +280,23 @@ internal sealed class GhPrFactsSource
 /// <summary>
 /// Resolves one PR number across the ordered set of repos the fleet touches, so a lookup is not silently
 /// scoped to whichever repo the operator's current directory happens to sit in. Each repo has its own
-/// <see cref="GhPrFactsSource"/> — hence its own ETag cache path and its own rate-limit accounting — and
-/// this aggregates them into one budget and one truthful outcome.
+/// <see cref="GhPrFactsSource"/> — hence its own repo-qualified ETag cache path — but all of them draw on
+/// one shared <c>gh</c> credential and therefore <em>one</em> REST rate-limit budget; this aggregates the
+/// per-repo call accounting and resolves one truthful outcome.
 /// </summary>
 /// <remarks>
-/// Every claimed PR is searched in <em>every</em> repo, not merely until the first hit: stopping at the
-/// first match cannot tell a unique resolution from a collision, and awarding the PR to the first repo that
-/// happens to have that number is exactly the "select an arbitrary repo" failure this exists to prevent.
-/// The cost is bounded — a miss is a single <c>pulls/{n}</c> that 404s, and only the one repo that has the
-/// PR pays for its <c>check-runs</c> — and the repo set is small, so a truthful search is affordable. The
-/// resolved repo is remembered per PR so a follow-up mergeability re-read is spent only where the PR lives.
+/// A unique resolution has to be <em>proven</em>, not assumed: a single hit only means "this PR lives
+/// here and nowhere else" when every other searched repo affirmatively answered 404. If any other repo
+/// could not be read — an outage, a 5xx, or a scope left unsearched because the shared budget was already
+/// spent — that repo may hold the same number, so one hit is reported <see cref="PrFetchStatus.Unavailable"/>
+/// (with the found repo preserved for diagnosis) rather than a false unique <see cref="PrFetchStatus.Found"/>.
+/// Two hits is a proven collision, reported <see cref="PrFetchStatus.Ambiguous"/> without picking either.
+///
+/// Because all repos share one budget, the moment any read observes exhaustion or pushback the fleet stops
+/// reading the rest — further calls are doomed and only deepen the hole for every other agent — and the
+/// unsearched scope counts as unavailable unless ambiguity is already proven. Subsequent PRs on an
+/// exhausted budget make no calls at all. The resolved repo is remembered per PR so a follow-up
+/// mergeability re-read is spent only where the PR lives.
 /// </remarks>
 internal sealed class GhFleetPrFactsSource
 {
@@ -324,50 +331,83 @@ internal sealed class GhFleetPrFactsSource
     /// <summary>Mergeability re-reads across every repo this run.</summary>
     public int Recomputed => _sources.Sum(s => s.Recomputed);
 
-    /// <summary>The smallest remaining budget any repo reported, or null when none did.</summary>
+    /// <summary>The remaining shared REST budget, from whichever repo read it most recently and lowest.</summary>
     public int? RateLimitRemaining => _sources.Select(s => s.RateLimitRemaining).Where(r => r is not null).Min();
 
-    /// <summary>True once any repo reported the budget spent or GitHub pushed back.</summary>
+    /// <summary>True once any repo reported the one shared budget spent or GitHub pushed back.</summary>
     public bool RateLimited => _sources.Any(s => s.RateLimited);
 
     /// <summary>
-    /// Resolves a PR across all searched repos into one truthful outcome. A single affirmative hit is
-    /// <see cref="PrFetchStatus.Found"/>; more than one is <see cref="PrFetchStatus.Ambiguous"/>; none, when
-    /// every repo answered 404, is <see cref="PrFetchStatus.NotFound"/>; none, when any repo could not be
-    /// read, is <see cref="PrFetchStatus.Unavailable"/> — an outage never proves absence. Every outcome
-    /// carries the searched-repo labels so a report can say where it looked.
+    /// Resolves a PR across the searched repos into one truthful outcome. Exactly one hit with every other
+    /// repo affirmatively 404 and the whole scope searched is <see cref="PrFetchStatus.Found"/>; two hits is
+    /// <see cref="PrFetchStatus.Ambiguous"/>; zero hits with the whole scope affirmatively 404 is
+    /// <see cref="PrFetchStatus.NotFound"/>; anything else — a repo unread, or the scope cut short by an
+    /// exhausted shared budget — is <see cref="PrFetchStatus.Unavailable"/>, since neither uniqueness nor
+    /// absence can be proven against a repo that was not truthfully read. Every outcome carries the
+    /// searched-repo labels so a report can say where it looked.
     /// </summary>
     public async Task<PrFetch> FetchDetailedAsync(int prNumber, CancellationToken ct)
     {
-        var found = new List<(GhPrFactsSource Source, PrFacts Facts)>();
+        var found = new List<GhPrFactsSource>();
+        var facts = new List<PrFacts>();
         bool anyUnavailable = false;
-        foreach (GhPrFactsSource source in _sources)
+
+        // Search all repos, but stop the moment the shared budget is spent: with one credential behind
+        // every source, a read after exhaustion cannot succeed and only deepens the hole. A scope left
+        // unsearched this way is not "absent from it" — it is unread, and folds into anyUnavailable below.
+        bool searchedAll = true;
+        for (int i = 0; i < _sources.Count; i++)
         {
+            if (RateLimited)
+            {
+                searchedAll = false;
+                break;
+            }
+
+            GhPrFactsSource source = _sources[i];
             PrFetch read = await source.FetchDetailedAsync(prNumber, ct);
             switch (read.Status)
             {
-                case PrFetchStatus.Found when read.Facts is { } facts:
-                    found.Add((source, facts));
+                case PrFetchStatus.Found when read.Facts is { } hit:
+                    found.Add(source);
+                    facts.Add(hit);
                     break;
                 case PrFetchStatus.Unavailable:
                     anyUnavailable = true;
                     break;
             }
+
+            // A proven collision needs no further reads; the extra repos cannot make two hits fewer.
+            if (found.Count > 1)
+            {
+                break;
+            }
         }
 
-        IReadOnlyList<string> foundIn = [.. found.Select(f => f.Source.Repo)];
-        if (found.Count == 1)
-        {
-            _resolved[prNumber] = found[0].Source;
-            return PrFetch.Found(found[0].Facts).WithRepos(_repos, foundIn);
-        }
+        IReadOnlyList<string> foundIn = [.. found.Select(s => s.Repo)];
 
         if (found.Count > 1)
         {
             return new PrFetch(PrFetchStatus.Ambiguous, null).WithRepos(_repos, foundIn);
         }
 
-        return (anyUnavailable ? PrFetch.Unavailable : PrFetch.NotFound).WithRepos(_repos, foundIn);
+        // Uniqueness and absence are only provable when the whole scope was read and every repo answered.
+        // One hit beside an unread repo cannot claim to be the only one; zero hits beside an unread repo
+        // cannot claim the PR does not exist.
+        bool wholeScopeAnswered = searchedAll && !anyUnavailable;
+
+        if (found.Count == 1)
+        {
+            if (wholeScopeAnswered)
+            {
+                _resolved[prNumber] = found[0];
+                return PrFetch.Found(facts[0]).WithRepos(_repos, foundIn);
+            }
+
+            return PrFetch.Unavailable.WithRepos(_repos, foundIn);
+        }
+
+        return (wholeScopeAnswered ? PrFetch.NotFound : PrFetch.Unavailable).WithRepos(_repos, foundIn);
     }
 
     /// <summary>The sweep shape: the facts when exactly one repo resolved the PR, otherwise null — a 404,

@@ -135,27 +135,158 @@ public class CrossRepoResolutionTests
         Assert.Equal(3, fleet.Calls);
     }
 
-    // ---- scope resolution --------------------------------------------------
-
     [Fact]
-    public void ResolveAll_ExplicitFlagsAreSearchedInOrderAndDeduplicated()
+    public async Task Fetch_OneHitBesideAnUnreadableRepoIsUnavailableNotAFalseUnique()
     {
-        Assert.Equal(
-            ["owner/one", "owner/two"],
-            RepoScope.ResolveAll(["owner/one", "owner/two", "owner/one"]));
+        // #178 round 1 / item 1: one repo has the PR, another could not be read (a 200 whose body cannot be
+        // parsed) — that unread repo may hold the same number, so a single hit cannot claim to be unique.
+        // The outcome is unavailable, with the found repo preserved for diagnosis but no facts to act on.
+        var gh = new FakeGh
+        {
+            ["repos/owner/first/pulls/4623"] = Pull(4623, HeadA),
+            [$"repos/owner/first/commits/{HeadA}/check-runs?per_page=100"] = Checks(),
+            ["repos/owner/second/pulls/4623"] = Response(200, "{ this is not json"),
+        };
+
+        PrFetch fetch = await Fleet(gh, "owner/first", "owner/second")
+            .FetchDetailedAsync(4623, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.Unavailable, fetch.Status);
+        Assert.Null(fetch.Facts);
+        Assert.Equal(["owner/first"], fetch.FoundIn);
+        Assert.Equal(["owner/first", "owner/second"], fetch.Searched);
     }
 
     [Fact]
-    public void ResolveAll_NoFlagsInfersASingleRepoFromTheRemote()
+    public async Task Fetch_AHitBesideAServerErrorRepoIsUnavailableNotAFalseUnique()
+    {
+        // The same rule for a 5xx: a repo behind a server error cannot be shown not to hold the number, so
+        // a hit in another repo is unavailable rather than a false unique. The 5xx is pushback, so the
+        // unread repo is not searched — but even had it been, one hit could not prove uniqueness.
+        var gh = new FakeGh
+        {
+            ["repos/owner/first/pulls/4623"] = Response(500, string.Empty),
+            ["repos/owner/second/pulls/4623"] = Pull(4623, HeadB),
+            [$"repos/owner/second/commits/{HeadB}/check-runs?per_page=100"] = Checks(),
+        };
+
+        PrFetch fetch = await Fleet(gh, "owner/first", "owner/second")
+            .FetchDetailedAsync(4623, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.Unavailable, fetch.Status);
+        Assert.Null(fetch.Facts);
+    }
+
+    // ---- one shared budget: stop on exhaustion, spend nothing after ---------
+
+    [Fact]
+    public async Task Fetch_ExhaustionMidScopeStopsFurtherReadsAndIsUnavailable()
+    {
+        // #178 item 4: all repos share one credential and one budget. A valid 200 that spends the last unit
+        // (X-RateLimit-Remaining: 0) still answers, but the fleet must not read the next repo — that call is
+        // doomed — so the scope is cut short and one hit beside an unread repo is unavailable, not a unique.
+        var gh = new FakeGh
+        {
+            ["repos/owner/first/pulls/4623"] = Response(200,
+                "{\"number\":4623,\"state\":\"open\",\"mergeable_state\":\"clean\",\"head\":{\"sha\":\"" + HeadA + "\"}}",
+                "x-ratelimit-remaining: 0"),
+            ["repos/owner/second/pulls/4623"] = Pull(4623, HeadB),
+            [$"repos/owner/second/commits/{HeadB}/check-runs?per_page=100"] = Checks(),
+        };
+
+        GhFleetPrFactsSource fleet = Fleet(gh, "owner/first", "owner/second");
+        PrFetch fetch = await fleet.FetchDetailedAsync(4623, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.Unavailable, fetch.Status);
+        Assert.Equal(["owner/first"], fetch.FoundIn);
+
+        // The first repo spent exactly one call (its check-runs read is refused once the budget is zero);
+        // the second repo was never touched.
+        Assert.Single(gh.Requests);
+        Assert.All(gh.Requests, args => Assert.Contains("repos/owner/first/pulls/4623", args));
+
+        // A subsequent PR on the exhausted shared budget makes no calls at all.
+        int spent = gh.Requests.Count;
+        PrFetch again = await fleet.FetchDetailedAsync(4999, TestContext.Current.CancellationToken);
+        Assert.Equal(PrFetchStatus.Unavailable, again.Status);
+        Assert.Equal(spent, gh.Requests.Count);
+    }
+
+    [Fact]
+    public async Task Fetch_PushbackOnTheFirstRepoStopsBeforeTheSecond()
+    {
+        // A 403/5xx is pushback on the one shared budget: the second repo is not read, and the outcome is
+        // unavailable — the scope was never fully searched, so absence cannot be claimed either.
+        var gh = new FakeGh
+        {
+            ["repos/owner/first/pulls/4623"] = Response(403, string.Empty, "x-ratelimit-remaining: 0"),
+            ["repos/owner/second/pulls/4623"] = Pull(4623, HeadB),
+            [$"repos/owner/second/commits/{HeadB}/check-runs?per_page=100"] = Checks(),
+        };
+
+        GhFleetPrFactsSource fleet = Fleet(gh, "owner/first", "owner/second");
+        PrFetch fetch = await fleet.FetchDetailedAsync(4623, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.Unavailable, fetch.Status);
+        Assert.Single(gh.Requests);
+    }
+
+    // ---- scope resolution --------------------------------------------------
+
+    [Fact]
+    public void Resolve_ExplicitFlagsAreSearchedInOrderAndDeduplicated()
+    {
+        RepoScope.Resolution resolution = RepoScope.Resolve(["owner/one", "owner/two", "owner/one"]);
+
+        Assert.Null(resolution.Error);
+        Assert.Equal(["owner/one", "owner/two"], resolution.Repos);
+    }
+
+    [Fact]
+    public void Resolve_NoFlagsInfersASingleRepoFromTheRemote()
     {
         // With no --repo the scope is inferred from the current worktree's origin — a single repo, never a
         // set — preserving the single-repo default. Compared against the inference directly so the test is
         // deterministic whether or not a remote is present.
-        string? inferred = RepoScope.Resolve(null);
+        string? inferred = RepoScope.Resolve((string?)null);
         IReadOnlyList<string> expected = inferred is null ? [] : [inferred];
 
-        Assert.Equal(expected, RepoScope.ResolveAll([]));
+        RepoScope.Resolution resolution = RepoScope.Resolve([]);
+        Assert.Null(resolution.Error);
+        Assert.Equal(expected, resolution.Repos);
     }
+
+    [Fact]
+    public void Resolve_AMalformedExplicitFlagFailsTheWholeInvocation()
+    {
+        // #178 item 2: a valid flag beside a malformed one must not silently narrow the scope to the valid
+        // one — that could turn a real collision into a false unique. The whole resolution fails with a
+        // usage error and no repos, so the caller neither infers nor proceeds.
+        RepoScope.Resolution resolution = RepoScope.Resolve(["owner/one", "not a repo"]);
+
+        Assert.NotNull(resolution.Error);
+        Assert.Empty(resolution.Repos);
+    }
+
+    [Theory]
+    [InlineData("owner")]              // no name segment
+    [InlineData("owner/name/extra")]   // too many segments
+    [InlineData("ow ner/name")]        // whitespace
+    [InlineData("owner/na me")]
+    [InlineData("owner/..")]           // relative path name
+    [InlineData("owner/na?me")]        // query metacharacter
+    [InlineData("owner/na#me")]
+    [InlineData("owner/na%2fme")]      // encoded slash
+    [InlineData("owner/na\u0000me")]   // control character
+    public void Validate_RejectsAnythingThatCannotFormASafeOwnerName(string value)
+        => Assert.NotNull(RepoScope.Validate(value));
+
+    [Theory]
+    [InlineData("owner/name")]
+    [InlineData("Owner-1/repo.name_2")]
+    [InlineData("owner/name.git")]     // the .git suffix is stripped, not rejected
+    public void Validate_AcceptsAWellFormedOwnerName(string value)
+        => Assert.Null(RepoScope.Validate(value));
 
     // ---- CLI parsing -------------------------------------------------------
 
@@ -171,7 +302,29 @@ public class CrossRepoResolutionTests
         Assert.Equal(["owner/one", "owner/two"], pr.GetValue<string[]>("--repo")!);
     }
 
-    // ---- waiting rows across repos are covered in WaitingScanTests, whose default (non-ConsoleCapture)
+    [Fact]
+    public void CreateRootCommand_RejectsAMalformedRepoValue()
+    {
+        // A malformed --repo is a usage error at the parser, the same as an option-shaped --host — even
+        // when a valid one accompanies it.
+        var waiting = Cli.CreateRootCommand().Parse(["waiting", "--repo", "not a repo"]);
+        Assert.NotEmpty(waiting.Errors);
+        Assert.Contains(waiting.Errors, e => e.Message.Contains("--repo", StringComparison.Ordinal));
+
+        var pr = Cli.CreateRootCommand().Parse(["pr", "4623", "--repo", "owner/one", "--repo", "bad slug"]);
+        Assert.NotEmpty(pr.Errors);
+    }
+
+    [Fact]
+    public async Task RunAsync_AMalformedRepoIsAUsageErrorAndNeverReadsGitHub()
+    {
+        // Defence in depth at the command layer: even reached directly, a malformed --repo fails Usage
+        // before any fleet source or GitHub read is constructed.
+        Assert.Equal(ExitCode.Usage, await WaitingCommand.RunAsync(["not a repo"], [], all: false, json: false, TestContext.Current.CancellationToken));
+        Assert.Equal(ExitCode.Usage, await PrCommand.RunAsync(4623, ["owner/one", "bad slug"], [], json: false, TestContext.Current.CancellationToken));
+    }
+
+    // ---- waiting rows across repos are covered in WaitingScanTests, whose non-parallel ConsoleCapture
     //      collection serializes the BuildRowsAsync tests that share WaitingCommand's static reporting
     //      fields; see WaitingScanTests.BuildRows_*AcrossRepos*.
 

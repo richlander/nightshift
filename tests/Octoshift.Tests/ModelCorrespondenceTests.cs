@@ -17,6 +17,7 @@ using Xunit;
 ///
 /// The model is the authority on ordering and memory; these tests are the evidence that the C# agrees.
 /// </remarks>
+[Collection("ConsoleCapture")]
 public class ModelCorrespondenceTests
 {
     private static TmuxPane Window(string paneId, string? host = "fernie", string epoch = "100:1")

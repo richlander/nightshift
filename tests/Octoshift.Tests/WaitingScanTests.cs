@@ -10,6 +10,14 @@ using Xunit;
 /// The plumbing around the pure core: reading tmux, reading GitHub conditionally, and deciding which
 /// panes are worth a call at all. Every seam is faked, so nothing here starts a process or a request.
 /// </summary>
+/// <remarks>
+/// Joins the non-parallel <c>ConsoleCapture</c> collection: several tests here reconcile through
+/// <see cref="WaitingCommand.BuildRowsAsync"/>, which mutates the shared static
+/// <see cref="WaitingCommand.Omitted"/>/<see cref="WaitingCommand.Departed"/> reporting fields and reads
+/// them back. Running in the serialized collection keeps a parallel reconcile in another class from
+/// clobbering those fields between a write and the assertion that reads it.
+/// </remarks>
+[Collection("ConsoleCapture")]
 public class WaitingScanTests
 {
     private const string Head = "722512e25f0c1d4a9b8e7360a1c2d3e4f5061728";

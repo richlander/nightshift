@@ -25,7 +25,14 @@ internal static class PrCommand
 {
     public static async Task<int> RunAsync(int prNumber, IReadOnlyList<string> repoFlags, IReadOnlyList<string> hosts, bool json, CancellationToken ct, string? historyPath = null)
     {
-        IReadOnlyList<string> repos = RepoScope.ResolveAll(repoFlags);
+        RepoScope.Resolution scope = RepoScope.Resolve(repoFlags);
+        if (scope.Error is { } scopeError)
+        {
+            Console.Error.WriteLine($"octoshift: {scopeError}");
+            return ExitCode.Usage;
+        }
+
+        IReadOnlyList<string> repos = scope.Repos;
         if (repos.Count == 0)
         {
             Console.Error.WriteLine("octoshift: could not resolve a repo scope; pass --repo owner/name.");
@@ -154,6 +161,14 @@ internal static class PrCommand
 
         /// <summary>The searched repos this PR number was found in; more than one means <see cref="PrDisposition.Ambiguous"/>.</summary>
         public IReadOnlyList<string> FoundIn { get; init; } = [];
+
+        /// <summary>
+        /// The full multi-repo resolution reconstructed from its parts, so a claim's verdict is joined
+        /// against the same outcome the top-line disposition names — an affirmative not-found or an
+        /// ambiguous collision resolves the claim's verdict truthfully rather than falling to a bare
+        /// "could not read from GitHub" that contradicts the header.
+        /// </summary>
+        public PrFetch Fetch => new(Github, Facts, Searched, FoundIn);
 
         /// <summary>
         /// The single word this location reduces to, which the human report leads its first line with and
@@ -428,7 +443,7 @@ internal static class PrCommand
             // follower is still working, so ownership is with the window that is doing the least. The
             // owner's verdict is read through the same pane-activity gate the verdict lines use, so a
             // working owner with a stale rec is never mistaken for one that has finished and handed over.
-            if (Claim.IsReleasing(claims[0].State, VerdictFor(claims[0].Pane, claims[0].State, facts), claims[0].Pane.Activity)
+            if (Claim.IsReleasing(claims[0].State, VerdictFor(claims[0].Pane, claims[0].State, located.Fetch), claims[0].Pane.Activity)
                 && claims.Skip(1).Any(c => c.Pane.Activity == PaneActivity.Working))
             {
                 output.WriteLine("            the owner is disengaging while a follower is active — consider promoting it");
@@ -446,7 +461,7 @@ internal static class PrCommand
         // which is truthful rather than an invented readiness.
         foreach ((TmuxPane pane, AgentState state, _) in claims)
         {
-            WaitingVerdict verdict = VerdictFor(pane, state, facts);
+            WaitingVerdict verdict = VerdictFor(pane, state, located.Fetch);
             string from = claims.Count > 1 ? $" [{DisplayText.Safe(pane.Where)}]" : string.Empty;
             output.WriteLine($"  verdict   {verdict.State.ToString().ToUpperInvariant()} ({verdict.Assurance.Label}) — {DisplayText.Safe(verdict.Reason)}{from}");
         }
@@ -536,8 +551,8 @@ internal static class PrCommand
     /// operator verdict instead. This is <see cref="WaitingVerdict.ForActivity"/>, the single copy of that
     /// policy `octoshift waiting` uses, so `pr` cannot print a verdict `waiting` would not.
     /// </summary>
-    private static WaitingVerdict VerdictFor(TmuxPane pane, AgentState state, PrFacts? facts)
-        => WaitingVerdict.ForActivity(pane.Activity, pane.Capture, () => WaitingVerdict.Resolve(state, facts));
+    private static WaitingVerdict VerdictFor(TmuxPane pane, AgentState state, PrFetch fetch)
+        => WaitingVerdict.ForActivity(pane.Activity, pane.Capture, () => WaitingVerdict.Resolve(state, fetch));
 
     private static string Github(PrFacts? facts, PrFetchStatus outcome, DateTimeOffset now, string scope, string ambiguousRepos)
     {
@@ -669,7 +684,7 @@ internal static class PrCommand
             // GitHub could not be read: VerdictFor resolves the non-idle activities and an idle explicit
             // escalation without facts, and only the genuinely GitHub-dependent idle outcomes fall to a
             // low-confidence unknown, matching the human report which now also prints a verdict per claim.
-            WaitingVerdict verdict = VerdictFor(pane, state, facts);
+            WaitingVerdict verdict = VerdictFor(pane, state, located.Fetch);
             writer.WriteStartObject("verdict");
             writer.WriteString("state", verdict.State.ToString().ToLowerInvariant());
             writer.WriteString("confidence", verdict.Assurance.Label);

@@ -234,6 +234,52 @@ public class PrCommandTests
     }
 
     [Fact]
+    public async Task Locate_ALocalClaimVerdictNamesTheNotFoundScopeNotAGithubOutage()
+    {
+        // #178 round 1 / item 3: an idle local window claims the PR, but every searched repo 404s. The
+        // claim's verdict must join against the same not-found the header names — "no such PR in <repos>",
+        // not the "could not read from GitHub" an outage earns, which would contradict the top line.
+        PrLocationResult result = await LocateAsync(4448, Collection(
+            [Pane("fernie", "%1", "cp:1", agentState: "pr=4448 head=abc1234 reviews=2/2 rec=merge", windowName: "pr4448")],
+            ["fernie"]),
+            PrFetch.NotFound.WithRepos(["owner/first", "owner/second"], []));
+
+        string report = result.Report();
+        Assert.Contains("no such PR #4448 in owner/first, owner/second", report, StringComparison.Ordinal);
+        Assert.DoesNotContain("could not read PR #4448 from GitHub", report, StringComparison.Ordinal);
+
+        using JsonDocument doc = JsonDocument.Parse(result.Json());
+        JsonElement claim = doc.RootElement.GetProperty("claims").EnumerateArray().First();
+        Assert.Contains(
+            "no such PR #4448 in owner/first, owner/second",
+            claim.GetProperty("verdict").GetProperty("reason").GetString()!,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Locate_ALocalClaimVerdictSaysAmbiguousWhenTheNumberCollides()
+    {
+        // #178 round 1 / item 3: with a claim and an ambiguous collision, the claim's verdict says
+        // ambiguous — matching the AMBIGUOUS header — rather than a bare "could not read from GitHub".
+        PrLocationResult result = await LocateAsync(4623, Collection(
+            [Pane("fernie", "%1", "cp:1", agentState: "pr=4623 head=abc1234 reviews=2/2 rec=merge", windowName: "pr4623")],
+            ["fernie"]),
+            new PrFetch(PrFetchStatus.Ambiguous, null).WithRepos(["owner/first", "owner/second"], ["owner/first", "owner/second"]));
+
+        Assert.Equal(PrCommand.PrDisposition.Ambiguous, result.Located.Disposition);
+        string report = result.Report();
+        Assert.Contains("ambiguous", report, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("could not read PR #4623 from GitHub", report, StringComparison.Ordinal);
+
+        using JsonDocument doc = JsonDocument.Parse(result.Json());
+        JsonElement claim = doc.RootElement.GetProperty("claims").EnumerateArray().First();
+        Assert.Contains(
+            "ambiguous",
+            claim.GetProperty("verdict").GetProperty("reason").GetString()!,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Locate_AcompleteViewWithNeitherClaimNorPrLeadsWithNotFound()
     {
         // A complete view that turned up no claiming window, and GitHub affirmatively 404s: NOTFOUND, exit

@@ -273,9 +273,13 @@ searched repo is found (and the row names that repo); a number that exists in **
 non-success `AMBIGUOUS`/ambiguous rather than awarded to an arbitrary repo (the remedy is a single
 `--repo`); a number in **none**, every searched repo answering 404, is an affirmative "no such PR in
 &lt;repos&gt;" — distinct from "could not be read," which stays reserved for a repo that genuinely could
-not be reached. Each searched repo keeps its own ETag cache and rate-limit budget; the report sums them
-and names the repos it searched, so a cross-repo miss is diagnosed as "widen the scope," not "wait out an
-outage." (#178.)
+not be reached. A single hit is only reported as *found* when every other searched repo affirmatively
+404s: a repo that could not be read might hold the same number, so one hit beside an unread repo is
+reported unavailable, not a false unique. All repos share one `gh` credential and therefore **one** REST
+rate-limit budget — each keeps its own repo-qualified ETag cache, but the moment any read hits exhaustion
+the fleet stops searching the rest (those calls are doomed) and treats the unsearched scope as unavailable
+unless a collision is already proven. The report names the repos it searched, so a cross-repo miss is
+diagnosed as "widen the scope," not "wait out an outage." (#178.)
 
 **Aliases that cannot reach a process.** A `--host` value becomes an `ssh` argument, so beyond an
 option-shaped or whitespace alias the one validation rule also rejects any value carrying a control
