@@ -66,32 +66,116 @@ public class GhAuthenticatedRunnerTests
     }
 
     [Fact]
-    public async Task RunProcessAsync_CancellationKillsTheChildRatherThanAbandoningIt()
+    public async Task RunProcessAsync_CancellationDoesNotCompleteUntilTheWholeTreeIsDead()
     {
         Assert.SkipWhen(OperatingSystem.IsWindows(), "The gh runner path starts a POSIX child here; there is nothing to start on Windows.");
 
-        // A child that is merely abandoned keeps running: it would finish its sleep and create the marker.
-        // A child whose tree is killed never gets there. The marker is written under the test's own output
-        // directory, and the observation window is longer than the child's sleep, so its continued absence
-        // can only mean the process was terminated — not that we simply stopped waiting on it.
-        string marker = Path.Combine(AppContext.BaseDirectory, $"gh-runner-kill-{Guid.NewGuid():N}.marker");
-        Assert.False(File.Exists(marker));
+        // The child forks a descendant, both record their pids, and both sleep indefinitely. The runner must
+        // not complete the cancellation until the entire tree is down: an implementation that merely stopped
+        // waiting, or that signalled a kill without confirming it, would hand control back with a
+        // token-bearing process still alive. Synchronization is deterministic — the test waits for the two
+        // pid files rather than for a fixed delay — and the assertion is on the processes themselves.
+        string dir = Path.Combine(AppContext.BaseDirectory, $"gh-runner-tree-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        try
+        {
+            // $0 is the directory. The descendant writes its own pid and idles; the child writes its pid,
+            // waits for the descendant's pid to exist, signals ready, then idles. SIGKILL from a tree kill
+            // cannot be trapped, so nothing here can survive it.
+            string script =
+                "d=\"$0\"; " +
+                "sh -c 'echo $$ > \"$0/desc.pid\"; while : ; do sleep 0.1; done' \"$d\" & " +
+                "echo $$ > \"$d/child.pid\"; " +
+                "while [ ! -s \"$d/desc.pid\" ]; do sleep 0.01; done; " +
+                "echo ready > \"$d/ready\"; " +
+                "wait";
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
-        var elapsed = Stopwatch.StartNew();
+            using var cts = new CancellationTokenSource();
+            Task<GhResult> run = GhAuthenticatedRunner.RunProcessAsync("/bin/sh", ["-c", script, dir], null, cts.Token);
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => GhAuthenticatedRunner.RunProcessAsync(
-                "/bin/sh",
-                ["-c", "sleep 2; : > \"$0\"", marker],
-                null,
-                cts.Token));
+            int childPid = await WaitForPidAsync(Path.Combine(dir, "child.pid"), TestContext.Current.CancellationToken);
+            int descPid = await WaitForPidAsync(Path.Combine(dir, "desc.pid"), TestContext.Current.CancellationToken);
+            await WaitForFileAsync(Path.Combine(dir, "ready"), TestContext.Current.CancellationToken);
 
-        Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(20), $"cancellation took {elapsed.Elapsed}");
+            // Both processes are up and the runner is still blocked on the tree — it has not returned control.
+            Assert.True(IsAlive(childPid), "child was not running before cancellation");
+            Assert.True(IsAlive(descPid), "descendant was not running before cancellation");
+            Assert.False(run.IsCompleted, "runner completed while the tree was still alive");
 
-        // Wait well past the child's own sleep. An abandoned child would have created the marker by now.
-        await Task.Delay(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
-        Assert.False(File.Exists(marker), "the cancelled gh child was abandoned rather than killed");
+            await cts.CancelAsync();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+
+            // The runner has returned only now. The direct child is awaited to exit before it returns, so it
+            // is dead the instant the await unblocks; the descendant is SIGKILL'd as part of the tree, and a
+            // bounded wait-for-death (not a fixed sleep) absorbs only the kernel's reap latency. Neither is
+            // left running behind a completed runner.
+            Assert.False(IsAlive(childPid), "child was still alive after the runner completed cancellation");
+            await AssertDiesAsync(descPid, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch (IOException) { }
+        }
+    }
+
+    private static async Task<int> WaitForPidAsync(string path, CancellationToken ct)
+    {
+        await WaitForFileAsync(path, ct);
+        for (int i = 0; i < 500; i++)
+        {
+            string text = File.ReadAllText(path).Trim();
+            if (text.Length > 0 && int.TryParse(text, out int pid))
+            {
+                return pid;
+            }
+
+            await Task.Delay(10, ct);
+        }
+
+        throw new InvalidOperationException($"pid never appeared in {path}");
+    }
+
+    private static async Task WaitForFileAsync(string path, CancellationToken ct)
+    {
+        for (int i = 0; i < 500; i++)
+        {
+            if (File.Exists(path) && new FileInfo(path).Length > 0)
+            {
+                return;
+            }
+
+            await Task.Delay(10, ct);
+        }
+
+        throw new InvalidOperationException($"file never appeared: {path}");
+    }
+
+    private static bool IsAlive(int pid)
+    {
+        try
+        {
+            using Process process = Process.GetProcessById(pid);
+            return !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    private static async Task AssertDiesAsync(int pid, CancellationToken ct)
+    {
+        for (int i = 0; i < 500; i++)
+        {
+            if (!IsAlive(pid))
+            {
+                return;
+            }
+
+            await Task.Delay(10, ct);
+        }
+
+        Assert.Fail($"process {pid} was still alive after the runner completed cancellation");
     }
 
     [Fact]
