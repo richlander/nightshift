@@ -72,7 +72,6 @@ public sealed class HistoryMigrationTests
         // The same pre-version shape, established but emptied by retirement — initialized true, no members.
         yield return ["{\"panes\":{},\"hosts\":{},\"attempted\":[],\"initialized\":true}"];
     }
-
     [Theory]
     [MemberData(nameof(MigratableLegacyHistories))]
     public async Task OpenAsync_MigratesAKnownLegacyShapeRatherThanBricking(string content)
@@ -374,4 +373,3 @@ public sealed class HistoryMigrationTests
         }
     }
 }
-
