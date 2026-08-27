@@ -37,9 +37,8 @@ internal sealed record TmuxPane
     /// <summary>
     /// The tmux pane id (<c>%12</c>): the identity used to read this window's active pane and to key its
     /// body digest, silence and claim history. It is unique within a server and cannot be confused by a
-    /// delimiter inside a session or window name. It is <em>not</em> the rename target — pane ids are
-    /// recycled by break/join, so a mutation is aimed at <see cref="WindowId"/> instead — and it is not
-    /// stable across a server restart, which is what <see cref="Epoch"/> guards.
+    /// delimiter inside a session or window name. It is not stable across a server restart, which is what
+    /// <see cref="Epoch"/> guards.
     /// </summary>
     public required string PaneId { get; init; }
 
@@ -65,19 +64,11 @@ internal sealed record TmuxPane
     /// <summary>
     /// The tmux window name, verbatim — leading and trailing spaces included. It is neither trimmed here
     /// nor stripped of its transport newline by a naive command substitution (the scanner uses a sentinel
-    /// so the exact bytes survive), because the rename path must reproduce it byte-for-byte or it would
-    /// churn a name that only looks unchanged. Agent-published <c>@agent_state</c>, by contrast, is
-    /// trimmed, since that is a value to interpret rather than a name to preserve.
+    /// so the exact bytes survive), because the name is a PR identifier this tool parses and reports, and a
+    /// value that only looks unchanged would misidentify the window. Agent-published <c>@agent_state</c>,
+    /// by contrast, is trimmed, since that is a value to interpret rather than a name to preserve.
     /// </summary>
     public required string WindowName { get; init; }
-
-    /// <summary>
-    /// The tmux window id (<c>@8</c>): stable for the life of the window across pane splits, joins and
-    /// reindexing, unlike the pane id, which is the active pane and can change when panes come and go.
-    /// This is the rename target, so the mutation lands on the window the sweep saw even if its active
-    /// pane has since changed.
-    /// </summary>
-    public string WindowId { get; init; } = string.Empty;
 
     /// <summary>Whether a client is attached to this window's session right now.</summary>
     public required bool SessionAttached { get; init; }
@@ -85,42 +76,8 @@ internal sealed record TmuxPane
     /// <summary>When the window last produced output — an observed stop time, not a claimed one.</summary>
     public DateTimeOffset? LastActivity { get; init; }
 
-    /// <summary>
-    /// The window's <c>#{window_activity}</c> exactly as tmux reports it — a non-negative integer second,
-    /// empty (never null) only when a manifest never carried one. tmux advances it on any pane output, so
-    /// it is the finest durable signal the tool has for "has this window done anything since the sweep".
-    /// The rename guard compares it byte-for-byte against the live value so a mutation whose truthfulness
-    /// depends on the pane still being quiescent — every <c>-ready</c>/<c>-ask</c>/<c>-stale</c> suffix does,
-    /// since each is read from a pane that had stopped — aborts the instant the window produced output,
-    /// rather than renaming a window that has since resumed. It is the raw stamp, distinct from the parsed
-    /// <see cref="LastActivity"/>, so the comparison is exact.
-    /// </summary>
-    public string ActivityStamp { get; init; } = string.Empty;
-
-    /// <summary>
-    /// The target's own second at the moment this sweep began reading window activities — its <c>date
-    /// +%s</c>, captured once before the per-window loop and shared by every pane in the sweep. It is the
-    /// same system clock <see cref="ActivityStamp"/> is stamped from (both on the target), so comparing the
-    /// two never depends on the local and remote clocks agreeing. The rename applies a suffix only when a
-    /// pane's <see cref="ActivityStamp"/> second <em>strictly predates</em> this one: then the pane has
-    /// been quiescent for a whole second, and any later output must advance <c>window_activity</c> to a
-    /// different value the mutation guard will catch — closing the same-second blind spot the bare stamp
-    /// leaves. Empty (never null) when a sweep did not carry one; that reads as not-strictly-older, so the
-    /// rename fails closed. Not part of a pane's identity — the mutation guard never embeds it.
-    /// </summary>
-    public string ObservationSecond { get; init; } = string.Empty;
-
     /// <summary>The window's <c>@agent_state</c> option: the agent's own account of where it is.</summary>
     public string? AgentStateOption { get; init; }
-
-    /// <summary>
-    /// The <c>@agent_state</c> option exactly as tmux reports it — untrimmed, and empty (never null) when
-    /// the option is unset, so it can be compared byte-for-byte against the live value at rename time. The
-    /// rename guard aborts a mutation whose window has since changed its published state, and the change it
-    /// must catch is any change, so the comparison is against the raw bytes, not the trimmed
-    /// <see cref="AgentStateOption"/> the verdict path interprets.
-    /// </summary>
-    public string AgentStateRaw { get; init; } = string.Empty;
 
     public PaneActivity Activity { get; init; }
 
@@ -210,15 +167,6 @@ internal sealed partial class TmuxScanner
     /// back to word splitting alone, with no pathname expansion behind it. A window that vanishes between
     /// the listing and its fields is dropped from both, so it is never named in the manifest and never
     /// expected in a capture frame.
-    ///
-    /// <strong>The observation second (<c>NONCE:obs</c>) is captured on the target, once, before any
-    /// window's <c>#{window_activity}</c> is read.</strong> It is the target's own <c>date +%s</c> — the
-    /// same system clock <c>window_activity</c> is stamped from, so the two are comparable with no
-    /// dependence on the local clock agreeing with the remote one. Because it is read before the per-window
-    /// activity loop, it is a lower bound on the second in which each activity was observed, which is what
-    /// lets the rename decide a window has been quiescent for a <em>whole</em> second: a scanned activity
-    /// strictly less than this second cannot be advanced to its own value by any later output, closing the
-    /// same-second window the bare activity stamp leaves open.
     /// </remarks>
     private const string ScriptTemplate = """
         set -f
@@ -240,8 +188,6 @@ internal sealed partial class TmuxScanner
         fi
         w=$o
         printf 'NONCE:epoch %s\n' "$q"
-        ob=$(date +%s 2>/dev/null)
-        printf 'NONCE:obs %s\n' "$ob"
         r=''
         p=''
         for i in $w; do
@@ -253,8 +199,7 @@ internal sealed partial class TmuxScanner
           s=${s%x}; s=${s%"$nl"}
           n=$(tmux display-message -p -t "$i" '#{window_name}' 2>/dev/null && printf x) || continue
           n=${n%x}; n=${n%"$nl"}
-          d=$(tmux display-message -p -t "$i" '#{window_id}' 2>/dev/null) || continue
-          r="$r NONCE:w|$(e "$i")|$(e "$t")|$(e "$a")|$(e "$y")|$(e "$s")|$(e "$n")|$(e "$d")"
+          r="$r NONCE:w|$(e "$i")|$(e "$t")|$(e "$a")|$(e "$y")|$(e "$s")|$(e "$n")"
           p="$p $i"
         done
         printf 'NONCE:manifest\n'
@@ -322,7 +267,6 @@ internal sealed partial class TmuxScanner
         string manifestOpen = nonce + ":manifest";
         string manifestClose = nonce + ":end";
         string epochPrefix = nonce + ":epoch ";
-        string obsPrefix = nonce + ":obs ";
         string rowMarker = nonce + ":w|";
         string paneHeader = nonce + ":pane ";
         string paneRead = nonce + ":read ";
@@ -339,12 +283,6 @@ internal sealed partial class TmuxScanner
         string endEpoch = string.Empty;
         int endEpochCount = 0;
         bool afterEndEpoch = false;
-
-        // The target's observation second, read once before any window_activity. Counted so a doubled or
-        // absent one is treated as no observation at all (the rename then fails closed for every pane),
-        // exactly as a malformed one is.
-        string observation = string.Empty;
-        int obsCount = 0;
 
         // The open frame, and the capture it has produced so far. A frame is HEADER, one encoded body
         // line, then the matching close — so `body` distinguishes "waiting for the capture" from
@@ -366,14 +304,6 @@ internal sealed partial class TmuxScanner
                     {
                         startEpoch = line[epochPrefix.Length..].Trim();
                         startEpochCount++;
-                    }
-                    else if (line.StartsWith(obsPrefix, StringComparison.Ordinal))
-                    {
-                        // The observation second, nonce-framed so a pane cannot forge it. Kept only when it
-                        // appears exactly once and is a canonical stamp; anything else leaves it empty, and
-                        // an empty observation makes every pane fail the strict-older rename test.
-                        observation = line[obsPrefix.Length..].Trim();
-                        obsCount++;
                     }
 
                     manifestOpened = line == manifestOpen;
@@ -534,14 +464,7 @@ internal sealed partial class TmuxScanner
             }
         }
 
-        // The observation second is only trusted when it appeared exactly once and is a canonical stamp;
-        // otherwise it is dropped to empty, which reads as "no whole-second quiescence proof" and makes the
-        // rename fail closed for every pane in this sweep. It is deliberately NOT a hard framing failure:
-        // it governs only whether a name may be corrected, never whether the fleet was seen, so a sweep
-        // whose clock read was odd still reports its windows — it just declines to rename them.
-        string trustedObservation = obsCount == 1 && IsActivityStamp(observation) ? observation : string.Empty;
-
-        return [.. order.Select(id => Finish(windows[id], captures[id]) with { ObservationSecond = trustedObservation })];
+        return [.. order.Select(id => Finish(windows[id], captures[id]))];
     }
 
     private static bool Closes(string line, string marker, string paneId)
@@ -616,12 +539,12 @@ internal sealed partial class TmuxScanner
         }
 
         string[] parts = line[rowMarker.Length..].Split('|');
-        if (parts.Length != 7)
+        if (parts.Length != 6)
         {
-            throw Unavailable(host, $"tmux collection returned a manifest row of {parts.Length} field(s), not 7");
+            throw Unavailable(host, $"tmux collection returned a manifest row of {parts.Length} field(s), not 6");
         }
 
-        var fields = new string[7];
+        var fields = new string[6];
         for (int i = 0; i < parts.Length; i++)
         {
             if (!TryDecode(parts[i], out fields[i]))
@@ -635,11 +558,6 @@ internal sealed partial class TmuxScanner
             throw Unavailable(host, $"tmux collection returned a manifest row naming '{fields[0]}', which is not a pane id");
         }
 
-        if (!IsWindowId(fields[6]))
-        {
-            throw Unavailable(host, $"tmux collection returned a manifest row naming '{fields[6]}', which is not a window id");
-        }
-
         return new TmuxPane
         {
             PaneId = fields[0],
@@ -647,11 +565,8 @@ internal sealed partial class TmuxScanner
             Host = host,
             SessionAttached = fields[2].Trim() != "0" && fields[2].Trim().Length > 0,
             LastActivity = ParseActivity(fields[3], host),
-            ActivityStamp = fields[3],
             AgentStateOption = fields[4].Trim() is { Length: > 0 } option ? option : null,
-            AgentStateRaw = fields[4],
             WindowName = fields[5],
-            WindowId = fields[6],
         };
     }
 
@@ -677,9 +592,6 @@ internal sealed partial class TmuxScanner
     /// rule its ids were written under.</summary>
     internal static bool IsPaneId(string value) => IsTmuxId(value, '%');
 
-    /// <summary>A tmux window id: <c>@</c> then a canonical non-negative decimal.</summary>
-    private static bool IsWindowId(string value) => IsTmuxId(value, '@');
-
     private static bool IsTmuxId(string value, char prefix)
         => value.Length >= 2 && value[0] == prefix && IsCanonicalNonNegative(value.AsSpan(1));
 
@@ -699,34 +611,6 @@ internal sealed partial class TmuxScanner
 
         return IsCanonicalPositive(value.AsSpan(0, colon)) && IsCanonicalPositive(value.AsSpan(colon + 1));
     }
-
-    /// <summary>
-    /// A tmux <c>#{window_activity}</c> stamp: a canonical non-negative decimal (a lone <c>0</c> for a
-    /// window that has produced nothing yet, otherwise a positive unix second with no leading zero) — the
-    /// exact shape the collection script prints. Anything else is not a stamp this scheme captured, so the
-    /// rename guard that embeds it fails closed rather than putting an unvalidated string into a tmux
-    /// format.
-    /// </summary>
-    internal static bool IsActivityStamp(string value) => IsCanonicalNonNegative(value.AsSpan());
-
-    /// <summary>
-    /// Whether a pane's scanned activity second <em>strictly predates</em> the sweep's observation second —
-    /// the fail-closed proof that the window has been quiescent for a whole second, which is what makes the
-    /// mutation guard on <c>window_activity</c> sufficient to name it safely. When it holds, the scanned
-    /// stamp is in a second already past by the time the sweep observed it, so any output from the sweep
-    /// onward must advance <c>window_activity</c> to a strictly greater value the guard will reject; the
-    /// same-second case (last activity in the observation second) cannot make that guarantee and is refused
-    /// until a later sweep. Both values are the target's own clock (window_activity and <c>date +%s</c>),
-    /// so the comparison never depends on the local clock. Returns false — declining the rename — for a
-    /// missing or malformed stamp on either side, and for an activity at or after the observation second
-    /// (a clock that stepped, or a pane that has just moved): every non-strictly-older case fails closed.
-    /// </summary>
-    internal static bool ActivityStrictlyPredatesObservation(TmuxPane pane)
-        => IsActivityStamp(pane.ActivityStamp)
-            && IsActivityStamp(pane.ObservationSecond)
-            && long.TryParse(pane.ActivityStamp, NumberStyles.None, CultureInfo.InvariantCulture, out long activity)
-            && long.TryParse(pane.ObservationSecond, NumberStyles.None, CultureInfo.InvariantCulture, out long observed)
-            && activity < observed;
 
     /// <summary>
     /// A canonical non-negative decimal: one or more ASCII digits with no leading zero, so a lone
