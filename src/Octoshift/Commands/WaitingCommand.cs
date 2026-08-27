@@ -101,7 +101,7 @@ internal static class WaitingCommand
         var facts = new GhPrFactsSource(
             repo,
             new FileConditionalCache(),
-            (args, token) => GhAuthenticatedRunner.RunGhAsync(args, null, token));
+            GhRunnerFactory.Create());
 
         try
         {

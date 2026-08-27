@@ -43,7 +43,7 @@ internal static class PrCommand
             }
         }
 
-        var facts = new GhPrFactsSource(repo, new FileConditionalCache(), (args, token) => GhAuthenticatedRunner.RunGhAsync(args, null, token));
+        var facts = new GhPrFactsSource(repo, new FileConditionalCache(), GhRunnerFactory.Create());
 
         try
         {
