@@ -9,6 +9,11 @@ namespace Octoshift.Waiting;
 /// a quiet fleet. Bare <c>--host --json</c> is the same failure from the other end — the flag is consumed
 /// as the hostname and the sweep silently loses its output mode. Both are usage errors, and the check
 /// belongs here so the parser and the command enforce one rule rather than two.
+///
+/// The same one rule also rejects a control character (U+0000 first): an alias is destined for
+/// <c>ProcessStartInfo.ArgumentList</c>, where a NUL cannot survive the OS argument boundary — it
+/// truncates the argument on Unix and throws or corrupts on Windows — so a control-bearing alias must be
+/// refused before it is ever handed to ssh, not left to fail outside the unavailable contract mid-sweep.
 /// </remarks>
 internal static class HostTarget
 {
@@ -35,6 +40,19 @@ internal static class HostTarget
         if (host.Any(char.IsWhiteSpace))
         {
             return $"--host requires a hostname or ssh-config alias; '{DisplayText.Safe(host)}' contains whitespace.";
+        }
+
+        // A control character — U+0000 above all — cannot be carried through an OS process argument
+        // intact, so an alias containing one must never reach ssh. On Unix a NUL truncates the argument at
+        // the null terminator (an alias `a\0b` silently becomes `a`, so a sweep contacts the wrong host);
+        // on Windows the same NUL, and other C0/C1 controls, throw or corrupt inside process construction —
+        // in every case outside the HistoryUnavailable/PARTIAL contract the caller relies on. None is a
+        // legitimate hostname or ssh-config alias, so reject them here, the single gate the CLI, the strict
+        // persisted-target load and the pre-scan defence all share. Whitespace controls (tab, newline) are
+        // already handled above; this catches NUL, DEL and the remaining non-whitespace control codes.
+        if (host.Any(char.IsControl))
+        {
+            return $"--host requires a hostname or ssh-config alias; '{DisplayText.Safe(host)}' contains a control character that cannot be passed to a process.";
         }
 
         return null;

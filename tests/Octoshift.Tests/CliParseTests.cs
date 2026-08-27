@@ -40,6 +40,9 @@ public class CliParseTests
     [InlineData("--host=")]
     [InlineData("--host= ")]
     [InlineData("--host=two words")]
+    [InlineData("--host=a\u0000b")]    // an embedded NUL truncates the ssh argument on Unix, throws on Windows
+    [InlineData("--host=a\u007fb")]    // DEL, and every other control code, cannot survive a process argument
+    [InlineData("--host=\u0000")]      // the one-character NUL alias the RAA target key decodes to
     public void CreateRootCommand_WaitingRejectsAHostSshWouldNotReadAsAHost(string argument)
     {
         var result = Cli.CreateRootCommand().Parse(["waiting", argument, "--repo", "owner/repo"]);
