@@ -73,9 +73,10 @@ first to register owns the PR and the rest are *followed* — reported in the ro
 as a follower, and never spoken to. Driving two agents on one PR is worse than
 either agent alone; forgetting the second is equally bad. This standing lives in
 the report, not the window name: which window follows is decided across the whole
-fleet, over state a per-window rename guard cannot revalidate at the moment it
-writes a name (a concurrent retire or a new rival can flip it), so a name — read
-at a glance and believed — is never made to assert it.
+fleet, over state that can change from under any single window (a concurrent
+retire or a new rival can flip it). The tool never writes window names (§4), so a
+name — read at a glance and believed — is never made to assert a standing that may
+already be stale.
 
 Ownership is only claimed as a fact when the tool watched both windows register.
 Rivals rarely appear in the same moment — one agent starts, another joins later —
@@ -116,36 +117,30 @@ The suffix convention is sound and its upkeep is not: an agent sets `-blocked` w
 to remember to clear it later. Measured on one fleet, six windows carried `-blocked` and **three had
 no prompt open**.
 
+The tool does not try to correct them. It once did — `octoshift waiting --rename` rewrote each window's
+suffix to match what a sweep observed — but a persistent window name cannot be made to stay true. A
+suffix like `-ready`, `-merged`, `-conflict` or `-stale` is derived from GitHub state, from which pane
+is active, and from the pane's wall-clock activity; a name outlives the instant it was written; and a
+merge, a push, a mergeability recompute, an active-pane switch, or a clock that steps backward can each
+falsify the suffix without moving anything a per-window tmux guard can revalidate at mutation time. A
+name is read at a glance and believed, so one that has silently gone false is worse than no name at
+all — which is exactly the `-blocked` failure above. Rather than layer another incomplete race guard on
+a value that cannot be atomically validated, the tool stopped writing window names entirely (nightshift
+issues #170–#172).
+
+The truth lives in the report instead, where every verdict is re-derived each sweep and cannot persist
+past the fact it asserts:
+
 ```
-$ octoshift waiting --rename
-RENAMED fernie cp:20 pr4553-blocked -> pr4553-merged
-RENAMED merritt cp:9 pr4635-blocked -> pr4635
+$ octoshift waiting
+fernie cp:20 pr4553-blocked   MERGED   #4553 is merged — the window still says -blocked
+merritt cp:9 pr4635-blocked   READY    reviews 2/2, mergeable — no longer blocked
 ```
 
-Renaming a window is not talking to an agent — it edits tmux metadata in your own view, cannot reach
-an agent's input, and is idempotent, so a fleet already correct costs nothing. The tool owns the
-suffix and rewrites it every sweep; the agent owns the `pr####` base and sets it once. A low-confidence
-verdict is never published as a name: a row can say "probably", a name is read at a glance and
-believed.
-
-The rename plan is computed from a sweep that is already stale by the time it runs — the history lock
-is released and GitHub is read first — so each rename is **guarded, atomically in one tmux client**, on
-the window's live name, its live `@agent_state`, the live server generation, **and** its live
-`window_activity`, all still equalling what the sweep saw. The activity stamp is what makes an
-activity-derived suffix defensible: every suffix is read from a pane that had *stopped*, and tmux
-advances `window_activity` on any output, so an idle pane that starts working during the GitHub read no
-longer matches and the rename aborts rather than naming a resumed window `-ready`.
-
-One gap the stamp alone leaves is the *same second*: if a pane went quiet and the sweep read it in the
-very second of its last output, a resume inside that second would stamp `window_activity` to the same
-value the guard compares against — undetectable. So the sweep also reads the **target's own second**
-(`date +%s`, the same clock `window_activity` is stamped from, so no local/remote clock agreement is
-assumed) once, before it reads any window's activity, and a suffix is applied only when a pane's activity
-second **strictly predates** it — proof the pane has been quiet for a whole second. A pane too recently
-active is *deferred* (`RENAME-DEFERRED`), not failed: it is simply named on a later sweep, once its
-activity is in a past second. Malformed or clock-anomalous readings defer too — fail closed. What a
-per-window guard *cannot* revalidate — fleet-global ownership, decided across other windows — is
-deliberately not a suffix at all: the follower/owner standing stays in the row, never in the name.
+The tool still *reads* a window name — it is how a window identifies its PR when `@agent_state` is
+absent (§3) — but the name is the agent's to set and the tool's only to report against. A stale suffix
+is contradicted in the row, never rewritten in the status bar, where a correction could be true when
+written and false a second later with nothing to catch it.
 
 ## 5. An agent says it is ready and it is not
 
@@ -299,8 +294,10 @@ at `4967/5000`.
 
 - **It does not act on an agent.** Every run prints `NOT ACTED` with a count of
   rows that met the bar, including when that count is zero — otherwise "did
-  nothing" and "saw nothing" look the same. (`--rename` writes window names,
-  which is metadata in your own view, never input to an agent.)
+  nothing" and "saw nothing" look the same.
+- **It does not write your terminal.** It reads tmux metadata; it never renames a
+  window or sets an option, so nothing it observes can be silently falsified by a
+  name it wrote and then failed to keep true.
 - **It does not guess.** Missing evidence produces a low-confidence row saying
   what was missing, rather than a cheerful default.
 - **It does not put credentials on your agent hosts.** Collection is a `tmux`
@@ -321,9 +318,6 @@ octoshift waiting --host fernie --host merritt
 
 # include the quiet and healthy windows too
 octoshift waiting --all
-
-# correct stale window-name suffixes from what the tool observes
-octoshift waiting --rename
 
 # locate one PR and report what is happening to it
 octoshift pr 4537

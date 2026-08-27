@@ -63,92 +63,16 @@ public class WaitingScanTests
     /// <summary>Encodes one field the way the script's <c>printf | od | tr</c> pipeline does.</summary>
     private static string Hex(string text) => Convert.ToHexStringLower(System.Text.Encoding.UTF8.GetBytes(text));
 
-    /// <summary>One manifest row, from the readable pipe form to the seven encoded fields on the wire.</summary>
+    /// <summary>One manifest row, from the readable pipe form to the six encoded fields on the wire.</summary>
     private static string Row(string fields, string nonce = Nonce)
     {
         string[] parts = fields.Split('|', 6);
-        // Synthesise a window id from the pane id, so a readable six-field fixture yields a valid row.
-        string windowId = "@" + (parts[0].StartsWith('%') ? parts[0][1..] : parts[0]);
-        return $"{nonce}:w|" + string.Join('|', parts.Append(windowId).Select(Hex));
+        return $"{nonce}:w|" + string.Join('|', parts.Select(Hex));
     }
 
     /// <summary>A row built field by field, for fixtures whose values contain the separator itself.</summary>
     private static string EncodedRow(params string[] fields)
         => $"{Nonce}:w|" + string.Join('|', fields.Select(Hex));
-
-    /// <summary>A collection stream with the observation-second line the real script emits, inserted after
-    /// the opening epoch (before the manifest, where the parser reads it). A null value omits the line
-    /// entirely, modelling a sweep that carried no observation second at all.</summary>
-    private static string StreamWithObs(string? observation, params string[] rows)
-    {
-        string baseStream = Stream(rows);
-        const string EpochLine = Nonce + ":epoch 4242:1755900000\n";
-        return observation is null ? baseStream : baseStream.Insert(EpochLine.Length, $"{Nonce}:obs {observation}\n");
-    }
-
-    [Fact]
-    public void ParseCollection_AttachesTheTargetObservationSecondToEveryPane()
-    {
-        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
-            StreamWithObs("1755900005", "%1|night:3|1|1755900000||pr4595", "%2|night:4|0|1755800000||i158"),
-            host: null,
-            Nonce);
-
-        Assert.All(panes, p => Assert.Equal("1755900005", p.ObservationSecond));
-    }
-
-    [Theory]
-    [InlineData(null)]              // no observation line at all (an older-format or clock-failed sweep)
-    [InlineData("")]               // present but empty (date +%s failed)
-    [InlineData("17559x0000")]     // non-canonical
-    [InlineData("017559")]         // leading zero
-    public void ParseCollection_DropsAMalformedOrAbsentObservationSecondToEmpty(string? observation)
-    {
-        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
-            StreamWithObs(observation, "%1|night:3|1|1755900000||pr4595"),
-            host: null,
-            Nonce);
-
-        // An untrusted observation second reads as empty, which the rename treats as "no whole-second proof"
-        // and fails closed — the pane is never renamed on a clock read it could not validate.
-        Assert.Equal(string.Empty, panes[0].ObservationSecond);
-        Assert.False(TmuxScanner.ActivityStrictlyPredatesObservation(panes[0]));
-    }
-
-    [Fact]
-    public void ParseCollection_DropsADoubledObservationSecondToEmpty()
-    {
-        // Two observation lines are a shape the script never produces; rather than pick one, the whole
-        // observation is dropped and the rename fails closed for every pane.
-        string doubled = StreamWithObs("1755900005", "%1|night:3|1|1755900000||pr4595")
-            .Replace($"{Nonce}:obs 1755900005\n", $"{Nonce}:obs 1755900005\n{Nonce}:obs 1755900006\n", StringComparison.Ordinal);
-
-        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(doubled, host: null, Nonce);
-
-        Assert.Equal(string.Empty, panes[0].ObservationSecond);
-    }
-
-    [Theory]
-    [InlineData("100", "101", true)]   // strictly older by a second — eligible
-    [InlineData("100", "100", false)]  // same second — the blind spot, refused
-    [InlineData("101", "100", false)]  // activity AFTER observation — a clock step, refused
-    [InlineData("100", "", false)]     // no observation second — refused
-    [InlineData("", "101", false)]     // no activity stamp — refused
-    [InlineData("100", "01", false)]   // non-canonical observation — refused
-    public void ActivityStrictlyPredatesObservation_IsTrueOnlyForAStrictlyOlderCanonicalPair(string activity, string observation, bool expected)
-    {
-        var pane = new TmuxPane
-        {
-            PaneId = "%1",
-            Target = "s:1",
-            WindowName = "pr4448",
-            SessionAttached = false,
-            ActivityStamp = activity,
-            ObservationSecond = observation,
-        };
-
-        Assert.Equal(expected, TmuxScanner.ActivityStrictlyPredatesObservation(pane));
-    }
 
     [Fact]
     public void ParseCollection_ReadsTargetAttachmentAndActivity()
@@ -169,22 +93,6 @@ public class WaitingScanTests
         Assert.Equal("pr=4595 head=abc1234 reviews=2/2 rec=merge", windows[0].AgentStateOption);
         Assert.Null(windows[1].AgentStateOption);
         Assert.False(windows[1].SessionAttached);
-    }
-
-    [Fact]
-    public void ParseCollection_ReadsAndValidatesTheWindowId()
-    {
-        // Blocker 4: the window id is the stable rename target, so it is scanned and validated like the
-        // pane id. A well-formed `@8` is kept verbatim.
-        IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseCollection(
-            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:3", "1", "1755900000", "pr=4595 head=abc1234", "pr4595", "@8")}\n{Nonce}:end\n"
-                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n{Nonce}:epoch 4242:1755900000\n",
-            host: null,
-            Nonce);
-
-        TmuxPane window = Assert.Single(windows);
-        Assert.Equal("%1", window.PaneId);
-        Assert.Equal("@8", window.WindowId);
     }
 
     [Fact]
@@ -209,7 +117,7 @@ public class WaitingScanTests
         const string hostile = "pr=4595 head=abc1234\ndeadbeefcafe0123:manifest\n%9|fake:9|1|1|pr=9999|pr9999";
 
         IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
-            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", hostile, "pr4595", "@1")}\n{Nonce}:end\n"
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", hostile, "pr4595")}\n{Nonce}:end\n"
                 + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n{Nonce}:epoch 4242:1755900000\n",
             host: null,
             Nonce);
@@ -228,7 +136,7 @@ public class WaitingScanTests
         const string hostile = "pr4595\r\n%9|fake:9|1|1||forged\u0007and still the name";
 
         IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
-            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, hostile, "@1")}\n{Nonce}:end\n"
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, hostile)}\n{Nonce}:end\n"
                 + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n{Nonce}:epoch 4242:1755900000\n",
             host: null,
             Nonce);
@@ -263,7 +171,7 @@ public class WaitingScanTests
         // empty epoch straight past AdoptEpoch's continuity and restart checks, so a manifest that lists
         // any window and names no server generation is not this collection's and is unreadable.
         Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
-            $"{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595", "@1")}\n{Nonce}:end\n"
+            $"{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595")}\n{Nonce}:end\n"
                 + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
             host: null,
             Nonce));
@@ -278,7 +186,7 @@ public class WaitingScanTests
     public void ParseCollection_RejectsAMalformedEpoch(string epoch)
     {
         Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
-            $"{Nonce}:epoch {epoch}\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595", "@1")}\n{Nonce}:end\n"
+            $"{Nonce}:epoch {epoch}\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595")}\n{Nonce}:end\n"
                 + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
             host: null,
             Nonce));
@@ -291,7 +199,7 @@ public class WaitingScanTests
         // script writes, and trusting either copy is a guess — so a repeat is invalid even if it matches.
         Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
             $"{Nonce}:epoch 4242:1755900000\n{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n"
-                + $"{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595", "@1")}\n{Nonce}:end\n"
+                + $"{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595")}\n{Nonce}:end\n"
                 + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
             host: null,
             Nonce));
@@ -340,7 +248,7 @@ public class WaitingScanTests
         // may then mix two generations and preserve a witnessed history that no longer exists, so the
         // whole account is rejected rather than parsed.
         Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
-            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595", "@1")}\n{Nonce}:end\n"
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595")}\n{Nonce}:end\n"
                 + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n{Nonce}:epoch 9999:1755900001\n",
             host: null,
             Nonce));
@@ -352,7 +260,7 @@ public class WaitingScanTests
         // The closing bracket is what proves the server did not restart during the collection, so a
         // manifest with windows and only an opening epoch is not this collection's complete account.
         Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
-            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595", "@1")}\n{Nonce}:end\n"
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595")}\n{Nonce}:end\n"
                 + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
             host: null,
             Nonce));
@@ -379,34 +287,31 @@ public class WaitingScanTests
     }
 
     [Theory]
-    [InlineData("%01", "@1")]     // leading-zero pane id
-    [InlineData("%00", "@1")]     // zero with a leading zero
-    [InlineData("%1", "@01")]     // leading-zero window id
-    [InlineData("%1", "@00")]
-    public void ParseCollection_RejectsANonCanonicalId(string paneId, string windowId)
+    [InlineData("%01")]     // leading-zero pane id
+    [InlineData("%00")]     // zero with a leading zero
+    public void ParseCollection_RejectsANonCanonicalId(string paneId)
     {
-        // Blocker 4: tmux mints an id as a canonical non-negative decimal — a lone 0, otherwise no leading
-        // zero — so `%01`, `%00`, `@01` are ids it never prints and are rejected.
+        // tmux mints an id as a canonical non-negative decimal — a lone 0, otherwise no leading zero — so
+        // `%01`, `%00` are ids it never prints and are rejected.
         Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
-            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow(paneId, "night:1", "1", "1755900000", string.Empty, "pr4595", windowId)}\n{Nonce}:end\n"
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow(paneId, "night:1", "1", "1755900000", string.Empty, "pr4595")}\n{Nonce}:end\n"
                 + $"{Nonce}:pane {paneId}\n{Hex("> ")}\n{Nonce}:read {paneId}\n{Nonce}:epoch 4242:1755900000\n",
             host: null,
             Nonce));
     }
 
     [Fact]
-    public void ParseCollection_AcceptsZeroAsALoneIdForPaneAndWindow()
+    public void ParseCollection_AcceptsZeroAsALoneIdForPane()
     {
-        // A lone 0 IS canonical — `%0` and `@0` are the first ids tmux mints — so they are kept verbatim.
+        // A lone 0 IS canonical — `%0` is the first pane id tmux mints — so it is kept verbatim.
         IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseCollection(
-            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%0", "night:1", "1", "1755900000", string.Empty, "pr4595", "@0")}\n{Nonce}:end\n"
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%0", "night:1", "1", "1755900000", string.Empty, "pr4595")}\n{Nonce}:end\n"
                 + $"{Nonce}:pane %0\n{Hex("> ")}\n{Nonce}:read %0\n{Nonce}:epoch 4242:1755900000\n",
             host: null,
             Nonce);
 
         TmuxPane w = Assert.Single(windows);
         Assert.Equal("%0", w.PaneId);
-        Assert.Equal("@0", w.WindowId);
     }
 
     [Theory]
@@ -420,7 +325,7 @@ public class WaitingScanTests
         // leading zero — so an impossible pair like `0:0` or `01:02` is rejected even when it brackets the
         // collection on both sides.
         Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
-            $"{Nonce}:epoch {epoch}\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595", "@1")}\n{Nonce}:end\n"
+            $"{Nonce}:epoch {epoch}\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595")}\n{Nonce}:end\n"
                 + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n{Nonce}:epoch {epoch}\n",
             host: null,
             Nonce));
@@ -2322,19 +2227,6 @@ public class WaitingScanTests
     }
 
     [Fact]
-    public void WindowNaming_DoesNotPublishFleetGlobalOwnershipAsAName()
-    {
-        // Ownership (owner/follower) is decided across the whole fleet, over state that can change in the
-        // unguardable gap between the sweep and the rename — a concurrent retire or a new rival can flip it
-        // without the guarded window itself moving. So it is no longer written into a window name, which is
-        // read at a glance and believed: SuffixFor is a pure function of the verdict, and a follower whose
-        // PR is ready earns the same `-ready` its verdict warrants. The follower standing stays in the row,
-        // not the status bar.
-        var ready = new WaitingVerdict(WaitingState.Ready, RowOwner.Operator, "reviews 2/2", Assurance.High);
-        Assert.Equal("ready", WindowNaming.SuffixFor(ready));
-    }
-
-    [Fact]
     public async Task CollectAsync_OneBadHostDoesNotStopTheOthers()
     {
         // One host unreachable, another quiet: the sweep still returns, reporting the failure rather than
@@ -2372,33 +2264,6 @@ public class WaitingScanTests
         string after = TmuxScanner.DigestBody("● Round 3 complete.\n● Round 4 starting.\nfooter\nfooter\nfooter");
 
         Assert.NotEqual(before, after);
-    }
-
-    [Theory]
-    [InlineData("pr4448-blocked", "pr4448")]
-    [InlineData("pr4448-merged", "pr4448")]
-    [InlineData("pr4448", "pr4448")]
-    [InlineData("tune-performance-triage", "tune-performance-triage")]
-    public void WindowNaming_StripsOnlyItsOwnSuffixes(string name, string expected)
-        => Assert.Equal(expected, WindowNaming.Strip(name));
-
-    [Fact]
-    public void WindowNaming_ReplacesAStaleSuffixRatherThanAppending()
-    {
-        // Three of six `-blocked` windows on one fleet had no prompt open. The suffix was believed and
-        // wrong, which is worse than absent.
-        Assert.Equal("pr4448-merged", WindowNaming.Apply("pr4448-blocked", "merged"));
-        Assert.Equal("pr4448", WindowNaming.Apply("pr4448-blocked", null));
-    }
-
-    [Fact]
-    public void WindowNaming_NeverPublishesALowConfidenceVerdictAsAName()
-    {
-        // A row can say "probably"; a name is read at a glance and believed.
-        WaitingVerdict unsure = new(WaitingState.Ready, RowOwner.Operator, "reviews 2/2", Assurance.Low("contradicts itself"));
-
-        Assert.Null(WindowNaming.SuffixFor(unsure));
-        Assert.Equal("ready", WindowNaming.SuffixFor(new(WaitingState.Ready, RowOwner.Operator, "reviews 2/2", Assurance.High)));
     }
 
     [Fact]

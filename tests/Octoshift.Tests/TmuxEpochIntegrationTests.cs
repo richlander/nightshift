@@ -66,7 +66,8 @@ public sealed class TmuxEpochIntegrationTests : IDisposable
         Assert.Equal(epoch1, epoch2);
 
         // A genuine restart is a new server: a different start time (and pid), so the epoch changes and the
-        // rename epoch guard would correctly refuse to touch recycled ids.
+        // collection's opening/closing epoch bracket would correctly reject an account that spans two
+        // generations of recycled ids.
         RunTmux("kill-server");
         RunTmux("new-session", "-d", "-s", "afterrestart");
         string epoch3 = await ScanEpochAsync();

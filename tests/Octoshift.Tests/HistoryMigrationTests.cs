@@ -33,7 +33,6 @@ public sealed class HistoryMigrationTests
         => new()
         {
             PaneId = paneId,
-            WindowId = "@1",
             Target = "cp:1",
             Host = null,
             WindowName = pr is { } p ? $"pr{p}" : "shell",
