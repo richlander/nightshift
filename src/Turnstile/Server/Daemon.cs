@@ -16,7 +16,15 @@ using Turnstile.Storage;
 public sealed class Daemon
 {
     /// <summary>Builds and runs the daemon until the socket is closed or the process is signalled.</summary>
-    public static async Task<int> RunAsync(string socketPath, string dbPath, CancellationToken ct = default)
+    public static Task<int> RunAsync(string socketPath, string dbPath, CancellationToken ct = default)
+        => RunAsync(socketPath, dbPath, options: null, ct);
+
+    /// <summary>
+    /// Test seam: same daemon, but with an injectable per-instance logging provider (to observe request-handler
+    /// logging without touching process-global state) and watch hooks (to drive a deterministic failure on the
+    /// watch path). Production callers use the two-argument overload; <paramref name="options"/> stays null there.
+    /// </summary>
+    internal static async Task<int> RunAsync(string socketPath, string dbPath, DaemonOptions? options, CancellationToken ct = default)
     {
         // A Unix socket bind fails if a stale file is present; clear it first.
         if (File.Exists(socketPath))
@@ -34,10 +42,16 @@ public sealed class Daemon
 
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
-        builder.Services.Configure<KestrelServerOptions>(options => options.ListenUnixSocket(socketPath));
+        if (options?.LoggerProvider is ILoggerProvider provider)
+        {
+            builder.Logging.AddProvider(provider);
+        }
+
+        builder.Services.Configure<KestrelServerOptions>(o => o.ListenUnixSocket(socketPath));
         builder.Services.ConfigureHttpJsonOptions(o => o.SerializerOptions.TypeInfoResolverChain.Insert(0, TurnstileJson.Default));
         builder.Services.AddSingleton(store);
         builder.Services.AddSingleton(new DaemonInfo(socketPath, dbPath));
+        builder.Services.AddSingleton(options?.WatchHooks ?? WatchHooks.None);
 
         WebApplication app = builder.Build();
         MapEndpoints(app);
@@ -177,7 +191,7 @@ public sealed class Daemon
     // SSE watch: stream the change log from ?from in revision order, emit `sync` when caught up, then
     // stream live events; heartbeat every 30s. The log-structured store makes "everything after N" a
     // WHERE id > N scan on short-lived connections, so a watcher never pins the WAL.
-    private static async Task WatchAsync(HttpContext ctx, KvStore store, string? prefix, long? from)
+    private static async Task WatchAsync(HttpContext ctx, KvStore store, WatchHooks hooks, string? prefix, long? from)
     {
         ctx.Response.Headers.ContentType = "text/event-stream";
         ctx.Response.Headers.CacheControl = "no-cache";
@@ -185,49 +199,72 @@ public sealed class Daemon
 
         CancellationToken ct = ctx.RequestAborted;
         string p = prefix ?? "/";
-        var heartbeat = TimeSpan.FromSeconds(30);
+        TimeSpan heartbeat = hooks.HeartbeatInterval ?? TimeSpan.FromSeconds(30);
 
+        // The enumeration runs under a token we own: linking it to RequestAborted still propagates a client
+        // disconnect, and cancelling it ourselves on the way out unblocks a pending MoveNextAsync so we can
+        // observe it before disposing. Disposing an async enumerator while a move is in flight is illegal — the
+        // generated state machine throws a NotSupportedException ("Specified method is not supported.") from
+        // DisposeAsync — so the observe-then-dispose ordering in the finally is what keeps teardown clean,
+        // rather than a catch that masks the symptom.
+        using var enumCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        IAsyncEnumerator<WatchMessage> events = store.WatchAsync(p, from ?? 0, enumCts.Token).GetAsyncEnumerator(enumCts.Token);
+        Task<bool> moveTask = events.MoveNextAsync().AsTask();
         try
         {
-            await using IAsyncEnumerator<WatchMessage> events =
-                store.WatchAsync(p, from ?? 0, ct).GetAsyncEnumerator(ct);
-
-            // Race the next message against a heartbeat timer. The move task persists across heartbeats,
-            // so a quiet stream still gets a ": heartbeat" comment every 30s without dropping events.
-            Task<bool> moveTask = events.MoveNextAsync().AsTask();
             while (true)
             {
-                using var delayCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                Task finished = await Task.WhenAny(moveTask, Task.Delay(heartbeat, delayCts.Token));
-                if (finished != moveTask)
+                // Race the next event against a heartbeat timer on its own token, never linked to
+                // RequestAborted. On a disconnect the cancelled move wins this race — never the delay — so the
+                // heartbeat write never runs on the cancellation path; a live event cancels the timer so idle
+                // heartbeats do not accumulate.
+                using var heartbeatCts = new CancellationTokenSource();
+                if (await Task.WhenAny(moveTask, Task.Delay(heartbeat, heartbeatCts.Token)) != moveTask)
                 {
+                    hooks.BeforeHeartbeatWrite?.Invoke();
                     await ctx.Response.WriteAsync(": heartbeat\n\n", ct);
                     await ctx.Response.Body.FlushAsync(ct);
                     continue;
                 }
 
-                delayCts.Cancel();
+                heartbeatCts.Cancel();
                 if (!await moveTask)
                 {
                     break;
                 }
 
+                hooks.BeforeMessageWrite?.Invoke();
                 await WriteWatchMessageAsync(ctx, events.Current, ct);
                 moveTask = events.MoveNextAsync().AsTask();
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             // The client disconnected and the abort surfaced cleanly: a watch ending is normal, not an error.
         }
-        catch (Exception ex) when (ct.IsCancellationRequested && ex is IOException or NotSupportedException or ObjectDisposedException)
+        catch (Exception ex) when (ct.IsCancellationRequested && ex is IOException or ObjectDisposedException)
         {
-            // Same disconnect, surfaced through a different door. Once RequestAborted has fired, a write or
-            // dispose racing the torn-down response can throw an IOException (connection reset), a
-            // NotSupportedException (a stream operation against the closed response body), or an
-            // ObjectDisposedException — none of which are failures, just the stream closing under us. We only
-            // swallow these once the request is actually aborted; anything thrown while the watch is still
-            // live propagates so real failures stay visible.
+            // The same disconnect, surfaced as a connection reset (IOException) or a write against the
+            // already-disposed response (ObjectDisposedException) that raced the abort. Normal only once the
+            // request is actually aborted; anything thrown while the watch is still live propagates untouched
+            // so real failures stay visible.
+        }
+        finally
+        {
+            // Unblock and observe the pending move before disposing, so DisposeAsync never races an in-flight
+            // MoveNextAsync. Its result and any cancellation are deliberately discarded: a genuine live error
+            // already propagated from the loop body above and must not be masked by teardown.
+            enumCts.Cancel();
+            try
+            {
+                await moveTask;
+            }
+            catch
+            {
+                // Expected during teardown: the move is cancelled, or observed the same disconnect.
+            }
+
+            await events.DisposeAsync();
         }
     }
 
@@ -412,3 +449,36 @@ public sealed class Daemon
 
 /// <summary>Immutable daemon configuration, injected into endpoints.</summary>
 internal sealed record DaemonInfo(string SocketPath, string DbPath);
+
+/// <summary>
+/// Test-only knobs for a single daemon instance. Never populated on the production path (the two-argument
+/// <see cref="Daemon.RunAsync(string, string, CancellationToken)"/> passes null), so it introduces no
+/// process-global state and no runtime behaviour change for real callers.
+/// </summary>
+internal sealed class DaemonOptions
+{
+    /// <summary>A per-instance logging provider so a test can observe this daemon's request-handler logging.</summary>
+    public ILoggerProvider? LoggerProvider { get; init; }
+
+    /// <summary>Hooks that let a test drive a deterministic failure on the watch path.</summary>
+    public WatchHooks? WatchHooks { get; init; }
+}
+
+/// <summary>
+/// Injection points on the watch handler, defaulting to no-ops (<see cref="None"/>). A test overrides the
+/// heartbeat interval and/or throws from a write to exercise a live failure or the enumerator-teardown
+/// ordering; production resolves <see cref="None"/> from DI and every callback is null.
+/// </summary>
+internal sealed class WatchHooks
+{
+    public static readonly WatchHooks None = new();
+
+    /// <summary>Overrides the 30s heartbeat cadence so a test does not have to wait for a real heartbeat.</summary>
+    public TimeSpan? HeartbeatInterval { get; init; }
+
+    /// <summary>Invoked just before a data message is written (the pending move is already observed here).</summary>
+    public Action? BeforeMessageWrite { get; init; }
+
+    /// <summary>Invoked just before a heartbeat is written (a move is in flight here — the teardown-race window).</summary>
+    public Action? BeforeHeartbeatWrite { get; init; }
+}
