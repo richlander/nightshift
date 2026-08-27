@@ -775,6 +775,18 @@ internal static class WaitingCommand
                     continue;
                 }
 
+                // Every suffix is read from a pane that had stopped. A pane whose scanned activity second is
+                // not strictly older than the sweep's observation second has not been proven quiescent for a
+                // whole second, so the mutation guard on window_activity alone could be defeated by a resume
+                // inside that same second — the same-second blind spot. Rather than rename on evidence that
+                // cannot be defended, defer it: this is not a failure but a benign wait for a later sweep,
+                // when the activity is in a past second, so it does not cost the exit code.
+                if (!TmuxScanner.ActivityStrictlyPredatesObservation(pane))
+                {
+                    diagnostics.WriteLine($"RENAME-DEFERRED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)}: last activity is not yet a full second old; too recent to name safely");
+                    continue;
+                }
+
                 renames.Add((pane, desired));
             }
 

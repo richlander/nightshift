@@ -18,7 +18,20 @@ public sealed class RenameTests
 {
     private const string ScannedEpoch = "4242:1755900000";
 
-    private static WaitingRow Row(string paneId, string windowName, string epoch = ScannedEpoch, string? windowId = null, string? host = null)
+    // A scanned second and an observation second one second later, so a Row is activity-fresh by default
+    // (its last activity strictly predates the sweep's observation second) and passes the rename's
+    // whole-second-quiescence gate; the same-second/too-recent case is exercised explicitly below.
+    private const string FreshActivity = "1755900000";
+    private const string FreshObservation = "1755900001";
+
+    private static WaitingRow Row(
+        string paneId,
+        string windowName,
+        string epoch = ScannedEpoch,
+        string? windowId = null,
+        string? host = null,
+        string activity = FreshActivity,
+        string observation = FreshObservation)
         => new()
         {
             Pane = new TmuxPane
@@ -30,6 +43,8 @@ public sealed class RenameTests
                 WindowName = windowName,
                 SessionAttached = false,
                 Activity = PaneActivity.Idle,
+                ActivityStamp = activity,
+                ObservationSecond = observation,
                 Epoch = epoch,
             },
             Verdict = new WaitingVerdict(WaitingState.Ready, RowOwner.Operator, "ready", Assurance.High),
@@ -92,6 +107,72 @@ public sealed class RenameTests
         string text = diagnostics.ToString();
         Assert.Equal(2, text.Split('\n').Count(l => l.StartsWith("RENAMED", StringComparison.Ordinal)));
         Assert.DoesNotContain("RENAME-FAILED", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Rename_DefersAPaneWhoseActivityIsInTheObservationSecondSoTheSameSecondBlindSpotIsClosed()
+    {
+        // The pane's last activity is the SAME second the sweep observed it, so a resume inside that second
+        // could stamp window_activity to the very value the guard compares against — undetectable. Rather
+        // than name it on evidence the guard cannot defend, the rename defers it: no rename, no shell call,
+        // and it does not cost the exit code (a benign wait for a later sweep, not a failure).
+        var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
+        IReadOnlyList<WaitingRow> rows =
+        [
+            Row("%1", "pr4448-blocked", activity: "1755900000", observation: "1755900000"),
+        ];
+
+        int failures = await WaitingCommand.RenameAsync(
+            rows,
+            _ => (_, _) => throw new Xunit.Sdk.XunitException("a deferred pane must not reach the shell"),
+            diagnostics,
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, failures);
+        string text = diagnostics.ToString();
+        Assert.Contains("RENAME-DEFERRED", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("RENAMED", text, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("1755900001", "1755900000")] // activity AFTER observation — a clock step; fail closed
+    [InlineData("", "1755900001")]            // no activity stamp
+    [InlineData("1755900000", "")]            // no observation second (an older-format or clock-failed sweep)
+    [InlineData("01", "1755900001")]          // non-canonical activity stamp
+    public async Task Rename_DefersOnAnyNonStrictlyOlderOrMalformedSnapshot(string activity, string observation)
+    {
+        var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
+        IReadOnlyList<WaitingRow> rows = [Row("%1", "pr4448-blocked", activity: activity, observation: observation)];
+
+        int failures = await WaitingCommand.RenameAsync(
+            rows,
+            _ => (_, _) => throw new Xunit.Sdk.XunitException("a deferred pane must not reach the shell"),
+            diagnostics,
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, failures);
+        Assert.Contains("RENAME-DEFERRED", diagnostics.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Rename_RenamesAPaneWhoseActivityStrictlyPredatesTheObservationSecond()
+    {
+        // The complement of the deferral: a pane quiescent into a strictly older second passes the gate and
+        // is renamed. One fresh, one same-second — only the fresh one is confirmed; the other is deferred,
+        // not failed.
+        var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
+        IReadOnlyList<WaitingRow> rows =
+        [
+            Row("%1", "pr4448-blocked", activity: "1755900000", observation: "1755900001"),
+            Row("%2", "pr4600-stale", activity: "1755900001", observation: "1755900001"),
+        ];
+
+        int failures = await WaitingCommand.RenameAsync(rows, SucceedingShell, diagnostics, TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, failures);
+        string text = diagnostics.ToString();
+        Assert.Single(text.Split('\n'), l => l.StartsWith("RENAMED", StringComparison.Ordinal));
+        Assert.Contains("RENAME-DEFERRED", text, StringComparison.Ordinal);
     }
 
     [Fact]

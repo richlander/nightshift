@@ -461,6 +461,85 @@ public sealed class TmuxRenameIntegrationTests : IDisposable
         Assert.Equal("pr4448", (await FirstWindowAsync()).Pane.WindowName);
     }
 
+    [Fact]
+    public async Task Rename_DefersASameSecondSnapshotThroughRenameAsyncAndLeavesTheNameUntouched()
+    {
+        // The same-second blind spot, closed against a live tmux and the full RenameAsync path. A snapshot
+        // scanned in the very second its activity was stamped cannot be proven quiescent for a whole
+        // second, so RenameAsync declines to name it — even though the mutation guard alone (name, state,
+        // epoch, activity all still matching) would have applied the suffix. Built from the real scanned
+        // pane so its identity is exactly the live window's; only the observation second is pinned equal to
+        // the activity, which is the timing the scanner captures for a window that just produced output.
+        if (_tmux is null)
+        {
+            Assert.Skip("tmux is not installed");
+        }
+
+        NewServer("s");
+        RunTmux("rename-window", "-t", "@0", "pr4448");
+        RunTmux("set-option", "-w", "-t", "@0", "@agent_state", "pr=4448 head=abc1234 reviews=2/2 rec=merge");
+        TmuxPane real = (await FirstWindowAsync()).Pane;
+        TmuxPane sameSecond = real with { ObservationSecond = real.ActivityStamp };
+
+        var diagnostics = new StringWriter();
+        int failures = await WaitingCommand.RenameAsync(
+            [Ready(sameSecond)], _ => RunAsync, diagnostics, TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, failures);   // a deferral costs nothing; it is a wait for a later sweep, not a failure
+        Assert.Contains("RENAME-DEFERRED", diagnostics.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("RENAMED", diagnostics.ToString(), StringComparison.Ordinal);
+        Assert.Equal("pr4448", (await FirstWindowAsync()).Pane.WindowName);   // untouched
+    }
+
+    [Fact]
+    public async Task Rename_RenamesAnOlderQuiescentSnapshotThroughRenameAsyncAgainstRealTmux()
+    {
+        // The complement, all real: once the window has genuinely been quiescent into a strictly older
+        // second (its scanned activity precedes the sweep's observation second, both read on the target),
+        // RenameAsync applies the suffix through the generated script and a live tmux confirms the rename.
+        if (_tmux is null)
+        {
+            Assert.Skip("tmux is not installed");
+        }
+
+        NewServer("s");
+        RunTmux("rename-window", "-t", "@0", "pr4448");
+        RunTmux("set-option", "-w", "-t", "@0", "@agent_state", "pr=4448 head=abc1234 reviews=2/2 rec=merge");
+        TmuxPane older = await ScanOlderQuiescentAsync();
+        Assert.True(TmuxScanner.ActivityStrictlyPredatesObservation(older));
+
+        var diagnostics = new StringWriter();
+        int failures = await WaitingCommand.RenameAsync(
+            [Ready(older)], _ => RunAsync, diagnostics, TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, failures);
+        Assert.Contains("RENAMED", diagnostics.ToString(), StringComparison.Ordinal);
+        Assert.Equal("pr4448-ready", (await FirstWindowAsync()).Pane.WindowName);
+    }
+
+    private static WaitingRow Ready(TmuxPane pane)
+        => new() { Pane = pane, Verdict = new WaitingVerdict(WaitingState.Ready, RowOwner.Operator, "reviews 2/2", Assurance.High) };
+
+    // Scans repeatedly until the window's last activity is in a strictly earlier second than the sweep's
+    // observation second — a genuine whole-second-quiescent snapshot, read from real tmux. The window is
+    // idle (nothing writes to it), so its activity is fixed and the observation second simply catches up.
+    private async Task<TmuxPane> ScanOlderQuiescentAsync()
+    {
+        for (int i = 0; i < 120; i++)
+        {
+            TmuxPane pane = (await FirstWindowAsync()).Pane;
+            if (TmuxScanner.ActivityStrictlyPredatesObservation(pane))
+            {
+                return pane;
+            }
+
+            await Task.Delay(50, TestContext.Current.CancellationToken);
+        }
+
+        Assert.Fail("window never became quiescent into a strictly older second");
+        throw new InvalidOperationException();
+    }
+
     // Polls #{window_activity} until it differs from the scanned stamp, so a test that depends on the pane
     // having produced output does not race tmux's own bookkeeping. Capped, and only used after an emit that
     // must advance it.

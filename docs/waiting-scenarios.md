@@ -134,9 +134,18 @@ the window's live name, its live `@agent_state`, the live server generation, **a
 `window_activity`, all still equalling what the sweep saw. The activity stamp is what makes an
 activity-derived suffix defensible: every suffix is read from a pane that had *stopped*, and tmux
 advances `window_activity` on any output, so an idle pane that starts working during the GitHub read no
-longer matches and the rename aborts rather than naming a resumed window `-ready`. What a per-window
-guard *cannot* revalidate — fleet-global ownership, decided across other windows — is deliberately not a
-suffix at all: the follower/owner standing stays in the row, never in the name.
+longer matches and the rename aborts rather than naming a resumed window `-ready`.
+
+One gap the stamp alone leaves is the *same second*: if a pane went quiet and the sweep read it in the
+very second of its last output, a resume inside that second would stamp `window_activity` to the same
+value the guard compares against — undetectable. So the sweep also reads the **target's own second**
+(`date +%s`, the same clock `window_activity` is stamped from, so no local/remote clock agreement is
+assumed) once, before it reads any window's activity, and a suffix is applied only when a pane's activity
+second **strictly predates** it — proof the pane has been quiet for a whole second. A pane too recently
+active is *deferred* (`RENAME-DEFERRED`), not failed: it is simply named on a later sweep, once its
+activity is in a past second. Malformed or clock-anomalous readings defer too — fail closed. What a
+per-window guard *cannot* revalidate — fleet-global ownership, decided across other windows — is
+deliberately not a suffix at all: the follower/owner standing stays in the row, never in the name.
 
 ## 5. An agent says it is ready and it is not
 

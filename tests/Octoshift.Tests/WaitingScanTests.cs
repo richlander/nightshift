@@ -76,6 +76,80 @@ public class WaitingScanTests
     private static string EncodedRow(params string[] fields)
         => $"{Nonce}:w|" + string.Join('|', fields.Select(Hex));
 
+    /// <summary>A collection stream with the observation-second line the real script emits, inserted after
+    /// the opening epoch (before the manifest, where the parser reads it). A null value omits the line
+    /// entirely, modelling a sweep that carried no observation second at all.</summary>
+    private static string StreamWithObs(string? observation, params string[] rows)
+    {
+        string baseStream = Stream(rows);
+        const string EpochLine = Nonce + ":epoch 4242:1755900000\n";
+        return observation is null ? baseStream : baseStream.Insert(EpochLine.Length, $"{Nonce}:obs {observation}\n");
+    }
+
+    [Fact]
+    public void ParseCollection_AttachesTheTargetObservationSecondToEveryPane()
+    {
+        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
+            StreamWithObs("1755900005", "%1|night:3|1|1755900000||pr4595", "%2|night:4|0|1755800000||i158"),
+            host: null,
+            Nonce);
+
+        Assert.All(panes, p => Assert.Equal("1755900005", p.ObservationSecond));
+    }
+
+    [Theory]
+    [InlineData(null)]              // no observation line at all (an older-format or clock-failed sweep)
+    [InlineData("")]               // present but empty (date +%s failed)
+    [InlineData("17559x0000")]     // non-canonical
+    [InlineData("017559")]         // leading zero
+    public void ParseCollection_DropsAMalformedOrAbsentObservationSecondToEmpty(string? observation)
+    {
+        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
+            StreamWithObs(observation, "%1|night:3|1|1755900000||pr4595"),
+            host: null,
+            Nonce);
+
+        // An untrusted observation second reads as empty, which the rename treats as "no whole-second proof"
+        // and fails closed — the pane is never renamed on a clock read it could not validate.
+        Assert.Equal(string.Empty, panes[0].ObservationSecond);
+        Assert.False(TmuxScanner.ActivityStrictlyPredatesObservation(panes[0]));
+    }
+
+    [Fact]
+    public void ParseCollection_DropsADoubledObservationSecondToEmpty()
+    {
+        // Two observation lines are a shape the script never produces; rather than pick one, the whole
+        // observation is dropped and the rename fails closed for every pane.
+        string doubled = StreamWithObs("1755900005", "%1|night:3|1|1755900000||pr4595")
+            .Replace($"{Nonce}:obs 1755900005\n", $"{Nonce}:obs 1755900005\n{Nonce}:obs 1755900006\n", StringComparison.Ordinal);
+
+        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(doubled, host: null, Nonce);
+
+        Assert.Equal(string.Empty, panes[0].ObservationSecond);
+    }
+
+    [Theory]
+    [InlineData("100", "101", true)]   // strictly older by a second — eligible
+    [InlineData("100", "100", false)]  // same second — the blind spot, refused
+    [InlineData("101", "100", false)]  // activity AFTER observation — a clock step, refused
+    [InlineData("100", "", false)]     // no observation second — refused
+    [InlineData("", "101", false)]     // no activity stamp — refused
+    [InlineData("100", "01", false)]   // non-canonical observation — refused
+    public void ActivityStrictlyPredatesObservation_IsTrueOnlyForAStrictlyOlderCanonicalPair(string activity, string observation, bool expected)
+    {
+        var pane = new TmuxPane
+        {
+            PaneId = "%1",
+            Target = "s:1",
+            WindowName = "pr4448",
+            SessionAttached = false,
+            ActivityStamp = activity,
+            ObservationSecond = observation,
+        };
+
+        Assert.Equal(expected, TmuxScanner.ActivityStrictlyPredatesObservation(pane));
+    }
+
     [Fact]
     public void ParseCollection_ReadsTargetAttachmentAndActivity()
     {

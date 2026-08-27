@@ -129,10 +129,16 @@ PublishUntargeted ==
 \* entirely: it is decided across windows other than the one being renamed, over state no
 \* per-window guard can revalidate at mutation time, so it is no longer written into a name
 \* at all -- which keeps this single-instant action, over one window's own channels, a
-\* faithful abstraction. Without the guard the code could write a name computed from an
-\* attribution that has since moved -- a transition this single-instant action does not
-\* contain -- so the guard is precisely what makes ToolRenames a faithful abstraction rather
-\* than an optimistic one.
+\* faithful abstraction. Round 12 closed the residual same-second window: the activity stamp
+\* is only a whole-second-quiescence proof if the pane's last activity is in a second already
+\* past when the sweep observed it, so the sweep also reads the TARGET's own second and the
+\* code applies a suffix only when the scanned activity strictly predates it -- a pane read in
+\* the same second as its last output is deferred, not named, until a later sweep. That makes
+\* the single-instant identity Attributed(w) faithful even at a second boundary: the code
+\* never writes a name whose activity premise it cannot prove held for a full second. Without
+\* the guard the code could write a name computed from an attribution that has since moved --
+\* a transition this single-instant action does not contain -- so the guard is precisely what
+\* makes ToolRenames a faithful abstraction rather than an optimistic one.
 ToolRenames ==
     /\ \E w \in AgentWindows :
          /\ Attributed(w) # None
