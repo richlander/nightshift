@@ -38,6 +38,24 @@ public class TargetIdTests
     }
 
     [Fact]
+    public void HumanLabelAndKindDistinguishTheLocalMachineFromAnAliasNamedLocal()
+    {
+        // The output contracts (fleet list/add/retire/unknown) read these to preserve the target kind, so a
+        // consumer can derive whether to pass --local or --host local. The real local machine labels and
+        // tags as local with no alias; an ssh alias literally named local labels as `host local` and tags
+        // host with the alias carried alongside.
+        Assert.Equal("local", TargetId.Local.HumanLabel);
+        Assert.Equal("local", TargetId.Local.KindTag);
+
+        TargetId aliasLocal = TargetId.ForHost("local");
+        Assert.Equal("host local", aliasLocal.HumanLabel);
+        Assert.Equal("host", aliasLocal.KindTag);
+        Assert.Equal("local", aliasLocal.Display);
+
+        Assert.Equal("host fernie", TargetId.ForHost("fernie").HumanLabel);
+    }
+
+    [Fact]
     public void AnAliasContainingTheSeparatorRoundTripsAndDoesNotBreakACompositeKey()
     {
         TargetId id = TargetId.ForHost("a|b");

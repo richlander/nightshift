@@ -2248,13 +2248,16 @@ public class WaitingScanTests
     }
 
     [Fact]
-    public void WindowNaming_MarksAFollowerSoItIsVisibleInTheStatusBar()
+    public void WindowNaming_DoesNotPublishFleetGlobalOwnershipAsAName()
     {
-        // Forgetting the second window is as bad as driving it. The suffix keeps it present.
-        var follower = new Claim(ClaimRank.Follower, [], null);
-
-        Assert.Equal("follows", WindowNaming.SuffixFor(
-            new(WaitingState.Ready, RowOwner.Operator, "reviews 2/2", Assurance.High), follower));
+        // Ownership (owner/follower) is decided across the whole fleet, over state that can change in the
+        // unguardable gap between the sweep and the rename — a concurrent retire or a new rival can flip it
+        // without the guarded window itself moving. So it is no longer written into a window name, which is
+        // read at a glance and believed: SuffixFor is a pure function of the verdict, and a follower whose
+        // PR is ready earns the same `-ready` its verdict warrants. The follower standing stays in the row,
+        // not the status bar.
+        var ready = new WaitingVerdict(WaitingState.Ready, RowOwner.Operator, "reviews 2/2", Assurance.High);
+        Assert.Equal("ready", WindowNaming.SuffixFor(ready));
     }
 
     [Fact]

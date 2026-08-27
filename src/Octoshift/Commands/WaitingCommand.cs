@@ -110,6 +110,24 @@ internal static class WaitingCommand
                 hosts, (host, token) => new TmuxScanner(host).ScanAsync(token),
                 facts.FetchAsync, facts.RefreshMergeabilityAsync, now: null, ct, historyPath: historyPath);
 
+            // An explicitly empty fleet is its own disposition, not a quiet sweep and not a failure: the
+            // operator retired every target, so there is nothing to sweep. Lead with a distinct EMPTY token
+            // (its own truthful contract, separate from the #169 total-failure gap) and succeed, so a
+            // harness can tell "nothing declared" from "nothing found".
+            if (result.EmptyFleet)
+            {
+                if (json)
+                {
+                    WriteEmptyFleetJson(Console.OpenStandardOutput());
+                }
+                else
+                {
+                    Console.Out.WriteLine("EMPTY the declared fleet is empty; nothing to sweep — add a target with 'octoshift fleet add'");
+                }
+
+                return ExitCode.Ok;
+            }
+
             // Total failure keeps its own path. A sweep where nothing could be collected is not a quiet
             // fleet, and printing a QUIET summary above the failure inverts which of the two the reader
             // sees first. CollectAndResolveAsync has already persisted the discontinuity under the
@@ -183,11 +201,14 @@ internal static class WaitingCommand
     }
 
     /// <summary>A completed sweep: its collection, its resolved rows (null on total failure), and, on
-    /// total failure, the messages to report.</summary>
+    /// total failure, the messages to report. <see cref="EmptyFleet"/> is the distinct disposition of a
+    /// fleet deliberately emptied by retirement — no target was even attempted, so it is neither a quiet
+    /// sweep nor a failure.</summary>
     internal readonly record struct FleetResult(
         Collection Collected,
         IReadOnlyList<WaitingRow>? Rows,
-        IReadOnlyList<string> Failures);
+        IReadOnlyList<string> Failures,
+        bool EmptyFleet = false);
 
     /// <summary>
     /// The product core of a sweep: acquire the history transaction, collect, and reconcile — in that
@@ -223,6 +244,16 @@ internal static class WaitingCommand
             // ordering that used to leave completeness permanently unsatisfiable now converges — while the
             // attempted membership still grows, so the round-9 safety is intact.
             IReadOnlyList<string?> targets = history.FleetTargets(hosts);
+
+            // An explicitly empty fleet — established, then emptied by retirement, with no --host request —
+            // has no target to attempt. That is neither a quiet sweep nor a total failure (no host was even
+            // asked), so it is reported as its own disposition. Membership is unchanged, so nothing is
+            // saved; the finally releases the transaction lock.
+            if (targets.Count == 0)
+            {
+                return new FleetResult(new Collection([], [], 0, [], []), [], [], EmptyFleet: true);
+            }
+
             Collection collected = await CollectTargetsAsync(targets, scanAsync, ct, perTargetTimeout);
 
             // Sample the registration clock only now — inside the held transaction, after collection.
@@ -792,15 +823,16 @@ internal static class WaitingCommand
             string[] lines = result.Stdout.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
 
             // Account per window, independently. Each window's guard prints exactly one marker naming that
-            // window: `<nonce>:ok:@id` when its epoch, name and state all still matched and tmux confirmed
-            // the rename; `<nonce>:stale:@id` when the server was unchanged but the window's name or
-            // published state had moved since the sweep, so the planned rename would overwrite a newer
-            // identity; and `<nonce>:epoch:@id` when the server generation itself changed. A restart or a
-            // reassignment between windows leaves the ones already renamed reported and only the affected
-            // one skipped — the earlier success is never discarded. Markers are counted per id and only for
-            // ids this host actually requested; a marker naming an unrequested id, or naming one more than
-            // once, or naming it in more than one way, is a shape the script never writes, so it confers
-            // nothing and the window falls through to failed, fail-closed.
+            // window: `<nonce>:ok:@id` when its epoch, activity, name and state all still matched and tmux
+            // confirmed the rename; `<nonce>:stale:@id` when the server was unchanged but the window's name,
+            // published state, or activity had moved since the sweep, so the planned rename would overwrite
+            // a newer identity or name a pane that has resumed; and `<nonce>:epoch:@id` when the server
+            // generation itself changed. A restart or a reassignment between windows leaves the ones already
+            // renamed reported and only the affected one skipped — the earlier success is never discarded.
+            // Markers are counted per id and only for ids this host actually requested; a marker naming an
+            // unrequested id, or naming one more than once, or naming it in more than one way, is a shape
+            // the script never writes, so it confers nothing and the window falls through to failed,
+            // fail-closed.
             string okPrefix = nonce + ":ok:";
             string epochPrefix = nonce + ":epoch:";
             string stalePrefix = nonce + ":stale:";
@@ -833,7 +865,7 @@ internal static class WaitingCommand
                 else if (total == 1 && stales == 1)
                 {
                     failures++;
-                    diagnostics.WriteLine($"RENAME-SKIPPED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)}: window name or published state changed since the sweep");
+                    diagnostics.WriteLine($"RENAME-SKIPPED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)}: window name, published state, or activity changed since the sweep");
                 }
                 else if (total == 0)
                 {
@@ -870,7 +902,7 @@ internal static class WaitingCommand
     /// <summary>The windows whose current name differs from the one the tool would give them.</summary>
     internal static IEnumerable<(TmuxPane Pane, string Desired)> RenamePlan(IEnumerable<WaitingRow> rows)
         => rows
-            .Select(r => (r.Pane, Desired: WindowNaming.Apply(r.Pane.WindowName, WindowNaming.SuffixFor(r.Verdict, r.Claim))))
+            .Select(r => (r.Pane, Desired: WindowNaming.Apply(r.Pane.WindowName, WindowNaming.SuffixFor(r.Verdict))))
             .Where(r => !string.Equals(r.Desired, r.Pane.WindowName, StringComparison.Ordinal));
 
     private static WaitingRow Row(TmuxPane pane, StateReading reading, WaitingVerdict verdict, DateTimeOffset now)
@@ -1084,6 +1116,23 @@ internal static class WaitingCommand
         using var writer = new Utf8JsonWriter(output, new JsonWriterOptions { Indented = true });
         writer.WriteStartObject();
         writer.WriteString("error", message);
+        writer.WriteStartArray("rows");
+        writer.WriteEndArray();
+        writer.WriteEndObject();
+        writer.Flush();
+        output.Write("\n"u8);
+        output.Flush();
+    }
+
+    /// <summary>Emits the explicitly-empty-fleet disposition as one JSON document — a success with no rows
+    /// and a <c>fleet:"empty"</c> marker, so a <c>--json</c> consumer can tell an emptied fleet from a
+    /// quiet one without a token to grep.</summary>
+    internal static void WriteEmptyFleetJson(Stream output)
+    {
+        using var writer = new Utf8JsonWriter(output, new JsonWriterOptions { Indented = true });
+        writer.WriteStartObject();
+        writer.WriteString("fleet", "empty");
+        writer.WriteString("message", "the declared fleet is empty; nothing to sweep — add a target with 'octoshift fleet add'");
         writer.WriteStartArray("rows");
         writer.WriteEndArray();
         writer.WriteEndObject();

@@ -33,18 +33,23 @@ internal static class FleetCommand
 
             if (json)
             {
-                WriteMembersJson(Console.OpenStandardOutput(), members);
+                WriteMembersJson(Console.OpenStandardOutput(), members, history.IsInitialized);
             }
             else if (members.Count == 0)
             {
-                Console.Out.WriteLine("FLEET empty; the local machine is scanned by default until a host is declared");
+                // An empty fleet is two different things, and the token must not conflate them. A fresh,
+                // never-established history scans the local machine by default; a fleet emptied on purpose
+                // by retirement scans nothing until a target is added back.
+                Console.Out.WriteLine(history.IsInitialized
+                    ? "FLEET empty; the fleet was emptied — nothing is swept until a target is added with 'octoshift fleet add'"
+                    : "FLEET empty; the local machine is scanned by default until a host is declared");
             }
             else
             {
                 Console.Out.WriteLine($"FLEET {members.Count} member(s)");
                 foreach (TargetId member in members)
                 {
-                    Console.Out.WriteLine($"  {DisplayText.Safe(member.Display)}");
+                    Console.Out.WriteLine($"  {DisplayText.Safe(member.HumanLabel)}");
                 }
             }
 
@@ -118,7 +123,7 @@ internal static class FleetCommand
             // Validate membership before mutating, so an all-or-nothing retire leaves the file untouched
             // when any target is unknown rather than removing the recognised ones and reporting the rest as
             // an error beside a partial write.
-            string[] unknown = [.. targets.Where(t => !history.IsFleetMember(t)).Select(Label)];
+            TargetId[] unknown = [.. targets.Where(t => !history.IsFleetMember(t)).Select(TargetId.ForHost)];
             if (unknown.Length > 0)
             {
                 return ReportUnknown(json, unknown);
@@ -132,14 +137,14 @@ internal static class FleetCommand
             // Commit the shrunk membership and pruned per-host state, releasing the transaction lock.
             history.Persist();
 
-            string[] retired = [.. targets.Select(Label)];
+            TargetId[] retired = [.. targets.Select(TargetId.ForHost)];
             if (json)
             {
-                WriteRetiredJson(Console.OpenStandardOutput(), retired);
+                WriteTargetsJson(Console.OpenStandardOutput(), "retired", retired);
             }
             else
             {
-                Console.Out.WriteLine($"RETIRED {string.Join(", ", retired.Select(DisplayText.Safe))}");
+                Console.Out.WriteLine($"RETIRED {string.Join(", ", retired.Select(t => DisplayText.Safe(t.HumanLabel)))}");
             }
 
             return ExitCode.Ok;
@@ -154,19 +159,104 @@ internal static class FleetCommand
         }
     }
 
-    private static string Label(string? host) => host ?? "local";
+    /// <summary>
+    /// Adds one or more targets to the declared fleet — the deliberate counterpart to <see
+    /// cref="RunRetireAsync"/>, and the only way to bring the local machine back after it has been retired,
+    /// since a bare sweep no longer bootstraps local once the fleet has been established. All-or-nothing:
+    /// an empty or option-shaped alias is rejected with nothing written, exactly as retire validates its
+    /// targets, so a typo cannot half-declare a fleet. Adding a member already present is an idempotent
+    /// success. Runs under the same transaction lock as a sweep and a retire.
+    /// </summary>
+    public static async Task<int> RunAddAsync(
+        IReadOnlyList<string> hosts,
+        bool local,
+        bool json,
+        CancellationToken ct,
+        string? historyPath = null)
+    {
+        // An add with no target is a usage error, not an empty success: it would declare nothing and
+        // report an addition that did not happen.
+        if (hosts.Count == 0 && !local)
+        {
+            Console.Error.WriteLine("octoshift: fleet add requires at least one --host <alias> or --local.");
+            return ExitCode.Usage;
+        }
 
-    private static int ReportUnknown(bool json, string[] unknown)
+        // Every alias becomes an ssh target, so an empty or option-shaped one is rejected here — before
+        // anything is written — rather than persisted as a member the collector would later choke on.
+        foreach (string host in hosts)
+        {
+            if (HostTarget.Validate(host) is { } invalid)
+            {
+                Console.Error.WriteLine($"octoshift: {invalid}");
+                return ExitCode.Usage;
+            }
+        }
+
+        // The targets to add, local first, deduplicated by identity so naming an alias twice adds it once.
+        // null is the local machine.
+        var targets = new List<string?>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        if (local)
+        {
+            targets.Add(null);
+            seen.Add(TargetId.Local.Key);
+        }
+
+        foreach (string host in hosts)
+        {
+            if (seen.Add(TargetId.ForHost(host).Key))
+            {
+                targets.Add(host);
+            }
+        }
+
+        PaneHistory? history = null;
+        try
+        {
+            history = await PaneHistory.OpenAsync(historyPath, ct);
+
+            foreach (string? target in targets)
+            {
+                history.Add(target);
+            }
+
+            // Commit the grown membership and the now-initialized flag, releasing the transaction lock.
+            history.Persist();
+
+            TargetId[] added = [.. targets.Select(TargetId.ForHost)];
+            if (json)
+            {
+                WriteTargetsJson(Console.OpenStandardOutput(), "added", added);
+            }
+            else
+            {
+                Console.Out.WriteLine($"ADDED {string.Join(", ", added.Select(t => DisplayText.Safe(t.HumanLabel)))}");
+            }
+
+            return ExitCode.Ok;
+        }
+        catch (HistoryUnavailableException ex)
+        {
+            return ReportHistoryUnavailable(json, ex);
+        }
+        finally
+        {
+            history?.Dispose();
+        }
+    }
+
+    private static int ReportUnknown(bool json, IReadOnlyList<TargetId> unknown)
     {
         if (json)
         {
             using var writer = new Utf8JsonWriter(Console.OpenStandardOutput(), new JsonWriterOptions { Indented = true });
             writer.WriteStartObject();
-            writer.WriteString("error", $"not in the declared fleet: {string.Join(", ", unknown)}");
+            writer.WriteString("error", $"not in the declared fleet: {string.Join(", ", unknown.Select(t => t.HumanLabel))}");
             writer.WriteStartArray("unknown");
-            foreach (string target in unknown)
+            foreach (TargetId target in unknown)
             {
-                writer.WriteStringValue(target);
+                WriteIdentity(writer, target);
             }
 
             writer.WriteEndArray();
@@ -176,7 +266,7 @@ internal static class FleetCommand
         }
         else
         {
-            Console.Out.WriteLine($"UNKNOWN {string.Join(", ", unknown.Select(DisplayText.Safe))} not in the declared fleet");
+            Console.Out.WriteLine($"UNKNOWN {string.Join(", ", unknown.Select(t => DisplayText.Safe(t.HumanLabel)))} not in the declared fleet");
         }
 
         return ExitCode.Usage;
@@ -200,14 +290,22 @@ internal static class FleetCommand
         return ExitCode.Unavailable;
     }
 
-    internal static void WriteMembersJson(Stream output, IReadOnlyList<TargetId> members)
+    /// <summary>
+    /// Emits the fleet as one JSON document whose members preserve target kind: <c>{"kind":"local"}</c>
+    /// for the real local machine, <c>{"kind":"host","host":"…"}</c> for an ssh alias — so a consumer can
+    /// tell a real local from an alias literally named <c>local</c> and knows whether to pass <c>--local</c>
+    /// or <c>--host local</c>. The <c>initialized</c> flag lets a reader tell an empty-on-purpose fleet from
+    /// a never-established one.
+    /// </summary>
+    internal static void WriteMembersJson(Stream output, IReadOnlyList<TargetId> members, bool initialized)
     {
         using var writer = new Utf8JsonWriter(output, new JsonWriterOptions { Indented = true });
         writer.WriteStartObject();
+        writer.WriteBoolean("initialized", initialized);
         writer.WriteStartArray("members");
         foreach (TargetId member in members)
         {
-            writer.WriteStringValue(member.Display);
+            WriteIdentity(writer, member);
         }
 
         writer.WriteEndArray();
@@ -217,14 +315,16 @@ internal static class FleetCommand
         output.Flush();
     }
 
-    internal static void WriteRetiredJson(Stream output, string[] retired)
+    /// <summary>Emits a retire/add result as one JSON document under the given key, each target a
+    /// kind-preserving identity so success output carries the same distinction the human labels do.</summary>
+    internal static void WriteTargetsJson(Stream output, string key, IReadOnlyList<TargetId> targets)
     {
         using var writer = new Utf8JsonWriter(output, new JsonWriterOptions { Indented = true });
         writer.WriteStartObject();
-        writer.WriteStartArray("retired");
-        foreach (string target in retired)
+        writer.WriteStartArray(key);
+        foreach (TargetId target in targets)
         {
-            writer.WriteStringValue(target);
+            WriteIdentity(writer, target);
         }
 
         writer.WriteEndArray();
@@ -232,5 +332,23 @@ internal static class FleetCommand
         writer.Flush();
         output.Write("\n"u8);
         output.Flush();
+    }
+
+    /// <summary>
+    /// Writes one target's structured identity: <c>{"kind":"local"}</c> for the local machine, or
+    /// <c>{"kind":"host","host":"&lt;alias&gt;"}</c> for a remote — the machine-readable form of the
+    /// distinction <see cref="TargetId.Display"/> collapses, so a consumer never confuses the local machine
+    /// with an ssh alias named <c>local</c>. The alias is the decoded value, not the opaque key.
+    /// </summary>
+    private static void WriteIdentity(Utf8JsonWriter writer, TargetId id)
+    {
+        writer.WriteStartObject();
+        writer.WriteString("kind", id.KindTag);
+        if (!id.IsLocal)
+        {
+            writer.WriteString("host", id.Display);
+        }
+
+        writer.WriteEndObject();
     }
 }

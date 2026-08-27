@@ -441,6 +441,59 @@ public class ModelCorrespondenceTests
     }
 
     /// <summary>
+    /// TLA+ <c>Add</c>: membership grows deliberately through the operator act, the counterpart to
+    /// <c>Retire</c>, and the only way to re-declare the local machine once it has been retired — because a
+    /// bare sweep bootstraps local only while the fleet is genuinely uninitialized, never again after it has
+    /// been emptied on purpose. The code realises <c>Add</c> as <see cref="PaneHistory.Add"/>: it puts the
+    /// target into the persistent membership (exactly where a first attempt would) and marks the fleet
+    /// initialized, so the added host enters <see cref="PaneHistory.KnownHosts"/> and a subsequent bare
+    /// sweep reaches it, while an emptied fleet that was <em>not</em> added back stays empty rather than
+    /// re-bootstrapping local. Mirrors the model's `initialized`/explicitly-empty distinction and the
+    /// `OwnerStableAcrossSweepStep` re-stamp reasoning at the membership boundary.
+    /// </summary>
+    [Fact]
+    public void AddingAHostDeclaresItAndReDeclaresLocalAfterRetirement()
+    {
+        string path = TempPath();
+        try
+        {
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+            // Establish a fleet of local plus fernie, then retire the sole local member: the fleet is now
+            // empty of local on purpose, and a bare sweep must NOT re-add it.
+            var first = new PaneHistory(path);
+            first.AdoptEpoch("fernie", "100:1", t);
+            first.Observe(Window("%1", host: "fernie"), t, claimedPr: 4448, registrationWitnessed: true);
+            first.Save([Window("%1", host: "fernie")], hosts: [null, "fernie"], attempted: [null, "fernie"]);
+
+            var retiring = new PaneHistory(path);
+            Assert.True(retiring.Retire(null));               // local was a member
+            retiring.Persist();
+
+            var emptiedOfLocal = new PaneHistory(path);
+            Assert.True(emptiedOfLocal.IsInitialized);
+            Assert.DoesNotContain(TargetId.Local.Key, emptiedOfLocal.KnownHosts);
+            // A bare sweep reaches fernie but NOT local — retirement is not undone.
+            Assert.DoesNotContain(null, emptiedOfLocal.FleetTargets([]));
+
+            // Add local back: an operator act, the only way to re-declare it.
+            var adding = new PaneHistory(path);
+            Assert.True(adding.Add(null));                    // newly declared
+            Assert.False(adding.Add(null));                   // idempotent: already a member
+            adding.Persist();
+
+            var reopened = new PaneHistory(path);
+            Assert.Contains(TargetId.Local.Key, reopened.KnownHosts);
+            Assert.Contains(TargetId.ForHost("fernie").Key, reopened.KnownHosts);
+            Assert.Contains(null, reopened.FleetTargets([])); // a bare sweep reaches local again
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    /// <summary>
     /// TLA+ <c>Sweep</c> completeness, the round-8 clause: <c>viewComplete' = (attempted ⊆ collected) ∧
     /// (knownHosts ⊆ collected)</c>. A target attempted for the very first time — never in KnownHosts —
     /// that fails leaves the second conjunct holding vacuously (<c>{} ⊆ collected</c>), so deriving

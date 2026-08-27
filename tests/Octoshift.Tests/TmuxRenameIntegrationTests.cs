@@ -424,6 +424,82 @@ public sealed class TmuxRenameIntegrationTests : IDisposable
         Assert.Equal(hostile + "-ready", (await FirstWindowAsync()).Pane.WindowName);
     }
 
+    [Fact]
+    public async Task Rename_AbortsWhenTheWindowProducedOutputSinceTheSweep()
+    {
+        // Finding round 11: the suffix also depends on the pane's activity — every suffix the tool applies
+        // is read from a pane that had STOPPED, so an idle pane that starts working during the GitHub read
+        // must not be renamed `-ready`. The name and @agent_state guards do not catch that (the agent need
+        // not have republished either), but tmux advances #{window_activity} on any output, and the guard
+        // now compares it. Here the window is quiesced, scanned, then made to emit — under the same server,
+        // same name, same state — and the guard refuses, reporting stale, so a resumed pane is not named as
+        // though it had stopped.
+        if (_tmux is null)
+        {
+            Assert.Skip("tmux is not installed");
+        }
+
+        NewServer("s");
+        RunTmux("rename-window", "-t", "@0", "pr4448");
+
+        // Let the shell prompt's activity settle a full second into the past, so the output below lands in
+        // a strictly later second than the scanned stamp and the change is deterministic, not sub-second.
+        await Task.Delay(1100, TestContext.Current.CancellationToken);
+        (string epoch, TmuxPane pane) = await FirstWindowAsync();
+
+        // The agent resumes and emits — window_activity advances, while the window name and @agent_state
+        // are untouched.
+        RunTmux("send-keys", "-t", pane.WindowId, "printf 'resumed\\n'", "Enter");
+        await WaitForActivityToAdvanceAsync(pane.WindowId, pane.ActivityStamp);
+
+        string nonce = Nonce();
+        string script = WindowNaming.BuildRenameScript([(pane, "pr4448-ready")], epoch, nonce)!;
+        CommandResult result = await RunAsync(script, TestContext.Current.CancellationToken);
+
+        Assert.Contains($"{nonce}:stale:{pane.WindowId}", result.Stdout, StringComparison.Ordinal);
+        Assert.DoesNotContain($"{nonce}:ok:", result.Stdout, StringComparison.Ordinal);
+        Assert.Equal("pr4448", (await FirstWindowAsync()).Pane.WindowName);
+    }
+
+    // Polls #{window_activity} until it differs from the scanned stamp, so a test that depends on the pane
+    // having produced output does not race tmux's own bookkeeping. Capped, and only used after an emit that
+    // must advance it.
+    private async Task WaitForActivityToAdvanceAsync(string windowId, string scanned)
+    {
+        for (int i = 0; i < 40; i++)
+        {
+            if (RunTmuxCapture("display-message", "-p", "-t", windowId, "#{window_activity}") != scanned)
+            {
+                return;
+            }
+
+            await Task.Delay(50, TestContext.Current.CancellationToken);
+        }
+
+        Assert.Fail("window_activity did not advance after the pane emitted");
+    }
+
+    private string RunTmuxCapture(params string[] args)
+    {
+        if (_tmux is null)
+        {
+            return string.Empty;
+        }
+
+        var psi = new ProcessStartInfo(_tmux) { RedirectStandardError = true, RedirectStandardOutput = true, UseShellExecute = false };
+        psi.ArgumentList.Add("-L");
+        psi.ArgumentList.Add(_socket);
+        foreach (string a in args)
+        {
+            psi.ArgumentList.Add(a);
+        }
+
+        using Process p = Process.Start(psi)!;
+        string output = p.StandardOutput.ReadToEnd();
+        p.WaitForExit(5000);
+        return output.Trim();
+    }
+
     private async Task<(string Epoch, TmuxPane Pane)> FirstWindowAsync()
     {
         IReadOnlyList<TmuxPane> panes = await ScanAsync();

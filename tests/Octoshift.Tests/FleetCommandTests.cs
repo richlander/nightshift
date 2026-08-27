@@ -251,6 +251,236 @@ public sealed class FleetCommandTests
     }
 
     [Fact]
+    public async Task Add_AHostAndLocalDeclareThemAndLeadWithAdded()
+    {
+        // A fleet first declared with only a remote has no way to gain local except an explicit add. Adding
+        // local and another host declares both, leads with the ADDED token, and makes them members.
+        string path = SeedFleet("fernie");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            // Start from a fleet that has local retired, so the add genuinely re-declares it.
+            await CapturedAsync(t => FleetCommand.RunRetireAsync([], local: true, json: false, t, historyPath: path), ct);
+            Assert.DoesNotContain(TargetId.Local.Key, new PaneHistory(path).KnownHosts);
+
+            (int exit, string stdout, _) = await CapturedAsync(
+                t => FleetCommand.RunAddAsync(["merritt"], local: true, json: false, t, historyPath: path), ct);
+
+            Assert.Equal(ExitCode.Ok, exit);
+            Assert.StartsWith("ADDED", stdout, StringComparison.Ordinal);
+
+            var reopened = new PaneHistory(path);
+            Assert.Contains(TargetId.Local.Key, reopened.KnownHosts);
+            Assert.Contains(TargetId.ForHost("merritt").Key, reopened.KnownHosts);
+            Assert.Contains(TargetId.ForHost("fernie").Key, reopened.KnownHosts);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task Add_LocalReturnsAfterRetirementAndABareSweepReachesItAgain()
+    {
+        // The explicit-local-re-add path: retire the sole local member, confirm a bare sweep would then
+        // reach nothing (the empty fleet stays empty), then add --local and confirm the bootstrap is back.
+        string path = SeedFleet();
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            await CapturedAsync(t => FleetCommand.RunRetireAsync([], local: true, json: false, t, historyPath: path), ct);
+            Assert.Empty(new PaneHistory(path).FleetTargets([]));
+
+            (int exit, _, _) = await CapturedAsync(
+                t => FleetCommand.RunAddAsync([], local: true, json: false, t, historyPath: path), ct);
+
+            Assert.Equal(ExitCode.Ok, exit);
+            var reopened = new PaneHistory(path);
+            Assert.Contains(TargetId.Local.Key, reopened.KnownHosts);
+
+            // A bare sweep now reaches the local machine again.
+            Assert.Equal<string?[]>([null], [.. reopened.FleetTargets([])]);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task Add_RejectsAnOptionShapedAliasAndWritesNothing()
+    {
+        string path = SeedFleet("fernie");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            string before = File.ReadAllText(path);
+            (int exit, _, string stderr) = await CapturedAsync(
+                t => FleetCommand.RunAddAsync(["-V"], local: false, json: false, t, historyPath: path), ct);
+
+            Assert.Equal(ExitCode.Usage, exit);
+            Assert.NotEqual(string.Empty, stderr.Trim());
+            Assert.Equal(before, File.ReadAllText(path));
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task Add_WithNoTargetIsAUsageError()
+    {
+        string path = SeedFleet("fernie");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            (int exit, _, string stderr) = await CapturedAsync(
+                t => FleetCommand.RunAddAsync([], local: false, json: false, t, historyPath: path), ct);
+
+            Assert.Equal(ExitCode.Usage, exit);
+            Assert.NotEqual(string.Empty, stderr.Trim());
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task Add_HumanOutputPreservesTargetKind()
+    {
+        string path = SeedFleet("fernie");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            (int exit, string stdout, _) = await CapturedAsync(
+                t => FleetCommand.RunAddAsync(["merritt"], local: true, json: false, t, historyPath: path), ct);
+
+            Assert.Equal(ExitCode.Ok, exit);
+            Assert.StartsWith("ADDED", stdout, StringComparison.Ordinal);
+            // The real local machine labels as `local`; a remote as `host <alias>`, so a consumer can tell
+            // which flag named it.
+            Assert.Contains("local", stdout, StringComparison.Ordinal);
+            Assert.Contains("host merritt", stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task List_ExplicitlyEmptyFleetReportsEmptiedNotDefaultLocal()
+    {
+        // After retiring the sole member the fleet is empty ON PURPOSE. List must say so — distinct from a
+        // never-established fleet, which defaults to scanning local — so an operator is not told the local
+        // machine will be swept when it will not.
+        string path = SeedFleet();
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            await CapturedAsync(t => FleetCommand.RunRetireAsync([], local: true, json: false, t, historyPath: path), ct);
+
+            (int exit, string stdout, _) = await CapturedAsync(t => FleetCommand.RunListAsync(json: false, t, historyPath: path), ct);
+
+            Assert.Equal(ExitCode.Ok, exit);
+            Assert.StartsWith("FLEET empty", stdout, StringComparison.Ordinal);
+            Assert.Contains("emptied", stdout, StringComparison.Ordinal);
+            Assert.DoesNotContain("scanned by default", stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task List_UninitializedFleetReportsDefaultLocal()
+    {
+        // A genuinely fresh history (absent file) is uninitialized: list says the local machine is scanned
+        // by default — the distinction a consumer needs to tell it from an emptied fleet. (The JSON
+        // initialized flag is covered directly in MembersJson_*, since the command writes JSON to the raw
+        // stdout stream Console redirection does not capture.)
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-fleetfresh-{Guid.NewGuid():N}.json");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            (int exit, string stdout, _) = await CapturedAsync(t => FleetCommand.RunListAsync(json: false, t, historyPath: path), ct);
+            Assert.Equal(ExitCode.Ok, exit);
+            Assert.Contains("scanned by default", stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task List_HumanOutputPreservesTheKindOfAnAliasNamedLocal()
+    {
+        // The collision this whole scheme exists to prevent, at the fleet surface: an ssh alias literally
+        // named `local` must render as `host local`, distinct from the real local machine's `local`, so a
+        // consumer can tell whether to pass --local or --host local.
+        string path = SeedFleet("local");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            (int exit, string stdout, _) = await CapturedAsync(t => FleetCommand.RunListAsync(json: false, t, historyPath: path), ct);
+            Assert.Equal(ExitCode.Ok, exit);
+            Assert.Contains("host local", stdout, StringComparison.Ordinal);
+            // And the real local machine is present as a bare `local` line, not `host local`.
+            Assert.Contains(stdout.Split('\n'), l => l.Trim() == "local");
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public void FleetTargets_BootstrapsLocalOnlyWhileUninitialized()
+    {
+        // The mechanism behind the empty-fleet contract, at the history level: an absent (fresh) history
+        // bootstraps local; once established and emptied, it returns nothing rather than re-adding local.
+        string fresh = Path.Combine(Path.GetTempPath(), $"octoshift-ft-{Guid.NewGuid():N}.json");
+        try
+        {
+            var uninitialized = new PaneHistory(fresh);
+            Assert.False(uninitialized.IsInitialized);
+            Assert.Equal<string?[]>([null], [.. uninitialized.FleetTargets([])]);
+
+            // Establish (attempt local), then retire it: the fleet is now empty on purpose.
+            uninitialized.Save([], hosts: [null], attempted: [null]);
+            var established = new PaneHistory(fresh);
+            Assert.True(established.IsInitialized);
+            established.Retire(null);
+            established.Persist();
+
+            var emptied = new PaneHistory(fresh);
+            Assert.True(emptied.IsInitialized);
+            Assert.Empty(emptied.FleetTargets([]));
+
+            // A --host request on an empty fleet still declares that host; local stays out.
+            Assert.Equal<string?[]>(["fernie"], [.. emptied.FleetTargets(["fernie"])]);
+        }
+        finally
+        {
+            File.Delete(fresh);
+            File.Delete(fresh + ".lock");
+        }
+    }
+
+    [Fact]
     public async Task List_LeadsWithPartialWhenTheHistoryIsMalformed()
     {
         string path = Path.Combine(Path.GetTempPath(), $"octoshift-fleetbad-{Guid.NewGuid():N}.json");
@@ -273,24 +503,50 @@ public sealed class FleetCommandTests
     }
 
     [Fact]
-    public void MembersJson_IsOneDocumentListingEveryMember()
+    public void MembersJson_IsOneDocumentListingEveryMemberWithItsKind()
     {
         using var stream = new MemoryStream();
-        FleetCommand.WriteMembersJson(stream, [TargetId.Local, TargetId.ForHost("fernie")]);
+        FleetCommand.WriteMembersJson(stream, [TargetId.Local, TargetId.ForHost("fernie"), TargetId.ForHost("local")], initialized: true);
         using JsonDocument doc = JsonDocument.Parse(Encoding.UTF8.GetString(stream.ToArray()));
 
-        string[] members = [.. doc.RootElement.GetProperty("members").EnumerateArray().Select(e => e.GetString()!)];
-        Assert.Equal(["local", "fernie"], members);
+        Assert.True(doc.RootElement.GetProperty("initialized").GetBoolean());
+        JsonElement[] members = [.. doc.RootElement.GetProperty("members").EnumerateArray()];
+
+        // The real local machine: kind local, no host.
+        Assert.Equal("local", members[0].GetProperty("kind").GetString());
+        Assert.False(members[0].TryGetProperty("host", out _));
+
+        // A remote: kind host, with its alias.
+        Assert.Equal("host", members[1].GetProperty("kind").GetString());
+        Assert.Equal("fernie", members[1].GetProperty("host").GetString());
+
+        // An ssh alias literally named `local` is NOT the local machine — a consumer must be able to tell.
+        Assert.Equal("host", members[2].GetProperty("kind").GetString());
+        Assert.Equal("local", members[2].GetProperty("host").GetString());
     }
 
     [Fact]
-    public void RetiredJson_IsOneDocumentListingWhatWasRetired()
+    public void MembersJson_CarriesTheInitializedFlagSoAnEmptiedFleetIsDistinguishable()
     {
         using var stream = new MemoryStream();
-        FleetCommand.WriteRetiredJson(stream, ["local", "merritt"]);
+        FleetCommand.WriteMembersJson(stream, [], initialized: false);
         using JsonDocument doc = JsonDocument.Parse(Encoding.UTF8.GetString(stream.ToArray()));
 
-        string[] retired = [.. doc.RootElement.GetProperty("retired").EnumerateArray().Select(e => e.GetString()!)];
-        Assert.Equal(["local", "merritt"], retired);
+        Assert.False(doc.RootElement.GetProperty("initialized").GetBoolean());
+        Assert.Empty(doc.RootElement.GetProperty("members").EnumerateArray());
+    }
+
+    [Fact]
+    public void RetiredJson_IsOneDocumentListingWhatWasRetiredWithKind()
+    {
+        using var stream = new MemoryStream();
+        FleetCommand.WriteTargetsJson(stream, "retired", [TargetId.Local, TargetId.ForHost("merritt")]);
+        using JsonDocument doc = JsonDocument.Parse(Encoding.UTF8.GetString(stream.ToArray()));
+
+        JsonElement[] retired = [.. doc.RootElement.GetProperty("retired").EnumerateArray()];
+        Assert.Equal("local", retired[0].GetProperty("kind").GetString());
+        Assert.False(retired[0].TryGetProperty("host", out _));
+        Assert.Equal("host", retired[1].GetProperty("kind").GetString());
+        Assert.Equal("merritt", retired[1].GetProperty("host").GetString());
     }
 }

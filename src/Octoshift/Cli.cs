@@ -196,7 +196,7 @@ public static class Cli
 
     private static Command CreateFleetCommand()
     {
-        var command = new Command("fleet", "Show or retire the declared fleet of targets that waiting and pr sweep.");
+        var command = new Command("fleet", "Show, add to, or retire from the declared fleet of targets that waiting and pr sweep.");
 
         // `octoshift fleet` with no subcommand lists the fleet — the reflex use — so the default action is
         // the list. `list` is also spellable explicitly for symmetry with `retire`.
@@ -227,6 +227,20 @@ public static class Cli
             parseResult.GetValue(retireJson),
             cancellationToken));
         command.Subcommands.Add(retire);
+
+        var add = new Command("add", "Add members to the declared fleet — the way to (re-)declare a target, including the local machine after it has been retired.");
+        Option<string[]> addHost = CreateHostOption("Add this host alias to the fleet; repeatable.");
+        var addLocal = new Option<bool>("--local") { Description = "Add the local machine to the fleet." };
+        var addJson = new Option<bool>("--json") { Description = "Emit the result as JSON instead of a token line." };
+        add.Options.Add(addHost);
+        add.Options.Add(addLocal);
+        add.Options.Add(addJson);
+        add.SetAction(async (parseResult, cancellationToken) => await FleetCommand.RunAddAsync(
+            parseResult.GetValue(addHost) ?? [],
+            parseResult.GetValue(addLocal),
+            parseResult.GetValue(addJson),
+            cancellationToken));
+        command.Subcommands.Add(add);
 
         return command;
     }

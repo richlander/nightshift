@@ -99,6 +99,19 @@ internal sealed class PaneHistory : IDisposable
     /// </summary>
     private readonly HashSet<string> _attempted;
 
+    /// <summary>
+    /// Whether the fleet has ever been <em>established</em> — bootstrapped by a bare sweep, grown by an
+    /// attempted target, or declared with an explicit <c>fleet add</c>. This is what separates a genuinely
+    /// uninitialized history (a first run, where a bare sweep may default to the local machine) from a
+    /// fleet deliberately emptied by retirement (which must stay empty — retiring the sole local member
+    /// must not be silently undone by re-bootstrapping local on the next sweep). Membership alone cannot
+    /// tell the two apart: both leave <see cref="_attempted"/> and <see cref="_hosts"/> empty. It is set
+    /// on any write that establishes the fleet and never cleared, so once the fleet has existed an empty
+    /// fleet is read as empty-on-purpose rather than never-initialized. A file the writer produced always
+    /// carries it <c>true</c>; only the absent-file first run is <c>false</c>.
+    /// </summary>
+    private bool _initialized;
+
     private FileStream? _lock;
 
     private static readonly TimeSpan LockTimeout = TimeSpan.FromSeconds(30);
@@ -130,7 +143,7 @@ internal sealed class PaneHistory : IDisposable
     {
         _path = path;
         _lock = lockStream;
-        (_entries, _hosts, _attempted) = Load(path, strictLoad);
+        (_entries, _hosts, _attempted, _initialized) = Load(path, strictLoad);
 
         // A strict (product) load has already reconciled its structure in Load — a missing map is a
         // rejection there. Here it rejects the whole file, bytes untouched, the moment any single record
@@ -187,6 +200,12 @@ internal sealed class PaneHistory : IDisposable
         }
 
         _attempted.UnionWith(_hosts.Keys);
+
+        // A hand-seeded fixture with members is, by definition, an established fleet — so treat any
+        // membership as initialized even when the on-disk flag was absent (an older or partial fixture).
+        // This keeps the forgiving loader's bootstrap behaviour honest: an empty, flag-less fixture is
+        // still a first run that may default to local, but one carrying hosts never re-bootstraps.
+        _initialized = _initialized || _attempted.Count > 0 || _hosts.Count > 0;
     }
 
     /// <summary>
@@ -221,6 +240,15 @@ internal sealed class PaneHistory : IDisposable
                 throw new HistoryUnavailableException($"pane history has an impossible record for host '{key}'");
             }
 
+            // A remote host key must decode to an alias this tool would actually collect from. A canonical
+            // base64url key can still decode to an option-shaped or empty/whitespace alias — the key for
+            // `-V`, say — which passes IsValidKey (it round-trips) yet is a usage error the collector would
+            // throw ArgumentException on mid-sweep, outside the unavailable contract. Reject it here, under
+            // the same HostTarget.Validate rules the CLI applies, so an unusable persisted target fails
+            // closed as HistoryUnavailable with the bytes preserved rather than crashing automatic
+            // collection later.
+            RequireUsableRemote(key, "host");
+
             // A host that answered was, by definition, attempted: the writer records both on the same
             // sweep. A collected host missing from the attempted set is a shape this scheme never wrote,
             // and reading past it would let the attempted-membership invariant it relies on go unchecked.
@@ -238,6 +266,11 @@ internal sealed class PaneHistory : IDisposable
             {
                 throw new HistoryUnavailableException($"pane history has an invalid attempted host key '{key}', so it was not written by this scheme");
             }
+
+            // The same usability gate as a collected host: a persistent fleet member is a target a later
+            // sweep will hand to the collector, so an option-shaped or empty/whitespace decoded alias must
+            // fail closed here rather than reach ssh as an argument.
+            RequireUsableRemote(key, "attempted host");
         }
 
         foreach ((string key, PaneMemory pane) in entries)
@@ -265,6 +298,25 @@ internal sealed class PaneHistory : IDisposable
             {
                 throw new HistoryUnavailableException($"pane history has pane '{key}' on host '{host.Key}', which is not in the hosts map");
             }
+        }
+    }
+
+    /// <summary>
+    /// Rejects a persisted <em>remote</em> target key whose decoded alias is one this tool could never
+    /// usably collect from — empty, whitespace, or option-shaped — under the same <see
+    /// cref="HostTarget.Validate"/> rules the CLI applies to a <c>--host</c> value. A local key is exempt
+    /// (it is never handed to ssh). The alias is recovered by decoding the key, never by parsing it, so
+    /// this reuses the target scheme rather than duplicating it; a key that <see cref="TargetId.IsValidKey"/>
+    /// has already accepted decodes without throwing. The point is defence at the trust boundary: without
+    /// it a canonical-but-unusable key (the key for <c>-V</c>) survives strict load and then throws
+    /// <see cref="ArgumentException"/> deep inside automatic collection, outside the unavailable contract.
+    /// </summary>
+    private static void RequireUsableRemote(string key, string what)
+    {
+        if (!TargetId.FromKey(key).IsLocal
+            && HostTarget.Validate(TargetId.FromKey(key).Display) is { } invalid)
+        {
+            throw new HistoryUnavailableException($"pane history has an unusable {what} key '{key}': {invalid}");
         }
     }
 
@@ -317,11 +369,11 @@ internal sealed class PaneHistory : IDisposable
     /// corrupt files deliberately. A well-formed file with entries this scheme never wrote is not a load
     /// failure — it parses — and is left to the sanitiser above to drop key by key.
     /// </summary>
-    private static (Dictionary<string, PaneMemory>, Dictionary<string, HostMemory>, HashSet<string>) Load(string path, bool strict)
+    private static (Dictionary<string, PaneMemory>, Dictionary<string, HostMemory>, HashSet<string>, bool) Load(string path, bool strict)
     {
         if (!File.Exists(path))
         {
-            return ([], [], []);
+            return ([], [], [], false);
         }
 
         string text;
@@ -336,7 +388,7 @@ internal sealed class PaneHistory : IDisposable
                 throw new HistoryUnavailableException($"could not read pane history from {path}: {ex.Message}", ex);
             }
 
-            return ([], [], []);
+            return ([], [], [], false);
         }
 
         // A strict (product) load validates the raw JSON shape before deserializing it, because the
@@ -364,7 +416,7 @@ internal sealed class PaneHistory : IDisposable
                 throw new HistoryUnavailableException($"could not read pane history from {path}: {ex.Message}", ex);
             }
 
-            return ([], [], []);
+            return ([], [], [], false);
         }
 
         if (file is null)
@@ -374,38 +426,49 @@ internal sealed class PaneHistory : IDisposable
                 throw new HistoryUnavailableException($"pane history at {path} is a null document, not an empty history");
             }
 
-            return ([], [], []);
+            return ([], [], [], false);
         }
 
-        // The writer always emits all three members (an empty first run writes
-        // `{"panes":{},"hosts":{},"attempted":[]}`), so a file missing any — `{}`, `{"panes":{}}`,
-        // `{"hosts":null}`, a file with no attempted array — was not written by this scheme. Under a strict
-        // load that is a rejection, not an empty history: reading it as empty would forget whatever the
-        // real file held. The forgiving loader treats an absent member as empty. (Strict never reaches here
-        // with a missing member — ValidateRawSchema already rejected it — but the guard stays as defence in
-        // depth.)
-        if (strict && (file.Panes is null || file.Hosts is null || file.Attempted is null))
+        // The writer always emits all four members (an empty first run writes
+        // `{"panes":{},"hosts":{},"attempted":[],"initialized":true}`), so a file missing any — `{}`,
+        // `{"panes":{}}`, `{"hosts":null}`, a file with no attempted array — was not written by this
+        // scheme. Under a strict load that is a rejection, not an empty history: reading it as empty would
+        // forget whatever the real file held. The forgiving loader treats an absent member as empty.
+        // (Strict never reaches here with a missing member — ValidateRawSchema already rejected it — but
+        // the guard stays as defence in depth.)
+        if (strict && (file.Panes is null || file.Hosts is null || file.Attempted is null || file.Initialized is null))
         {
-            throw new HistoryUnavailableException($"pane history at {path} is missing its panes, hosts or attempted member, so it was not written by this scheme");
+            throw new HistoryUnavailableException($"pane history at {path} is missing its panes, hosts, attempted or initialized member, so it was not written by this scheme");
         }
 
-        return (file.Panes ?? [], file.Hosts ?? [], [.. file.Attempted ?? []]);
+        // Every write establishes the fleet, so the writer only ever persists initialized = true; a first
+        // run is the absent-file case above, which never reaches disk. A persisted file whose flag is not
+        // true is therefore a shape this scheme could not have written — reject it rather than let a
+        // tampered `initialized:false` re-enable the local bootstrap on a fleet that was deliberately
+        // emptied.
+        if (strict && file.Initialized is not true)
+        {
+            throw new HistoryUnavailableException($"pane history at {path} has initialized = {(file.Initialized is null ? "absent" : "false")}, which this scheme never writes");
+        }
+
+        return (file.Panes ?? [], file.Hosts ?? [], [.. file.Attempted ?? []], file.Initialized ?? false);
     }
 
-    private static readonly string[] RootMembers = ["panes", "hosts", "attempted"];
+    private static readonly string[] RootMembers = ["panes", "hosts", "attempted", "initialized"];
     private static readonly string[] HostMembers = ["epoch", "sweptAt", "continuous"];
     private static readonly string[] PaneMembers = ["digest", "since", "pr", "claimedAt", "witnessed"];
 
     /// <summary>
     /// Validates the raw JSON shape of a strict load with <see cref="JsonDocument"/> — AOT-safe, no
     /// reflection — before the lenient source-generated deserializer sees it. The root must be an object
-    /// with exactly a <c>panes</c> object, a <c>hosts</c> object and an <c>attempted</c> array, exact
-    /// casing, no unknown or duplicate members; each host record exactly
+    /// with exactly a <c>panes</c> object, a <c>hosts</c> object, an <c>attempted</c> array and an
+    /// <c>initialized</c> flag, exact casing, no unknown or duplicate members; each host record exactly
     /// <c>epoch</c>/<c>sweptAt</c>/<c>continuous</c> and each pane record exactly
     /// <c>digest</c>/<c>since</c>/<c>pr</c>/<c>claimedAt</c>/<c>witnessed</c>, again with no unknown or
     /// duplicate members; no dictionary key may repeat; and the attempted array must be strings only, none
-    /// repeated. Anything else is not a file this scheme wrote, so it is rejected here — bytes untouched —
-    /// rather than deserialized into a rewritten approximation of itself.
+    /// repeated. The <c>initialized</c> member's boolean value is enforced by deserialization and its
+    /// truth by the loader. Anything else is not a file this scheme wrote, so it is rejected here — bytes
+    /// untouched — rather than deserialized into a rewritten approximation of itself.
     /// </summary>
     private static void ValidateRawSchema(string json, string path)
     {
@@ -719,7 +782,9 @@ internal sealed class PaneHistory : IDisposable
     /// <summary>
     /// The hosts a sweep should reach: the whole declared fleet unioned with the run's extra <c>--host</c>
     /// targets, so a normal sweep covers everything remembered rather than silently omitting a member and
-    /// reading its narrower view as complete. <c>null</c> stands for the local machine, first.
+    /// reading its narrower view as complete. <c>null</c> stands for the local machine, first. Empty when
+    /// the fleet has been established and then deliberately emptied by retirement — an explicitly empty
+    /// fleet the caller reports as such rather than sweeping the local machine by default.
     /// </summary>
     /// <remarks>
     /// This is the collect-the-declared-fleet half of the manageable-fleet fix: because the history is
@@ -727,11 +792,17 @@ internal sealed class PaneHistory : IDisposable
     /// so once local and a host have each been attempted a later run reaches both together — the local-then
     /// -<c>--host</c> ordering that used to leave completeness permanently unsatisfiable now converges on a
     /// complete view. The local machine is included whenever it is a member; it joins the fleet the first
-    /// time a sweep reaches it, which is any bare run — a fresh fleet with nothing declared and nothing
-    /// requested defaults to the local machine (the bootstrap below), and thereafter every run that keeps
-    /// local a member reaches it alongside the remotes. Retiring local while remotes remain therefore keeps
-    /// it out of subsequent sweeps. Extra hosts are appended in first-seen order and deduplicated by target
-    /// key, so naming an alias that is already a member costs one connection, not two.
+    /// time a sweep reaches it, which is any bare run on an <em>uninitialized</em> history — a genuinely
+    /// fresh fleet with nothing declared and nothing requested defaults to the local machine (the bootstrap
+    /// below), and thereafter every run that keeps local a member reaches it alongside the remotes. Once the
+    /// fleet has been established, retiring local (or every member) no longer re-bootstraps: an initialized
+    /// history with no members and no request returns no targets, so local can never silently reappear after
+    /// it was retired on purpose — only an explicit <c>fleet add --local</c> brings it back. Extra hosts are
+    /// appended in first-seen order and deduplicated by target key, so naming an alias that is already a
+    /// member costs one connection, not two. A decoded declared member whose alias is unusable — an
+    /// option-shaped or whitespace alias a strict load would have rejected, but a forgiving or hand-seeded
+    /// history might still hold — is dropped here rather than handed to the collector, so automatic
+    /// collection can never construct an ssh argument that throws.
     /// </remarks>
     public IReadOnlyList<string?> FleetTargets(IReadOnlyList<string> extraHosts)
     {
@@ -750,6 +821,15 @@ internal sealed class PaneHistory : IDisposable
             .Where(id => !id.IsLocal)
             .OrderBy(id => id.Key, StringComparer.Ordinal))
         {
+            // Defence in depth: a strict product load has already rejected an unusable persisted alias, so
+            // this only fires for a forgiving or hand-seeded history — but it must never let the collector
+            // build `ssh -- -V …`, so an option-shaped or empty/whitespace member is dropped rather than
+            // swept.
+            if (HostTarget.Validate(member.Display) is not null)
+            {
+                continue;
+            }
+
             if (seen.Add(member.Key))
             {
                 targets.Add(member.Display);
@@ -764,10 +844,11 @@ internal sealed class PaneHistory : IDisposable
             }
         }
 
-        // A fresh fleet with nothing declared and nothing requested defaults to the local machine, so a
-        // first-ever bare sweep reads this machine and declares it. Once anything is a member or requested,
-        // the lines above have already chosen the target set and this does not fire.
-        if (targets.Count == 0)
+        // A genuinely uninitialized fleet — nothing declared, nothing requested, and never established —
+        // defaults to the local machine, so a first-ever bare sweep reads this machine and declares it.
+        // An initialized-but-empty fleet (every member retired on purpose) returns nothing: the caller
+        // reports it as an explicitly empty fleet rather than re-adding local behind the operator's back.
+        if (targets.Count == 0 && !_initialized)
         {
             targets.Add(null);
         }
@@ -803,8 +884,37 @@ internal sealed class PaneHistory : IDisposable
             _entries.Remove(pane);
         }
 
+        // _initialized is left set: retiring the last member leaves the fleet explicitly empty, not
+        // uninitialized, so a later bare sweep does not re-bootstrap local behind the operator's back.
         return known;
     }
+
+    /// <summary>
+    /// Adds a target to the declared fleet — the deliberate operator counterpart to <see cref="Retire"/>,
+    /// and the only way to (re-)declare the local machine after it has been retired, since a bare sweep no
+    /// longer bootstraps local once the fleet has been established. Idempotent: adding a member already in
+    /// the fleet is a no-op that still succeeds. Returns whether the target was newly added, so the command
+    /// can distinguish a fresh declaration from a redundant one if it wishes; either way the target is a
+    /// member afterwards.
+    /// </summary>
+    /// <remarks>
+    /// The target joins <see cref="_attempted"/>, exactly where a first attempt would put it, so it becomes
+    /// a <see cref="KnownHosts"/> member and a subsequent bare sweep reaches it — with no epoch, continuity
+    /// or pane of its own until a sweep actually collects it, the same shape a never-yet-collected attempted
+    /// target has. Marking the fleet initialized is what makes the addition durable against the bootstrap:
+    /// once anything has been declared, an empty fleet is empty on purpose. Runs under the same transaction
+    /// lock as a sweep and a retire; the command commits with <see cref="Persist"/>.
+    /// </remarks>
+    public bool Add(string? host)
+    {
+        string key = TargetId.ForHost(host).Key;
+        _initialized = true;
+        return _attempted.Add(key);
+    }
+
+    /// <summary>Whether the fleet has been established at least once. False only for a genuinely
+    /// uninitialized first run, where a bare sweep may still bootstrap the local machine.</summary>
+    public bool IsInitialized => _initialized;
 
     /// <summary>
     /// The timestamp a transaction stamps its observations with: the sampled wall clock, but never
@@ -1018,13 +1128,18 @@ internal sealed class PaneHistory : IDisposable
     /// </summary>
     private void WriteAndRelease()
     {
+        // Any commit establishes the fleet: a persisted history is never the never-initialized first run
+        // (that is the absent-file case), so the flag is forced true at the single commit point. This is
+        // what the strict loader relies on — a persisted initialized:false is a shape this scheme never
+        // writes — and it keeps a retired local from re-bootstrapping on the next bare sweep.
+        _initialized = true;
         string dir = Path.GetDirectoryName(_path)!;
         string tmp = _path + "." + Environment.ProcessId + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
             Directory.CreateDirectory(dir);
             File.WriteAllText(tmp, JsonSerializer.Serialize(
-                new HistoryFile { Panes = _entries, Hosts = _hosts, Attempted = [.. _attempted] },
+                new HistoryFile { Panes = _entries, Hosts = _hosts, Attempted = [.. _attempted], Initialized = _initialized },
                 PaneHistoryJsonContext.Default.HistoryFile));
             File.Move(tmp, _path, overwrite: true);
         }
@@ -1073,6 +1188,14 @@ internal sealed record HistoryFile
     /// canonical target keys.</summary>
     [JsonPropertyName("attempted")]
     public List<string>? Attempted { get; init; }
+
+    /// <summary>Whether the fleet has been established at least once. The writer only ever persists it
+    /// <c>true</c> — a never-initialized fleet is the absent-file case, which is never written — so it
+    /// separates a deliberately emptied fleet (stays empty) from a genuinely first run (may bootstrap
+    /// local). Nullable so a tampered or older file missing it is caught as a schema violation rather than
+    /// defaulting silently.</summary>
+    [JsonPropertyName("initialized")]
+    public bool? Initialized { get; init; }
 }
 
 [JsonSourceGenerationOptions(PropertyNameCaseInsensitive = true)]

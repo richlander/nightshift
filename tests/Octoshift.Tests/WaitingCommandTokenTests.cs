@@ -117,4 +117,43 @@ public sealed class WaitingCommandTokenTests
             File.Delete(path + ".lock");
         }
     }
+
+    [Fact]
+    public async Task RunAsync_LeadsWithEmptyTokenForAnExplicitlyEmptyFleet()
+    {
+        // Round 11: a fleet established and then emptied by retirement is its own disposition — not a quiet
+        // sweep and not a failure. A bare run must not re-bootstrap the local machine (that would undo the
+        // retirement); it leads with a distinct EMPTY token and succeeds, and reaches no ssh or GitHub
+        // because no target is even attempted.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-emptyfleet-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, "{\"panes\":{},\"hosts\":{},\"attempted\":[],\"initialized\":true}");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            (int exit, string stdout, _) = await RunWithCapturedConsoleAsync(
+                token => WaitingCommand.RunAsync("owner/name", [], all: false, json: false, rename: false, token, historyPath: path), ct);
+
+            Assert.Equal(ExitCode.Ok, exit);
+            Assert.StartsWith("EMPTY", stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public void EmptyFleetJson_IsOneSuccessDocumentMarkingTheFleetEmpty()
+    {
+        // The command writes JSON to the raw stdout stream Console redirection does not capture, so the
+        // shape is verified at the writer: one document marking the fleet empty, with no rows — a success a
+        // consumer can branch on.
+        using var stream = new MemoryStream();
+        WaitingCommand.WriteEmptyFleetJson(stream);
+        using System.Text.Json.JsonDocument doc = System.Text.Json.JsonDocument.Parse(System.Text.Encoding.UTF8.GetString(stream.ToArray()));
+
+        Assert.Equal("empty", doc.RootElement.GetProperty("fleet").GetString());
+        Assert.Empty(doc.RootElement.GetProperty("rows").EnumerateArray());
+    }
 }

@@ -69,9 +69,13 @@ PR #4448  Add full-screen annotated source explorer
 
 **Both claims are kept, and ranked.** Rejecting the second loses work that is
 really happening; treating them as equals gives two owners and a fight. So the
-first to register owns the PR and the rest are *followed* — reported, named in
-the status bar with a `-follows` suffix, and never spoken to. Driving two agents
-on one PR is worse than either agent alone; forgetting the second is equally bad.
+first to register owns the PR and the rest are *followed* — reported in the row
+as a follower, and never spoken to. Driving two agents on one PR is worse than
+either agent alone; forgetting the second is equally bad. This standing lives in
+the report, not the window name: which window follows is decided across the whole
+fleet, over state a per-window rename guard cannot revalidate at the moment it
+writes a name (a concurrent retire or a new rival can flip it), so a name — read
+at a glance and believed — is never made to assert it.
 
 Ownership is only claimed as a fact when the tool watched both windows register.
 Rivals rarely appear in the same moment — one agent starts, another joins later —
@@ -123,6 +127,16 @@ an agent's input, and is idempotent, so a fleet already correct costs nothing. T
 suffix and rewrites it every sweep; the agent owns the `pr####` base and sets it once. A low-confidence
 verdict is never published as a name: a row can say "probably", a name is read at a glance and
 believed.
+
+The rename plan is computed from a sweep that is already stale by the time it runs — the history lock
+is released and GitHub is read first — so each rename is **guarded, atomically in one tmux client**, on
+the window's live name, its live `@agent_state`, the live server generation, **and** its live
+`window_activity`, all still equalling what the sweep saw. The activity stamp is what makes an
+activity-derived suffix defensible: every suffix is read from a pane that had *stopped*, and tmux
+advances `window_activity` on any output, so an idle pane that starts working during the GitHub read no
+longer matches and the rename aborts rather than naming a resumed window `-ready`. What a per-window
+guard *cannot* revalidate — fleet-global ownership, decided across other windows — is deliberately not a
+suffix at all: the follower/owner standing stays in the row, never in the name.
 
 ## 5. An agent says it is ready and it is not
 
@@ -196,30 +210,50 @@ unavailable exit, so it stays a single valid JSON document — the token is neve
 ## 9. Managing the fleet — `octoshift fleet`
 
 The declared fleet grows on its own: attempting a target declares it, which is what keeps a first-time
-failure from being forgotten. The only manual step is retiring a member that should no longer count — a
+failure from being forgotten. The manual steps are *retiring* a member that should no longer count — a
 decommissioned box, a renamed alias, a typo — because otherwise it is attempted forever and every sweep
-that cannot reach it stays partial.
+that cannot reach it stays partial; and *adding* one back, which is the only way to re-declare the local
+machine once it has been retired.
 
 ```
 $ octoshift fleet
 FLEET 3 member(s)
   local
-  fernie
-  merritt
+  host fernie
+  host merritt
 
 $ octoshift fleet retire --host merritt        # merritt was decommissioned
-RETIRED merritt
+RETIRED host merritt
 
 $ octoshift fleet retire --host typoo
-UNKNOWN typoo not in the declared fleet   # exit Usage — a typo cannot silently retire the wrong thing
+UNKNOWN host typoo not in the declared fleet   # exit Usage — a typo cannot silently retire the wrong thing
+
+$ octoshift fleet add --host banff --local     # declare a new box, and bring local back
+ADDED host banff, local
 ```
 
-`fleet retire --host <alias>` (repeatable) retires remotes and `--local` retires this machine; an unknown
-target makes the whole command a non-success with nothing written. Retiring a member also prunes the
-host, pane, and registration state kept under it, so no ownership can be derived from a retired host's
-stale claim. `--json` emits the members or the retired set as one document. It is credential-free and
-GitHub-unaware: the fleet is a set of `tmux` collection targets kept in the same machine-local history the
-sweeps use, mutated under the same transaction lock so a retire cannot race a concurrent sweep.
+`fleet retire`/`fleet add` take `--host <alias>` (repeatable) for remotes and `--local` for this machine;
+both validate all targets before writing anything (an empty or option-shaped alias is rejected), and an
+unknown *retire* target makes the whole command a non-success with nothing written. Retiring a member
+also prunes the host, pane, and registration state kept under it, so no ownership can be derived from a
+retired host's stale claim.
+
+**Kind, preserved.** Every label distinguishes the local machine from an ssh alias literally *named*
+`local`: the real machine is `local`, an alias is `host <alias>` (so an alias named `local` reads `host
+local`), and `--json` carries the same distinction structurally as `{"kind":"local"}` versus
+`{"kind":"host","host":"local"}` — a consumer can always tell whether it was `--local` or `--host local`.
+
+**Empty on purpose is not the same as fresh.** A never-established fleet scans the local machine by
+default; a fleet emptied by retiring its last member scans **nothing** until a target is added back —
+retiring local must not be silently undone by re-bootstrapping it next sweep. `fleet list` says which it
+is, and a bare `waiting`/`pr` over an emptied fleet leads with an `EMPTY` token and succeeds rather than
+sweeping local behind your back. The distinction is persisted (an `initialized` flag), so it survives
+across runs.
+
+`--json` emits the members, the added set, or the retired set as one document, each target a
+kind-preserving identity. The fleet is credential-free and GitHub-unaware: a set of `tmux` collection
+targets kept in the same machine-local history the sweeps use, mutated under the same transaction lock so
+a retire or add cannot race a concurrent sweep.
 
 ---
 
@@ -269,8 +303,9 @@ octoshift waiting --rename
 # locate one PR and report what is happening to it
 octoshift pr 4537
 
-# show or prune the declared fleet
+# show, extend, or prune the declared fleet
 octoshift fleet
+octoshift fleet add --host banff --local
 octoshift fleet retire --host merritt
 
 # same rows, for a dashboard

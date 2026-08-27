@@ -19,6 +19,14 @@ using System.Text.RegularExpressions;
 internal static partial class WindowNaming
 {
     /// <summary>Every suffix the tool owns. Any of these is stripped before a new one is applied.</summary>
+    /// <remarks>
+    /// <c>follows</c> remains here so a legacy window still carrying it is cleaned up on the next pass, but
+    /// it is no longer <em>applied</em>: it was a fleet-global ownership standing (whether another window
+    /// registered the same PR first), which no per-window tmux guard can revalidate at mutation time — a
+    /// concurrent retire or a new rival could flip it while the guarded window itself did not change — so a
+    /// window name, which is read at a glance and believed, must not assert it. The contest is still
+    /// reported in the row; it just no longer drives a rename.
+    /// </remarks>
     private static readonly string[] Owned = ["blocked", "conflict", "merged", "ready", "stale", "ask", "follows"];
 
     /// <summary>The suffix a verdict earns, or null when the window should carry none.</summary>
@@ -26,16 +34,17 @@ internal static partial class WindowNaming
     /// Deliberately sparse. A name is read at a glance and believed, so it carries only states that are
     /// unambiguous and worth acting on; everything else leaves the base name clean rather than crowding
     /// the status bar with detail the row already gives.
+    ///
+    /// The suffix is a pure function of the <em>verdict</em> — never of fleet-wide ownership. Ownership
+    /// (owner/follower) is decided across every window claiming a PR, over state that lives outside this
+    /// window and can change during the unguardable gap between the sweep and the rename; publishing it in
+    /// a name the rename guard cannot revalidate would assert as current fact something that may already be
+    /// stale. The verdict's own inputs — the pane's activity and its published <c>@agent_state</c> — are
+    /// what the rename guard revalidates at mutation time (a window that resumed, or republished, aborts),
+    /// so a suffix built from them alone is defensible where an ownership suffix is not.
     /// </remarks>
-    internal static string? SuffixFor(WaitingVerdict verdict, Claim claim = default)
+    internal static string? SuffixFor(WaitingVerdict verdict)
     {
-        // A follower is second-class and must stay visible as such. The status bar is where the operator
-        // notices which window to talk to, so the standing belongs there rather than only in a report.
-        if (claim.IsFollower)
-        {
-            return "follows";
-        }
-
         // A low-confidence verdict must not be published as a fact in the one place that is read without
         // context. The row can say "probably"; a window name cannot.
         if (verdict.Assurance.Level == Confidence.Low)
@@ -104,6 +113,22 @@ internal static partial class WindowNaming
     /// per-run user options (keyed by the batch nonce, so a concurrent rename process cannot read or clash
     /// with them) using the same escaping; the guard then compares against <c>#{@…}</c>. A third invocation
     /// unsets them, so no run leaks options.
+    /// <strong>Each mutation is guarded on the whole scanned identity, atomically.</strong> A rename is
+    /// planned against a sweep that is already stale by the time it runs: the history lock is released and
+    /// GitHub is read before rename, and a second concurrent sweep may act in between. Guarding on the
+    /// server epoch alone is not enough — the same window may have changed its published PR or its name, a
+    /// newer sweep may have already renamed it, or the pane may have <em>resumed</em> since it was scanned
+    /// idle, all under an unchanged server. So each window's guard compares, in one tmux client's command
+    /// queue, the live server generation (<c>#{pid}:#{start_time}</c>), the live <c>#{window_activity}</c>,
+    /// the live <c>#{window_name}</c>, and the live <c>#{@agent_state}</c> against the exact values the
+    /// sweep saw. The activity stamp is the durable half of the suffix's other input: every suffix the tool
+    /// applies is read from a pane that had <em>stopped</em> (idle, blocked, or stalled — never mid-turn),
+    /// and tmux advances <c>window_activity</c> on any pane output, so a window that has produced anything
+    /// since the sweep — an idle pane that started working during the GitHub read, a prompt that appeared,
+    /// a stall that cleared — no longer matches and the rename aborts. It is the finest atomic activity
+    /// signal tmux exposes; the suffix set is deliberately confined to what this plus the name and state
+    /// guards can defend, and fleet-global ownership, which none of them can, is no longer published as a
+    /// suffix at all.
     ///
     /// <strong>The epoch check and the mutation share one server connection.</strong> The guard is a
     /// <c>tmux if-shell -F</c>: the format is evaluated and, only on a full match, its true branch — a tmux
@@ -111,11 +136,11 @@ internal static partial class WindowNaming
     /// <c>run-shell</c> — renames the window and prints its confirmation. There is no gap between "checked"
     /// and "renamed" for a restart or a concurrent rename to slip into. Each invocation prints exactly one
     /// marker naming its own window: <c>&lt;nonce&gt;:ok:@id</c> on a confirmed rename;
-    /// <c>&lt;nonce&gt;:stale:@id</c> when the server is unchanged but the window's name or state has moved
-    /// since the sweep (its false branch tests the epoch to tell this from a restart); and
-    /// <c>&lt;nonce&gt;:epoch:@id</c> when the server generation itself changed. The caller accounts for
-    /// every window independently, so a change to one window leaves the others' outcomes intact.
-    /// <c>|| :</c> keeps one failed invocation from aborting the rest.
+    /// <c>&lt;nonce&gt;:stale:@id</c> when the server is unchanged but the window's name, published state,
+    /// or activity has moved since the sweep (its false branch tests the epoch to tell this from a
+    /// restart); and <c>&lt;nonce&gt;:epoch:@id</c> when the server generation itself changed. The caller
+    /// accounts for every window independently, so a change to one window leaves the others' outcomes
+    /// intact. <c>|| :</c> keeps one failed invocation from aborting the rest.
     /// </remarks>
     internal static string? BuildRenameScript(
         IReadOnlyList<(TmuxPane Pane, string Desired)> renames,
@@ -148,6 +173,13 @@ internal static partial class WindowNaming
         {
             string id = pane.WindowId;
 
+            // The scanned window_activity, a non-negative integer validated at collection, so it is safe
+            // inside the single-quoted format. Anything else is replaced with a value tmux never prints for
+            // window_activity (it is always >= 0), so the guard fails closed rather than embedding an
+            // unvalidated string.
+            string activity = TmuxScanner.IsActivityStamp(pane.ActivityStamp) ? pane.ActivityStamp : "-1";
+            string activityEq = $"#{{==:#{{window_activity}},{activity}}}";
+
             // 1. Stage the scanned name, raw state, and desired name into this window's options, escaped so
             //    no raw byte reaches shell or tmux syntax. if-shell -F 1 is only a way to have tmux lex the
             //    command string, which is what decodes the escapes; there is no false branch.
@@ -156,13 +188,16 @@ internal static partial class WindowNaming
                   .Append(" \"").Append(TmuxEscape(pane.AgentStateRaw)).Append("\" ; set-option -w -t ").Append(id).Append(' ').Append(descKey)
                   .Append(" \"").Append(TmuxEscape(desired)).Append("\"'\n");
 
-            // 2. Guard on epoch AND name AND state, and mutate in the same client's queue. The rename reads
-            //    the desired name from its staged option (#{@descKey}) rather than an inline literal:
-            //    rename-window subjects its argument to a *second*, format-expansion pass, so any inline
-            //    literal #{…}/#(…)/#[…]/shorthand in an agent-chosen name would be evaluated. A staged
-            //    option value is substituted but not itself re-expanded, so the name lands byte-for-byte.
-            //    The false branch reports whether the server moved (epoch) or only the identity did (stale).
-            string guard = $"#{{&&:{epochEq},#{{&&:#{{==:#{{window_name}},#{{{nameKey}}}}},#{{==:#{{@agent_state}},#{{{stateKey}}}}}}}}}";
+            // 2. Guard on epoch AND activity AND name AND state, and mutate in the same client's queue. The
+            //    rename reads the desired name from its staged option (#{@descKey}) rather than an inline
+            //    literal: rename-window subjects its argument to a *second*, format-expansion pass, so any
+            //    inline literal #{…}/#(…)/#[…]/shorthand in an agent-chosen name would be evaluated. A
+            //    staged option value is substituted but not itself re-expanded, so the name lands
+            //    byte-for-byte. The false branch reports whether the server moved (epoch) or only the
+            //    identity/activity did (stale).
+            string nameEq = $"#{{==:#{{window_name}},#{{{nameKey}}}}}";
+            string stateEq = $"#{{==:#{{@agent_state}},#{{{stateKey}}}}}";
+            string guard = $"#{{&&:{epochEq},#{{&&:{activityEq},#{{&&:{nameEq},{stateEq}}}}}}}";
             string falseReport = $"#{{?{epochEq},{nonce}:stale:{id},{nonce}:epoch:{id}}}";
             script.Append("tmux if-shell -F -t ").Append(id).Append(" '").Append(guard)
                   .Append("' 'rename-window -t ").Append(id).Append(" -- \"#{").Append(descKey).Append("}\"")

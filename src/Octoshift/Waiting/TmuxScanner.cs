@@ -85,6 +85,18 @@ internal sealed record TmuxPane
     /// <summary>When the window last produced output — an observed stop time, not a claimed one.</summary>
     public DateTimeOffset? LastActivity { get; init; }
 
+    /// <summary>
+    /// The window's <c>#{window_activity}</c> exactly as tmux reports it — a non-negative integer second,
+    /// empty (never null) only when a manifest never carried one. tmux advances it on any pane output, so
+    /// it is the finest durable signal the tool has for "has this window done anything since the sweep".
+    /// The rename guard compares it byte-for-byte against the live value so a mutation whose truthfulness
+    /// depends on the pane still being quiescent — every <c>-ready</c>/<c>-ask</c>/<c>-stale</c> suffix does,
+    /// since each is read from a pane that had stopped — aborts the instant the window produced output,
+    /// rather than renaming a window that has since resumed. It is the raw stamp, distinct from the parsed
+    /// <see cref="LastActivity"/>, so the comparison is exact.
+    /// </summary>
+    public string ActivityStamp { get; init; } = string.Empty;
+
     /// <summary>The window's <c>@agent_state</c> option: the agent's own account of where it is.</summary>
     public string? AgentStateOption { get; init; }
 
@@ -589,6 +601,7 @@ internal sealed partial class TmuxScanner
             Host = host,
             SessionAttached = fields[2].Trim() != "0" && fields[2].Trim().Length > 0,
             LastActivity = ParseActivity(fields[3], host),
+            ActivityStamp = fields[3],
             AgentStateOption = fields[4].Trim() is { Length: > 0 } option ? option : null,
             AgentStateRaw = fields[4],
             WindowName = fields[5],
@@ -640,6 +653,15 @@ internal sealed partial class TmuxScanner
 
         return IsCanonicalPositive(value.AsSpan(0, colon)) && IsCanonicalPositive(value.AsSpan(colon + 1));
     }
+
+    /// <summary>
+    /// A tmux <c>#{window_activity}</c> stamp: a canonical non-negative decimal (a lone <c>0</c> for a
+    /// window that has produced nothing yet, otherwise a positive unix second with no leading zero) — the
+    /// exact shape the collection script prints. Anything else is not a stamp this scheme captured, so the
+    /// rename guard that embeds it fails closed rather than putting an unvalidated string into a tmux
+    /// format.
+    /// </summary>
+    internal static bool IsActivityStamp(string value) => IsCanonicalNonNegative(value.AsSpan());
 
     /// <summary>
     /// A canonical non-negative decimal: one or more ASCII digits with no leading zero, so a lone

@@ -41,6 +41,24 @@ internal readonly record struct TargetId
     public bool IsLocal => Key == LocalKey;
 
     /// <summary>
+    /// The target kind, as a machine-readable tag: <c>local</c> for the real local machine, <c>host</c>
+    /// for any ssh alias. This is the distinction <see cref="Display"/> deliberately collapses — the local
+    /// machine and an alias literally named <c>local</c> both display <c>local</c> — so every output
+    /// contract that a consumer reads to decide between <c>--local</c> and <c>--host</c> must carry the tag
+    /// beside the alias rather than the alias alone.
+    /// </summary>
+    public string KindTag => IsLocal ? "local" : "host";
+
+    /// <summary>
+    /// An unambiguous human label that preserves the target kind: <c>local</c> for the real local machine,
+    /// and <c>host &lt;alias&gt;</c> for every ssh alias — including one literally named <c>local</c>,
+    /// which renders <c>host local</c> and so can never be read as the local machine. Every fleet surface
+    /// (list, add, retire, unknown) labels a target this way, on success and on failure alike, so a reader
+    /// can always derive whether it was <c>--local</c> or <c>--host &lt;alias&gt;</c> that named it.
+    /// </summary>
+    public string HumanLabel => IsLocal ? "local" : $"host {Display}";
+
+    /// <summary>
     /// Wraps a key this scheme produced (e.g. a <see cref="PaneHistory.KnownHosts"/> entry) so it can be
     /// shown, validating it first. A key that <see cref="IsValidKey"/> rejects is not a target this scheme
     /// would ever have minted, so it is a caller error rather than something to display — use <see

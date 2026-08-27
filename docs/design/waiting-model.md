@@ -228,6 +228,20 @@ because several of them were violated by code that passed its unit tests.
     sanctioned way to forget a target, the mirror of invariant 18: collection must
     never forget, retirement is how an operator does. Modelled as the `Retire`
     action and the `NoOwnerFromRetiredHost` invariant.)*
+20. Fleet membership *grows deliberately* through an operator **addition**, the
+    counterpart to retirement and the only way to re-declare the local machine
+    once it has been retired — because a bare sweep bootstraps local only while
+    the fleet is genuinely *uninitialized*, never again after it has been emptied
+    on purpose. Adding a host declares it (no epoch, continuity or pane until a
+    sweep reaches it) and, like any fleet change, drops the last sweep's
+    completeness until a fresh complete sweep re-earns it; a collected window's
+    registration is re-understood against the now-larger fleet so an otherwise
+    unchanged sweep does not spuriously flip ownership. *(The `initialized` flag is
+    what separates a fresh fleet, where a bare sweep defaults to local, from a fleet
+    emptied by retirement, which stays empty — over an emptied fleet a bare
+    `waiting`/`pr` leads with `EMPTY` and succeeds rather than re-adding local.
+    Modelled as the `Add` action and the `OwnerStableAcrossSweepStep` property,
+    which the re-stamp keeps holding.)*
 
 Invariants 9–14 are the ones unit tests cover least well, because they are
 statements about *sequences* of sweeps interleaved with fleet events rather than

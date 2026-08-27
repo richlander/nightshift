@@ -605,6 +605,28 @@ public sealed class PersistenceTests
         yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"1:1\",\"sweptAt\":null,\"continuous\":true}}}},{att}}}"];
         // A host carrying a non-canonical epoch.
         yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"0:0\",\"sweptAt\":\"2026-01-01T00:00:00+00:00\",\"continuous\":true}}}},{att}}}"];
+
+        // --- Round 11: the initialized flag. The writer only ever persists it true (a first run is the
+        //     absent-file case, never written), so a persisted false or absent flag is a shape it never
+        //     produced — and tampering it to false must not re-enable the local bootstrap on an emptied
+        //     fleet. These fixtures are otherwise valid, so the flag is the tested defect. ---
+        yield return ["{\"panes\":{},\"hosts\":{},\"attempted\":[],\"initialized\":false}"];
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{ValidHost}}},\"attempted\":[\"{hostKey}\"],\"initialized\":false}}"];
+        yield return ["{\"panes\":{},\"hosts\":{},\"attempted\":[],\"initialized\":null}"];
+
+        // --- Round 11: a persisted remote alias that decodes to something the collector could never use.
+        //     A canonical base64url key round-trips (IsValidKey passes) yet decodes to an option-shaped or
+        //     whitespace alias a strict load must reject as HistoryUnavailable, so automatic collection
+        //     never builds an ssh argument that throws ArgumentException. HostTarget.Validate is the same
+        //     gate the CLI applies. ---
+        string dashVKey = TargetId.ForHost("-V").Key;
+        string whitespaceKey = TargetId.ForHost(" ").Key;
+        // Option-shaped, as a collected host (valid record, unusable alias).
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{dashVKey}\":{ValidHost}}},\"attempted\":[\"{dashVKey}\"],\"initialized\":true}}"];
+        // Option-shaped, as an attempted-only member.
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{}},\"attempted\":[\"{dashVKey}\"],\"initialized\":true}}"];
+        // Whitespace alias as an attempted-only member.
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{}},\"attempted\":[\"{whitespaceKey}\"],\"initialized\":true}}"];
     }
 
     [Theory]
@@ -689,6 +711,63 @@ public sealed class PersistenceTests
             await Assert.ThrowsAsync<HistoryUnavailableException>(() => PrCommand.LocateAsync(
                 4448, collected, history: null, NoneFetch, None, DateTimeOffset.UtcNow, ct, historyPath: path));
             Assert.Equal(content, File.ReadAllText(path));
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task AnOptionShapedPersistedTargetIsUnavailableNotAnArgumentExceptionMidSweep()
+    {
+        // Finding round 11 / #4: the key for `-V` is canonical base64url — IsValidKey accepts it — but it
+        // decodes to an ssh option the collector would throw ArgumentException on mid-sweep, outside the
+        // PARTIAL/history-unavailable contract. Strict load rejects it as HistoryUnavailable with the bytes
+        // preserved, and the collecting entry point surfaces exactly that, never an ArgumentException.
+        string key = TargetId.ForHost("-V").Key;
+        string content = $"{{\"panes\":{{}},\"hosts\":{{}},\"attempted\":[\"{key}\"],\"initialized\":true}}";
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-optiontarget-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, content);
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            await Assert.ThrowsAsync<HistoryUnavailableException>(() => PaneHistory.OpenAsync(path, ct));
+            Assert.Equal(content, File.ReadAllText(path));
+
+            // The waiting collect path opens the history strictly first, so it surfaces the same unavailable
+            // contract before any scanner is constructed — the injected scan is never even reached.
+            await Assert.ThrowsAsync<HistoryUnavailableException>(() => WaitingCommand.CollectAndResolveAsync(
+                [],
+                (_, _) => throw new Xunit.Sdk.XunitException("the scanner must never be constructed for an unusable persisted target"),
+                None, None, DateTimeOffset.UtcNow, ct, historyPath: path));
+            Assert.Equal(content, File.ReadAllText(path));
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public void FleetTargets_DropsAForgivinglyLoadedUnusableRemoteRatherThanCollectingIt()
+    {
+        // Defense in depth: a strict product load rejects an option-shaped persisted alias, but a forgiving
+        // or hand-seeded history might still hold one. FleetTargets must not hand it to the collector — the
+        // unusable member is dropped so no ssh argument is ever built from `-V`, while usable members stay.
+        string dashV = TargetId.ForHost("-V").Key;
+        string fernie = TargetId.ForHost("fernie").Key;
+        string content = $"{{\"panes\":{{}},\"hosts\":{{}},\"attempted\":[\"{dashV}\",\"{fernie}\"],\"initialized\":true}}";
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-ftdrop-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, content);
+        try
+        {
+            var history = new PaneHistory(path);
+            IReadOnlyList<string?> targets = history.FleetTargets([]);
+            Assert.DoesNotContain("-V", targets);
+            Assert.Contains("fernie", targets);
         }
         finally
         {
