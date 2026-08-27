@@ -17,11 +17,11 @@ others:
 - **Turnstile** (`turnstile`) — a credential-free coordination store: kv, leases, and an
   ETag watch over a local Unix socket. No GitHub, no network, no auth. This is the
   long-running state substrate the gate caches into.
-- **Octoshift** (`octoshift`) — the single membrane between Turnstile and GitHub. It holds
-  the GitHub App credentials agents never touch, observes PR/merge/CI state (preferring
-  cheap REST + `If-None-Match` over the exhausted GraphQL half), and writes what it learns
-  into Turnstile's cache. `octoshift waiting` joins agent-published tmux window state with
-  GitHub to report which windows need a person.
+- **Octoshift** (`octoshift`) — the GitHub-facing membrane. It holds the GitHub App credentials
+  agents never touch and observes PR/CI state over cheap REST + `If-None-Match` (leaving the
+  exhausted GraphQL half alone). `octoshift waiting` joins agent-published tmux window state across
+  hosts with what GitHub says about each PR to report which windows need a person; `octoshift pr`
+  locates a single PR across the fleet; `octoshift fleet` manages the set of collection targets.
 - **Nightsky** (`nightsky`) — a read-only dashboard over the Turnstile keyspace. It renders
   and never mutates: it files no claim, writes no key, and holds no GitHub credentials.
 
@@ -33,10 +33,9 @@ Keep this file to repository-wide engineering rules. Subsystem design lives in
 | Topic | Doc |
 | --- | --- |
 | Turnstile store (kv/lease/watch, socket) | `docs/design/turnstile.md` |
-| Octoshift — the GitHub membrane | `docs/design/octoshift.md` |
 | Nightsky — the read-only dashboard | `docs/design/nightsky.md` |
 | What `octoshift waiting` is for, by scenario | `docs/waiting-scenarios.md` |
-| The waiting state machine and its invariants | `docs/design/waiting-model.md` |
+| The `octoshift waiting` state machine and its invariants | `docs/design/waiting-model.md` |
 | TLA+ models (waiting / tmux windows) | `docs/model/README.md` |
 
 ## Repository-wide engineering constraints

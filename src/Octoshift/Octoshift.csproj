@@ -14,10 +14,9 @@
   </ItemGroup>
 
   <!--
-    Octoshift is the GitHub membrane. It COMPOSES `nightshift` and `gh` as SUBPROCESSES and links neither:
-    there is intentionally NO ProjectReference to nightshift or Turnstile. Nightshift stays GitHub-unaware,
-    and octoshift stays the single gh-aware component. The only coupling is the observable CLI contracts
-    (nightshift where json output, nightshift land, gh api).
+    Octoshift is the GitHub membrane: the single gh-aware component. It COMPOSES `gh` as a SUBPROCESS
+    and links nothing — there is intentionally NO ProjectReference to any other project here. The only
+    coupling is the observable CLI contract of `gh` (gh api, the REST + If-None-Match pattern).
   -->
 
 </Project>

@@ -85,3 +85,6 @@ internal static class GhAuthenticatedRunner
         return new GhResult(proc.ExitCode, stdout.ToString(), stderr.ToString());
     }
 }
+
+/// <summary>The raw result of running <c>gh</c>: its exit code and captured stdout/stderr.</summary>
+internal readonly record struct GhResult(int ExitCode, string Stdout, string Stderr);

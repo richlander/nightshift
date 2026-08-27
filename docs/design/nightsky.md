@@ -4,7 +4,7 @@
 *Turnstile coordinates. Octoshift translates. Nightsky shows you the whole sky — and touches nothing.*
 
 *Draft spec v0.1 — Rich Lander, July 2026*
-*Built on Nightshift, [Turnstile](turnstile.md), and [Octoshift](octoshift.md). Not yet built — this is the map.*
+*Built on Nightshift, [Turnstile](turnstile.md), and Octoshift. Not yet built — this is the map.*
 
 ---
 
@@ -12,7 +12,7 @@
 
 A running shift has three planes of truth, and today you read them one window at a time. [Turnstile](turnstile.md)
 holds live coordination — claims, leases, the ready set, directives, control flags. Nightshift
-projects that into orders — plans, states, branches, the roster, escalations. [Octoshift](octoshift.md) carries the
+projects that into orders — plans, states, branches, the roster, escalations. Octoshift carries the
 GitHub reality — which PR opened, whether it is mergeable, whether it merged. `turnstile watch`, `nightshift watch`,
 and the planned `octoshift watch` (#34) each render **one** of these. Nobody renders all three at one address.
 
@@ -36,7 +36,7 @@ That keeps it a narrow building block in the vision's sense, and it keeps it
 
 ## 1. One pane over three planes
 
-An order [exists on three planes at one identity](octoshift.md) — the tri-plane model is Octoshift's, and
+An order exists on three planes at one identity — the tri-plane model is Octoshift's, and
 Nightsky is the surface that renders it whole. For order `op1` of plan `9001`:
 
 | Plane | Source of truth | What Nightsky shows | Read from |
@@ -74,7 +74,7 @@ There were two candidate designs:
 1. **One primitive, one connection.** All three planes are already Turnstile rows: the Nightshift projection is
    `/plan/*` (`{base}/state`, `{base}/branch`, `{base}/directive`), the ready set is `/ready/`, the roster is
    `/agent/{id}`, the control flags are `/control/halt` and `/control/draining`, and — critically — Octoshift's PR
-   cache is [the opaque `{base}/pr` tier it already writes to Turnstile](octoshift.md). One SSE watch over the
+   cache is the opaque `{base}/pr` tier it already writes to Turnstile. One SSE watch over the
    relevant prefixes sees every plane. Wrapping would re-serialize state out of the kernel only to re-parse and
    re-join it, when a single range + watch already has it joined by key.
 2. **It inherits the level-triggered contract.** Turnstile's [`/watch`](turnstile.md) emits a `sync` once the
