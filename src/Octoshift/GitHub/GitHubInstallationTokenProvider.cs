@@ -29,7 +29,13 @@ internal sealed class GitHubAppInstallationTokenProvider : IGitHubInstallationTo
     private readonly IGitHubTokenAuditSink _auditSink;
     private readonly SemaphoreSlim _refreshLock = new(1, 1);
 
-    private GitHubInstallationToken? _cached;
+    // A single reference published through a volatile field, rather than a Nullable<GitHubInstallationToken>
+    // read outside the lock. The nullable struct is three fields (has-value, the token reference, the expiry)
+    // whose stores are not atomic together, so the fast-path reader could observe a new token string beside a
+    // stale expiry — a torn read. A CachedToken is immutable and fully constructed before it is published, and
+    // a reference store is atomic; the volatile write/read pair orders that publication so the fast path only
+    // ever sees a wholly initialized token or none at all.
+    private volatile CachedToken? _cached;
 
     public GitHubAppInstallationTokenProvider(GitHubAppCredentials credentials)
         : this(
@@ -66,23 +72,23 @@ internal sealed class GitHubAppInstallationTokenProvider : IGitHubInstallationTo
     public async Task<GitHubInstallationToken> GetTokenAsync(CancellationToken ct)
     {
         DateTimeOffset now = _clock();
-        if (_cached is { } cached && !NeedsRefresh(cached, now))
+        if (_cached is { } cached && !NeedsRefresh(cached.Token, now))
         {
-            return cached;
+            return cached.Token;
         }
 
         await _refreshLock.WaitAsync(ct);
         try
         {
             now = _clock();
-            if (_cached is { } current && !NeedsRefresh(current, now))
+            if (_cached is { } current && !NeedsRefresh(current.Token, now))
             {
-                return current;
+                return current.Token;
             }
 
             bool refreshed = _cached is not null;
             GitHubInstallationToken minted = await MintTokenAsync(refreshed, ct);
-            _cached = minted;
+            _cached = new CachedToken(minted);
             return minted;
         }
         finally
@@ -160,6 +166,12 @@ internal sealed class GitHubAppInstallationTokenProvider : IGitHubInstallationTo
         return minted;
     }
 }
+
+/// <summary>
+/// Immutable holder that lets the cached token be published as one atomic reference store. Its single field
+/// is set before the holder is assigned to a volatile field, so a reader either sees the whole token or none.
+/// </summary>
+internal sealed record CachedToken(GitHubInstallationToken Token);
 
 internal sealed record GitHubInstallationTokenResponseDto
 {
