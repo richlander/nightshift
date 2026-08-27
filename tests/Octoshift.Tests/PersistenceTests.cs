@@ -538,16 +538,18 @@ public sealed class PersistenceTests
         string att = $"\"attempted\":[\"{hostKey}\"]";
         const string attEmpty = "\"attempted\":[]";
 
-        // --- Raw schema: shapes the source-gen deserializer would leniently accept and rewrite. ---
+        // --- Unversioned member set: shapes no version of this scheme ever wrote. ---
 
-        // The writer always emits all three members, so a file missing any was not written by this scheme.
+        // A file whose member set is not one of the known legacy shapes (panes+hosts; +attempted;
+        // +initialized) was not written by any version, so it fails closed rather than migrating. A null
+        // map inside an otherwise-recognised shape is a structural reject on the same footing.
         yield return ["{}"];
         yield return ["{\"panes\":{}}"];
         yield return ["{\"hosts\":{}}"];
         yield return ["{\"panes\":null,\"hosts\":null}"];
-        yield return ["{\"panes\":{},\"hosts\":{}}"];                       // the two maps, but no attempted set
 
-        // An extra root member, or the wrong casing, which case-insensitive matching would silently drop.
+        // An extra root member on a versioned file, or the wrong casing, which case-insensitive matching
+        // would silently drop. The `version:2` file is a versioned document this build cannot read.
         yield return [$"{{\"panes\":{{}},\"hosts\":{{}},{attEmpty},\"version\":2}}"];
         yield return ["{\"Panes\":{},\"Hosts\":{},\"Attempted\":[]}"];
 
@@ -572,16 +574,11 @@ public sealed class PersistenceTests
         yield return ["{\"panes\":{},\"hosts\":{},\"attempted\":[\"L\",\"L\"]}"];
         yield return ["{\"panes\":{},\"hosts\":{},\"attempted\":[\"RA\"]}"];
 
-        // A host that answered but is absent from the attempted set — a shape the writer, which records
-        // both on the same sweep, could never produce; reading past it would leave the membership invariant
-        // KnownHosts relies on unchecked.
-        yield return [$"{{\"panes\":{{}},{hosts},{attEmpty}}}"];
+        // A host that answered but is absent from the attempted set is no longer rejected: it is a valid
+        // legacy shape whose attempted membership migration derives from the hosts map, so it is asserted
+        // to migrate in HistoryMigrationTests rather than fail closed here.
 
         // --- Semantic: full, well-formed records this implementation could never have written. ---
-
-        // A pane whose host is absent from the hosts map — it would carry a registration for a host that
-        // never enters the collected fleet, defeating narrowed-fleet detection.
-        yield return [$"{{\"panes\":{{\"{paneKey}\":{ValidPane}}},\"hosts\":{{}},{attEmpty}}}"];
 
         // An invalid host key: `RA` is not canonical base64url, so it is not a target this scheme minted.
         yield return [$"{{\"panes\":{{}},\"hosts\":{{\"RA\":{ValidHost}}},{attEmpty}}}"];

@@ -36,6 +36,29 @@ an update, and the write itself is atomic (temp file then rename). A lock that
 cannot be taken, or a write that fails, is surfaced as unavailable — never a
 success that leaves a stale witnessed order on disk.
 
+**Schema version and upgrade skew.** Every write stamps an integer `version`, and
+the loader branches on it rather than inferring scheme identity from which members
+happen to be present — the inference that once bricked every history written before
+`attempted` and `initialized` existed, because a routine upgrade made a real file
+look like one "not written by this scheme." A file whose `version` matches is
+validated exactly (exact members, casing, no duplicates or unknowns, and the same
+record invariants a writer produces); a `version` that is newer, unknown, or
+malformed is refused, bytes untouched, so a future format cannot be misread by an
+old build. An *unversioned* file is one an earlier build wrote: if its member set is
+one of the exact known legacy shapes (`panes`+`hosts`; +`attempted`; +`initialized`)
+and its records are ones a writer produced, it is **migrated in memory** — panes and
+host memory preserved, and the `attempted` membership *derived* from every persisted
+host key **and every pane's composite host** (the real payload that motivated this
+carries local panes with an empty `hosts` map, so its local membership survives only
+in the pane keys). Anything else fails closed with its bytes preserved: a foreign
+member set, a hand-edited or impossible record, or a persisted alias this build
+cannot represent — including a NUL, which no real invocation ever produced because a
+NUL cannot be carried through a process argument, so it is a file this scheme never
+wrote rather than upgrade skew. The strict load is not relaxed, only taught to tell
+an ordinary older file from one no version wrote; every unusable persisted alias is
+refused before any scanner is constructed, the same contract the versioned path
+applies.
+
 ---
 
 ## 2. The per-window state vector

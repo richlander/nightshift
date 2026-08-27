@@ -21,12 +21,31 @@ public class CliParseTests
     [InlineData("--host=")]
     [InlineData("--host= ")]
     [InlineData("--host=two words")]
+    [InlineData("--host=a\u0000b")]    // an embedded NUL truncates the ssh argument on Unix, throws on Windows
+    [InlineData("--host=a\u007fb")]    // DEL, and every other control code, cannot survive a process argument
+    [InlineData("--host=\u0000")]      // the one-character NUL alias the RAA target key decodes to
     public void CreateRootCommand_WaitingRejectsAHostSshWouldNotReadAsAHost(string argument)
     {
         var result = Cli.CreateRootCommand().Parse(["waiting", argument, "--repo", "owner/repo"]);
 
         Assert.NotEmpty(result.Errors);
         Assert.Contains(result.Errors, e => e.Message.Contains("--host", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void CreateRootCommand_WaitingRejectsAnUnpairedSurrogateHost()
+    {
+        // A lone surrogate has no UTF-8 encoding, so it would collapse onto U+FFFD's target key — the alias
+        // dialling a different host. The strings are built in-body, not via InlineData: xUnit serialises
+        // theory arguments and a lone surrogate does not survive that round trip (it is replaced with
+        // U+FFFD), which would silently defeat the case.
+        foreach (string host in new[] { "\ud800", "\udc00", "host\ud800" })
+        {
+            var result = Cli.CreateRootCommand().Parse(["waiting", "--host", host, "--repo", "owner/repo"]);
+
+            Assert.NotEmpty(result.Errors);
+            Assert.Contains(result.Errors, e => e.Message.Contains("--host", StringComparison.Ordinal));
+        }
     }
 
     [Fact]
