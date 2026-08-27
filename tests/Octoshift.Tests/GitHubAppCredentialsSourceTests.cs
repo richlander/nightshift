@@ -14,8 +14,16 @@ using Xunit;
 public class GitHubAppCredentialsSourceTests
 {
     private const string CredentialsPathVariable = "OCTOSHIFT_GITHUB_APP_CREDENTIALS_PATH";
-    private const string CredentialsPath = "/creds/app.json";
-    private const string PrivateKeyPath = "/creds/k.pem";
+
+    // Paths are built and normalized the way production builds them (Path.GetFullPath from a platform-native
+    // base), so the fake-reader keys match what Load computes on every OS. Hard-coded POSIX literals like
+    // "/creds/app.json" would be rewritten to a drive-qualified backslash path by Path.GetFullPath on Windows
+    // and never match the fake reader — the load tests would silently miss their files and the permission test
+    // would report the wrong one. The directories are never touched on disk; the reader is faked in memory.
+    private static readonly string CredentialsStoreDir = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "ns-cred-store"));
+    private static readonly string CredentialsPath = Path.GetFullPath(Path.Combine(CredentialsStoreDir, "app.json"));
+    private static readonly string PrivateKeyPath = Path.GetFullPath(Path.Combine(CredentialsStoreDir, "k.pem"));
+    private static readonly string WorkingTreeDir = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "ns-cred-work"));
 
     private sealed class FakeReader(IReadOnlyDictionary<string, ProtectedFileData> files) : IProtectedFileReader
     {
@@ -24,10 +32,11 @@ public class GitHubAppCredentialsSourceTests
                 ? data
                 : throw new InvalidOperationException($"octoshift: {label} file '{path}' does not exist.");
     }
+
     private static FileGitHubAppCredentialsSource SourceReading(string credentialsJson, UnixFileMode? mode = UnixFileMode.UserRead)
         => new(
             name => name == CredentialsPathVariable ? CredentialsPath : null,
-            () => "/work",
+            () => WorkingTreeDir,
             new FakeReader(new Dictionary<string, ProtectedFileData>(StringComparer.Ordinal)
             {
                 [CredentialsPath] = new ProtectedFileData(mode, credentialsJson),
@@ -42,7 +51,7 @@ public class GitHubAppCredentialsSourceTests
         bool enforceOutsideWorkingTree = false)
         => new(
             name => name == CredentialsPathVariable ? CredentialsPath : null,
-            () => "/work",
+            () => WorkingTreeDir,
             new FakeReader(new Dictionary<string, ProtectedFileData>(StringComparer.Ordinal)
             {
                 [CredentialsPath] = new ProtectedFileData(credentialsMode, credentialsJson),
@@ -148,12 +157,16 @@ public class GitHubAppCredentialsSourceTests
         // for the boundary. Note this is a lexical containment check on the normalized path only — it does not
         // resolve symlinks, so it is not by itself a defense against a symlink that points from outside the
         // tree back in (tracked separately). This test asserts only the lexical behavior.
+        //
+        // The credentials path is built under the working tree with Path.GetFullPath so the containment check
+        // sees drive-qualified, natively-separated paths on Windows just as it does on Unix.
+        string insideTree = Path.GetFullPath(Path.Combine(WorkingTreeDir, "creds", "app.json"));
         var source = new FileGitHubAppCredentialsSource(
-            name => name == CredentialsPathVariable ? "/work/creds/app.json" : null,
-            () => "/work",
+            name => name == CredentialsPathVariable ? insideTree : null,
+            () => WorkingTreeDir,
             new FakeReader(new Dictionary<string, ProtectedFileData>(StringComparer.Ordinal)
             {
-                ["/work/creds/app.json"] = new ProtectedFileData(UnixFileMode.UserRead, "{}"),
+                [insideTree] = new ProtectedFileData(UnixFileMode.UserRead, "{}"),
             }),
             enforceOutsideWorkingTree: true);
 
