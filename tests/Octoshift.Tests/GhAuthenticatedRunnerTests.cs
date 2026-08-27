@@ -106,12 +106,11 @@ public class GhAuthenticatedRunnerTests
             await cts.CancelAsync();
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
 
-            // The runner has returned only now. The direct child is reaped before it returns, so it is dead
-            // the instant the await unblocks; the descendant is killed as part of the process group, and a
-            // bounded wait-for-death (not a fixed sleep) absorbs only the kernel's reap latency. Neither is
-            // left running behind a completed runner.
+            // The runner has returned only now. Its uncancellable teardown does not complete until the whole
+            // process group is positively confirmed extinct, so both the direct child and the descendant are
+            // already gone the instant the await unblocks — asserted immediately, with no post-return wait.
             Assert.False(IsAlive(childPid), "child was still alive after the runner completed cancellation");
-            await AssertDiesAsync(descPid, TestContext.Current.CancellationToken);
+            Assert.False(IsAlive(descPid), "descendant was still alive after the runner completed cancellation");
         }
         finally
         {
@@ -152,7 +151,10 @@ public class GhAuthenticatedRunnerTests
             GhResult result = await run.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
 
             Assert.Equal(0, result.ExitCode);
-            await AssertDiesAsync(descPid, TestContext.Current.CancellationToken);
+
+            // Completion already proves the descendant died (the drain could not EOF otherwise), and teardown
+            // verified group extinction, so the descendant is gone immediately on return.
+            Assert.False(IsAlive(descPid), "descendant holding the inherited pipe survived the runner");
         }
         finally
         {
@@ -185,7 +187,11 @@ public class GhAuthenticatedRunnerTests
             GhResult result = await run.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
 
             Assert.Equal(0, result.ExitCode);
-            await AssertDiesAsync(descPid, TestContext.Current.CancellationToken);
+
+            // The drains EOF'd on their own here, so death is not implied by completion — the runner's
+            // extinction check is what must have killed the still-live descendant. Asserted immediately on
+            // return, not with a post-return wait.
+            Assert.False(IsAlive(descPid), "the descendant that closed its pipes was left alive after the runner returned");
         }
         finally
         {
@@ -236,21 +242,6 @@ public class GhAuthenticatedRunnerTests
         {
             return false;
         }
-    }
-
-    private static async Task AssertDiesAsync(int pid, CancellationToken ct)
-    {
-        for (int i = 0; i < 500; i++)
-        {
-            if (!IsAlive(pid))
-            {
-                return;
-            }
-
-            await Task.Delay(10, ct);
-        }
-
-        Assert.Fail($"process {pid} was still alive after the runner completed cancellation");
     }
 
     [Fact]

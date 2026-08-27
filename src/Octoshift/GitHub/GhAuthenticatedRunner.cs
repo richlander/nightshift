@@ -123,6 +123,12 @@ internal static class GhAuthenticatedRunner
                 // Already gone, or the platform will not walk the tree; nothing further to do.
             }
 
+            // Confirm at least the direct process is dead before returning control — #92's minimum contract is
+            // that a cancelled runner never leaves the token-bearing gh process itself alive. Descendant
+            // containment is best-effort here: the tree kill above is a snapshot that cannot reach a
+            // descendant once the root has exited (a durable job-object boundary is tracked separately for
+            // Windows).
+            await proc.WaitForExitAsync(CancellationToken.None);
             await ObserveDrainAsync(stdout);
             await ObserveDrainAsync(stderr);
             throw;

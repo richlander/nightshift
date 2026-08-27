@@ -4,8 +4,8 @@ using System.Runtime.InteropServices;
 using System.Text;
 
 /// <summary>
-/// Runs a child process inside a durable OS containment boundary and guarantees that boundary is torn down
-/// before the call returns — nothing the child spawned outlives it, whatever the child's own lifetime.
+/// Runs a child process inside a durable OS containment boundary and guarantees that boundary is torn down —
+/// and positively verified extinct — before the call returns, whatever the child's own lifetime.
 /// </summary>
 /// <remarks>
 /// On Unix the boundary is a fresh process group. The child is <c>posix_spawn</c>ed with
@@ -15,7 +15,9 @@ using System.Text;
 /// member survives, so tearing the group down does not depend on the root staying alive to be walked
 /// (unlike <c>Process.Kill(entireProcessTree)</c>, a best-effort snapshot rooted at a process that may
 /// already be gone). Killing the group closes every inherited copy of the output pipes, which is what lets
-/// the drains reach EOF instead of hanging on a descendant that inherited a write end.
+/// the drains reach EOF instead of hanging on a descendant that inherited a write end — but pipe EOF is not
+/// treated as proof of death: teardown re-signals and probes with <c>kill(-pgid, 0)</c> until the group is
+/// empty.
 ///
 /// Windows is handled by the caller with a best-effort <see cref="System.Diagnostics.Process"/> tree kill;
 /// the process-group guarantee here is Unix-only and not claimed elsewhere.
@@ -25,24 +27,28 @@ internal static partial class ContainedProcess
     private const int POSIX_SPAWN_SETPGROUP = 0x02;
     private const int SIGKILL = 9;
     private const int EINTR = 4;
+    private const int ESRCH = 3;
+    private const int F_DUPFD = 0;
     private const int F_SETFD = 2;
     private const int FD_CLOEXEC = 1;
 
     // The opaque spawn types are pointer-sized on macOS and larger structs on glibc (~80 and ~336 bytes).
-    // Over-allocating a fixed buffer covers both: init writes only within the real size, and the surplus is
-    // never touched.
-    private const int SpawnObjectBufferSize = 1024;
+    // Over-allocating a fixed, suitably aligned block covers both ABIs: init writes only within the real
+    // struct size, and the surplus is never touched. An alignment of 16 satisfies every field these types
+    // are documented to contain (pointers, longs, sigset_t, sched_param).
+    private const nuint SpawnObjectBufferSize = 1024;
+    private const nuint SpawnObjectAlignment = 16;
 
     /// <summary>
-    /// Raised when the child could not be started at all (for example the program was not found on PATH),
-    /// so the caller can report it as a 127 exit rather than a crash.
+    /// Raised when the child could not be started at all (a pipe/spawn setup failure, or the program was not
+    /// found on PATH), so the caller can report it as a 127 exit rather than a crash.
     /// </summary>
     internal sealed class SpawnFailedException(string message) : Exception(message);
 
     /// <summary>
     /// Spawns <paramref name="file"/> (searched on PATH) in a new process group, runs it to completion, and
-    /// returns its exit code and captured stdout/stderr. On cancellation the entire group is killed and
-    /// reaped, and both pipes drained, before the original cancellation propagates.
+    /// returns its exit code and captured stdout/stderr. On cancellation the entire group is killed, verified
+    /// extinct, and both pipes drained before the original cancellation propagates.
     /// </summary>
     internal static async Task<GhResult> RunAsync(
         string file,
@@ -64,30 +70,79 @@ internal static partial class ContainedProcess
 
         // The drains run without the caller's token: killing the group is what unblocks them, so cancelling
         // the reads would only abandon the pipes while the tree is coming down. A child that fills its stdout
-        // pipe stops making progress, so both are read on their own threads, concurrently with the wait.
-        Task<string> stdoutTask = Task.Run(() => ReadAllUtf8(outRead), CancellationToken.None);
-        Task<string> stderrTask = Task.Run(() => ReadAllUtf8(errRead), CancellationToken.None);
+        // pipe stops making progress, so both are read on their own threads, concurrently with the wait. Each
+        // reader owns and closes its fd; if a reader task fails to even start, its fd is closed here so the
+        // descriptor never leaks, and the group is still torn down.
+        Task<string> stdoutTask;
+        Task<string> stderrTask;
+        try
+        {
+            stdoutTask = Task.Run(() => ReadAllUtf8(outRead), CancellationToken.None);
+        }
+        catch
+        {
+            SafeClose(outRead);
+            SafeClose(errRead);
+            AwaitGroupExtinct(pid);
+            throw;
+        }
 
+        try
+        {
+            stderrTask = Task.Run(() => ReadAllUtf8(errRead), CancellationToken.None);
+        }
+        catch
+        {
+            // outRead is already owned by stdoutTask, which will close it; only errRead is orphaned here.
+            SafeClose(errRead);
+            AwaitGroupExtinct(pid);
+            await ObserveAsync(stdoutTask).ConfigureAwait(false);
+            throw;
+        }
+
+        var teardown = new TeardownState { Pid = pid };
         int exitCode;
-        using (ct.Register(static state => KillGroup((int)state!), pid))
+        using (ct.Register(static state => ((TeardownState)state!).ObserveCancellation(), teardown))
         {
             // Reaps the direct child. If the caller cancels, the registration kills the group, which makes
-            // this return with the signalled status; the group teardown below then sweeps any descendants.
+            // this return with the signalled status; the extinction sweep below then confirms every
+            // descendant is gone.
             exitCode = await Task.Run(() => WaitForExit(pid), CancellationToken.None).ConfigureAwait(false);
         }
 
-        // Whether the child exited on its own or was cancelled, sweep the group so any descendant that
-        // inherited a pipe is killed and the drains can reach EOF. Empty groups are a harmless no-op.
-        KillGroup(pid);
+        // Uncancellable cleanup: whether the child exited on its own or was cancelled, kill the group and do
+        // not return until it is positively confirmed extinct (kill(-pgid, 0) == ESRCH). Pipe EOF alone does
+        // not prove a descendant that closed its own pipes is dead.
+        AwaitGroupExtinct(pid);
 
         string stdout = await stdoutTask.ConfigureAwait(false);
         string stderr = await stderrTask.ConfigureAwait(false);
 
-        // Only now that the tree is confirmed down and both pipes are drained does cancellation surface, with
-        // its original identity.
-        ct.ThrowIfCancellationRequested();
+        // Only surface cancellation if the registered callback actually observed it and tore the tree down.
+        // A token cancelled after the registration was disposed did not cancel this operation, so a child
+        // that already completed on its own is reported as the success it was.
+        if (teardown.CancellationObserved)
+        {
+            throw new OperationCanceledException(ct);
+        }
 
         return new GhResult(exitCode, stdout, stderr);
+    }
+
+    /// <summary>Mutable state shared with the cancellation callback: the group to kill and whether it fired.</summary>
+    private sealed class TeardownState
+    {
+        private volatile bool _observed;
+
+        public int Pid { get; init; }
+
+        public bool CancellationObserved => _observed;
+
+        public void ObserveCancellation()
+        {
+            _observed = true;
+            KillGroup(Pid);
+        }
     }
 
     private static unsafe (int Pid, int OutRead, int ErrRead) Spawn(
@@ -95,26 +150,26 @@ internal static partial class ContainedProcess
         IReadOnlyList<string> args,
         IReadOnlyDictionary<string, string?>? environmentOverrides)
     {
-        Span<int> outPipe = stackalloc int[2];
-        Span<int> errPipe = stackalloc int[2];
-        if (MakePipe(outPipe) != 0)
+        (int outRead, int outWrite) = MakePipe();
+        int errRead;
+        int errWrite;
+        try
         {
-            throw new SpawnFailedException($"octoshift: failed to create stdout pipe (errno {Marshal.GetLastPInvokeError()}).");
+            (errRead, errWrite) = MakePipe();
         }
-
-        if (MakePipe(errPipe) != 0)
+        catch
         {
-            close(outPipe[0]);
-            close(outPipe[1]);
-            throw new SpawnFailedException($"octoshift: failed to create stderr pipe (errno {Marshal.GetLastPInvokeError()}).");
+            SafeClose(outRead);
+            SafeClose(outWrite);
+            throw;
         }
 
         byte** argv = null;
         byte** envp = null;
-        byte* faBuffer = stackalloc byte[SpawnObjectBufferSize];
-        byte* attrBuffer = stackalloc byte[SpawnObjectBufferSize];
-        new Span<byte>(faBuffer, SpawnObjectBufferSize).Clear();
-        new Span<byte>(attrBuffer, SpawnObjectBufferSize).Clear();
+        void* faBuffer = NativeMemory.AlignedAlloc(SpawnObjectBufferSize, SpawnObjectAlignment);
+        void* attrBuffer = NativeMemory.AlignedAlloc(SpawnObjectBufferSize, SpawnObjectAlignment);
+        new Span<byte>(faBuffer, (int)SpawnObjectBufferSize).Clear();
+        new Span<byte>(attrBuffer, (int)SpawnObjectBufferSize).Clear();
         bool faInit = false;
         bool attrInit = false;
 
@@ -123,44 +178,35 @@ internal static partial class ContainedProcess
             argv = BuildNativeStringArray(BuildArgv(file, args));
             envp = BuildNativeStringArray(BuildEnvironment(environmentOverrides));
 
-            if (posix_spawn_file_actions_init(faBuffer) != 0)
-            {
-                throw new SpawnFailedException("octoshift: failed to init posix_spawn file actions.");
-            }
-
+            CheckSpawn(posix_spawn_file_actions_init(faBuffer), "init file actions");
             faInit = true;
-            posix_spawn_file_actions_adddup2(faBuffer, outPipe[1], 1);
-            posix_spawn_file_actions_adddup2(faBuffer, errPipe[1], 2);
-            posix_spawn_file_actions_addclose(faBuffer, outPipe[0]);
-            posix_spawn_file_actions_addclose(faBuffer, errPipe[0]);
-            posix_spawn_file_actions_addclose(faBuffer, outPipe[1]);
-            posix_spawn_file_actions_addclose(faBuffer, errPipe[1]);
 
-            if (posix_spawnattr_init(attrBuffer) != 0)
-            {
-                throw new SpawnFailedException("octoshift: failed to init posix_spawn attributes.");
-            }
+            // Route the pipe write ends onto the child's stdout/stderr, then drop every descriptor the child
+            // should not keep. Because the pipe ends were normalised above fd 2, no dup2 target ever collides
+            // with a descriptor a later addclose removes.
+            CheckSpawn(posix_spawn_file_actions_adddup2(faBuffer, outWrite, 1), "dup2 stdout");
+            CheckSpawn(posix_spawn_file_actions_adddup2(faBuffer, errWrite, 2), "dup2 stderr");
+            CheckSpawn(posix_spawn_file_actions_addclose(faBuffer, outRead), "close stdout read end");
+            CheckSpawn(posix_spawn_file_actions_addclose(faBuffer, errRead), "close stderr read end");
+            CheckSpawn(posix_spawn_file_actions_addclose(faBuffer, outWrite), "close stdout write end");
+            CheckSpawn(posix_spawn_file_actions_addclose(faBuffer, errWrite), "close stderr write end");
 
+            CheckSpawn(posix_spawnattr_init(attrBuffer), "init attributes");
             attrInit = true;
-            posix_spawnattr_setflags(attrBuffer, POSIX_SPAWN_SETPGROUP);
-            posix_spawnattr_setpgroup(attrBuffer, 0);
+            CheckSpawn(posix_spawnattr_setflags(attrBuffer, POSIX_SPAWN_SETPGROUP), "set flags");
+            CheckSpawn(posix_spawnattr_setpgroup(attrBuffer, 0), "set process group");
 
             byte* path = Utf8(file);
             try
             {
                 int pid;
-                int rc = posix_spawnp(&pid, path, faBuffer, attrBuffer, argv, envp);
-                if (rc != 0)
-                {
-                    throw new SpawnFailedException(
-                        $"octoshift: failed to start '{file}' ({Marshal.GetPInvokeErrorMessage(rc)}).");
-                }
+                CheckSpawn(posix_spawnp(&pid, path, faBuffer, attrBuffer, argv, envp), $"start '{file}'");
 
                 // The parent never writes to the child; closing its write ends is what lets the reader see EOF
                 // once the last group member releases them.
-                close(outPipe[1]);
-                close(errPipe[1]);
-                return (pid, outPipe[0], errPipe[0]);
+                SafeClose(outWrite);
+                SafeClose(errWrite);
+                return (pid, outRead, errRead);
             }
             finally
             {
@@ -169,10 +215,10 @@ internal static partial class ContainedProcess
         }
         catch
         {
-            close(outPipe[0]);
-            close(outPipe[1]);
-            close(errPipe[0]);
-            close(errPipe[1]);
+            SafeClose(outRead);
+            SafeClose(outWrite);
+            SafeClose(errRead);
+            SafeClose(errWrite);
             throw;
         }
         finally
@@ -187,28 +233,86 @@ internal static partial class ContainedProcess
                 posix_spawnattr_destroy(attrBuffer);
             }
 
+            NativeMemory.AlignedFree(faBuffer);
+            NativeMemory.AlignedFree(attrBuffer);
             FreeNativeStringArray(argv);
             FreeNativeStringArray(envp);
         }
     }
 
-    private static unsafe int MakePipe(Span<int> fds)
+    /// <summary>
+    /// Creates a pipe, moves both ends above the standard descriptors, and marks them close-on-exec. Returns
+    /// the read and write fds; throws <see cref="SpawnFailedException"/> (having closed any it opened) on any
+    /// failure.
+    /// </summary>
+    private static unsafe (int Read, int Write) MakePipe()
     {
+        Span<int> fds = stackalloc int[2];
         fixed (int* p = fds)
         {
             if (pipe(p) != 0)
             {
-                return -1;
+                throw Errno("create pipe");
             }
         }
 
-        // Close-on-exec so a concurrent, unrelated spawn cannot inherit these fds and hold a pipe open past
-        // its owner's exit. The child receives fds 1 and 2 through explicit dup2, which clears the flag on the
-        // duplicated descriptors, so the program still gets working stdout/stderr.
-        fcntl(fds[0], F_SETFD, FD_CLOEXEC);
-        fcntl(fds[1], F_SETFD, FD_CLOEXEC);
-        return 0;
+        try
+        {
+            // pipe() can hand back fd 0/1/2 if the parent had a standard descriptor closed. Move both ends
+            // above fd 2 so the child's stdout/stderr (the dup2 targets) can never be an addclose target.
+            MoveAboveStandardDescriptors(ref fds[0]);
+            MoveAboveStandardDescriptors(ref fds[1]);
+
+            // Close-on-exec so a concurrent, unrelated spawn cannot inherit these fds and hold a pipe open
+            // past its owner's exit. The child receives fds 1 and 2 through explicit dup2, which clears the
+            // flag on the duplicated descriptors, so the program still gets working stdout/stderr.
+            SetCloseOnExec(fds[0]);
+            SetCloseOnExec(fds[1]);
+            return (fds[0], fds[1]);
+        }
+        catch
+        {
+            SafeClose(fds[0]);
+            SafeClose(fds[1]);
+            throw;
+        }
     }
+
+    private static void MoveAboveStandardDescriptors(ref int fd)
+    {
+        if (fd > 2)
+        {
+            return;
+        }
+
+        int moved = fcntl(fd, F_DUPFD, 3);
+        if (moved < 0)
+        {
+            throw Errno("duplicate descriptor above standard streams");
+        }
+
+        SafeClose(fd);
+        fd = moved;
+    }
+
+    private static void SetCloseOnExec(int fd)
+    {
+        if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0)
+        {
+            throw Errno("set close-on-exec");
+        }
+    }
+
+    private static void CheckSpawn(int rc, string what)
+    {
+        if (rc != 0)
+        {
+            throw new SpawnFailedException($"octoshift: failed to {what} ({Marshal.GetPInvokeErrorMessage(rc)}).");
+        }
+    }
+
+    private static SpawnFailedException Errno(string what)
+        => new($"octoshift: failed to {what} ({Marshal.GetPInvokeErrorMessage(Marshal.GetLastPInvokeError())}).");
 
     private static string[] BuildArgv(string file, IReadOnlyList<string> args)
     {
@@ -294,31 +398,40 @@ internal static partial class ContainedProcess
 
     private static unsafe string ReadAllUtf8(int fd)
     {
-        var buffer = new MemoryStream();
-        byte* chunk = stackalloc byte[8192];
-        while (true)
+        try
         {
-            nint n = read(fd, chunk, 8192);
-            if (n < 0)
+            var buffer = new MemoryStream();
+            byte* chunk = stackalloc byte[8192];
+            while (true)
             {
-                if (Marshal.GetLastPInvokeError() == EINTR)
+                nint n = read(fd, chunk, 8192);
+                if (n < 0)
                 {
-                    continue;
+                    int err = Marshal.GetLastPInvokeError();
+                    if (err == EINTR)
+                    {
+                        continue;
+                    }
+
+                    // A read failure must not masquerade as a truncated-but-successful capture: the caller
+                    // parses this output, and silently dropping the tail would corrupt that.
+                    throw new IOException($"octoshift: reading child output failed ({Marshal.GetPInvokeErrorMessage(err)}).");
                 }
 
-                break;
+                if (n == 0)
+                {
+                    break;
+                }
+
+                buffer.Write(new ReadOnlySpan<byte>(chunk, (int)n));
             }
 
-            if (n == 0)
-            {
-                break;
-            }
-
-            buffer.Write(new ReadOnlySpan<byte>(chunk, (int)n));
+            return Encoding.UTF8.GetString(buffer.GetBuffer(), 0, (int)buffer.Length);
         }
-
-        close(fd);
-        return Encoding.UTF8.GetString(buffer.GetBuffer(), 0, (int)buffer.Length);
+        finally
+        {
+            SafeClose(fd);
+        }
     }
 
     private static unsafe int WaitForExit(int pid)
@@ -344,10 +457,65 @@ internal static partial class ContainedProcess
 
     private static void KillGroup(int pid)
     {
-        // Negative pid targets the whole process group. The group id equals the leader's pid, and it stays a
+        // Negative pid targets the whole process group. The group id equals the leader's pid and stays a
         // valid target while any member lives, so this reaches descendants even after the leader has exited.
-        // ESRCH (an already-empty group) is the expected no-op after a clean exit.
         _ = kill(-pid, SIGKILL);
+    }
+
+    /// <summary>
+    /// Kills the process group and does not return until it is positively confirmed extinct — every member
+    /// reaped — by probing with signal 0 until <c>ESRCH</c>. Re-sends <c>SIGKILL</c> each round so a
+    /// descendant that was mid-fork when the first signal landed is still taken down. Uncancellable: this is
+    /// the cleanup that must not leave a token-bearing process alive.
+    /// </summary>
+    private static void AwaitGroupExtinct(int pid)
+    {
+        while (true)
+        {
+            _ = kill(-pid, SIGKILL);
+
+            if (kill(-pid, 0) != 0)
+            {
+                int err = Marshal.GetLastPInvokeError();
+                if (err == ESRCH)
+                {
+                    // No process remains in the group: extinct.
+                    return;
+                }
+
+                if (err == EINTR)
+                {
+                    // Interrupted by a signal; probe again without sleeping.
+                    continue;
+                }
+
+                // Any other error (for example EPERM against a member we cannot signal — not expected for a
+                // group we spawned as the same user) means we cannot yet prove extinction, so we keep trying
+                // rather than silently returning past a possibly-live process.
+            }
+
+            Thread.Sleep(1);
+        }
+    }
+
+    private static void SafeClose(int fd)
+    {
+        if (fd >= 0)
+        {
+            _ = close(fd);
+        }
+    }
+
+    private static async Task ObserveAsync(Task task)
+    {
+        try
+        {
+            await task.ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or OperationCanceledException)
+        {
+            // The reader is being abandoned on an error path; its result is discarded, so observe and move on.
+        }
     }
 
     [LibraryImport("libc", SetLastError = true)]
@@ -369,29 +537,29 @@ internal static partial class ContainedProcess
     private static unsafe partial int waitpid(int pid, int* status, int options);
 
     [LibraryImport("libc", SetLastError = true)]
-    private static unsafe partial int posix_spawnp(int* pid, byte* file, byte* fileActions, byte* attrp, byte** argv, byte** envp);
+    private static unsafe partial int posix_spawnp(int* pid, byte* file, void* fileActions, void* attrp, byte** argv, byte** envp);
 
     [LibraryImport("libc")]
-    private static unsafe partial int posix_spawn_file_actions_init(byte* fileActions);
+    private static unsafe partial int posix_spawn_file_actions_init(void* fileActions);
 
     [LibraryImport("libc")]
-    private static unsafe partial int posix_spawn_file_actions_destroy(byte* fileActions);
+    private static unsafe partial int posix_spawn_file_actions_destroy(void* fileActions);
 
     [LibraryImport("libc")]
-    private static unsafe partial int posix_spawn_file_actions_adddup2(byte* fileActions, int fd, int newFd);
+    private static unsafe partial int posix_spawn_file_actions_adddup2(void* fileActions, int fd, int newFd);
 
     [LibraryImport("libc")]
-    private static unsafe partial int posix_spawn_file_actions_addclose(byte* fileActions, int fd);
+    private static unsafe partial int posix_spawn_file_actions_addclose(void* fileActions, int fd);
 
     [LibraryImport("libc")]
-    private static unsafe partial int posix_spawnattr_init(byte* attr);
+    private static unsafe partial int posix_spawnattr_init(void* attr);
 
     [LibraryImport("libc")]
-    private static unsafe partial int posix_spawnattr_destroy(byte* attr);
+    private static unsafe partial int posix_spawnattr_destroy(void* attr);
 
     [LibraryImport("libc")]
-    private static unsafe partial int posix_spawnattr_setflags(byte* attr, short flags);
+    private static unsafe partial int posix_spawnattr_setflags(void* attr, short flags);
 
     [LibraryImport("libc")]
-    private static unsafe partial int posix_spawnattr_setpgroup(byte* attr, int pgroup);
+    private static unsafe partial int posix_spawnattr_setpgroup(void* attr, int pgroup);
 }
