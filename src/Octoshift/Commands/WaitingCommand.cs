@@ -98,10 +98,8 @@ internal static class WaitingCommand
             }
         }
 
-        var facts = new GhPrFactsSource(
-            repo,
-            new FileConditionalCache(),
-            GhRunnerFactory.Create());
+        using GhRunnerSession gh = GhRunnerFactory.Create();
+        var facts = new GhPrFactsSource(repo, new FileConditionalCache(), gh.Run);
 
         try
         {
