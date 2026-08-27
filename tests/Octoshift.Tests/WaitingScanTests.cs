@@ -10,6 +10,14 @@ using Xunit;
 /// The plumbing around the pure core: reading tmux, reading GitHub conditionally, and deciding which
 /// panes are worth a call at all. Every seam is faked, so nothing here starts a process or a request.
 /// </summary>
+/// <remarks>
+/// Joins the non-parallel <c>ConsoleCapture</c> collection: several tests here reconcile through
+/// <see cref="WaitingCommand.BuildRowsAsync"/>, which mutates the shared static
+/// <see cref="WaitingCommand.Omitted"/>/<see cref="WaitingCommand.Departed"/> reporting fields and reads
+/// them back. Running in the serialized collection keeps a parallel reconcile in another class from
+/// clobbering those fields between a write and the assertion that reads it.
+/// </remarks>
+[Collection("ConsoleCapture")]
 public class WaitingScanTests
 {
     private const string Head = "722512e25f0c1d4a9b8e7360a1c2d3e4f5061728";
@@ -2028,6 +2036,117 @@ public class WaitingScanTests
         {
             File.Delete(path);
         }
+    }
+
+    [Fact]
+    public async Task BuildRows_ClaimsResolveToTheirOwnRepoAcrossRepos()
+    {
+        // #178: two idle windows, each claiming a PR that lives in a different repo. Each row resolves to
+        // its own repo — the point of searching the fleet's repos rather than the one inferred scope.
+        TmuxPane onFirst = Pane("cp:1", "", PaneActivity.Idle, agentState: "pr=100 head=aaaa1111 reviews=2/2 rec=merge", windowName: "pr100");
+        TmuxPane onSecond = Pane("cp:2", "", PaneActivity.Idle, agentState: "pr=200 head=bbbb1111 reviews=2/2 rec=merge", windowName: "pr200");
+
+        PrFacts factsFirst = new() { Number = 100, Repo = "owner/first", HeadSha = "aaaa1111", State = "open", MergeableState = "clean" };
+        PrFacts factsSecond = new() { Number = 200, Repo = "owner/second", HeadSha = "bbbb1111", State = "open", MergeableState = "clean" };
+
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [onFirst, onSecond],
+            (pr, _) => Task.FromResult(pr == 100
+                ? PrFetch.Found(factsFirst).WithRepos(["owner/first", "owner/second"], ["owner/first"])
+                : PrFetch.Found(factsSecond).WithRepos(["owner/first", "owner/second"], ["owner/second"])),
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            DateTimeOffset.UtcNow, all: true, TestContext.Current.CancellationToken);
+
+        Assert.Equal("owner/first", Assert.Single(rows, r => r.Record?.PrNumber == 100).Repo);
+        Assert.Equal("owner/second", Assert.Single(rows, r => r.Record?.PrNumber == 200).Repo);
+    }
+
+    [Fact]
+    public async Task BuildRows_ANotFoundClaimSaysNotInTheSearchedReposNotCouldNotBeRead()
+    {
+        // #178 reporting fix: a claimed PR that affirmatively 404s in every searched repo reads as "no such
+        // PR in <repos>", never as "could not be read" — different fact, different remedy (widen the scope).
+        TmuxPane pane = Pane("cp:1", "", PaneActivity.Idle, agentState: "pr=4623 head=abcd1234", windowName: "pr4623");
+
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [pane],
+            (_, _) => Task.FromResult(PrFetch.NotFound.WithRepos(["owner/first", "owner/second"], [])),
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            DateTimeOffset.UtcNow, all: true, TestContext.Current.CancellationToken);
+
+        WaitingRow row = Assert.Single(rows);
+        Assert.Contains("no such PR #4623 in owner/first, owner/second", row.Verdict.Reason, StringComparison.Ordinal);
+        Assert.DoesNotContain("could not be read", row.Verdict.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task BuildRows_AnUnavailableClaimAcrossReposStillSaysCouldNotBeRead()
+    {
+        // The complement: an outage in a searched repo keeps the honest "could not read from GitHub"
+        // reading, since existence is genuinely unknown.
+        TmuxPane pane = Pane("cp:1", "", PaneActivity.Idle, agentState: "pr=4623 head=abcd1234", windowName: "pr4623");
+
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [pane],
+            (_, _) => Task.FromResult(PrFetch.Unavailable.WithRepos(["owner/first", "owner/second"], [])),
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            DateTimeOffset.UtcNow, all: true, TestContext.Current.CancellationToken);
+
+        Assert.Contains("could not read PR #4623 from GitHub", Assert.Single(rows).Verdict.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task BuildRows_JsonNamesTheSearchedReposAndPerRowResolvedRepo()
+    {
+        // #178: the searched-repo scope and the per-row resolved repo are both in the JSON, so a consumer
+        // reads the sweep's scope and where each claim landed rather than inferring a single repo.
+        TmuxPane pane = Pane("cp:1", "", PaneActivity.Idle, agentState: "pr=100 head=aaaa1111 reviews=2/2 rec=merge", windowName: "pr100");
+        PrFacts facts = new() { Number = 100, Repo = "owner/first", HeadSha = "aaaa1111", State = "open", MergeableState = "clean" };
+
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [pane],
+            (_, _) => Task.FromResult(PrFetch.Found(facts).WithRepos(["owner/first", "owner/second"], ["owner/first"])),
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            DateTimeOffset.UtcNow, all: true, TestContext.Current.CancellationToken);
+
+        using var stream = new MemoryStream();
+        WaitingCommand.WriteJson(stream, rows, default, [], null, null, ["owner/first", "owner/second"]);
+        using System.Text.Json.JsonDocument doc = System.Text.Json.JsonDocument.Parse(System.Text.Encoding.UTF8.GetString(stream.ToArray()));
+
+        Assert.Equal(
+            ["owner/first", "owner/second"],
+            doc.RootElement.GetProperty("repos").EnumerateArray().Select(e => e.GetString()!).ToArray());
+        System.Text.Json.JsonElement row = Assert.Single(doc.RootElement.GetProperty("rows").EnumerateArray().ToArray());
+        Assert.Equal("owner/first", row.GetProperty("repo").GetString());
+    }
+
+    [Fact]
+    public async Task BuildRows_APartialHitSaysFoundButUniquenessUnprovenAndSurfacesFoundIn()
+    {
+        // #178 round 3 / item 2: a claimed PR found in one repo while the rest of the scope went unsearched
+        // (budget spent) is non-actionable, but the verdict must say the PR was found and only uniqueness is
+        // unproven — not a bare "could not be read" — and the found repo is surfaced as structured data.
+        TmuxPane pane = Pane("cp:1", "", PaneActivity.Idle, agentState: "pr=4623 head=abcd1234 reviews=2/2 rec=merge", windowName: "pr4623");
+
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [pane],
+            (_, _) => Task.FromResult(PrFetch.Unavailable.WithRepos(["owner/first"], ["owner/first"], ["owner/first", "owner/second"])),
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            DateTimeOffset.UtcNow, all: true, TestContext.Current.CancellationToken);
+
+        WaitingRow row = Assert.Single(rows);
+        Assert.Contains("found in owner/first, but uniqueness unproven — owner/second not searched (budget spent)", row.Verdict.Reason, StringComparison.Ordinal);
+        Assert.DoesNotContain("could not be read", row.Verdict.Reason, StringComparison.Ordinal);
+        Assert.Equal(["owner/first"], row.FoundIn);
+        Assert.False(row.MayAct);
+
+        using var stream = new MemoryStream();
+        WaitingCommand.WriteJson(stream, rows, default, [], null, null, ["owner/first", "owner/second"]);
+        using System.Text.Json.JsonDocument doc = System.Text.Json.JsonDocument.Parse(System.Text.Encoding.UTF8.GetString(stream.ToArray()));
+        System.Text.Json.JsonElement jsonRow = Assert.Single(doc.RootElement.GetProperty("rows").EnumerateArray().ToArray());
+        Assert.Equal(
+            ["owner/first"],
+            jsonRow.GetProperty("foundIn").EnumerateArray().Select(e => e.GetString()!).ToArray());
     }
 
     [Fact]

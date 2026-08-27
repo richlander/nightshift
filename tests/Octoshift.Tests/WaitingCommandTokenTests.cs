@@ -57,7 +57,7 @@ public sealed class WaitingCommandTokenTests
         try
         {
             (int exit, string stdout, string stderr) = await RunWithCapturedConsoleAsync(
-                token => WaitingCommand.RunAsync("owner/name", [], all: false, json: false, token, historyPath: path), ct);
+                token => WaitingCommand.RunAsync(["owner/name"], [], all: false, json: false, token, historyPath: path), ct);
 
             Assert.Equal(ExitCode.Unavailable, exit);
             Assert.StartsWith("PARTIAL", stdout, StringComparison.Ordinal);
@@ -84,7 +84,7 @@ public sealed class WaitingCommandTokenTests
         try
         {
             (int exit, string stdout, string stderr) = await RunWithCapturedConsoleAsync(
-                token => WaitingCommand.RunAsync("owner/name", [], all: false, json: false, token, historyPath: path), ct);
+                token => WaitingCommand.RunAsync(["owner/name"], [], all: false, json: false, token, historyPath: path), ct);
 
             Assert.Equal(ExitCode.Unavailable, exit);
             Assert.StartsWith("PARTIAL", stdout, StringComparison.Ordinal);
@@ -107,7 +107,7 @@ public sealed class WaitingCommandTokenTests
         try
         {
             (int exit, string stdout, _) = await RunWithCapturedConsoleAsync(
-                token => WaitingCommand.RunAsync("owner/name", [], all: false, json: true, token, historyPath: path), ct);
+                token => WaitingCommand.RunAsync(["owner/name"], [], all: false, json: true, token, historyPath: path), ct);
 
             Assert.Equal(ExitCode.Unavailable, exit);
             Assert.DoesNotContain("PARTIAL", stdout, StringComparison.Ordinal);
@@ -132,7 +132,7 @@ public sealed class WaitingCommandTokenTests
         try
         {
             (int exit, string stdout, _) = await RunWithCapturedConsoleAsync(
-                token => WaitingCommand.RunAsync("owner/name", [], all: false, json: false, token, historyPath: path), ct);
+                token => WaitingCommand.RunAsync(["owner/name"], [], all: false, json: false, token, historyPath: path), ct);
 
             Assert.Equal(ExitCode.Ok, exit);
             Assert.StartsWith("EMPTY", stdout, StringComparison.Ordinal);
@@ -157,8 +157,7 @@ public sealed class WaitingCommandTokenTests
         try
         {
             (int exit, string stdout, string stderr) = await RunWithCapturedConsoleAsync(
-                token => WaitingCommand.RunAsync(
-                    "owner/name", [], all: false, json: false, token, historyPath: path,
+                token => WaitingCommand.RunAsync(["owner/name"], [], all: false, json: false, token, historyPath: path,
                     scanAsync: (_, _) => throw new TmuxUnavailableException("local: tmux is not running")),
                 ct);
 
@@ -184,8 +183,7 @@ public sealed class WaitingCommandTokenTests
         try
         {
             (int exit, string stdout, _) = await RunWithCapturedConsoleAsync(
-                token => WaitingCommand.RunAsync(
-                    "owner/name", [], all: false, json: true, token, historyPath: path,
+                token => WaitingCommand.RunAsync(["owner/name"], [], all: false, json: true, token, historyPath: path,
                     scanAsync: (_, _) => throw new TmuxUnavailableException("local: tmux is not running")),
                 ct);
 
@@ -211,8 +209,7 @@ public sealed class WaitingCommandTokenTests
         try
         {
             await Assert.ThrowsAnyAsync<OperationCanceledException>(
-                () => WaitingCommand.RunAsync(
-                    "owner/name", [], all: false, json: false, cts.Token, historyPath: path,
+                () => WaitingCommand.RunAsync(["owner/name"], [], all: false, json: false, cts.Token, historyPath: path,
                     scanAsync: (_, token) =>
                     {
                         cts.Cancel();
@@ -236,8 +233,7 @@ public sealed class WaitingCommandTokenTests
         // there is no path on which the unrepresentable alias reaches ssh or a colliding identity.
         CancellationToken ct = TestContext.Current.CancellationToken;
         (int exit, _, string stderr) = await RunWithCapturedConsoleAsync(
-            token => WaitingCommand.RunAsync(
-                "owner/name", ["\ud800"], all: false, json: false, token,
+            token => WaitingCommand.RunAsync(["owner/name"], ["\ud800"], all: false, json: false, token,
                 scanAsync: (_, _) => throw new Xunit.Sdk.XunitException("the scanner must never be constructed for an unrepresentable host")),
             ct);
 

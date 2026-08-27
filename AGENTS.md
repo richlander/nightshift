@@ -22,6 +22,9 @@ other:
   exhausted GraphQL half alone). `octoshift waiting` joins agent-published tmux window state across
   hosts with what GitHub says about each PR to report which windows need a person; `octoshift pr`
   locates a single PR across the fleet; `octoshift fleet` manages the set of collection targets.
+  Both `waiting` and `pr` resolve a claimed PR across the repos the fleet touches — pass `--repo`
+  repeatably, or let the scope infer from the current directory's remote — and keep "no such PR in
+  the searched repos" distinct from "GitHub could not be read" (#178).
 
 Keep this file to repository-wide engineering rules. Subsystem design lives in
 `docs/design/`; current code is authoritative when prose and implementation disagree.

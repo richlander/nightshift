@@ -23,10 +23,17 @@ using Octoshift.Waiting;
 /// </remarks>
 internal static class PrCommand
 {
-    public static async Task<int> RunAsync(int prNumber, string? repoFlag, IReadOnlyList<string> hosts, bool json, CancellationToken ct, string? historyPath = null)
+    public static async Task<int> RunAsync(int prNumber, IReadOnlyList<string> repoFlags, IReadOnlyList<string> hosts, bool json, CancellationToken ct, string? historyPath = null)
     {
-        string? repo = RepoScope.Resolve(repoFlag);
-        if (repo is null)
+        RepoScope.Resolution scope = RepoScope.Resolve(repoFlags);
+        if (scope.Error is { } scopeError)
+        {
+            Console.Error.WriteLine($"octoshift: {scopeError}");
+            return ExitCode.Usage;
+        }
+
+        IReadOnlyList<string> repos = scope.Repos;
+        if (repos.Count == 0)
         {
             Console.Error.WriteLine("octoshift: could not resolve a repo scope; pass --repo owner/name.");
             return ExitCode.Usage;
@@ -44,7 +51,7 @@ internal static class PrCommand
         }
 
         using GhRunnerSession gh = GhRunnerFactory.Create();
-        var facts = new GhPrFactsSource(repo, new FileConditionalCache(), gh.Run);
+        var facts = new GhFleetPrFactsSource(repos, new FileConditionalCache(), gh.Run);
 
         try
         {
@@ -149,21 +156,43 @@ internal static class PrCommand
         WaitingCommand.Collection Collected,
         IReadOnlyDictionary<string, TimeSpan?> Silence)
     {
+        /// <summary>The repos this PR was actually queried in — narrower than <see cref="Configured"/> when
+        /// the search stopped early on a proven collision or an exhausted shared budget.</summary>
+        public IReadOnlyList<string> Searched { get; init; } = [];
+
+        /// <summary>The searched repos this PR number was found in; more than one means <see cref="PrDisposition.Ambiguous"/>.</summary>
+        public IReadOnlyList<string> FoundIn { get; init; } = [];
+
+        /// <summary>The full configured <c>--repo</c> (or inferred) scope, so a report can explain the
+        /// unqueried remainder rather than relabelling it as searched.</summary>
+        public IReadOnlyList<string> Configured { get; init; } = [];
+
+        /// <summary>
+        /// The full multi-repo resolution reconstructed from its parts, so a claim's verdict is joined
+        /// against the same outcome the top-line disposition names — an affirmative not-found, an ambiguous
+        /// collision, or a partial hit whose uniqueness is unproven resolves the claim's verdict truthfully
+        /// rather than falling to a bare "could not read from GitHub" that contradicts the header.
+        /// </summary>
+        public PrFetch Fetch => new(Github, Facts, Searched, FoundIn, Configured);
+
         /// <summary>
         /// The single word this location reduces to, which the human report leads its first line with and
         /// the exit code follows. A partly invisible fleet (a host that did not answer, or a
         /// previously-collected host this run omitted) means the PR may be claimed somewhere this sweep
         /// could not see, so a success-shaped result would assert a completeness the sweep did not have:
         /// <see cref="PrDisposition.Partial"/> when a host was unreachable, <see cref="PrDisposition.Narrowed"/>
-        /// when the view was merely narrower than before. Under a complete, fully-reached view: a claim or a
-        /// GitHub PR is <see cref="PrDisposition.Found"/>; neither, with GitHub answering an affirmative 404,
-        /// is <see cref="PrDisposition.NotFound"/>; neither, with GitHub merely unreadable, is
+        /// when the view was merely narrower than before. Under a complete, fully-reached view: a PR number
+        /// that resolves in more than one searched repo is <see cref="PrDisposition.Ambiguous"/> — reported
+        /// rather than resolved to an arbitrary repo; a claim or a single-repo GitHub PR is
+        /// <see cref="PrDisposition.Found"/>; neither, with every searched repo answering 404, is
+        /// <see cref="PrDisposition.NotFound"/>; neither, with a searched repo merely unreadable, is
         /// <see cref="PrDisposition.Unavailable"/> — the one case a prior head wrongly called NotFound, since
         /// an outage cannot prove a PR does not exist.
         /// </summary>
         public PrDisposition Disposition
             => Collected.Unreachable.Count > 0 ? PrDisposition.Partial
                 : !ViewComplete ? PrDisposition.Narrowed
+                : Github == PrFetchStatus.Ambiguous ? PrDisposition.Ambiguous
                 : Claims.Count > 0 || Github == PrFetchStatus.Found ? PrDisposition.Found
                 : Github == PrFetchStatus.Unavailable ? PrDisposition.Unavailable
                 : PrDisposition.NotFound;
@@ -193,6 +222,10 @@ internal static class PrCommand
         /// <summary>A complete view with no claim, and GitHub could not be read — so existence is unknown, never
         /// a not-found. Leads with the same <c>PARTIAL</c> token the other unavailable results use.</summary>
         Unavailable,
+
+        /// <summary>The PR number resolves in more than one searched repo, so no single repo can be chosen
+        /// truthfully. A non-success disposition leading with <c>AMBIGUOUS</c>; the remedy is a single <c>--repo</c>.</summary>
+        Ambiguous,
     }
 
 
@@ -329,7 +362,12 @@ internal static class PrCommand
                     : prFacts;
         }
 
-        return new PrLocation(prNumber, mine, prFacts, fetched.Status, viewComplete, collected, silence);
+        return new PrLocation(prNumber, mine, prFacts, fetched.Status, viewComplete, collected, silence)
+        {
+            Searched = fetched.Searched,
+            FoundIn = fetched.FoundIn,
+            Configured = fetched.Configured,
+        };
         }
         finally
         {
@@ -353,15 +391,41 @@ internal static class PrCommand
         // before the details rather than a success-shaped `PR #…` above a later NARROWED/UNREACHABLE line.
         // The reasons themselves still follow in the body below; this is the one-line summary.
         string titleSuffix = facts?.Title is { Length: > 0 } title ? $"  {DisplayText.Safe(title)}" : string.Empty;
+        string scope = located.Searched.Count > 0 ? string.Join(", ", located.Searched.Select(DisplayText.Safe)) : "the searched repo(s)";
+        string configuredScope = located.Configured.Count > 0 ? string.Join(", ", located.Configured.Select(DisplayText.Safe)) : scope;
+        string ambiguousRepos = located.FoundIn.Count > 0 ? string.Join(", ", located.FoundIn.Select(DisplayText.Safe)) : scope;
+        string foundInText = string.Join(", ", located.FoundIn.Select(DisplayText.Safe));
+        IReadOnlyList<string> unsearched = located.Fetch.Unsearched;
+        string partialTail = unsearched.Count > 0
+            ? $"{string.Join(", ", unsearched.Select(DisplayText.Safe))} not searched (budget spent)"
+            : "part of the scope could not be read";
+
+        // A partial hit — GitHub could not be read across the whole scope, but the PR *was* found in at
+        // least one repo — is not the same as a blank outage: existence is proven, only uniqueness is not.
+        bool partialHit = located.Disposition == PrDisposition.Unavailable && located.FoundIn.Count > 0;
         string headline = located.Disposition switch
         {
             PrDisposition.Partial => $"PARTIAL PR #{prNumber}{titleSuffix} — fleet partly unreachable; a claim may be on a host not swept",
             PrDisposition.Narrowed => $"NARROWED PR #{prNumber}{titleSuffix} — fewer hosts than collected before; a claim may be on a host not swept this run",
-            PrDisposition.NotFound => $"NOTFOUND PR #{prNumber}{titleSuffix} — no window claims it and GitHub has no such PR",
+            PrDisposition.NotFound => $"NOTFOUND PR #{prNumber}{titleSuffix} — no window claims it and no such PR in {scope}",
+            PrDisposition.Unavailable when partialHit => $"PARTIAL PR #{prNumber}{titleSuffix} — found in {foundInText}, but uniqueness unproven; {partialTail}",
             PrDisposition.Unavailable => $"PARTIAL PR #{prNumber}{titleSuffix} — no window claims it and GitHub could not be read; existence unknown",
+            PrDisposition.Ambiguous => $"AMBIGUOUS PR #{prNumber}{titleSuffix} — #{prNumber} exists in {ambiguousRepos}; pass a single --repo to choose",
             _ => $"PR #{prNumber}{titleSuffix}",
         };
         output.WriteLine(headline);
+
+        // Name the scope, truthfully separating what was configured from what was actually searched, so a
+        // cross-repo miss is diagnosed as "wrong scope" and an early exit does not read as a full search.
+        // Placed under the token line, never on it.
+        if (located.Configured.Count > 0)
+        {
+            bool sameScope = located.Searched.Count == located.Configured.Count
+                && located.Searched.SequenceEqual(located.Configured, StringComparer.OrdinalIgnoreCase);
+            output.WriteLine(sameScope
+                ? $"  scope     searched {scope}"
+                : $"  scope     configured {configuredScope}; searched {scope}");
+        }
 
         if (claims.Count == 0)
         {
@@ -401,14 +465,14 @@ internal static class PrCommand
             // follower is still working, so ownership is with the window that is doing the least. The
             // owner's verdict is read through the same pane-activity gate the verdict lines use, so a
             // working owner with a stale rec is never mistaken for one that has finished and handed over.
-            if (Claim.IsReleasing(claims[0].State, VerdictFor(claims[0].Pane, claims[0].State, facts), claims[0].Pane.Activity)
+            if (Claim.IsReleasing(claims[0].State, VerdictFor(claims[0].Pane, claims[0].State, located.Fetch), claims[0].Pane.Activity)
                 && claims.Skip(1).Any(c => c.Pane.Activity == PaneActivity.Working))
             {
                 output.WriteLine("            the owner is disengaging while a follower is active — consider promoting it");
             }
         }
 
-        output.WriteLine($"  github    {Github(facts, located.Github, now)}");
+        output.WriteLine($"  github    {Github(facts, located.Github, now, scope, ambiguousRepos, foundInText, partialTail)}");
 
         // One verdict per claim when contested: the disagreement between them is the finding, and
         // collapsing it to a single row would hide which window the answer came from. Emitted for every
@@ -419,7 +483,7 @@ internal static class PrCommand
         // which is truthful rather than an invented readiness.
         foreach ((TmuxPane pane, AgentState state, _) in claims)
         {
-            WaitingVerdict verdict = VerdictFor(pane, state, facts);
+            WaitingVerdict verdict = VerdictFor(pane, state, located.Fetch);
             string from = claims.Count > 1 ? $" [{DisplayText.Safe(pane.Where)}]" : string.Empty;
             output.WriteLine($"  verdict   {verdict.State.ToString().ToUpperInvariant()} ({verdict.Assurance.Label}) — {DisplayText.Safe(verdict.Reason)}{from}");
         }
@@ -509,29 +573,40 @@ internal static class PrCommand
     /// operator verdict instead. This is <see cref="WaitingVerdict.ForActivity"/>, the single copy of that
     /// policy `octoshift waiting` uses, so `pr` cannot print a verdict `waiting` would not.
     /// </summary>
-    private static WaitingVerdict VerdictFor(TmuxPane pane, AgentState state, PrFacts? facts)
-        => WaitingVerdict.ForActivity(pane.Activity, pane.Capture, () => WaitingVerdict.Resolve(state, facts));
+    private static WaitingVerdict VerdictFor(TmuxPane pane, AgentState state, PrFetch fetch)
+        => WaitingVerdict.ForActivity(pane.Activity, pane.Capture, () => WaitingVerdict.Resolve(state, fetch));
 
-    private static string Github(PrFacts? facts, PrFetchStatus outcome, DateTimeOffset now)
+    private static string Github(PrFacts? facts, PrFetchStatus outcome, DateTimeOffset now, string scope, string ambiguousRepos, string foundInText, string partialTail)
     {
         if (facts is null)
         {
-            // Keep the body honest about which of the two null outcomes this was: GitHub looked and there
-            // is no such PR, versus GitHub could not be read at all. Only the first is an assertion.
-            return outcome == PrFetchStatus.NotFound ? "no such PR" : "could not be read";
+            // Keep the body honest about which null outcome this was: every searched repo answered 404,
+            // the number collides across repos, a partial hit whose uniqueness is unproven, or GitHub could
+            // not be read at all. Each has a different remedy — widen the scope, narrow it, retry, or wait.
+            return outcome switch
+            {
+                PrFetchStatus.NotFound => $"no such PR in {scope}",
+                PrFetchStatus.Ambiguous => $"AMBIGUOUS — exists in {ambiguousRepos}; pass a single --repo to choose",
+                PrFetchStatus.Unavailable when foundInText.Length > 0
+                    => $"found in {foundInText}; uniqueness unproven ({partialTail})",
+                _ => "could not be read",
+            };
         }
+
+        // Name the repo a single-repo resolution landed in, so the reader is never left inferring scope.
+        string repoSuffix = facts.Repo is { Length: > 0 } repo ? $" [{DisplayText.Safe(repo)}]" : string.Empty;
 
         if (facts.Merged)
         {
             // The question behind "where is it" is often "did I already land this", and how long ago is
             // what turns that from a fact into an orientation.
             string ago = facts.MergedAt is { } mergedAt && mergedAt <= now ? $" {Duration(now - mergedAt)} ago" : string.Empty;
-            return $"merged{ago}";
+            return $"merged{ago}{repoSuffix}";
         }
 
         if (string.Equals(facts.State, "closed", StringComparison.OrdinalIgnoreCase))
         {
-            return "closed without merging";
+            return $"closed without merging{repoSuffix}";
         }
 
         var parts = new List<string> { "open" };
@@ -554,7 +629,7 @@ internal static class PrCommand
             parts.Add("CI green");
         }
 
-        return string.Join(" · ", parts) + $" · head {Short(facts.HeadSha)}";
+        return string.Join(" · ", parts) + $" · head {Short(facts.HeadSha)}{repoSuffix}";
     }
 
     private static string Short(string sha) => sha.Length <= 9 ? sha : sha[..9];
@@ -581,6 +656,36 @@ internal static class PrCommand
         if (facts?.Title is { } title)
         {
             writer.WriteString("title", title);
+        }
+
+        // The producer-owned repo labels: the full configured scope, the subset actually searched (narrower
+        // when an early exit stopped the search), of those where the PR was found, and the single repo it
+        // resolved to. Naming all four lets a consumer tell a wrong-scope miss from an outage, diagnose an
+        // ambiguous collision, and see a partial hit whose uniqueness could not be established.
+        writer.WriteStartArray("configured");
+        foreach (string repo in located.Configured)
+        {
+            writer.WriteStringValue(repo);
+        }
+
+        writer.WriteEndArray();
+        writer.WriteStartArray("searched");
+        foreach (string repo in located.Searched)
+        {
+            writer.WriteStringValue(repo);
+        }
+
+        writer.WriteEndArray();
+        writer.WriteStartArray("foundIn");
+        foreach (string repo in located.FoundIn)
+        {
+            writer.WriteStringValue(repo);
+        }
+
+        writer.WriteEndArray();
+        if (facts?.Repo is { Length: > 0 } resolvedRepo)
+        {
+            writer.WriteString("repo", resolvedRepo);
         }
 
         writer.WriteStartArray("claims");
@@ -611,7 +716,7 @@ internal static class PrCommand
             // GitHub could not be read: VerdictFor resolves the non-idle activities and an idle explicit
             // escalation without facts, and only the genuinely GitHub-dependent idle outcomes fall to a
             // low-confidence unknown, matching the human report which now also prints a verdict per claim.
-            WaitingVerdict verdict = VerdictFor(pane, state, facts);
+            WaitingVerdict verdict = VerdictFor(pane, state, located.Fetch);
             writer.WriteStartObject("verdict");
             writer.WriteString("state", verdict.State.ToString().ToLowerInvariant());
             writer.WriteString("confidence", verdict.Assurance.Label);
@@ -648,6 +753,7 @@ internal static class PrCommand
         {
             PrFetchStatus.Found => "found",
             PrFetchStatus.NotFound => "notfound",
+            PrFetchStatus.Ambiguous => "ambiguous",
             _ => "unavailable",
         });
 

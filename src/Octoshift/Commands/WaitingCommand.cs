@@ -30,6 +30,21 @@ internal sealed record WaitingRow
     public TimeSpan? StoppedFor { get; init; }
 
     /// <summary>
+    /// The <c>owner/name</c> repo this window's PR resolved to, when exactly one searched repo had it.
+    /// Null for a window that identifies no PR, or whose PR could not be located in a single repo. Lets a
+    /// cross-repo report name where a claim landed rather than leaving the reader to guess the scope.
+    /// </summary>
+    public string? Repo { get; init; }
+
+    /// <summary>
+    /// On a cross-repo miss where the PR was found in one or more repos but could not be resolved to a
+    /// single one — an ambiguous collision, or a partial hit whose uniqueness is unproven — the repos it
+    /// was found in. Empty when the PR resolved cleanly or was found nowhere. Surfaced so a reader sees the
+    /// existence the verdict reason describes as structured data, not only prose.
+    /// </summary>
+    public IReadOnlyList<string> FoundIn { get; init; } = [];
+
+    /// <summary>
     /// How long the window has produced no new content, measured across runs. Null until a second
     /// observation exists. Distinct from <see cref="StoppedFor"/>, which a repainting spinner resets.
     /// </summary>
@@ -74,10 +89,17 @@ internal static class WaitingCommand
     /// <summary>Hosts collected before but not in this run, so the view is narrower than it has been.</summary>
     internal static IReadOnlyList<string> Omitted { get; private set; } = [];
 
-    public static async Task<int> RunAsync(string? repoFlag, IReadOnlyList<string> hosts, bool all, bool json, CancellationToken ct, string? historyPath = null, Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>>? scanAsync = null)
+    public static async Task<int> RunAsync(IReadOnlyList<string> repoFlags, IReadOnlyList<string> hosts, bool all, bool json, CancellationToken ct, string? historyPath = null, Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>>? scanAsync = null)
     {
-        string? repo = RepoScope.Resolve(repoFlag);
-        if (repo is null)
+        RepoScope.Resolution scope = RepoScope.Resolve(repoFlags);
+        if (scope.Error is { } scopeError)
+        {
+            Console.Error.WriteLine($"octoshift: {scopeError}");
+            return ExitCode.Usage;
+        }
+
+        IReadOnlyList<string> repos = scope.Repos;
+        if (repos.Count == 0)
         {
             Console.Error.WriteLine("octoshift: could not resolve a repo scope; pass --repo owner/name.");
             return ExitCode.Usage;
@@ -99,7 +121,7 @@ internal static class WaitingCommand
         }
 
         using GhRunnerSession gh = GhRunnerFactory.Create();
-        var facts = new GhPrFactsSource(repo, new FileConditionalCache(), gh.Run);
+        var facts = new GhFleetPrFactsSource(repos, new FileConditionalCache(), gh.Run);
 
         try
         {
@@ -108,7 +130,7 @@ internal static class WaitingCommand
             // failure and its PARTIAL token — are exercisable without a tmux server.
             FleetResult result = await CollectAndResolveAsync(
                 hosts, scanAsync ?? ((host, token) => new TmuxScanner(host).ScanAsync(token)),
-                facts.FetchAsync, facts.RefreshMergeabilityAsync, now: null, ct, historyPath: historyPath);
+                facts.FetchDetailedAsync, facts.RefreshMergeabilityAsync, now: null, ct, historyPath: historyPath);
 
             // An explicitly empty fleet is its own disposition, not a quiet sweep and not a failure: the
             // operator retired every target, so there is nothing to sweep. Lead with a distinct EMPTY token
@@ -162,11 +184,11 @@ internal static class WaitingCommand
             IReadOnlyList<WaitingRow> shown = Present(resolved, all);
             if (json)
             {
-                WriteJson(Console.OpenStandardOutput(), shown, Budget.From(facts), collected.Unreachable, Omitted, Departed);
+                WriteJson(Console.OpenStandardOutput(), shown, Budget.From(facts), collected.Unreachable, Omitted, Departed, repos);
             }
             else
             {
-                WriteTable(Console.Out, shown, Budget.From(facts), collected.Unreachable, Omitted, Departed);
+                WriteTable(Console.Out, shown, Budget.From(facts), collected.Unreachable, Omitted, Departed, repos);
             }
 
             // A partly invisible fleet is not a clean sweep, so a single failed host — or a previously
@@ -220,10 +242,22 @@ internal static class WaitingCommand
     /// <see cref="ResolveAllAsync"/>'s Save before its GitHub reads (or by the total-failure Save here), so
     /// the network is never held under it; the finally disposes the transaction on any early exit.
     /// </summary>
-    internal static async Task<FleetResult> CollectAndResolveAsync(
+    internal static Task<FleetResult> CollectAndResolveAsync(
         IReadOnlyList<string> hosts,
         Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> scanAsync,
         Func<int, CancellationToken, Task<PrFacts?>> fetchAsync,
+        Func<int, CancellationToken, Task<PrFacts?>> refreshMergeabilityAsync,
+        DateTimeOffset? now,
+        CancellationToken ct,
+        string? historyPath = null,
+        TimeSpan? perTargetTimeout = null)
+        => CollectAndResolveAsync(
+            hosts, scanAsync, Wrap(fetchAsync), refreshMergeabilityAsync, now, ct, historyPath, perTargetTimeout);
+
+    internal static async Task<FleetResult> CollectAndResolveAsync(
+        IReadOnlyList<string> hosts,
+        Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> scanAsync,
+        Func<int, CancellationToken, Task<PrFetch>> fetchAsync,
         Func<int, CancellationToken, Task<PrFacts?>> refreshMergeabilityAsync,
         DateTimeOffset? now,
         CancellationToken ct,
@@ -469,9 +503,23 @@ internal static class WaitingCommand
     /// supplied it isolates to a throwaway file rather than the shared default path, so a single-shot row
     /// test neither pollutes nor reads another run's state.
     /// </summary>
-    internal static async Task<IReadOnlyList<WaitingRow>> BuildRowsAsync(
+    internal static Task<IReadOnlyList<WaitingRow>> BuildRowsAsync(
         IReadOnlyList<TmuxPane> panes,
         Func<int, CancellationToken, Task<PrFacts?>> fetchAsync,
+        Func<int, CancellationToken, Task<PrFacts?>> refreshMergeabilityAsync,
+        DateTimeOffset now,
+        bool all,
+        CancellationToken ct,
+        IReadOnlyList<string?>? collectedHosts = null,
+        bool allHostsAnswered = true,
+        PaneHistory? history = null)
+        => BuildRowsAsync(panes, Wrap(fetchAsync), refreshMergeabilityAsync, now, all, ct, collectedHosts, allHostsAnswered, history);
+
+    /// <summary>The resolution-shaped overload, used to test the multi-repo dispositions a facts-only fetch
+    /// cannot express (an affirmative not-found, or a number that collides across repos).</summary>
+    internal static async Task<IReadOnlyList<WaitingRow>> BuildRowsAsync(
+        IReadOnlyList<TmuxPane> panes,
+        Func<int, CancellationToken, Task<PrFetch>> fetchAsync,
         Func<int, CancellationToken, Task<PrFacts?>> refreshMergeabilityAsync,
         DateTimeOffset now,
         bool all,
@@ -522,9 +570,33 @@ internal static class WaitingCommand
     /// lookup, by contrast, is spent only on an idle window, because idle is the one state a published
     /// record is taken as a handover in and the only state a verdict may be acted on in.
     /// </remarks>
-    internal static async Task<IReadOnlyList<WaitingRow>> ResolveAllAsync(
+    /// <summary>
+    /// The <see cref="PrFacts"/>-shaped overload, kept for callers and tests that inject a fetch which
+    /// cannot tell a 404 from an outage: a null result is wrapped as <see cref="PrFetch.Unavailable"/>, the
+    /// same "could not be read" reading it had before the multi-repo outcome existed.
+    /// </summary>
+    internal static Task<IReadOnlyList<WaitingRow>> ResolveAllAsync(
         IReadOnlyList<TmuxPane> panes,
         Func<int, CancellationToken, Task<PrFacts?>> fetchAsync,
+        Func<int, CancellationToken, Task<PrFacts?>> refreshMergeabilityAsync,
+        DateTimeOffset now,
+        CancellationToken ct,
+        IReadOnlyList<string?>? collectedHosts,
+        bool allHostsAnswered,
+        PaneHistory? history = null,
+        string? historyPath = null,
+        IReadOnlyList<string?>? attemptedHosts = null)
+        => ResolveAllAsync(
+            panes, Wrap(fetchAsync), refreshMergeabilityAsync, now, ct,
+            collectedHosts, allHostsAnswered, history, historyPath, attemptedHosts);
+
+    /// <summary>Adapts a facts-only fetch to the resolution shape: a null read is an unreadable one.</summary>
+    private static Func<int, CancellationToken, Task<PrFetch>> Wrap(Func<int, CancellationToken, Task<PrFacts?>> fetchAsync)
+        => async (prNumber, token) => await fetchAsync(prNumber, token) is { } facts ? PrFetch.Found(facts) : PrFetch.Unavailable;
+
+    internal static async Task<IReadOnlyList<WaitingRow>> ResolveAllAsync(
+        IReadOnlyList<TmuxPane> panes,
+        Func<int, CancellationToken, Task<PrFetch>> fetchAsync,
         Func<int, CancellationToken, Task<PrFacts?>> refreshMergeabilityAsync,
         DateTimeOffset now,
         CancellationToken ct,
@@ -665,7 +737,7 @@ internal static class WaitingCommand
         // first's. Only idle claimants are resolved — a window mid-turn has handed nothing over, and an
         // issue-tracking window has no PR to ask pulls/{n} about — but every claimant already contested
         // above, under the lock, on the strength of the history alone.
-        var seen = new Dictionary<int, PrFacts?>();
+        var seen = new Dictionary<int, PrFetch>();
         foreach ((TmuxPane pane, StateReading reading) in readings)
         {
             if (pane.Activity == PaneActivity.Idle
@@ -679,7 +751,7 @@ internal static class WaitingCommand
         // Second pass for mergeability GitHub had not finished computing. Deliberately after every other
         // PR has been read: the calculation needs a moment, and the time spent on the rest of the fleet
         // is that moment. Re-reading immediately just collects `unknown` a second time.
-        foreach (int prNumber in seen.Where(e => e.Value is { MergeabilityKnown: false, Merged: false }).Select(e => e.Key).ToArray())
+        foreach (int prNumber in seen.Where(e => e.Value.Facts is { MergeabilityKnown: false, Merged: false }).Select(e => e.Key).ToArray())
         {
             if (await refreshMergeabilityAsync(prNumber, ct) is not { } refreshed || !refreshed.MergeabilityKnown)
             {
@@ -688,20 +760,28 @@ internal static class WaitingCommand
 
             // Only graft when the PR has not moved between the two reads. Otherwise the answer belongs to
             // a different head, and pairing it with the old snapshot would report the agent's head as
-            // mergeable on the strength of a newer one.
-            PrFacts current = seen[prNumber]!;
-            seen[prNumber] = string.Equals(current.HeadSha, refreshed.HeadSha, StringComparison.OrdinalIgnoreCase)
-                ? current with { MergeableState = refreshed.MergeableState }
-                : refreshed with { ChecksKnown = false };
+            // mergeable on the strength of a newer one. The resolution wrapper (searched/found repos) is
+            // preserved either way, so the row still names where the PR was located.
+            PrFetch located = seen[prNumber];
+            PrFacts current = located.Facts!;
+            seen[prNumber] = located with
+            {
+                Facts = string.Equals(current.HeadSha, refreshed.HeadSha, StringComparison.OrdinalIgnoreCase)
+                    ? current with { MergeableState = refreshed.MergeableState }
+                    : refreshed with { ChecksKnown = false },
+            };
         }
 
         var rows = new List<WaitingRow>(readings.Count);
         foreach ((TmuxPane pane, StateReading reading) in readings)
         {
             AgentState? record = reading.Identified;
+            PrFetch resolved = record is { IsIssue: false } claim
+                ? (seen.TryGetValue(claim.PrNumber, out PrFetch pf) ? pf : PrFetch.Unavailable)
+                : PrFetch.Unavailable;
             WaitingVerdict verdict = WaitingVerdict.ForActivity(pane.Activity, pane.Capture, () =>
                 record is not null
-                    ? WaitingVerdict.Resolve(record, record.IsIssue ? null : seen.GetValueOrDefault(record.PrNumber))
+                    ? WaitingVerdict.Resolve(record, record.IsIssue ? PrFetch.Unavailable : resolved)
                     : reading.Unidentified is { } unusable
                         ? WaitingVerdict.Unidentified(unusable)
                         : new WaitingVerdict(
@@ -713,6 +793,8 @@ internal static class WaitingCommand
                 Claim = claims.GetValueOrDefault(Claim.Key(pane), Claim.Sole),
                 Retirement = Retirement.For(verdict, record, pane.Activity),
                 SilentFor = silence.GetValueOrDefault(Claim.Key(pane)),
+                Repo = resolved.Facts?.Repo,
+                FoundIn = resolved.FoundIn,
             });
         }
 
@@ -745,6 +827,9 @@ internal static class WaitingCommand
     internal readonly record struct Budget(int Calls, int NotModified, int Recomputed, int? RateLimitRemaining, bool RateLimited)
     {
         public static Budget From(GhPrFactsSource facts)
+            => new(facts.Calls, facts.NotModified, facts.Recomputed, facts.RateLimitRemaining, facts.RateLimited);
+
+        public static Budget From(GhFleetPrFactsSource facts)
             => new(facts.Calls, facts.NotModified, facts.Recomputed, facts.RateLimitRemaining, facts.RateLimited);
 
         public override string ToString()
@@ -805,9 +890,20 @@ internal static class WaitingCommand
         Budget budget,
         IReadOnlyList<string> unreachable,
         IReadOnlyList<string>? omitted = null,
-        IReadOnlyList<string>? departed = null)
+        IReadOnlyList<string>? departed = null,
+        IReadOnlyList<string>? configuredRepos = null)
     {
         output.WriteLine(Summary(rows, unreachable, omitted));
+
+        // Name the configured repo scope — the CLI's --repo set (or the inferred single repo), not any
+        // per-PR attempt — so a cross-repo fleet reads the scope of the sweep rather than assuming the one
+        // repo the operator's directory sits in. Each row's own resolution names where its claim landed.
+        // Emitted after the token line, never before it, so the first-line contract a harness greps is
+        // untouched.
+        if (configuredRepos is { Count: > 0 })
+        {
+            output.WriteLine($"SCOPE configured {string.Join(", ", configuredRepos.Select(DisplayText.Safe))}");
+        }
 
         // Said on every run, including when the number is zero. A tool that speaks to agents only when it
         // is sure has to be legible about when it was not, or "it did nothing" and "it saw nothing" look
@@ -817,6 +913,9 @@ internal static class WaitingCommand
         int actionable = rows.Count(r => r.MayAct);
         output.WriteLine($"NOT ACTED nothing was sent to any agent; {actionable} row(s) met the bar to act, {rows.Count - actionable} did not");
 
+        // Only worth naming a resolved repo per row when more than one was configured; a single-repo sweep
+        // adds nothing by repeating its one scope on every line.
+        bool nameRepo = configuredRepos is { Count: > 1 };
         if (rows.Count > 0)
         {
             output.WriteLine();
@@ -831,7 +930,7 @@ internal static class WaitingCommand
                     row.Verdict.State.ToString().ToUpperInvariant(),
                     row.Verdict.Assurance.Label,
                     Duration(row.SilentFor ?? row.StoppedFor),
-                    Detail(row),
+                    Detail(row, nameRepo),
                 ]);
             }
 
@@ -858,9 +957,17 @@ internal static class WaitingCommand
         }
     }
 
-    private static string Detail(WaitingRow row)
+    private static string Detail(WaitingRow row, bool nameRepo = false)
     {
         string detail = row.Verdict.Reason;
+
+        // Name the repo this claim resolved to when the sweep spanned more than one, so a reader is not
+        // left inferring which repo a cross-repo row belongs to.
+        if (nameRepo && row.Repo is { Length: > 0 } repo)
+        {
+            detail += $"  [{DisplayText.Safe(repo)}]";
+        }
+
         if (row.Claim.IsContested)
         {
             // Same host is called out separately: those two are sharing a worktree, so the damage is
@@ -980,7 +1087,8 @@ internal static class WaitingCommand
         Budget budget,
         IReadOnlyList<string> unreachable,
         IReadOnlyList<string>? omitted = null,
-        IReadOnlyList<string>? departed = null)
+        IReadOnlyList<string>? departed = null,
+        IReadOnlyList<string>? configuredRepos = null)
     {
         using var writer = new Utf8JsonWriter(output, new JsonWriterOptions { Indented = true });
         writer.WriteStartObject();
@@ -988,6 +1096,21 @@ internal static class WaitingCommand
         writer.WriteNumber("notModified", budget.NotModified);
         writer.WriteNumber("mergeabilityRereads", budget.Recomputed);
         writer.WriteBoolean("rateLimited", budget.RateLimited);
+
+        // The configured repo scope, in order — the CLI's --repo set (or the inferred single repo), so a
+        // consumer reads the sweep's scope rather than inferring a single repo from the current directory.
+        // Each row carries its own resolved repo and, on a cross-repo miss, the repos it was found in.
+        if (configuredRepos is { Count: > 0 })
+        {
+            writer.WriteStartArray("repos");
+            foreach (string repo in configuredRepos)
+            {
+                writer.WriteStringValue(repo);
+            }
+
+            writer.WriteEndArray();
+        }
+
         writer.WriteStartArray("unreachable");
         foreach (string failure in unreachable)
         {
@@ -1035,6 +1158,23 @@ internal static class WaitingCommand
 
             writer.WriteString("window", row.Pane.WindowName);
             writer.WriteBoolean("attached", row.Pane.SessionAttached);
+            if (row.Repo is { Length: > 0 } resolvedRepo)
+            {
+                writer.WriteString("repo", resolvedRepo);
+            }
+            else if (row.FoundIn is { Count: > 0 } foundIn)
+            {
+                // Only when the PR did not resolve to a single repo — an ambiguous collision or a partial
+                // hit — is FoundIn worth its own field; a clean resolution is already named by `repo`.
+                writer.WriteStartArray("foundIn");
+                foreach (string repo in foundIn)
+                {
+                    writer.WriteStringValue(repo);
+                }
+
+                writer.WriteEndArray();
+            }
+
             if (row.Record is { } record)
             {
                 writer.WriteNumber("pr", record.PrNumber);

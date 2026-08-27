@@ -62,7 +62,7 @@ public static class Cli
         var all = new Option<bool>("--all") { Description = "Include windows that are holding legitimately, and windows that identify nothing." };
         Option<string[]> host = CreateHostOption();
         var json = new Option<bool>("--json") { Description = "Emit the rows as JSON instead of a table." };
-        Option<string?> repo = CreateRepoOption();
+        Option<string[]> repo = CreateRepoOption();
 
         command.Options.Add(all);
         command.Options.Add(host);
@@ -70,7 +70,7 @@ public static class Cli
         command.Options.Add(repo);
 
         command.SetAction(async (parseResult, cancellationToken) => await WaitingCommand.RunAsync(
-            parseResult.GetValue(repo),
+            parseResult.GetValue(repo) ?? [],
             parseResult.GetValue(host) ?? [],
             parseResult.GetValue(all),
             parseResult.GetValue(json),
@@ -86,7 +86,7 @@ public static class Cli
         var number = new Argument<int>("number") { Description = "The pull request number." };
         var host = CreateHostOption();
         var json = new Option<bool>("--json") { Description = "Emit the answer as JSON." };
-        Option<string?> repo = CreateRepoOption();
+        Option<string[]> repo = CreateRepoOption();
 
         command.Arguments.Add(number);
         command.Options.Add(host);
@@ -95,7 +95,7 @@ public static class Cli
 
         command.SetAction(async (parseResult, cancellationToken) => await PrCommand.RunAsync(
             parseResult.GetValue(number),
-            parseResult.GetValue(repo),
+            parseResult.GetValue(repo) ?? [],
             parseResult.GetValue(host) ?? [],
             parseResult.GetValue(json),
             cancellationToken));
@@ -182,6 +182,30 @@ public static class Cli
         return host;
     }
 
-    private static Option<string?> CreateRepoOption()
-        => new("--repo") { Description = "Repository scope owner/name; inferred from the git remote when omitted." };
+    private static Option<string[]> CreateRepoOption()
+    {
+        var repo = new Option<string[]>("--repo")
+        {
+            Description = "Repository scope owner/name; repeatable to search several repos. Inferred from the git remote when omitted.",
+            Arity = ArgumentArity.OneOrMore,
+            AllowMultipleArgumentsPerToken = false,
+        };
+
+        // A malformed --repo cannot be silently dropped: it would narrow the scope the operator asked for
+        // and could turn a real collision into a false unique, so it is a usage error at the parser, the
+        // same as an option-shaped --host.
+        repo.Validators.Add(result =>
+        {
+            foreach (var token in result.Tokens)
+            {
+                if (RepoScope.Validate(token.Value) is { } error)
+                {
+                    result.AddError(error);
+                    break;
+                }
+            }
+        });
+
+        return repo;
+    }
 }
