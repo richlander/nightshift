@@ -36,6 +36,29 @@ an update, and the write itself is atomic (temp file then rename). A lock that
 cannot be taken, or a write that fails, is surfaced as unavailable — never a
 success that leaves a stale witnessed order on disk.
 
+**Schema version and upgrade skew.** Every write stamps an integer `version`, and
+the loader branches on it rather than inferring scheme identity from which members
+happen to be present — the inference that once bricked every history written before
+`attempted` and `initialized` existed, because a routine upgrade made a real file
+look like one "not written by this scheme." A file whose `version` matches is
+validated exactly (exact members, casing, no duplicates or unknowns, and the same
+record invariants a writer produces); a `version` that is newer, unknown, or
+malformed is refused, bytes untouched, so a future format cannot be misread by an
+old build. An *unversioned* file is one an earlier build wrote: if its member set is
+one of the exact known legacy shapes (`panes`+`hosts`; +`attempted`; +`initialized`)
+and its records are ones a writer produced, it is **migrated in memory** — panes and
+host memory preserved, and the `attempted` membership *derived* from every persisted
+host key **and every pane's composite host** (the real payload that motivated this
+carries local panes with an empty `hosts` map, so its local membership survives only
+in the pane keys). A legacy file that cannot be migrated safely — one naming a target
+alias this build can no longer represent — is **discarded to a truthful first-run
+state with a stderr warning** rather than bricked; the history is a cache the next
+sweep rebuilds, so losing it costs ownership confidence for one round, the same
+position as a first run on a new machine. Anything else — a foreign member set, a
+hand-edited or impossible record — still fails closed with its bytes preserved: the
+strict load is not relaxed, only taught to tell upgrade skew from a file no version
+ever wrote.
+
 ---
 
 ## 2. The per-window state vector
