@@ -355,19 +355,4 @@ public class WaitingReportTests
         Assert.False(row.GetProperty("mayAct").GetBoolean());
         Assert.NotEmpty(row.GetProperty("defects").EnumerateArray().ToArray());
     }
-
-    [Fact]
-    public void WriteJson_ARenameDoesNotWriteToTheJsonStream()
-    {
-        // The blocking finding, from the JSON side: `--json --rename` must leave a single valid JSON
-        // document on stdout. WriteJson is the only thing that writes stdout, and it emits nothing but the
-        // document — the rename diagnostics are written to a separate sink (stderr in production).
-        using var stream = new MemoryStream();
-        WaitingCommand.WriteJson(stream, [Row(Ready())], NoBudget, []);
-        string stdout = Encoding.UTF8.GetString(stream.ToArray());
-
-        Assert.DoesNotContain("RENAMED", stdout, StringComparison.Ordinal);
-        using JsonDocument parsed = JsonDocument.Parse(stdout);
-        Assert.True(parsed.RootElement.TryGetProperty("rows", out _));
-    }
 }

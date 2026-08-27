@@ -1,7 +1,6 @@
 namespace Octoshift.Commands;
 
 using System.Globalization;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Octoshift.GitHub;
@@ -75,7 +74,7 @@ internal static class WaitingCommand
     /// <summary>Hosts collected before but not in this run, so the view is narrower than it has been.</summary>
     internal static IReadOnlyList<string> Omitted { get; private set; } = [];
 
-    public static async Task<int> RunAsync(string? repoFlag, IReadOnlyList<string> hosts, bool all, bool json, bool rename, CancellationToken ct, string? historyPath = null)
+    public static async Task<int> RunAsync(string? repoFlag, IReadOnlyList<string> hosts, bool all, bool json, CancellationToken ct, string? historyPath = null)
     {
         string? repo = RepoScope.Resolve(repoFlag);
         if (repo is null)
@@ -152,14 +151,6 @@ internal static class WaitingCommand
             Collection collected = result.Collected;
             IReadOnlyList<WaitingRow> resolved = result.Rows;
 
-            int renameFailures = 0;
-            if (rename)
-            {
-                // Diagnostics (RENAMED, and the failure/skip lines) go to stderr, never stdout, so a
-                // --json --rename run leaves a single valid JSON document on stdout.
-                renameFailures = await RenameAsync(resolved, ShellRunner.For, Console.Error, ct);
-            }
-
             IReadOnlyList<WaitingRow> shown = Present(resolved, all);
             if (json)
             {
@@ -172,10 +163,9 @@ internal static class WaitingCommand
 
             // A partly invisible fleet is not a clean sweep, so a single failed host — or a previously
             // collected host this run omitted — still costs the exit code even though every other host's
-            // rows were printed. A rename that could not be confirmed does too, so a harness is not told
-            // everything was corrected when some of it was not. Omitted is set by ResolveAllAsync and
-            // reflects this run.
-            return collected.AnyFailure || Omitted.Count > 0 || renameFailures > 0 ? ExitCode.Unavailable : ExitCode.Ok;
+            // rows were printed, so a harness is not told everything was seen when some of it was not.
+            // Omitted is set by ResolveAllAsync and reflects this run.
+            return collected.AnyFailure || Omitted.Count > 0 ? ExitCode.Unavailable : ExitCode.Ok;
         }
         catch (HistoryUnavailableException ex)
         {
@@ -729,193 +719,6 @@ internal static class WaitingCommand
             .OrderByDescending(r => r.Verdict.NeedsAttention)
             .ThenBy(r => r.Verdict.Severity)
             .ThenByDescending(r => r.StoppedFor ?? TimeSpan.Zero)];
-
-    /// <summary>
-    /// Corrects window names the tool can see are wrong, one batched command per host. Only names that
-    /// actually differ are touched, so a fleet already correct costs nothing.
-    /// </summary>
-    /// <remarks>
-    /// Works over the complete resolved fleet, not the shown subset: a quiet or working window with a
-    /// stale suffix is exactly the one the presentation filter drops, and it still needs correcting.
-    /// Diagnostics go to <paramref name="diagnostics"/> — stderr in production — never stdout, so
-    /// <c>--json --rename</c> leaves a single valid JSON document on stdout rather than a run of
-    /// <c>RENAMED</c> lines before it. The shell runner and the diagnostics sink are injected so the whole
-    /// decision is testable without a tmux server.
-    /// </remarks>
-    internal static async Task<int> RenameAsync(
-        IReadOnlyList<WaitingRow> rows,
-        Func<string?, Func<string, CancellationToken, Task<CommandResult>>> shellFor,
-        TextWriter diagnostics,
-        CancellationToken ct,
-        TimeSpan? perHostTimeout = null)
-    {
-        TimeSpan timeout = perHostTimeout ?? DefaultTargetTimeout;
-        int failures = 0;
-        foreach (IGrouping<string?, WaitingRow> host in rows.GroupBy(r => r.Pane.Host))
-        {
-            string label = TargetId.ForHost(host.Key).Display;
-
-            // Window ids duplicated across this host's rows are ambiguous. One-row-per-window collection
-            // should never produce them, so a duplicate is a defect — and renaming by an id that names two
-            // windows could rename the wrong one, so those are skipped conservatively, as is a row whose
-            // window id was not captured.
-            HashSet<string> duplicateWindowIds = [.. host
-                .Where(r => r.Pane.WindowId.Length > 0)
-                .GroupBy(r => r.Pane.WindowId, StringComparer.Ordinal)
-                .Where(g => g.Count() > 1)
-                .Select(g => g.Key)];
-
-            var renames = new List<(TmuxPane Pane, string Desired)>();
-            foreach ((TmuxPane pane, string desired) in RenamePlan(host))
-            {
-                if (pane.WindowId.Length == 0 || duplicateWindowIds.Contains(pane.WindowId))
-                {
-                    failures++;
-                    diagnostics.WriteLine($"RENAME-SKIPPED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)}: window id is missing or ambiguous");
-                    continue;
-                }
-
-                // Every suffix is read from a pane that had stopped. A pane whose scanned activity second is
-                // not strictly older than the sweep's observation second has not been proven quiescent for a
-                // whole second, so the mutation guard on window_activity alone could be defeated by a resume
-                // inside that same second — the same-second blind spot. Rather than rename on evidence that
-                // cannot be defended, defer it: this is not a failure but a benign wait for a later sweep,
-                // when the activity is in a past second, so it does not cost the exit code.
-                if (!TmuxScanner.ActivityStrictlyPredatesObservation(pane))
-                {
-                    diagnostics.WriteLine($"RENAME-DEFERRED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)}: last activity is not yet a full second old; too recent to name safely");
-                    continue;
-                }
-
-                renames.Add((pane, desired));
-            }
-
-            if (renames.Count == 0)
-            {
-                continue;
-            }
-
-            // All panes on a host share one tmux server, so any of their scanned epochs is the batch's.
-            string scannedEpoch = renames[0].Pane.Epoch;
-            string nonce = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(8));
-            string script = WindowNaming.BuildRenameScript(renames, scannedEpoch, nonce)!;
-
-            // A linked deadline per host, mirroring CollectAsync: one hung host cannot hold up the rest,
-            // and genuine caller cancellation dominates and escapes carrying the caller's own token.
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            linked.CancelAfter(timeout);
-            CommandResult result;
-            try
-            {
-                result = await shellFor(host.Key)(script, linked.Token);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                ct.ThrowIfCancellationRequested();
-                throw;
-            }
-            catch (OperationCanceledException)
-            {
-                failures += renames.Count;
-                string secs = timeout.TotalSeconds.ToString("0.###", CultureInfo.InvariantCulture);
-                diagnostics.WriteLine($"RENAME-TIMEOUT {DisplayText.Safe(label)}: rename timed out after {secs}s; {renames.Count} window(s) not renamed");
-                continue;
-            }
-
-            // A nonzero exit is the shell or ssh transport failing before anything was confirmed: nothing
-            // renamed, so nothing is reported as renamed.
-            if (result.ExitCode != 0)
-            {
-                failures += renames.Count;
-                string detail = result.Stderr.Trim() is { Length: > 0 } stderr ? stderr : $"exited {result.ExitCode}";
-                diagnostics.WriteLine($"RENAME-FAILED {DisplayText.Safe(label)}: {DisplayText.Safe(detail)}; {renames.Count} window(s) not renamed");
-                continue;
-            }
-
-            string[] lines = result.Stdout.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
-
-            // Account per window, independently. Each window's guard prints exactly one marker naming that
-            // window: `<nonce>:ok:@id` when its epoch, activity, name and state all still matched and tmux
-            // confirmed the rename; `<nonce>:stale:@id` when the server was unchanged but the window's name,
-            // published state, or activity had moved since the sweep, so the planned rename would overwrite
-            // a newer identity or name a pane that has resumed; and `<nonce>:epoch:@id` when the server
-            // generation itself changed. A restart or a reassignment between windows leaves the ones already
-            // renamed reported and only the affected one skipped — the earlier success is never discarded.
-            // Markers are counted per id and only for ids this host actually requested; a marker naming an
-            // unrequested id, or naming one more than once, or naming it in more than one way, is a shape
-            // the script never writes, so it confers nothing and the window falls through to failed,
-            // fail-closed.
-            string okPrefix = nonce + ":ok:";
-            string epochPrefix = nonce + ":epoch:";
-            string stalePrefix = nonce + ":stale:";
-            HashSet<string> requested = [.. renames.Select(r => r.Pane.WindowId)];
-            var okCounts = new Dictionary<string, int>(StringComparer.Ordinal);
-            var epochCounts = new Dictionary<string, int>(StringComparer.Ordinal);
-            var staleCounts = new Dictionary<string, int>(StringComparer.Ordinal);
-            foreach (string line in lines)
-            {
-                Tally(line, okPrefix, requested, okCounts);
-                Tally(line, epochPrefix, requested, epochCounts);
-                Tally(line, stalePrefix, requested, staleCounts);
-            }
-
-            foreach ((TmuxPane pane, string desired) in renames)
-            {
-                int oks = okCounts.GetValueOrDefault(pane.WindowId);
-                int epochs = epochCounts.GetValueOrDefault(pane.WindowId);
-                int stales = staleCounts.GetValueOrDefault(pane.WindowId);
-                int total = oks + epochs + stales;
-                if (total == 1 && oks == 1)
-                {
-                    diagnostics.WriteLine($"RENAMED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)} -> {DisplayText.Safe(desired)}");
-                }
-                else if (total == 1 && epochs == 1)
-                {
-                    failures++;
-                    diagnostics.WriteLine($"RENAME-SKIPPED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)}: tmux server changed since the sweep");
-                }
-                else if (total == 1 && stales == 1)
-                {
-                    failures++;
-                    diagnostics.WriteLine($"RENAME-SKIPPED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)}: window name, published state, or activity changed since the sweep");
-                }
-                else if (total == 0)
-                {
-                    failures++;
-                    diagnostics.WriteLine($"RENAME-FAILED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)}: tmux did not confirm the rename");
-                }
-                else
-                {
-                    // More than one marker for one window — impossible from the single guard per window this
-                    // script writes, so it is a defect: fail closed rather than credit the success.
-                    failures++;
-                    diagnostics.WriteLine($"RENAME-FAILED {DisplayText.Safe(pane.Where)} {DisplayText.Safe(pane.WindowName)}: conflicting confirmations");
-                }
-            }
-        }
-
-        // A cancellation landing between the last shell call and here is still the caller's.
-        ct.ThrowIfCancellationRequested();
-        return failures;
-    }
-
-    /// <summary>Counts a marker line against the window it names, but only when that id was requested — so
-    /// a marker for an unrequested id can never confer success.</summary>
-    private static void Tally(string line, string prefix, HashSet<string> requested, Dictionary<string, int> counts)
-    {
-        if (line.StartsWith(prefix, StringComparison.Ordinal)
-            && line[prefix.Length..] is { } id
-            && requested.Contains(id))
-        {
-            counts[id] = counts.GetValueOrDefault(id) + 1;
-        }
-    }
-
-    /// <summary>The windows whose current name differs from the one the tool would give them.</summary>
-    internal static IEnumerable<(TmuxPane Pane, string Desired)> RenamePlan(IEnumerable<WaitingRow> rows)
-        => rows
-            .Select(r => (r.Pane, Desired: WindowNaming.Apply(r.Pane.WindowName, WindowNaming.SuffixFor(r.Verdict))))
-            .Where(r => !string.Equals(r.Desired, r.Pane.WindowName, StringComparison.Ordinal));
 
     private static WaitingRow Row(TmuxPane pane, StateReading reading, WaitingVerdict verdict, DateTimeOffset now)
         => new()

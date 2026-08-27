@@ -62,13 +62,11 @@ public static class Cli
         var all = new Option<bool>("--all") { Description = "Include windows that are holding legitimately, and windows that identify nothing." };
         Option<string[]> host = CreateHostOption();
         var json = new Option<bool>("--json") { Description = "Emit the rows as JSON instead of a table." };
-        var rename = new Option<bool>("--rename") { Description = "Correct tmux window-name suffixes to match what the tool observes." };
         Option<string?> repo = CreateRepoOption();
 
         command.Options.Add(all);
         command.Options.Add(host);
         command.Options.Add(json);
-        command.Options.Add(rename);
         command.Options.Add(repo);
 
         command.SetAction(async (parseResult, cancellationToken) => await WaitingCommand.RunAsync(
@@ -76,7 +74,6 @@ public static class Cli
             parseResult.GetValue(host) ?? [],
             parseResult.GetValue(all),
             parseResult.GetValue(json),
-            parseResult.GetValue(rename),
             cancellationToken));
 
         return command;

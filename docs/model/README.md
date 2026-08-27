@@ -12,11 +12,21 @@ different state, different actions and different failure modes.
 
 ## TmuxWindows
 
-Several agents write one shared namespace with no access control, and the tool is one of
-the writers. A tmux command without an explicit target lands on whichever window is
-*current*, which is somebody else's — observed live twice, as four windows carrying a
-fifth's `@agent_state`, and as a window named for a PR its own state said it was not
-working on.
+Several agents write one shared namespace with no access control, and the tool reads it. A
+tmux command without an explicit target lands on whichever window is *current*, which is
+somebody else's — observed live twice, as four windows carrying a fifth's `@agent_state`,
+and as a window named for a PR its own state said it was not working on.
+
+The tool used to be a writer here too: `octoshift waiting --rename` corrected window-name
+suffixes to match what a sweep observed. That was removed (nightshift issues #170–#172). A
+persistent window name is read at a glance and believed, but its suffix encoded GitHub
+state, the active pane and wall-clock activity — none of which a per-window tmux guard can
+atomically revalidate at mutation time against a name that outlives the fact it asserted. So
+the tool no longer writes this namespace at all; it reports the same findings in the row,
+where they are re-derived each sweep and cannot go stale. The model follows: the name
+channel is now written only by agents (`NameWindow` is an ordinary agent naming its own
+window), and the feedback-loop property that once checked the tool's own rename is gone with
+the rename.
 
 The model does not ask whether agents make that mistake; they demonstrably do. It asks
 which identity channels survive it. The answer is sharper than expected:

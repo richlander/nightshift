@@ -1,6 +1,13 @@
 ---- MODULE TmuxWindows ----
 (* Model of identity over tmux window state, where several agents write to one shared
-   namespace with no access control and one of them is the tool itself.
+   namespace with no access control. The tool only READS this namespace. The earlier
+   `octoshift waiting --rename` once made the tool a writer here too, but it was removed
+   (nightshift issues #170-#172): a persistent window name cannot be atomically validated
+   against the GitHub state, active-pane selection and wall-clock activity its suffix
+   encoded, so a name that was true when written could silently go false. With the tool no
+   longer writing, the feedback loop this model once also checked -- whether the tool's own
+   writing makes things worse -- is closed by construction; what remains, and is live, is
+   which identity channels a reader can trust.
 
    The bug class: a tmux command without an explicit target applies to whichever window
    is CURRENT, which is somebody else's. Observed live, twice and in two forms -- four
@@ -10,7 +17,7 @@
 
    The question this model exists to answer is not "do agents make that mistake" -- they
    demonstrably do -- but "GIVEN that they do, which identity channels can still be
-   trusted, and does the tool's own writing make things worse."
+   trusted."
 
    Scope: names, options and pane text are abstract PR identifiers, not strings. Parsing
    is not modelled -- Waiting.tla's header explains why that boundary is deliberate, and
@@ -38,7 +45,7 @@ VARIABLES
     worksOn,   \* window -> the PR its own agent is actually working on. Ground truth,
                \* and unobservable: it exists only inside the agent.
     stateOpt,  \* window -> PR in its @agent_state. Writable by ANY agent.
-    nameOpt,   \* window -> PR encoded in its name. Writable by any agent AND the tool.
+    nameOpt,   \* window -> PR encoded in its name. Writable by any agent; the tool only reads it.
     paneText,  \* window -> PR its agent printed. Writable ONLY by its own agent, because
                \* a process writes to its own terminal and nowhere else.
     current    \* the window an untargeted command lands on
@@ -54,8 +61,8 @@ TypeOK ==
 
 (* ---- What the tool concludes ---------------------------------------------------- *)
 
-\* A name shared by two windows belongs to neither: a duplicate is evidence that a
-\* rename landed somewhere it did not belong.
+\* A name shared by two windows belongs to neither: a duplicate is evidence that a rename
+\* -- an agent's own, targeted or not -- landed somewhere it did not belong.
 NameIsUnique(w) ==
     /\ nameOpt[w] # None
     /\ \A o \in AgentWindows \ {w} : nameOpt[o] # nameOpt[w]
@@ -110,39 +117,21 @@ PublishUntargeted ==
          /\ nameOpt' = [nameOpt EXCEPT ![current] = worksOn[w]]
     /\ UNCHANGED << worksOn, paneText, current >>
 
-\* The tool's own --rename. It is a writer into the same namespace it reads identity
-\* from, which is the feedback loop worth checking: renaming must never change what the
-\* tool would conclude about any window, including the one it renamed.
+\* An agent names its OWN window -- targeted, so it writes its own window -- for the PR it
+\* is working on, without publishing @agent_state at the same time. This is how a window
+\* comes to carry a PR-encoding name with no state yet: a window named at creation, or by
+\* the coordinator at branch push, before the agent has published anything. It is the one
+\* action that writes nameOpt independently of stateOpt, and so the one that exercises the
+\* reader's name fallback and its ambiguity rule -- two agents on one PR that both name
+\* their windows collide, and a shared name identifies neither.
 \*
-\* This action renames to Attributed(w) -- the identity read at the SAME instant the name
-\* is written -- so it models a rename that acts on the window's live attribution, not a
-\* stale one. That correspondence is load-bearing and it is what the rename guard enforces
-\* in the code: a plan is computed from an earlier sweep, but each mutation is guarded, in
-\* one tmux client, on the live window name, the live @agent_state, the live server epoch
-\* AND the live #{window_activity} all still equalling the scanned values, and aborts
-\* (reporting stale) otherwise. The activity stamp was added in round 11: the suffix the
-\* code applies also depends on the pane's activity (every suffix is read from a pane that
-\* had STOPPED), and tmux advances window_activity on any output, so a pane that resumed
-\* between the sweep and the rename no longer matches and the mutation aborts -- closing the
-\* gap where an idle pane that started working during the GitHub read could still be renamed
-\* -ready. The same round removed fleet-global ownership (owner/follower) from the suffix
-\* entirely: it is decided across windows other than the one being renamed, over state no
-\* per-window guard can revalidate at mutation time, so it is no longer written into a name
-\* at all -- which keeps this single-instant action, over one window's own channels, a
-\* faithful abstraction. Round 12 closed the residual same-second window: the activity stamp
-\* is only a whole-second-quiescence proof if the pane's last activity is in a second already
-\* past when the sweep observed it, so the sweep also reads the TARGET's own second and the
-\* code applies a suffix only when the scanned activity strictly predates it -- a pane read in
-\* the same second as its last output is deferred, not named, until a later sweep. That makes
-\* the single-instant identity Attributed(w) faithful even at a second boundary: the code
-\* never writes a name whose activity premise it cannot prove held for a full second. Without
-\* the guard the code could write a name computed from an attribution that has since moved --
-\* a transition this single-instant action does not contain -- so the guard is precisely what
-\* makes ToolRenames a faithful abstraction rather than an optimistic one.
-ToolRenames ==
+\* The tool used to be a writer here too (`octoshift waiting --rename`), and this action was
+\* its rename. It is not any longer: a persistent window name cannot be atomically validated
+\* against the volatile state its suffix encoded, so the rename was removed and the tool now
+\* only reads this namespace (issues #170-#172). What remains is an ordinary agent write.
+NameWindow ==
     /\ \E w \in AgentWindows :
-         /\ Attributed(w) # None
-         /\ nameOpt' = [nameOpt EXCEPT ![w] = Attributed(w)]
+         /\ nameOpt' = [nameOpt EXCEPT ![w] = worksOn[w]]
     /\ UNCHANGED << worksOn, stateOpt, paneText, current >>
 
 \* An agent moves on to different work.
@@ -152,7 +141,7 @@ Reassign ==
          /\ worksOn' = [worksOn EXCEPT ![w] = p]
     /\ UNCHANGED << stateOpt, nameOpt, paneText, current >>
 
-Next == SwitchCurrent \/ PublishTargeted \/ PublishUntargeted \/ ToolRenames \/ Reassign
+Next == SwitchCurrent \/ PublishTargeted \/ PublishUntargeted \/ NameWindow \/ Reassign
 
 Spec == Init /\ [][Next]_vars
 
@@ -203,14 +192,5 @@ CorroborationCatchesAClobber ==
     \A w \in AgentWindows :
         (stateOpt[w] # None /\ paneText[w] # None /\ stateOpt[w] # paneText[w])
             => AttributedCorroborated(w) = None
-
-(* ---- Step properties ---- *)
-
-\* The feedback loop. The tool writes names and reads names, so its own rename must never
-\* change what it would conclude -- about the window it renamed or any other, including
-\* by creating or resolving a duplicate.
-ToolRenameChangesNothingStep ==
-    [][ (stateOpt' = stateOpt /\ worksOn' = worksOn /\ paneText' = paneText)
-          => \A w \in AgentWindows : Attributed(w)' = Attributed(w) ]_vars
 
 ====
