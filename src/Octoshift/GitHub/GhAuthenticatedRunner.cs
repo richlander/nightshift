@@ -2,7 +2,6 @@ namespace Octoshift.GitHub;
 
 using System.ComponentModel;
 using System.Diagnostics;
-using System.Text;
 
 /// <summary>
 /// Builds <c>gh</c> runner delegates that inject an installation token as <c>GH_TOKEN</c>.
@@ -32,12 +31,25 @@ internal static class GhAuthenticatedRunner
         };
     }
 
-    internal static async Task<GhResult> RunGhAsync(
+    internal static Task<GhResult> RunGhAsync(
+        IReadOnlyList<string> args,
+        IReadOnlyDictionary<string, string?>? environmentOverrides,
+        CancellationToken ct)
+        => RunProcessAsync("gh", args, environmentOverrides, ct);
+
+    /// <summary>
+    /// Starts <paramref name="file"/> with <paramref name="args"/>, drains both output streams while it
+    /// runs, and returns its exit code and captured output. On cancellation the whole process tree is taken
+    /// down before the cancellation propagates. The program name is a parameter so this can be exercised
+    /// against a purpose-built child rather than only the real <c>gh</c> binary.
+    /// </summary>
+    internal static async Task<GhResult> RunProcessAsync(
+        string file,
         IReadOnlyList<string> args,
         IReadOnlyDictionary<string, string?>? environmentOverrides,
         CancellationToken ct)
     {
-        var psi = new ProcessStartInfo("gh")
+        var psi = new ProcessStartInfo(file)
         {
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -65,10 +77,6 @@ internal static class GhAuthenticatedRunner
         }
 
         using var proc = new Process { StartInfo = psi };
-        var stdout = new StringBuilder();
-        var stderr = new StringBuilder();
-        proc.OutputDataReceived += (_, e) => { if (e.Data is not null) { stdout.AppendLine(e.Data); } };
-        proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) { stderr.AppendLine(e.Data); } };
 
         try
         {
@@ -76,13 +84,37 @@ internal static class GhAuthenticatedRunner
         }
         catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
         {
-            return new GhResult(127, stdout.ToString(), ex.Message);
+            return new GhResult(127, string.Empty, ex.Message);
         }
 
-        proc.BeginOutputReadLine();
-        proc.BeginErrorReadLine();
-        await proc.WaitForExitAsync(ct);
-        return new GhResult(proc.ExitCode, stdout.ToString(), stderr.ToString());
+        // Drain both streams concurrently with the wait, because a child that fills its stdout pipe stops
+        // making progress — and reading either stream only after exit truncates whatever a burst wrote past
+        // the buffer. Starting the reads before the wait is what the event-based BeginOutputReadLine path
+        // could not guarantee: WaitForExitAsync can return before the last data-received callback fires.
+        Task<string> stdout = proc.StandardOutput.ReadToEndAsync(ct);
+        Task<string> stderr = proc.StandardError.ReadToEndAsync(ct);
+
+        try
+        {
+            await proc.WaitForExitAsync(ct);
+            return new GhResult(proc.ExitCode, await stdout, await stderr);
+        }
+        catch (OperationCanceledException)
+        {
+            // Disposing the Process alone leaves the gh child — and anything it spawned — running. Take the
+            // tree down before the cancellation propagates, so a cancelled token exchange never orphans a
+            // process holding a token in its environment.
+            try
+            {
+                proc.Kill(entireProcessTree: true);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or Win32Exception)
+            {
+                // Already gone, or the platform will not walk the tree; nothing further to do.
+            }
+
+            throw;
+        }
     }
 }
 
