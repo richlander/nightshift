@@ -55,8 +55,8 @@ java -cp tla2tools.jar tlc2.TLC -config Waiting.cfg -workers auto Waiting.tla
 ```
 
 Current bounds — 3 windows, 2 hosts, 2 PRs, 8 steps — run in a few seconds: with TLC 2.19
-(12 workers) SANY parses cleanly and TLC reports 8,399,658 states generated, 1,539,916
-distinct, depth 9, zero violations (~11s). Raise `MaxTime` for a
+(12 workers) SANY parses cleanly and TLC reports 8,484,242 states generated, 1,539,916
+distinct, depth 9, zero violations (~10s). Raise `MaxTime` for a
 deeper search; hosts multiply the state space quickly, since every sweep branches over
 the subsets of hosts it might have collected and every host restarts on its own epoch —
 and opening the first window on an empty host is a server start that advances that host's
@@ -68,10 +68,14 @@ collected ones, so a host that fails on its very first attempt is still remember
 later sweep that omits it reads as narrowed rather than complete. A ghost `everAttempted`
 tracks that independently, so `CompletenessCoversEveryAttemptedHost` refutes a mutation
 that reverts the membership to collected-growth (the round-9 first-time-failed-host bug).
-Membership also *shrinks*, but only through the explicit `Retire` action — an operator act,
-never ordinary collection — which removes a host from the fleet and clears the registration
-state kept under it. `NoOwnerFromRetiredHost` is the safety this earns: a retired host's
-stale claim can never remain actionable.
+Membership also *shrinks* through the explicit `Retire` action and *grows back* through the
+explicit `Add` action — operator acts, never ordinary collection — which respectively remove
+a host and clear the registration state kept under it, and re-declare a host (the only way to
+bring the local machine back once retired). `NoOwnerFromRetiredHost` is the safety retirement
+earns: a retired host's stale claim can never remain actionable. `Add` adds transitions
+without adding reachable distinct states (an add-then-sweep reaches only what a sweep already
+does), and it re-stamps a collected window's registration fleet exactly as `Retire` does, so
+`OwnerStableAcrossSweepStep` still holds — dropping that re-stamp is a refuted mutation.
 
 
 ## What is modelled, and what is not
@@ -109,6 +113,7 @@ implementation, named for what it mirrors:
 | `OwnerStableAcrossSweepStep` | `OwnerStableAcrossSweepStep` |
 | `Observed` | `ObservedRequiresAWitnessedRegistration` |
 | `NoOwnerFromRetiredHost` | `RetiringAHostRemovesItAndClearsItsClaims` |
+| `Add` | `AddingAHostDeclaresItAndReDeclaresLocalAfterRetirement` |
 
 The model is the authority on ordering and memory; those tests are the evidence the C#
 agrees with it.
@@ -130,6 +135,7 @@ here has a mutation that breaks it:
 | let a partial sweep rewrite registrations | `NoPhantomDepartureStep` |
 | retire a host but leave it in `lastCollected` with `viewComplete` still true | `NoOwnerFromRetiredHost` |
 | let a registration count against a fleet it was not made against | `OwnerStableAcrossSweepStep` |
+| `Add` a host without re-stamping a collected window's registration fleet | `OwnerStableAcrossSweepStep` |
 
 Every invariant and property in the config has an entry, which is the bar for calling
 the run clean. A mutation must also be attributed to the *intended* property: an early

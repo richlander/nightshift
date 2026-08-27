@@ -28,13 +28,15 @@
    switch PRs for reasons this tool neither controls nor predicts.
 
    Status: parsed cleanly with SANY and model-checked with TLC 2.19 against Waiting.cfg --
-   no errors, 8,399,658 states generated, 1,539,916 distinct, depth 9, zero violations
-   (~11s, 12 workers; the per-host epoch, the empty sweep, modelling an empty host's first
+   no errors, 8,484,242 states generated, 1,539,916 distinct, depth 9, zero violations
+   (~10s, 12 workers; the per-host epoch, the empty sweep, modelling an empty host's first
    window as a server start, separating the hosts a sweep ATTEMPTED from the subset that
-   ANSWERED, growing persistent fleet membership from ATTEMPTED, and the operator Retire that
-   shrinks it all widen the space from
+   ANSWERED, growing persistent fleet membership from ATTEMPTED, the operator Retire that
+   shrinks it and the operator Add that grows it back all widen the space from
    the earlier single-epoch model, while the server-start
-   advance prunes some by failing more first looks closed). Re-run TLC
+   advance prunes some by failing more first looks closed; the distinct-state count is
+   unchanged by Add, since an Add followed by a sweep reaches only configurations a sweep
+   already reaches, but it adds transitions). Re-run TLC
    after any change here to regenerate the count
    and confirm zero violations. Validated by mutation:
    reintroducing the real pane-id-across-restart bug (dropping the epoch check in
@@ -49,7 +51,9 @@
    recomputing witness from the current sweep's coverage, the fleet-expansion laundering
    where the third sweep of a full fleet promotes a claim first recorded under a narrow
    view -- violates NoOwnerFromUnwitnessedRegistration, and doing the same recomputation
-   while the claim continues violates the RegWitnessedStableStep temporal property. The
+   while the claim continues violates the RegWitnessedStableStep temporal property; and an Add
+   that grows knownHosts without re-stamping a collected window's regFleet leaves it stale, so
+   the next otherwise-unchanged sweep flips Owner and violates OwnerStableAcrossSweepStep. The
    corresponding code is covered
    by InvariantTests, ModelCorrespondenceTests and WaitingScanTests against the real
    implementation, not just this model. *)
@@ -192,6 +196,15 @@ OwnsClaim(w) ==
 
 (* ---- Actions ---- *)
 
+\* knownHosts = {} is the UNINITIALIZED fleet -- nothing declared yet. The model's hosts are symmetric, so
+\* it does not distinguish "never established" from "established then emptied by retirement": that
+\* distinction matters only to the implementation's local-machine bootstrap (a bare sweep defaults to the
+\* local machine while uninitialized, and must NOT re-add it once the fleet has been emptied on purpose),
+\* which is a code concern -- the persisted `initialized` flag -- outside this abstraction. What the model
+\* does carry is the safety that survives either reading of an empty fleet: a window on a host outside
+\* knownHosts can never own (NoOwnerFromRetiredHost), so emptying the fleet, by retirement or by never
+\* declaring it, strands no actionable ownership. Add and Retire are the deliberate operator acts that grow
+\* and shrink membership; Sweep grows it as a side effect of attempting a target.
 Init ==
     /\ now = 0
     /\ claims = [w \in Windows |-> NoPr]
@@ -421,7 +434,47 @@ Retire ==
          /\ viewComplete' = FALSE
     /\ UNCHANGED << claims, live, epoch >>
 
-Next == AgentActs \/ ServerRestarts \/ Sweep \/ Retire
+\* An operator adds a host to the declared fleet. The deliberate counterpart to Retire, and -- besides a
+\* bare sweep's bootstrap of the local machine, which the implementation does once and never repeats after
+\* a retirement -- the only way to (re-)declare a target. In the implementation this is `octoshift fleet
+\* add`, whose reason for existing is exactly that ordinary collection no longer re-bootstraps a member
+\* retired on purpose (see the initialized/explicitly-empty distinction in PaneHistory): bringing local, or
+\* any host, back is now an act rather than a side effect.
+\*
+\* It grows persistent membership without collecting anything. The added host enters knownHosts (and the
+\* everAttempted ghost) with no epoch, no continuity and no pane of its own -- exactly the shape a
+\* never-yet-collected attempted target has -- so a window on it cannot own until a complete sweep has
+\* actually reached it, and a later sweep that omits it still reads as narrowed. Only a host not already a
+\* member is added; re-adding an existing member is an idempotent no-op the implementation allows and which
+\* would change nothing here.
+\*
+\* Growing the fleet invalidates the last sweep's completeness -- an ordering established when the fleet was
+\* smaller is not an ordering over the fleet now -- so viewComplete drops to FALSE until a fresh complete
+\* sweep re-earns it, exactly as Retire and a Sweep recompute it. A surviving window that was under
+\* observation has its registration fleet re-understood against the now-larger fleet, exactly as Retire
+\* re-stamps it against the now-smaller one: without this a collected window's regFleet would stay pinned to
+\* the pre-addition fleet, its registration would read stale until the next sweep re-stamped it, and that
+\* sweep -- over an otherwise unchanged fleet -- would flip Owner, an artifact the real tool (whose ranking
+\* is a stable function of registration time and witness, not of a fleet snapshot) does not have. A window
+\* the tool did not look at last sweep keeps its fleet, since the tool did not observe it, and it is not a
+\* Claimant anyway. The re-stamp does NOT witness anything: regWitnessed is untouched and viewComplete is
+\* FALSE, so nothing on the added, uncollected host becomes actionable until a complete sweep reaches it.
+\* Because knownHosts changes, RegistrationStableStep, RegWitnessedStableStep and OwnerStableAcrossSweepStep
+\* all exclude this step just as they exclude a Retire; NoPhantomDepartureStep permits the regFleet re-stamp
+\* because every re-stamped window's host stays in lastCollected' (= lastCollected).
+Add ==
+    /\ now < MaxTime
+    /\ now' = now + 1
+    /\ \E h \in Hosts \ knownHosts :
+         /\ knownHosts' = knownHosts \union {h}
+         /\ everAttempted' = everAttempted \union {h}
+         /\ regFleet' = [w \in Windows |->
+                          IF HostOf(w) \in lastCollected THEN knownHosts \union {h}
+                          ELSE regFleet[w]]
+         /\ viewComplete' = FALSE
+    /\ UNCHANGED << claims, live, epoch, regEpoch, regTime, regPr, lastCollected, regWitnessed >>
+
+Next == AgentActs \/ ServerRestarts \/ Sweep \/ Retire \/ Add
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Sweep)
 

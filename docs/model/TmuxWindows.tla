@@ -116,14 +116,23 @@ PublishUntargeted ==
 \*
 \* This action renames to Attributed(w) -- the identity read at the SAME instant the name
 \* is written -- so it models a rename that acts on the window's live attribution, not a
-\* stale one. That correspondence is load-bearing and it is what the round-7 rename guard
-\* enforces in the code: a plan is computed from an earlier sweep, but each mutation is
-\* guarded, in one tmux client, on the live window name, the live @agent_state and the
-\* live server epoch all still equalling the scanned values, and aborts (reporting stale)
-\* otherwise. Without that guard the code could write a name computed from an attribution
-\* that has since moved -- a transition this single-instant action does not contain -- so
-\* the guard is precisely what makes ToolRenames a faithful abstraction rather than an
-\* optimistic one.
+\* stale one. That correspondence is load-bearing and it is what the rename guard enforces
+\* in the code: a plan is computed from an earlier sweep, but each mutation is guarded, in
+\* one tmux client, on the live window name, the live @agent_state, the live server epoch
+\* AND the live #{window_activity} all still equalling the scanned values, and aborts
+\* (reporting stale) otherwise. The activity stamp was added in round 11: the suffix the
+\* code applies also depends on the pane's activity (every suffix is read from a pane that
+\* had STOPPED), and tmux advances window_activity on any output, so a pane that resumed
+\* between the sweep and the rename no longer matches and the mutation aborts -- closing the
+\* gap where an idle pane that started working during the GitHub read could still be renamed
+\* -ready. The same round removed fleet-global ownership (owner/follower) from the suffix
+\* entirely: it is decided across windows other than the one being renamed, over state no
+\* per-window guard can revalidate at mutation time, so it is no longer written into a name
+\* at all -- which keeps this single-instant action, over one window's own channels, a
+\* faithful abstraction. Without the guard the code could write a name computed from an
+\* attribution that has since moved -- a transition this single-instant action does not
+\* contain -- so the guard is precisely what makes ToolRenames a faithful abstraction rather
+\* than an optimistic one.
 ToolRenames ==
     /\ \E w \in AgentWindows :
          /\ Attributed(w) # None
