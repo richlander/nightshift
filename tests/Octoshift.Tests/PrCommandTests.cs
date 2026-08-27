@@ -280,6 +280,83 @@ public class PrCommandTests
     }
 
     [Fact]
+    public async Task Locate_APartialHitLeadsWithFoundButUniquenessUnprovenWhenAScopeRepoIsUnreadable()
+    {
+        // #178 round 3 / item 2, no claim: the PR was found in one repo, but another configured repo could
+        // not be read, so uniqueness is unproven. The header must say found-but-uniqueness-unproven — not a
+        // blank "could not be read" that hides the proven existence — and stay non-success.
+        PrLocationResult result = await LocateAsync(4623, Collection(
+            [],
+            [null]),
+            new PrFetch(PrFetchStatus.Unavailable, null).WithRepos(["owner/first", "owner/second"], ["owner/first"]));
+
+        Assert.Equal(PrCommand.PrDisposition.Unavailable, result.Located.Disposition);
+        Assert.Equal(ExitCode.Unavailable, result.Located.ExitCode);
+        string report = result.Report();
+        Assert.StartsWith("PARTIAL PR #4623", report, StringComparison.Ordinal);
+        Assert.Contains("found in owner/first, but uniqueness unproven", report, StringComparison.Ordinal);
+        Assert.Contains("part of the scope could not be read", report, StringComparison.Ordinal);
+
+        using JsonDocument doc = JsonDocument.Parse(result.Json());
+        Assert.Equal("unavailable", doc.RootElement.GetProperty("github").GetString());
+        Assert.Equal(
+            ["owner/first"],
+            doc.RootElement.GetProperty("foundIn").EnumerateArray().Select(e => e.GetString()!).ToArray());
+    }
+
+    [Fact]
+    public async Task Locate_APartialHitNamesTheUnsearchedRemainderWhenTheBudgetWasSpent()
+    {
+        // #178 round 3 / item 2, no claim, budget cutoff: the PR was found in the first repo, but the search
+        // stopped before the second on an exhausted shared budget. The report separates configured from
+        // searched and names the unsearched remainder, rather than relabelling it as searched.
+        PrLocationResult result = await LocateAsync(4623, Collection(
+            [],
+            [null]),
+            new PrFetch(PrFetchStatus.Unavailable, null).WithRepos(["owner/first"], ["owner/first"], ["owner/first", "owner/second"]));
+
+        Assert.Equal(PrCommand.PrDisposition.Unavailable, result.Located.Disposition);
+        string report = result.Report();
+        Assert.Contains("found in owner/first, but uniqueness unproven", report, StringComparison.Ordinal);
+        Assert.Contains("owner/second not searched (budget spent)", report, StringComparison.Ordinal);
+        Assert.Contains("configured owner/first, owner/second; searched owner/first", report, StringComparison.Ordinal);
+
+        using JsonDocument doc = JsonDocument.Parse(result.Json());
+        Assert.Equal(
+            ["owner/first", "owner/second"],
+            doc.RootElement.GetProperty("configured").EnumerateArray().Select(e => e.GetString()!).ToArray());
+        Assert.Equal(
+            ["owner/first"],
+            doc.RootElement.GetProperty("searched").EnumerateArray().Select(e => e.GetString()!).ToArray());
+    }
+
+    [Fact]
+    public async Task Locate_ALocalClaimVerdictSaysFoundButUniquenessUnprovenOnAPartialHit()
+    {
+        // #178 round 3 / item 2, local claim: with a claiming window and a partial hit, the claim's verdict
+        // must say the PR was found but uniqueness is unproven — matching the body — rather than a bare
+        // "could not read from GitHub". It stays non-actionable: no facts, no readiness.
+        PrLocationResult result = await LocateAsync(4623, Collection(
+            [Pane("fernie", "%1", "cp:1", agentState: "pr=4623 head=abc1234 reviews=2/2 rec=merge", windowName: "pr4623")],
+            ["fernie"]),
+            new PrFetch(PrFetchStatus.Unavailable, null).WithRepos(["owner/first", "owner/second"], ["owner/first"]));
+
+        string report = result.Report();
+        Assert.Contains("PR #4623 found in owner/first, but uniqueness unproven", report, StringComparison.Ordinal);
+        Assert.DoesNotContain("could not read PR #4623 from GitHub", report, StringComparison.Ordinal);
+
+        using JsonDocument doc = JsonDocument.Parse(result.Json());
+        JsonElement claim = doc.RootElement.GetProperty("claims").EnumerateArray().First();
+        JsonElement verdict = claim.GetProperty("verdict");
+        Assert.Contains(
+            "found in owner/first, but uniqueness unproven",
+            verdict.GetProperty("reason").GetString()!,
+            StringComparison.Ordinal);
+        // Non-actionable: a low-confidence, non-ready verdict.
+        Assert.Equal("low", verdict.GetProperty("confidence").GetString());
+    }
+
+    [Fact]
     public async Task Locate_AcompleteViewWithNeitherClaimNorPrLeadsWithNotFound()
     {
         // A complete view that turned up no claiming window, and GitHub affirmatively 404s: NOTFOUND, exit

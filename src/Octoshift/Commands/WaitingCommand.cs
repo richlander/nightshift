@@ -37,6 +37,14 @@ internal sealed record WaitingRow
     public string? Repo { get; init; }
 
     /// <summary>
+    /// On a cross-repo miss where the PR was found in one or more repos but could not be resolved to a
+    /// single one — an ambiguous collision, or a partial hit whose uniqueness is unproven — the repos it
+    /// was found in. Empty when the PR resolved cleanly or was found nowhere. Surfaced so a reader sees the
+    /// existence the verdict reason describes as structured data, not only prose.
+    /// </summary>
+    public IReadOnlyList<string> FoundIn { get; init; } = [];
+
+    /// <summary>
     /// How long the window has produced no new content, measured across runs. Null until a second
     /// observation exists. Distinct from <see cref="StoppedFor"/>, which a repainting spinner resets.
     /// </summary>
@@ -786,6 +794,7 @@ internal static class WaitingCommand
                 Retirement = Retirement.For(verdict, record, pane.Activity),
                 SilentFor = silence.GetValueOrDefault(Claim.Key(pane)),
                 Repo = resolved.Facts?.Repo,
+                FoundIn = resolved.FoundIn,
             });
         }
 
@@ -882,16 +891,18 @@ internal static class WaitingCommand
         IReadOnlyList<string> unreachable,
         IReadOnlyList<string>? omitted = null,
         IReadOnlyList<string>? departed = null,
-        IReadOnlyList<string>? searchedRepos = null)
+        IReadOnlyList<string>? configuredRepos = null)
     {
         output.WriteLine(Summary(rows, unreachable, omitted));
 
-        // Name the repos a claimed PR was searched in, so a cross-repo fleet reads the scope of the sweep
-        // rather than assuming the one repo the operator's directory sits in. Emitted after the token line,
-        // never before it, so the first-line contract a harness greps is untouched.
-        if (searchedRepos is { Count: > 0 })
+        // Name the configured repo scope — the CLI's --repo set (or the inferred single repo), not any
+        // per-PR attempt — so a cross-repo fleet reads the scope of the sweep rather than assuming the one
+        // repo the operator's directory sits in. Each row's own resolution names where its claim landed.
+        // Emitted after the token line, never before it, so the first-line contract a harness greps is
+        // untouched.
+        if (configuredRepos is { Count: > 0 })
         {
-            output.WriteLine($"SCOPE searched {string.Join(", ", searchedRepos.Select(DisplayText.Safe))}");
+            output.WriteLine($"SCOPE configured {string.Join(", ", configuredRepos.Select(DisplayText.Safe))}");
         }
 
         // Said on every run, including when the number is zero. A tool that speaks to agents only when it
@@ -902,9 +913,9 @@ internal static class WaitingCommand
         int actionable = rows.Count(r => r.MayAct);
         output.WriteLine($"NOT ACTED nothing was sent to any agent; {actionable} row(s) met the bar to act, {rows.Count - actionable} did not");
 
-        // Only worth naming a resolved repo per row when more than one was searched; a single-repo sweep
+        // Only worth naming a resolved repo per row when more than one was configured; a single-repo sweep
         // adds nothing by repeating its one scope on every line.
-        bool nameRepo = searchedRepos is { Count: > 1 };
+        bool nameRepo = configuredRepos is { Count: > 1 };
         if (rows.Count > 0)
         {
             output.WriteLine();
@@ -1077,7 +1088,7 @@ internal static class WaitingCommand
         IReadOnlyList<string> unreachable,
         IReadOnlyList<string>? omitted = null,
         IReadOnlyList<string>? departed = null,
-        IReadOnlyList<string>? searchedRepos = null)
+        IReadOnlyList<string>? configuredRepos = null)
     {
         using var writer = new Utf8JsonWriter(output, new JsonWriterOptions { Indented = true });
         writer.WriteStartObject();
@@ -1086,12 +1097,13 @@ internal static class WaitingCommand
         writer.WriteNumber("mergeabilityRereads", budget.Recomputed);
         writer.WriteBoolean("rateLimited", budget.RateLimited);
 
-        // The repos a claimed PR was searched in, in scope order — the producer-owned label list, so a
+        // The configured repo scope, in order — the CLI's --repo set (or the inferred single repo), so a
         // consumer reads the sweep's scope rather than inferring a single repo from the current directory.
-        if (searchedRepos is { Count: > 0 })
+        // Each row carries its own resolved repo and, on a cross-repo miss, the repos it was found in.
+        if (configuredRepos is { Count: > 0 })
         {
             writer.WriteStartArray("repos");
-            foreach (string repo in searchedRepos)
+            foreach (string repo in configuredRepos)
             {
                 writer.WriteStringValue(repo);
             }
@@ -1149,6 +1161,18 @@ internal static class WaitingCommand
             if (row.Repo is { Length: > 0 } resolvedRepo)
             {
                 writer.WriteString("repo", resolvedRepo);
+            }
+            else if (row.FoundIn is { Count: > 0 } foundIn)
+            {
+                // Only when the PR did not resolve to a single repo — an ambiguous collision or a partial
+                // hit — is FoundIn worth its own field; a clean resolution is already named by `repo`.
+                writer.WriteStartArray("foundIn");
+                foreach (string repo in foundIn)
+                {
+                    writer.WriteStringValue(repo);
+                }
+
+                writer.WriteEndArray();
             }
 
             if (row.Record is { } record)

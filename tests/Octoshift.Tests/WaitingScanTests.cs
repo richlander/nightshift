@@ -2121,6 +2121,35 @@ public class WaitingScanTests
     }
 
     [Fact]
+    public async Task BuildRows_APartialHitSaysFoundButUniquenessUnprovenAndSurfacesFoundIn()
+    {
+        // #178 round 3 / item 2: a claimed PR found in one repo while the rest of the scope went unsearched
+        // (budget spent) is non-actionable, but the verdict must say the PR was found and only uniqueness is
+        // unproven — not a bare "could not be read" — and the found repo is surfaced as structured data.
+        TmuxPane pane = Pane("cp:1", "", PaneActivity.Idle, agentState: "pr=4623 head=abcd1234 reviews=2/2 rec=merge", windowName: "pr4623");
+
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [pane],
+            (_, _) => Task.FromResult(PrFetch.Unavailable.WithRepos(["owner/first"], ["owner/first"], ["owner/first", "owner/second"])),
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            DateTimeOffset.UtcNow, all: true, TestContext.Current.CancellationToken);
+
+        WaitingRow row = Assert.Single(rows);
+        Assert.Contains("found in owner/first, but uniqueness unproven — owner/second not searched (budget spent)", row.Verdict.Reason, StringComparison.Ordinal);
+        Assert.DoesNotContain("could not be read", row.Verdict.Reason, StringComparison.Ordinal);
+        Assert.Equal(["owner/first"], row.FoundIn);
+        Assert.False(row.MayAct);
+
+        using var stream = new MemoryStream();
+        WaitingCommand.WriteJson(stream, rows, default, [], null, null, ["owner/first", "owner/second"]);
+        using System.Text.Json.JsonDocument doc = System.Text.Json.JsonDocument.Parse(System.Text.Encoding.UTF8.GetString(stream.ToArray()));
+        System.Text.Json.JsonElement jsonRow = Assert.Single(doc.RootElement.GetProperty("rows").EnumerateArray().ToArray());
+        Assert.Equal(
+            ["owner/first"],
+            jsonRow.GetProperty("foundIn").EnumerateArray().Select(e => e.GetString()!).ToArray());
+    }
+
+    [Fact]
     public void Claim_OrdersByRegistrationNotByCollectionOrder()
     {
         // An owner that changes identity between sweeps is worse than no owner, so ranking is by when

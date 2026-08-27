@@ -275,11 +275,15 @@ non-success `AMBIGUOUS`/ambiguous rather than awarded to an arbitrary repo (the 
 &lt;repos&gt;" — distinct from "could not be read," which stays reserved for a repo that genuinely could
 not be reached. A single hit is only reported as *found* when every other searched repo affirmatively
 404s: a repo that could not be read might hold the same number, so one hit beside an unread repo is
-reported unavailable, not a false unique. All repos share one `gh` credential and therefore **one** REST
-rate-limit budget — each keeps its own repo-qualified ETag cache, but the moment any read hits exhaustion
-the fleet stops searching the rest (those calls are doomed) and treats the unsearched scope as unavailable
-unless a collision is already proven. The report names the repos it searched, so a cross-repo miss is
-diagnosed as "widen the scope," not "wait out an outage." (#178.)
+reported unavailable — a **partial hit** whose existence is proven but whose uniqueness is not, named as
+"found in &lt;repos&gt; but uniqueness unproven" rather than a blank "could not be read." All repos share
+one `gh` credential and therefore **one** REST rate-limit budget — each keeps its own repo-qualified ETag
+cache, but the moment any read hits exhaustion the fleet stops searching the rest (those calls are doomed)
+and treats the unsearched scope as unavailable unless a collision is already proven. Reporting keeps
+**configured** scope (the `--repo` set, named on the `SCOPE configured` line) distinct from the repos
+actually **searched** for a given PR (narrower whenever an early exit stopped the search), so an unqueried
+repo is never relabelled as one that was searched — a cross-repo miss is diagnosed as "widen the scope,"
+and a budget cutoff names the remainder it did not reach. (#178.)
 
 **Aliases that cannot reach a process.** A `--host` value becomes an `ssh` argument, so beyond an
 option-shaped or whitespace alias the one validation rule also rejects any value carrying a control

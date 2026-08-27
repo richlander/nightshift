@@ -350,11 +350,14 @@ internal sealed class GhFleetPrFactsSource
     {
         var found = new List<GhPrFactsSource>();
         var facts = new List<PrFacts>();
+        var attempted = new List<string>();
         bool anyUnavailable = false;
 
         // Search all repos, but stop the moment the shared budget is spent: with one credential behind
         // every source, a read after exhaustion cannot succeed and only deepens the hole. A scope left
         // unsearched this way is not "absent from it" — it is unread, and folds into anyUnavailable below.
+        // Only the repos actually queried are recorded as attempted, so the report never claims to have
+        // searched a repo the early exit skipped.
         bool searchedAll = true;
         for (int i = 0; i < _sources.Count; i++)
         {
@@ -365,6 +368,7 @@ internal sealed class GhFleetPrFactsSource
             }
 
             GhPrFactsSource source = _sources[i];
+            attempted.Add(source.Repo);
             PrFetch read = await source.FetchDetailedAsync(prNumber, ct);
             switch (read.Status)
             {
@@ -380,6 +384,7 @@ internal sealed class GhFleetPrFactsSource
             // A proven collision needs no further reads; the extra repos cannot make two hits fewer.
             if (found.Count > 1)
             {
+                searchedAll = false;
                 break;
             }
         }
@@ -388,7 +393,7 @@ internal sealed class GhFleetPrFactsSource
 
         if (found.Count > 1)
         {
-            return new PrFetch(PrFetchStatus.Ambiguous, null).WithRepos(_repos, foundIn);
+            return new PrFetch(PrFetchStatus.Ambiguous, null).WithRepos(attempted, foundIn, _repos);
         }
 
         // Uniqueness and absence are only provable when the whole scope was read and every repo answered.
@@ -401,13 +406,13 @@ internal sealed class GhFleetPrFactsSource
             if (wholeScopeAnswered)
             {
                 _resolved[prNumber] = found[0];
-                return PrFetch.Found(facts[0]).WithRepos(_repos, foundIn);
+                return PrFetch.Found(facts[0]).WithRepos(attempted, foundIn, _repos);
             }
 
-            return PrFetch.Unavailable.WithRepos(_repos, foundIn);
+            return PrFetch.Unavailable.WithRepos(attempted, foundIn, _repos);
         }
 
-        return (wholeScopeAnswered ? PrFetch.NotFound : PrFetch.Unavailable).WithRepos(_repos, foundIn);
+        return (wholeScopeAnswered ? PrFetch.NotFound : PrFetch.Unavailable).WithRepos(attempted, foundIn, _repos);
     }
 
     /// <summary>The sweep shape: the facts when exactly one repo resolved the PR, otherwise null — a 404,

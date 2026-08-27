@@ -79,8 +79,9 @@ public class CrossRepoResolutionTests
     [Fact]
     public async Task Fetch_OneUnavailableRepoAndOne404IsUnavailableNotNotFound()
     {
-        // A repo that could not be read cannot prove absence, so even when the other repo affirmatively
-        // 404s the whole resolution is unavailable — existence is unknown, never a false not-found.
+        // A repo that could not be read cannot prove absence, so the resolution is unavailable, never a
+        // false not-found. The 5xx is pushback on the shared budget, so the second repo is not queried —
+        // and the report says so: only the first repo is searched, the second stays configured-but-unsearched.
         var gh = new FakeGh
         {
             ["repos/owner/first/pulls/4623"] = Response(500, string.Empty),
@@ -92,7 +93,9 @@ public class CrossRepoResolutionTests
 
         Assert.Equal(PrFetchStatus.Unavailable, fetch.Status);
         Assert.Null(fetch.Facts);
-        Assert.Equal(["owner/first", "owner/second"], fetch.Searched);
+        Assert.Equal(["owner/first"], fetch.Searched);
+        Assert.Equal(["owner/first", "owner/second"], fetch.Configured);
+        Assert.Equal(["owner/second"], fetch.Unsearched);
     }
 
     [Fact]
@@ -229,6 +232,59 @@ public class CrossRepoResolutionTests
 
         Assert.Equal(PrFetchStatus.Unavailable, fetch.Status);
         Assert.Single(gh.Requests);
+    }
+
+    // ---- three-repo scope: attempted must not be relabelled as configured ---
+
+    [Fact]
+    public async Task Fetch_AmbiguityInTheFirstTwoReposSkipsTheThirdAndReportsTwoAttempted()
+    {
+        // #178 round 3 / item 1: a proven collision in the first two repos ends the search — the third is
+        // never queried, so it must be reported as configured-but-unsearched, not as a repo that was searched.
+        var gh = new FakeGh
+        {
+            ["repos/owner/first/pulls/4623"] = Pull(4623, HeadA),
+            [$"repos/owner/first/commits/{HeadA}/check-runs?per_page=100"] = Checks(),
+            ["repos/owner/second/pulls/4623"] = Pull(4623, HeadB),
+            [$"repos/owner/second/commits/{HeadB}/check-runs?per_page=100"] = Checks(),
+            // owner/third would also have it, but the search must stop before ever asking.
+            ["repos/owner/third/pulls/4623"] = Pull(4623, HeadA),
+        };
+
+        PrFetch fetch = await Fleet(gh, "owner/first", "owner/second", "owner/third")
+            .FetchDetailedAsync(4623, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.Ambiguous, fetch.Status);
+        Assert.Equal(["owner/first", "owner/second"], fetch.FoundIn);
+        Assert.Equal(["owner/first", "owner/second"], fetch.Searched);
+        Assert.Equal(["owner/first", "owner/second", "owner/third"], fetch.Configured);
+        Assert.Equal(["owner/third"], fetch.Unsearched);
+        Assert.DoesNotContain(gh.Requests, args => args.Contains("repos/owner/third/pulls/4623"));
+    }
+
+    [Fact]
+    public async Task Fetch_LastUnitExhaustionBeforeLaterReposReportsAttemptedVsConfigured()
+    {
+        // #178 round 3 / item 1: a hit in the first repo and a last-unit 404 in the second exhaust the
+        // shared budget before the third repo is reached. Only the two queried repos are reported as
+        // searched; the third is configured-but-unsearched, and one hit beside it is not a proven unique.
+        var gh = new FakeGh
+        {
+            ["repos/owner/first/pulls/4623"] = Pull(4623, HeadA),
+            [$"repos/owner/first/commits/{HeadA}/check-runs?per_page=100"] = Checks(),
+            ["repos/owner/second/pulls/4623"] = Response(404, """{"message":"Not Found"}""", "x-ratelimit-remaining: 0"),
+            ["repos/owner/third/pulls/4623"] = Pull(4623, HeadB),
+        };
+
+        PrFetch fetch = await Fleet(gh, "owner/first", "owner/second", "owner/third")
+            .FetchDetailedAsync(4623, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.Unavailable, fetch.Status);
+        Assert.Equal(["owner/first"], fetch.FoundIn);
+        Assert.Equal(["owner/first", "owner/second"], fetch.Searched);
+        Assert.Equal(["owner/first", "owner/second", "owner/third"], fetch.Configured);
+        Assert.Equal(["owner/third"], fetch.Unsearched);
+        Assert.DoesNotContain(gh.Requests, args => args.Contains("repos/owner/third/pulls/4623"));
     }
 
     [Fact]

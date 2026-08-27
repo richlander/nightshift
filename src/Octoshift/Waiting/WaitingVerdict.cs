@@ -200,7 +200,7 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
             return Resolve(state, facts);
         }
 
-        if (state.IsIssue || fetch.Status == PrFetchStatus.Unavailable)
+        if (state.IsIssue)
         {
             return Resolve(state, null);
         }
@@ -213,6 +213,34 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
             return new(WaitingState.NeedsOperator, RowOwner.Operator,
                 $"PR #{state.PrNumber} is ambiguous — found in {repos}; pass a single --repo to disambiguate",
                 Assurance.Low($"#{state.PrNumber} exists in more than one searched repo"));
+        }
+
+        if (fetch.Status == PrFetchStatus.Unavailable)
+        {
+            // A partial hit: the PR exists in at least one repo, but the rest of the configured scope could
+            // not be read or was cut short by the shared budget, so uniqueness is unproven — the found repo
+            // might not be the only one. Existence is known, so this is not the bare "could not read"; it is
+            // non-actionable all the same, since acting would mean choosing a repo that may not be unique.
+            if (fetch.FoundIn.Count > 0)
+            {
+                string where = string.Join(", ", fetch.FoundIn);
+                string tail = fetch.Unsearched.Count > 0
+                    ? $"{string.Join(", ", fetch.Unsearched)} not searched (budget spent)"
+                    : "part of the scope could not be read";
+                Assurance partial = Assurance.Low($"found in {where}; uniqueness unproven — {tail}");
+                return state.Recommendation switch
+                {
+                    Recommendation.Stop => new(WaitingState.NeedsOperator, RowOwner.Operator,
+                        $"asking to stop; PR #{state.PrNumber} found in {where} but uniqueness is unproven — {tail}", partial),
+                    Recommendation.Approve => new(WaitingState.NeedsOperator, RowOwner.Operator,
+                        $"asking to authorise more rounds; PR #{state.PrNumber} found in {where} but uniqueness is unproven — {tail}", partial),
+                    _ => new(WaitingState.Unknown, RowOwner.Operator,
+                        $"PR #{state.PrNumber} found in {where}, but uniqueness unproven — {tail}", partial),
+                };
+            }
+
+            // A pure outage: no repo confirmed the PR, so existence itself is unknown.
+            return Resolve(state, null);
         }
 
         // Affirmative not-found: every searched repo answered 404. Distinct from an outage, and its remedy

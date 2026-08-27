@@ -26,18 +26,22 @@ internal enum PrFetchStatus
 
 /// <summary>
 /// One PR resolution reduced to its outcome, the facts when <see cref="PrFetchStatus.Found"/>, and the
-/// producer-owned repo labels: the ordered set of repos <see cref="Searched"/> and, of those, the ones the
-/// PR was <see cref="FoundIn"/>. The single-repo primitive leaves both empty; the fleet resolver fills them
-/// so a report can name where it looked and where it landed.
+/// producer-owned repo labels. These are kept apart so a report can be truthful about what it did versus
+/// what it was asked to do: <see cref="Configured"/> is the full <c>--repo</c> (or inferred) scope;
+/// <see cref="Searched"/> is the subset actually queried — which is smaller than <see cref="Configured"/>
+/// when the search stopped early on a proven collision or an exhausted shared budget; and
+/// <see cref="FoundIn"/> is, of the searched repos, those the PR was found in. The single-repo primitive
+/// leaves all three empty; the fleet resolver fills them.
 /// </summary>
 internal readonly record struct PrFetch(
     PrFetchStatus Status,
     PrFacts? Facts,
     IReadOnlyList<string> Searched,
-    IReadOnlyList<string> FoundIn)
+    IReadOnlyList<string> FoundIn,
+    IReadOnlyList<string> Configured)
 {
     public PrFetch(PrFetchStatus status, PrFacts? facts)
-        : this(status, facts, [], [])
+        : this(status, facts, [], [], [])
     {
     }
 
@@ -47,9 +51,31 @@ internal readonly record struct PrFetch(
 
     public static PrFetch Found(PrFacts facts) => new(PrFetchStatus.Found, facts);
 
-    /// <summary>Attaches the searched/found repo labels the fleet resolver owns to an existing outcome.</summary>
+    /// <summary>The configured repos that were not actually queried — the search stopped before them.</summary>
+    public IReadOnlyList<string> Unsearched
+    {
+        get
+        {
+            IReadOnlyList<string> searched = Searched;
+            return [.. Configured.Where(repo => !searched.Contains(repo, StringComparer.OrdinalIgnoreCase))];
+        }
+    }
+
+    /// <summary>
+    /// Attaches the repo labels the fleet resolver owns, when every configured repo was searched: the
+    /// searched set doubles as the configured scope. Used by the outcomes that reached the end of the
+    /// scope (an affirmative not-found, a whole-scope hit).
+    /// </summary>
     public PrFetch WithRepos(IReadOnlyList<string> searched, IReadOnlyList<string> foundIn)
-        => this with { Searched = searched, FoundIn = foundIn };
+        => this with { Searched = searched, FoundIn = foundIn, Configured = searched };
+
+    /// <summary>
+    /// Attaches the repo labels when the searched subset may be narrower than the configured scope — the
+    /// search stopped early on a proven collision or an exhausted shared budget, so the report must not
+    /// relabel unqueried repos as searched.
+    /// </summary>
+    public PrFetch WithRepos(IReadOnlyList<string> searched, IReadOnlyList<string> foundIn, IReadOnlyList<string> configured)
+        => this with { Searched = searched, FoundIn = foundIn, Configured = configured };
 }
 
 /// <summary>One check run on a head sha, reduced to the fields a verdict turns on.</summary>
