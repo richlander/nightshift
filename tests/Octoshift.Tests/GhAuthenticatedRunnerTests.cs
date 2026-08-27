@@ -5,12 +5,12 @@ using Octoshift.GitHub;
 using Xunit;
 
 /// <summary>
-/// How a <c>gh</c> subprocess is run. On Unix the runner puts the child in its own process group and tears
-/// that group down — every descendant, independent of the root's lifetime — before returning, so a cancelled
-/// or completed <c>gh</c> never leaves a token-bearing process behind. It also drains both output streams
-/// concurrently with the wait so a burst larger than a pipe buffer is neither truncated nor able to deadlock
-/// the child. The program name is a seam so these facts are provable against a purpose-built child rather than
-/// only the real binary.
+/// How a <c>gh</c> subprocess is run. The runner drains both output streams concurrently with the wait so a
+/// burst larger than a pipe buffer is neither truncated nor able to deadlock the child, returns the full
+/// output and exit code on ordinary completion, and on cancellation confirms the launched process itself has
+/// exited and unblocks both reads before the cancellation propagates. Descendant containment is best-effort
+/// (a tree kill that cannot reach a process that outlived the root), and is not claimed here. The program name
+/// is a seam so these facts are provable against a purpose-built child rather than only the real binary.
 /// </summary>
 public class GhAuthenticatedRunnerTests
 {
@@ -67,50 +67,34 @@ public class GhAuthenticatedRunnerTests
     }
 
     [Fact]
-    public async Task RunProcessAsync_CancellationDoesNotCompleteUntilTheWholeTreeIsDead()
+    public async Task RunProcessAsync_CancellationConfirmsTheLaunchedProcessIsDeadBeforeReturning()
     {
         Assert.SkipWhen(OperatingSystem.IsWindows(), "The gh runner path starts a POSIX child here; there is nothing to start on Windows.");
 
-        // The child forks a descendant, both record their pids, and both sleep indefinitely. The runner must
-        // not complete the cancellation until the entire tree is down: an implementation that merely stopped
-        // waiting, or that signalled a kill without confirming it, would hand control back with a
-        // token-bearing process still alive. Synchronization is deterministic — the test waits for the two
-        // pid files rather than for a fixed delay — and the assertion is on the processes themselves.
-        string dir = Path.Combine(AppContext.BaseDirectory, $"gh-runner-tree-{Guid.NewGuid():N}");
+        // The launched process would otherwise run for a minute. The runner must not merely stop waiting on
+        // cancellation: it must confirm the token-bearing process it started has actually exited before
+        // handing control back. `exec sleep` replaces the shell in place, so the pid the shell recorded is the
+        // very process the runner is waiting on.
+        string dir = Path.Combine(AppContext.BaseDirectory, $"gh-runner-direct-{Guid.NewGuid():N}");
         Directory.CreateDirectory(dir);
         try
         {
-            // $0 is the directory. The descendant writes its own pid and idles; the child writes its pid,
-            // waits for the descendant's pid to exist, signals ready, then idles. Killing the process group
-            // with SIGKILL cannot be trapped, so nothing here can survive it.
-            string script =
-                "d=\"$0\"; " +
-                "sh -c 'echo $$ > \"$0/desc.pid\"; while : ; do sleep 0.1; done' \"$d\" & " +
-                "echo $$ > \"$d/child.pid\"; " +
-                "while [ ! -s \"$d/desc.pid\" ]; do sleep 0.01; done; " +
-                "echo ready > \"$d/ready\"; " +
-                "wait";
+            string script = "echo $$ > \"$0/pid\"; exec sleep 60";
 
             using var cts = new CancellationTokenSource();
             Task<GhResult> run = GhAuthenticatedRunner.RunProcessAsync("/bin/sh", ["-c", script, dir], null, cts.Token);
 
-            int childPid = await WaitForPidAsync(Path.Combine(dir, "child.pid"), TestContext.Current.CancellationToken);
-            int descPid = await WaitForPidAsync(Path.Combine(dir, "desc.pid"), TestContext.Current.CancellationToken);
-            await WaitForFileAsync(Path.Combine(dir, "ready"), TestContext.Current.CancellationToken);
-
-            // Both processes are up and the runner is still blocked on the tree — it has not returned control.
-            Assert.True(IsAlive(childPid), "child was not running before cancellation");
-            Assert.True(IsAlive(descPid), "descendant was not running before cancellation");
-            Assert.False(run.IsCompleted, "runner completed while the tree was still alive");
+            int pid = await WaitForPidAsync(Path.Combine(dir, "pid"), TestContext.Current.CancellationToken);
+            Assert.True(IsAlive(pid), "launched process was not running before cancellation");
+            Assert.False(run.IsCompleted, "runner completed while the launched process was still alive");
 
             await cts.CancelAsync();
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => run.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken));
 
-            // The runner has returned only now. Its uncancellable teardown does not complete until the whole
-            // process group is positively confirmed extinct, so both the direct child and the descendant are
-            // already gone the instant the await unblocks — asserted immediately, with no post-return wait.
-            Assert.False(IsAlive(childPid), "child was still alive after the runner completed cancellation");
-            Assert.False(IsAlive(descPid), "descendant was still alive after the runner completed cancellation");
+            // The runner returned only after confirming exit, so the process is gone immediately — no
+            // post-return wait.
+            Assert.False(IsAlive(pid), "launched process was still alive after the runner completed cancellation");
         }
         finally
         {
@@ -119,82 +103,43 @@ public class GhAuthenticatedRunnerTests
     }
 
     [Fact]
-    public async Task RunProcessAsync_RootExitsButDescendantHoldingThePipeIsContainedNotLeaked()
+    public async Task RunProcessAsync_CancellationUnblocksWhenARootExitedDescendantHoldsThePipe()
     {
         Assert.SkipWhen(OperatingSystem.IsWindows(), "The gh runner path starts a POSIX child here; there is nothing to start on Windows.");
 
-        // The hard case for a root-relative tree kill: the root (the direct child) exits, leaving a descendant
-        // that inherited the stdout pipe and idles forever. A snapshot rooted at the now-dead parent can no
-        // longer discover that descendant, so it would leak — and because it still holds the write end, the
-        // drain would never see EOF and the runner would hang. Real process-group containment sweeps it after
-        // the root exits, which both kills the leak and closes the pipe. Completion here is itself the proof
-        // the descendant died: the drain cannot finish while the descendant holds the pipe.
-        //
-        // The descendant publishes its pid and signals readiness before the root exits, so the pid is captured
-        // deterministically rather than racing the (correctly prompt) containment kill.
+        // The root exits but leaves a descendant that inherited the stdout pipe and idles, so the output drain
+        // can never reach EOF on its own — the completion would hang forever. Cancellation must still be
+        // prompt: the runner closes the read streams to unblock the drains, observes them, and propagates the
+        // cancellation rather than leaving an orphaned read task running. Descendant containment is
+        // best-effort, so this test kills the known descendant itself rather than asserting the runner did.
         string dir = Path.Combine(AppContext.BaseDirectory, $"gh-runner-inherit-{Guid.NewGuid():N}");
         Directory.CreateDirectory(dir);
+        int descPid = 0;
         try
         {
             string script =
                 "d=\"$0\"; " +
-                "sh -c 'echo $$ > \"$0/desc.pid\"; : > \"$0/ready\"; while : ; do sleep 0.1; done' \"$d\" & " +
+                "sh -c 'echo $$ > \"$0/desc.pid\"; echo r > \"$0/ready\"; while : ; do sleep 0.1; done' \"$d\" & " +
                 "while [ ! -f \"$d/ready\" ]; do sleep 0.01; done; " +
                 "exit 0";
 
-            Task<GhResult> run = GhAuthenticatedRunner.RunProcessAsync("/bin/sh", ["-c", script, dir], null, TestContext.Current.CancellationToken);
+            using var cts = new CancellationTokenSource();
+            Task<GhResult> run = GhAuthenticatedRunner.RunProcessAsync("/bin/sh", ["-c", script, dir], null, cts.Token);
 
-            int descPid = await WaitForPidAsync(Path.Combine(dir, "desc.pid"), TestContext.Current.CancellationToken);
+            descPid = await WaitForPidAsync(Path.Combine(dir, "desc.pid"), TestContext.Current.CancellationToken);
+            await WaitForFileAsync(Path.Combine(dir, "ready"), TestContext.Current.CancellationToken);
 
-            // If containment were missing, this would hang on the never-closing pipe; the timeout turns that
-            // into a clear failure instead of a hung suite.
-            GhResult result = await run.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+            await cts.CancelAsync();
 
-            Assert.Equal(0, result.ExitCode);
-
-            // Completion already proves the descendant died (the drain could not EOF otherwise), and teardown
-            // verified group extinction, so the descendant is gone immediately on return.
-            Assert.False(IsAlive(descPid), "descendant holding the inherited pipe survived the runner");
+            // If the runner did not unblock the drain, its completion (and this await) would hang until the
+            // timeout turned it into a TimeoutException — which is not an OperationCanceledException, so this
+            // assertion is exactly the "prompt cancellation, no orphaned drain" check.
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => run.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken));
         }
         finally
         {
-            try { Directory.Delete(dir, recursive: true); } catch (IOException) { }
-        }
-    }
-
-    [Fact]
-    public async Task RunProcessAsync_RootExitsAndDescendantThatClosedItsPipesIsStillContained()
-    {
-        Assert.SkipWhen(OperatingSystem.IsWindows(), "The gh runner path starts a POSIX child here; there is nothing to start on Windows.");
-
-        // Companion to the inherited-pipe case: here the descendant closes its inherited stdout/stderr before
-        // idling, so the drains reach EOF on their own and cannot prove anything. The descendant is
-        // nonetheless still alive after the root exits, and only group containment reaches it. The runner must
-        // have killed it before returning — not left it for a post-return sweep by the test.
-        string dir = Path.Combine(AppContext.BaseDirectory, $"gh-runner-closed-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(dir);
-        try
-        {
-            string script =
-                "d=\"$0\"; " +
-                "sh -c 'echo $$ > \"$0/desc.pid\"; exec 1>&- 2>&-; : > \"$0/ready\"; while : ; do sleep 0.1; done' \"$d\" & " +
-                "while [ ! -f \"$d/ready\" ]; do sleep 0.01; done; " +
-                "exit 0";
-
-            Task<GhResult> run = GhAuthenticatedRunner.RunProcessAsync("/bin/sh", ["-c", script, dir], null, TestContext.Current.CancellationToken);
-
-            int descPid = await WaitForPidAsync(Path.Combine(dir, "desc.pid"), TestContext.Current.CancellationToken);
-            GhResult result = await run.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
-
-            Assert.Equal(0, result.ExitCode);
-
-            // The drains EOF'd on their own here, so death is not implied by completion — the runner's
-            // extinction check is what must have killed the still-live descendant. Asserted immediately on
-            // return, not with a post-return wait.
-            Assert.False(IsAlive(descPid), "the descendant that closed its pipes was left alive after the runner returned");
-        }
-        finally
-        {
+            KillIfAlive(descPid);
             try { Directory.Delete(dir, recursive: true); } catch (IOException) { }
         }
     }
@@ -241,6 +186,24 @@ public class GhAuthenticatedRunnerTests
         catch (ArgumentException)
         {
             return false;
+        }
+    }
+
+    private static void KillIfAlive(int pid)
+    {
+        if (pid <= 0)
+        {
+            return;
+        }
+
+        try
+        {
+            using Process process = Process.GetProcessById(pid);
+            process.Kill();
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            // Already gone, or not ours to signal; nothing to clean up.
         }
     }
 

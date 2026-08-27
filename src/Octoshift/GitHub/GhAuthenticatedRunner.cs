@@ -38,29 +38,17 @@ internal static class GhAuthenticatedRunner
         => RunProcessAsync("gh", args, environmentOverrides, ct);
 
     /// <summary>
-    /// Starts <paramref name="file"/> with <paramref name="args"/>, drains both output streams while it
-    /// runs, and returns its exit code and captured output. On Unix the child runs inside a new process
-    /// group that is torn down — with every descendant it spawned — before this returns, so a cancelled
-    /// token exchange never orphans a process holding a token in its environment; see
-    /// <see cref="ContainedProcess"/>. On Windows the containment is a best-effort
-    /// <see cref="Process.Kill(bool)"/> tree kill. The program name is a parameter so this can be exercised
-    /// against a purpose-built child rather than only the real <c>gh</c> binary.
+    /// Starts <paramref name="file"/> with <paramref name="args"/> and returns its exit code and captured
+    /// stdout/stderr. On ordinary completion the full output and exit code are returned. On cancellation the
+    /// contract is scoped to the process we launch: the tree is asked to die (best-effort
+    /// <see cref="Process.Kill(bool)"/>, so a descendant that outlived the root may not be reached — durable
+    /// descendant containment is tracked separately), but the direct token-bearing process is always
+    /// confirmed exited and both output reads are unblocked and observed before the cancellation propagates,
+    /// so the runner never returns with the launched process alive nor leaves a drain task running. The
+    /// program name is a parameter so this can be exercised against a purpose-built child rather than only the
+    /// real <c>gh</c> binary.
     /// </summary>
-    internal static Task<GhResult> RunProcessAsync(
-        string file,
-        IReadOnlyList<string> args,
-        IReadOnlyDictionary<string, string?>? environmentOverrides,
-        CancellationToken ct)
-        => OperatingSystem.IsWindows()
-            ? RunWithProcessAsync(file, args, environmentOverrides, ct)
-            : ContainedProcess.RunAsync(file, args, environmentOverrides, ct);
-
-    /// <summary>
-    /// Windows fallback. There is no process-group boundary here: the tree is taken down with a best-effort
-    /// <see cref="Process.Kill(bool)"/> snapshot, which cannot reach a descendant once the root has exited.
-    /// The reads stay cancellable so a descendant that inherited a pipe cannot hang the drain.
-    /// </summary>
-    private static async Task<GhResult> RunWithProcessAsync(
+    internal static async Task<GhResult> RunProcessAsync(
         string file,
         IReadOnlyList<string> args,
         IReadOnlyDictionary<string, string?>? environmentOverrides,
@@ -104,47 +92,124 @@ internal static class GhAuthenticatedRunner
             return new GhResult(127, string.Empty, ex.Message);
         }
 
-        Task<string> stdout = proc.StandardOutput.ReadToEndAsync(ct);
-        Task<string> stderr = proc.StandardError.ReadToEndAsync(ct);
+        // Read both streams without the caller's token: cancelling a read would abandon the pipe mid-drain,
+        // and the point of cancellation here is the opposite — to bring the process down and account for its
+        // output before returning. A child that fills its stdout pipe stops making progress, so both are read
+        // concurrently with the wait.
+        Task<string> stdout = proc.StandardOutput.ReadToEndAsync(CancellationToken.None);
+        Task<string> stderr = proc.StandardError.ReadToEndAsync(CancellationToken.None);
+
+        // One completion task: the direct process exits (uncancellable) and both drains finish. Awaiting it
+        // through the caller's token means cancellation still interrupts the case where the root exited but a
+        // descendant that inherited a pipe keeps the drain from ever reaching EOF.
+        Task<GhResult> completion = CompleteAsync(proc, stdout, stderr);
 
         try
         {
-            await proc.WaitForExitAsync(ct);
-            return new GhResult(proc.ExitCode, await stdout, await stderr);
+            return await completion.WaitAsync(ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
-            try
-            {
-                proc.Kill(entireProcessTree: true);
-            }
-            catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or Win32Exception)
-            {
-                // Already gone, or the platform will not walk the tree; nothing further to do.
-            }
-
-            // Confirm at least the direct process is dead before returning control — #92's minimum contract is
-            // that a cancelled runner never leaves the token-bearing gh process itself alive. Descendant
-            // containment is best-effort here: the tree kill above is a snapshot that cannot reach a
-            // descendant once the root has exited (a durable job-object boundary is tracked separately for
-            // Windows).
-            await proc.WaitForExitAsync(CancellationToken.None);
-            await ObserveDrainAsync(stdout);
-            await ObserveDrainAsync(stderr);
+            await TerminateAndDrainAsync(proc, completion, stdout, stderr).ConfigureAwait(false);
             throw;
         }
     }
 
-    private static async Task ObserveDrainAsync(Task drain)
+    private static async Task<GhResult> CompleteAsync(Process proc, Task<string> stdout, Task<string> stderr)
+    {
+        await proc.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+        return new GhResult(proc.ExitCode, await stdout.ConfigureAwait(false), await stderr.ConfigureAwait(false));
+    }
+
+    /// <summary>
+    /// Cancellation cleanup. Requests termination of the tree (falling back to the direct process), refuses
+    /// to return while the launched process may still be alive, confirms its exit uncancellably, then unblocks
+    /// and observes both drains so no read task is orphaned.
+    /// </summary>
+    private static async Task TerminateAndDrainAsync(Process proc, Task completion, Task stdout, Task stderr)
+    {
+        if (!RequestTermination(proc))
+        {
+            // Termination could not even be requested and the process is not observably dead. Surface a
+            // deterministic cleanup failure rather than silently returning past a possibly-live process or
+            // waiting on an exit that may never come.
+            throw new InvalidOperationException(
+                "octoshift: could not terminate the gh process on cancellation; refusing to return while it may be alive.");
+        }
+
+        // Uncancellable: the launched process must be confirmed gone before control returns.
+        await proc.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+
+        // The tree kill cannot reach a descendant that outlived the root, and such a descendant may still hold
+        // a write end, so the drains could hang forever on EOF. Closing the read streams forces them to end;
+        // their captured output is discarded on this path anyway.
+        CloseStreams(proc);
+
+        await ObserveAsync(completion).ConfigureAwait(false);
+        await ObserveAsync(stdout).ConfigureAwait(false);
+        await ObserveAsync(stderr).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Asks the process tree to die, then the direct process, returning true once termination is requested or
+    /// the process is already gone, and false only when termination could not be requested and it is still
+    /// alive.
+    /// </summary>
+    private static bool RequestTermination(Process proc)
+    {
+        if (TryKill(proc, entireProcessTree: true) || proc.HasExited)
+        {
+            return true;
+        }
+
+        return TryKill(proc, entireProcessTree: false) || proc.HasExited;
+    }
+
+    private static bool TryKill(Process proc, bool entireProcessTree)
     {
         try
         {
-            await drain;
+            proc.Kill(entireProcessTree);
+            return true;
+        }
+        catch (Exception ex) when (ex is AggregateException or Win32Exception or NotSupportedException or InvalidOperationException)
+        {
+            // A tree kill can fault (AggregateException) or the platform may refuse to walk the tree; the
+            // process may also have already exited (InvalidOperationException). Report success only if it is
+            // in fact gone, so the caller can fall back or fail deterministically.
+            return proc.HasExited;
+        }
+    }
+
+    private static void CloseStreams(Process proc)
+    {
+        try
+        {
+            proc.StandardOutput.Close();
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+        }
+
+        try
+        {
+            proc.StandardError.Close();
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+        }
+    }
+
+    private static async Task ObserveAsync(Task task)
+    {
+        try
+        {
+            await task.ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException or OperationCanceledException)
         {
-            // Reading a killed process's pipe can end with a broken-pipe or disposed-stream error; on the
-            // cancellation path the captured output is discarded anyway, so observe and move on.
+            // Reading a killed process's pipe, or a stream closed to unblock it, ends in a broken-pipe or
+            // disposed-stream error; the captured output is discarded on the cancellation path, so observe it.
         }
     }
 }
