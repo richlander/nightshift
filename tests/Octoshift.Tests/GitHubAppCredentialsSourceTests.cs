@@ -143,8 +143,11 @@ public class GitHubAppCredentialsSourceTests
     [Fact]
     public void CredentialsInsideWorkingTree_AreRejectedWhenEnforced()
     {
-        // When enforcement is on, a credentials file under the working tree is refused: a secret that lives in
-        // the checkout can be committed by accident, which is the whole reason for the boundary.
+        // When enforcement is on, a credentials file whose path lexically resolves under the working tree is
+        // refused: a secret that lives in the checkout can be committed by accident, which is the whole reason
+        // for the boundary. Note this is a lexical containment check on the normalized path only — it does not
+        // resolve symlinks, so it is not by itself a defense against a symlink that points from outside the
+        // tree back in (tracked separately). This test asserts only the lexical behavior.
         var source = new FileGitHubAppCredentialsSource(
             name => name == CredentialsPathVariable ? "/work/creds/app.json" : null,
             () => "/work",
