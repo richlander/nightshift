@@ -16,13 +16,14 @@ public class LeaseTests : IDisposable
     public async Task Sweep_ExpiredLease_DeletesAttachedKeys()
     {
         using KvStore store = Open();
-        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 1);
+        await LeaseClock.EnsureHeadroomAsync(TestContext.Current.CancellationToken);
+        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 5);
         await store.CreateAsync("/agent/dev-b", Bytes("host"), lease: lease.Id);
         await store.CreateAsync("/order/1/claim", Bytes("dev-b"), lease: lease.Id);
         Assert.NotNull(store.Get("/agent/dev-b"));
 
         // Force the deadline into the past by waiting past the TTL, then sweep.
-        await Task.Delay(1200, TestContext.Current.CancellationToken);
+        await LeaseClock.WaitPastExpiryAsync(lease, TestContext.Current.CancellationToken);
         int deleted = await store.SweepExpiredAsync();
 
         Assert.Equal(2, deleted);

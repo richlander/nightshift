@@ -26,16 +26,19 @@ public class HardeningTests : IDisposable
         for (int round = 0; round < rounds; round++)
         {
             string key = $"/claim/{round}";
-            using var barrier = new Barrier(contenders);
+
+            // An async gate, not a Barrier: a Barrier of 64 needs 64 threads resident at once, and the
+            // pool only injects a couple per second, so it held the pool hostage for the whole class and
+            // stalled unrelated tests by tens of seconds. Releasing a TaskCompletionSource fires the
+            // contenders just as simultaneously without parking a thread each.
+            var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var tasks = new Task<WriteStatus>[contenders];
             for (int i = 0; i < contenders; i++)
             {
-                tasks[i] = Task.Run(() =>
-                {
-                    barrier.SignalAndWait();
-                    return store.CreateAsync(key, Bytes("me")).GetAwaiter().GetResult().Status;
-                });
+                tasks[i] = Contend(gate.Task, store, key);
             }
+
+            gate.SetResult();
 
             WriteStatus[] outcomes = await Task.WhenAll(tasks);
             Assert.Equal(1, outcomes.Count(s => s == WriteStatus.Created));
@@ -45,6 +48,15 @@ public class HardeningTests : IDisposable
         // Exactly one revision consumed per round (Exists never touches the log).
         Assert.Equal(rounds, store.CurrentRevision);
     }
+
+    private static async Task<WriteStatus> Contend(Task gate, KvStore store, string key)
+    {
+        await gate;
+        return (await store.CreateAsync(key, Bytes("me"))).Status;
+    }
+
+    private static async Task<long> Write(KvStore store, string key)
+        => (await store.CreateAsync(key, Bytes("v"))).Revision;
 
     [Fact]
     public async Task Revisions_UnderConcurrentWriters_AreGaplessAndUnique()
@@ -56,7 +68,7 @@ public class HardeningTests : IDisposable
         for (int i = 0; i < writers; i++)
         {
             int me = i;
-            tasks[i] = Task.Run(() => store.CreateAsync($"/k/{me:D4}", Bytes("v")).GetAwaiter().GetResult().Revision);
+            tasks[i] = Write(store, $"/k/{me:D4}");
         }
 
         long[] revisions = await Task.WhenAll(tasks);
@@ -111,12 +123,14 @@ public class HardeningTests : IDisposable
 
         for (int trial = 0; trial < 12; trial++)
         {
-            LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 1);
+            await LeaseClock.EnsureHeadroomAsync(TestContext.Current.CancellationToken);
+            LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 2);
             string key = $"/eph/{trial}";
             await store.CreateAsync(key, Bytes("v"), lease: lease.Id);
 
-            // Land the keepalive within a jittered window around the 1s deadline.
-            await Task.Delay(950 + rng.Next(0, 120), TestContext.Current.CancellationToken);
+            // Land the keepalive within a jittered window around the deadline. Anchored to the lease's own
+            // deadline, not to elapsed time since the create, so a stall in setup cannot slide the window.
+            await LeaseClock.WaitUntilNearExpiryAsync(lease, -50 + rng.Next(0, 120), TestContext.Current.CancellationToken);
 
             Task<long?> keepalive = store.KeepAliveAsync(lease.Id);
             Task<int> sweep = store.SweepExpiredAsync();
