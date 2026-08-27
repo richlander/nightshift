@@ -255,6 +255,21 @@ sweeping local behind your back; `pr` still locates the PR on GitHub, reporting 
 alongside whatever GitHub says, since a lookup does not depend on any window existing. The distinction is
 persisted (an `initialized` flag), so it survives across runs.
 
+**Declared but unreachable is neither.** When the fleet *is* declared but nothing could be collected —
+every target unreachable, so the sweep saw no fleet at all — `waiting` leads its first stdout line with
+`PARTIAL` and exits unavailable, the same paired token-and-exit-code contract `pr` uses, with the
+per-target diagnostics on stderr. This is distinct from `EMPTY` (nothing to sweep, a success): a total
+collection failure leaves fleet ownership unknown, so it must not read as a quiet or empty fleet. The
+`--json` form stays one truthful error document with the same unavailable exit, the token never prepended
+to it; a genuine cancellation propagates rather than being reported as a failure.
+
+**Aliases that cannot reach a process.** A `--host` value becomes an `ssh` argument, so beyond an
+option-shaped or whitespace alias the one validation rule also rejects any value carrying a control
+character — U+0000 above all, which truncates the argument on Unix and throws inside process construction
+on Windows. The same rule guards CLI input, a persisted target decoded from the history, and the last
+defence before a scanner is built, so an unusable alias fails as a usage error or the unavailable
+contract rather than reaching `ssh` and failing outside it.
+
 `--json` emits the members, the added set, or the retired set as one document, each target a
 kind-preserving identity. The fleet is credential-free and GitHub-unaware: a set of `tmux` collection
 targets kept in the same machine-local history the sweeps use, mutated under the same transaction lock so

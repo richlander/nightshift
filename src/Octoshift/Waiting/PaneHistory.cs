@@ -114,6 +114,14 @@ internal sealed class PaneHistory : IDisposable
 
     private FileStream? _lock;
 
+    /// <summary>
+    /// The schema version stamped on every new write. Present on disk from this version on so the loader
+    /// can tell one of its own current files (validate exactly) from an older unversioned file (migrate)
+    /// from a newer or unknown one (fail closed), rather than inferring scheme identity from which members
+    /// happen to be present — the inference that bricked every pre-version history on upgrade.
+    /// </summary>
+    private const int CurrentVersion = 1;
+
     private static readonly TimeSpan LockTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan LockRetry = TimeSpan.FromMilliseconds(50);
 
@@ -143,18 +151,20 @@ internal sealed class PaneHistory : IDisposable
     {
         _path = path;
         _lock = lockStream;
-        (_entries, _hosts, _attempted, _initialized) = Load(path, strictLoad);
+        LoadResult loaded = Load(path, strictLoad);
+        _entries = loaded.Entries;
+        _hosts = loaded.Hosts;
+        _attempted = loaded.Attempted;
+        _initialized = loaded.Initialized;
 
-        // A strict (product) load has already reconciled its structure in Load — a missing map is a
-        // rejection there. Here it rejects the whole file, bytes untouched, the moment any single record
-        // is one this scheme could not have written: an invalid or null key, a null value, or a
-        // semantically impossible record. Sanitising instead — dropping the bad entry and keeping the
-        // rest — is exactly the laundering the load-bearing history must not do: a corrupted entry for a
-        // known host would be silently forgotten, so a narrowed sweep reads its view as complete and then
-        // overwrites the evidence. Only the forgiving loader below drops key by key, and it is test-only.
+        // A strict (product) load is fully resolved inside Load: a current versioned file is validated
+        // exactly, a known unversioned legacy file is migrated in memory (its panes/hosts preserved and its
+        // attempted membership derived), and anything else — a foreign member set, a hand-edited or
+        // impossible record, or an unusable persisted alias — has already been rejected with its bytes
+        // untouched. Nothing further to reconcile here; sanitising a strict load key by key would be the
+        // very laundering the load-bearing history must not do.
         if (strictLoad)
         {
-            ValidateStrict(_entries, _hosts, _attempted);
             return;
         }
 
@@ -192,14 +202,23 @@ internal sealed class PaneHistory : IDisposable
         }
 
         // Attempted membership: drop any key not one this scheme minted, and fold in every collected host
-        // so the persisted invariant (a host that answered was, by definition, attempted) holds even for a
-        // hand-seeded fixture.
+        // and every pane's composite host so the persistent invariant (a host that answered, or that a
+        // remembered pane sits on, was by definition attempted) holds even for a hand-seeded fixture. The
+        // pane composite host matters because a real pre-`attempted` payload carries local panes with an
+        // empty hosts map, and its local membership is recoverable only from the pane keys.
         foreach (string key in _attempted.Where(k => !TargetId.IsValidKey(k)).ToArray())
         {
             _attempted.Remove(key);
         }
 
         _attempted.UnionWith(_hosts.Keys);
+        foreach (string paneKey in _entries.Keys)
+        {
+            if (TargetId.HostOfComposite(paneKey) is { } paneHost)
+            {
+                _attempted.Add(paneHost.Key);
+            }
+        }
 
         // A hand-seeded fixture with members is, by definition, an established fleet — so treat any
         // membership as initialized even when the on-disk flag was absent (an older or partial fixture).
@@ -208,17 +227,27 @@ internal sealed class PaneHistory : IDisposable
         _initialized = _initialized || _attempted.Count > 0 || _hosts.Count > 0;
     }
 
+    /// <summary>The outcome of a load: the three maps and the initialized flag.</summary>
+    private readonly record struct LoadResult(
+        Dictionary<string, PaneMemory> Entries,
+        Dictionary<string, HostMemory> Hosts,
+        HashSet<string> Attempted,
+        bool Initialized);
+
     /// <summary>
-    /// Rejects the entire history — bytes untouched — if any record is one this scheme could not have
-    /// written. Unlike the forgiving sanitiser, which drops a bad entry and keeps the rest, a strict load
-    /// treats a single corrupt or impossible record as evidence the whole file is not trustworthy:
-    /// dropping one host's entry would forget that host, letting a run that collects a narrower fleet read
-    /// its view as complete and own a sole claim, then overwrite the evidence with an empty-derived
-    /// snapshot. So it throws, the command reports the unavailable contract, and the file is left as it
-    /// was for a human to inspect. The invariants below are exactly the shapes <see cref="AdoptEpoch"/>,
-    /// <see cref="RecordSweptEmpty"/>, <see cref="Observe"/> and <see cref="Save"/> can produce.
+    /// Rejects the entire history — bytes untouched — if any record in a current <em>versioned</em> file is
+    /// one this scheme could not have written. Unlike the forgiving sanitiser, which drops a bad entry and
+    /// keeps the rest, a strict load treats a single corrupt or impossible record as evidence the whole
+    /// file is not trustworthy: dropping one host's entry would forget that host, letting a run that
+    /// collects a narrower fleet read its view as complete and own a sole claim, then overwrite the
+    /// evidence with an empty-derived snapshot. So it throws, the command reports the unavailable contract,
+    /// and the file is left as it was for a human to inspect. The invariants below are exactly the shapes
+    /// <see cref="AdoptEpoch"/>, <see cref="RecordSweptEmpty"/>, <see cref="Observe"/> and
+    /// <see cref="Save"/> can produce. Legacy unversioned files do not reach here — they go through
+    /// <see cref="MigrateLegacy"/>, which derives the membership these invariants assume rather than
+    /// requiring it to be present already.
     /// </summary>
-    private static void ValidateStrict(
+    private static void ValidateVersionedSemantics(
         Dictionary<string, PaneMemory> entries,
         Dictionary<string, HostMemory> hosts,
         HashSet<string> attempted)
@@ -290,13 +319,16 @@ internal sealed class PaneHistory : IDisposable
                 throw new HistoryUnavailableException($"pane history has an impossible record for pane '{key}'");
             }
 
-            // Every pane belongs to a host, and the writer records that host in the hosts map on the same
-            // sweep. A pane whose host key is absent is impossible — and dangerous: it carries a
-            // registration for a host that never enters KnownHosts, so a narrowed sweep could not tell the
-            // fleet was wider than it saw. Reject rather than let a pane smuggle in an invisible host.
-            if (!hosts.ContainsKey(host.Key))
+            // Every pane belongs to a known fleet member — a host that answered this run (the hosts map) or
+            // one still remembered as attempted. A pane whose host is in neither is impossible and
+            // dangerous: it carries a registration for a host that never enters KnownHosts, so a narrowed
+            // sweep could not tell the fleet was wider than it saw. The attempted set is accepted here (not
+            // only the hosts map) because a legacy file migrated forward can persist a pane on a host that
+            // has not answered since — its membership lives in attempted — and that migrated file must
+            // reload strictly on the next run rather than brick a second time.
+            if (!hosts.ContainsKey(host.Key) && !attempted.Contains(host.Key))
             {
-                throw new HistoryUnavailableException($"pane history has pane '{key}' on host '{host.Key}', which is not in the hosts map");
+                throw new HistoryUnavailableException($"pane history has pane '{key}' on host '{host.Key}', which is not a known fleet member");
             }
         }
     }
@@ -360,20 +392,21 @@ internal sealed class PaneHistory : IDisposable
     }
 
     /// <summary>
-    /// Reads the two dictionaries and the attempted-host set off disk. Absence of the file is a first
-    /// run — a genuinely empty history. An existing file that cannot be read or parsed, or that is a null
-    /// JSON document, is NOT empty: it is a history whose contents are unknown, and treating it as empty
-    /// would forget the known hosts and witnessed orders it held — letting a narrowed sweep read as
-    /// complete and then overwrite the evidence. So under a strict (product) load that case throws and the
-    /// transaction is unavailable; the forgiving loader used by unit tests tolerates it, since those seed
-    /// corrupt files deliberately. A well-formed file with entries this scheme never wrote is not a load
-    /// failure — it parses — and is left to the sanitiser above to drop key by key.
+    /// Reads the maps, the attempted-host set and the initialized flag off disk. Absence of the file is a
+    /// first run — a genuinely empty history. An existing file that cannot be read or parsed, or that is a
+    /// null JSON document, is NOT empty: it is a history whose contents are unknown, and treating it as
+    /// empty would forget the known hosts and witnessed orders it held. So under a strict (product) load
+    /// that case throws and the transaction is unavailable; the forgiving loader used by unit tests
+    /// tolerates it, since those seed corrupt files deliberately. A well-formed file with entries this
+    /// scheme never wrote is not a load failure for the forgiving loader — it parses — and is left to the
+    /// sanitiser to drop key by key; the strict loader routes it through <see cref="LoadStrict"/>, which
+    /// validates a current versioned file, migrates a known older unversioned one, or rejects the rest.
     /// </summary>
-    private static (Dictionary<string, PaneMemory>, Dictionary<string, HostMemory>, HashSet<string>, bool) Load(string path, bool strict)
+    private static LoadResult Load(string path, bool strict)
     {
         if (!File.Exists(path))
         {
-            return ([], [], [], false);
+            return new([], [], [], false);
         }
 
         string text;
@@ -388,94 +421,50 @@ internal sealed class PaneHistory : IDisposable
                 throw new HistoryUnavailableException($"could not read pane history from {path}: {ex.Message}", ex);
             }
 
-            return ([], [], [], false);
+            return new([], [], [], false);
         }
 
-        // A strict (product) load validates the raw JSON shape before deserializing it, because the
-        // source-generated deserializer is deliberately lenient in ways this file must not be: it matches
-        // property names case-insensitively and silently ignores unknown members, so a hand-tampered
-        // `{"panes":{},"hosts":{},"version":2}` or an uppercase `Panes` would be read, its unexpected parts
-        // dropped, and the result rewritten — laundering exactly the corruption the strict load exists to
-        // refuse. Deserialization then enforces value kinds (a bool where a number is written throws), and
-        // the semantic validator enforces the record invariants. The forgiving loader skips this and
-        // tolerates whatever parses.
         if (strict)
         {
-            ValidateRawSchema(text, path);
+            return LoadStrict(text, path);
         }
 
+        // Forgiving (test-only): tolerate whatever parses. A malformed document or a null root becomes an
+        // empty history the constructor then sanitises; the version member, if present, is ignored.
         HistoryFile? file;
         try
         {
             file = JsonSerializer.Deserialize(text, PaneHistoryJsonContext.Default.HistoryFile);
         }
-        catch (JsonException ex)
+        catch (JsonException)
         {
-            if (strict)
-            {
-                throw new HistoryUnavailableException($"could not read pane history from {path}: {ex.Message}", ex);
-            }
-
-            return ([], [], [], false);
+            return new([], [], [], false);
         }
 
         if (file is null)
         {
-            if (strict)
-            {
-                throw new HistoryUnavailableException($"pane history at {path} is a null document, not an empty history");
-            }
-
-            return ([], [], [], false);
+            return new([], [], [], false);
         }
 
-        // The writer always emits all four members (an empty first run writes
-        // `{"panes":{},"hosts":{},"attempted":[],"initialized":true}`), so a file missing any — `{}`,
-        // `{"panes":{}}`, `{"hosts":null}`, a file with no attempted array — was not written by this
-        // scheme. Under a strict load that is a rejection, not an empty history: reading it as empty would
-        // forget whatever the real file held. The forgiving loader treats an absent member as empty.
-        // (Strict never reaches here with a missing member — ValidateRawSchema already rejected it — but
-        // the guard stays as defence in depth.)
-        if (strict && (file.Panes is null || file.Hosts is null || file.Attempted is null || file.Initialized is null))
-        {
-            throw new HistoryUnavailableException($"pane history at {path} is missing its panes, hosts, attempted or initialized member, so it was not written by this scheme");
-        }
-
-        // Every write establishes the fleet, so the writer only ever persists initialized = true; a first
-        // run is the absent-file case above, which never reaches disk. A persisted file whose flag is not
-        // true is therefore a shape this scheme could not have written — reject it rather than let a
-        // tampered `initialized:false` re-enable the local bootstrap on a fleet that was deliberately
-        // emptied.
-        if (strict && file.Initialized is not true)
-        {
-            throw new HistoryUnavailableException($"pane history at {path} has initialized = {(file.Initialized is null ? "absent" : "false")}, which this scheme never writes");
-        }
-
-        return (file.Panes ?? [], file.Hosts ?? [], [.. file.Attempted ?? []], file.Initialized ?? false);
+        return new(file.Panes ?? [], file.Hosts ?? [], [.. file.Attempted ?? []], file.Initialized ?? false);
     }
 
-    private static readonly string[] RootMembers = ["panes", "hosts", "attempted", "initialized"];
-    private static readonly string[] HostMembers = ["epoch", "sweptAt", "continuous"];
-    private static readonly string[] PaneMembers = ["digest", "since", "pr", "claimedAt", "witnessed"];
-
     /// <summary>
-    /// Validates the raw JSON shape of a strict load with <see cref="JsonDocument"/> — AOT-safe, no
-    /// reflection — before the lenient source-generated deserializer sees it. The root must be an object
-    /// with exactly a <c>panes</c> object, a <c>hosts</c> object, an <c>attempted</c> array and an
-    /// <c>initialized</c> flag, exact casing, no unknown or duplicate members; each host record exactly
-    /// <c>epoch</c>/<c>sweptAt</c>/<c>continuous</c> and each pane record exactly
-    /// <c>digest</c>/<c>since</c>/<c>pr</c>/<c>claimedAt</c>/<c>witnessed</c>, again with no unknown or
-    /// duplicate members; no dictionary key may repeat; and the attempted array must be strings only, none
-    /// repeated. The <c>initialized</c> member's boolean value is enforced by deserialization and its
-    /// truth by the loader. Anything else is not a file this scheme wrote, so it is rejected here — bytes
-    /// untouched — rather than deserialized into a rewritten approximation of itself.
+    /// The strict (product) load. It first decides which on-disk scheme a file is written in — a nul or
+    /// non-object root is rejected outright — and then branches on the presence of an explicit
+    /// <c>version</c>: a versioned file is validated exactly against the current schema
+    /// (<see cref="LoadVersioned"/>), and an unversioned one is treated as a legacy file to migrate or
+    /// reject (<see cref="LoadLegacy"/>). Branching on a written version rather than inferring scheme
+    /// identity from which members happen to be present is the whole point: member presence is exactly
+    /// what changed as the scheme evolved, so inferring from it bricked every pre-version history on
+    /// upgrade.
     /// </summary>
-    private static void ValidateRawSchema(string json, string path)
+    private static LoadResult LoadStrict(string text, string path)
     {
         JsonDocument doc;
         try
         {
-            doc = JsonDocument.Parse(json);
+            doc = JsonDocument.Parse(text);
         }
         catch (JsonException ex)
         {
@@ -484,12 +473,296 @@ internal sealed class PaneHistory : IDisposable
 
         using (doc)
         {
-            RequireExactMembers(doc.RootElement, RootMembers, path, "the root");
-            ValidateDictionary(doc.RootElement.GetProperty("hosts"), HostMembers, path, "host");
-            ValidateDictionary(doc.RootElement.GetProperty("panes"), PaneMembers, path, "pane");
-            ValidateAttemptedArray(doc.RootElement.GetProperty("attempted"), path);
+            JsonElement root = doc.RootElement;
+            if (root.ValueKind == JsonValueKind.Null)
+            {
+                throw new HistoryUnavailableException($"pane history at {path} is a null document, not an empty history");
+            }
+
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                throw new HistoryUnavailableException($"pane history at {path} is not a JSON object, so it was not written by this scheme");
+            }
+
+            // TryGetProperty is ordinal, so only a lowercase `version` selects the versioned branch; a
+            // `Version` (wrong casing) is treated as an unknown member of an unversioned file and rejected
+            // by the legacy classifier rather than silently accepted.
+            return root.TryGetProperty("version", out _)
+                ? LoadVersioned(root, text, path)
+                : LoadLegacy(root, text, path);
         }
     }
+
+    /// <summary>
+    /// Validates a current <em>versioned</em> file exactly: the root must carry exactly
+    /// <c>version</c>/<c>panes</c>/<c>hosts</c>/<c>attempted</c>/<c>initialized</c>, and the version must be
+    /// the integer this build writes. A version that is newer, older, unknown, or not an integer is not
+    /// something to guess at — it is rejected, bytes untouched, so a future format can change the meaning
+    /// of a field without an old build quietly misreading it. When the version matches, the record shapes
+    /// and semantic invariants are the same ones the writer produces, enforced by
+    /// <see cref="ValidateVersionedSemantics"/>.
+    /// </summary>
+    private static LoadResult LoadVersioned(JsonElement root, string text, string path)
+    {
+        RequireExactMembers(root, VersionedRootMembers, path, "the root");
+
+        JsonElement versionElement = root.GetProperty("version");
+        if (versionElement.ValueKind != JsonValueKind.Number || !versionElement.TryGetInt32(out int version))
+        {
+            throw new HistoryUnavailableException($"pane history at {path} has a non-integer version, so it was not written by this scheme");
+        }
+
+        if (version != CurrentVersion)
+        {
+            string relation = version > CurrentVersion ? "newer" : "unknown";
+            throw new HistoryUnavailableException(
+                $"pane history at {path} is schema version {version}, but this build reads version {CurrentVersion}; refusing to guess at an {relation} format");
+        }
+
+        ValidateDictionary(root.GetProperty("hosts"), HostMembers, path, "host");
+        ValidateDictionary(root.GetProperty("panes"), PaneMembers, path, "pane");
+        ValidateAttemptedArray(root.GetProperty("attempted"), path);
+
+        HistoryFile file = Deserialize(text, path);
+
+        // Defence in depth: the raw schema already required every member, but a deserialize that somehow
+        // yields a null map or flag is still not a file this scheme wrote.
+        if (file.Panes is null || file.Hosts is null || file.Attempted is null || file.Initialized is null)
+        {
+            throw new HistoryUnavailableException($"pane history at {path} is missing its panes, hosts, attempted or initialized member, so it was not written by this scheme");
+        }
+
+        // Every write establishes the fleet, so the writer only ever persists initialized = true; a first
+        // run is the absent-file case, which never reaches disk. A persisted false is a shape this scheme
+        // could not have written — reject it rather than let a tampered `initialized:false` re-enable the
+        // local bootstrap on a fleet that was deliberately emptied.
+        if (file.Initialized is not true)
+        {
+            throw new HistoryUnavailableException($"pane history at {path} has initialized = false, which this scheme never writes");
+        }
+
+        var attempted = new HashSet<string>(file.Attempted, StringComparer.Ordinal);
+        ValidateVersionedSemantics(file.Panes, file.Hosts, attempted);
+        return new(file.Panes, file.Hosts, attempted, true);
+    }
+
+    /// <summary>
+    /// Handles an <em>unversioned</em> file: the pre-version shapes an earlier build of this same tool
+    /// wrote, before <c>version</c> — and before <c>attempted</c> and <c>initialized</c> — existed. It
+    /// recognises only the exact member sets those builds produced (<see cref="ClassifyLegacyShape"/>);
+    /// anything else is hand-edited or another program's and is rejected with its bytes untouched. A
+    /// recognised shape is validated the same way a versioned file is — exact record members, no
+    /// duplicates — and then migrated forward in memory by <see cref="MigrateLegacy"/>. This is the fix
+    /// for the upgrade brick: an ordinary older history is carried forward rather than refused, while a
+    /// genuinely foreign file still fails closed.
+    /// </summary>
+    private static LoadResult LoadLegacy(JsonElement root, string text, string path)
+    {
+        LegacyShape shape = ClassifyLegacyShape(root, path);
+
+        ValidateDictionary(root.GetProperty("hosts"), HostMembers, path, "host");
+        ValidateDictionary(root.GetProperty("panes"), PaneMembers, path, "pane");
+        if (shape is LegacyShape.PanesHostsAttempted or LegacyShape.PanesHostsAttemptedInitialized)
+        {
+            ValidateAttemptedArray(root.GetProperty("attempted"), path);
+        }
+
+        if (shape is LegacyShape.PanesHostsAttemptedInitialized)
+        {
+            JsonElement initialized = root.GetProperty("initialized");
+            if (initialized.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+            {
+                throw new HistoryUnavailableException($"pane history at {path} has an initialized member that is not a boolean");
+            }
+        }
+
+        HistoryFile file = Deserialize(text, path);
+        return MigrateLegacy(file.Panes ?? [], file.Hosts ?? [], file.Attempted ?? [], file.Initialized, shape, path);
+    }
+
+    /// <summary>
+    /// Migrates a structurally-recognised legacy file forward in memory, or refuses it. Each record must
+    /// still be one a writer produced — a valid key, an exact shape, a possible record — so an impossible or
+    /// hand-edited record fails closed exactly as it would in a versioned file; no version, past or present,
+    /// wrote a witnessed claim with no PR. What migration adds is <em>derivation</em>: the attempted
+    /// membership the current scheme keys completeness on is rebuilt from every persisted host key <em>and
+    /// every pane's composite host</em> — not only the hosts map — because the real pre-<c>attempted</c>
+    /// payload that motivated this carries local panes with an empty hosts map, so its local membership
+    /// survives only in the pane keys. Panes and host memory are preserved as-is where the records are
+    /// valid.
+    /// </summary>
+    /// <remarks>
+    /// Every persisted remote alias is held to the same <see cref="HostTarget.Validate"/> rule the versioned
+    /// path applies, and an unusable one — option-shaped, whitespace, or control-bearing (a NUL) — fails
+    /// closed with the bytes preserved rather than being migrated. A NUL is not upgrade skew even though the
+    /// old validator lacked the check: a NUL cannot be carried through an OS process argument, so no real
+    /// invocation ever produced it, and treating it as a valid older payload would let a later command
+    /// overwrite the file. Refusing it here, before any scanner is constructed, is exactly the versioned
+    /// contract: the unavailable result, the original bytes left for inspection, and ssh never handed the
+    /// alias.
+    /// </remarks>
+    private static LoadResult MigrateLegacy(
+        Dictionary<string, PaneMemory> entries,
+        Dictionary<string, HostMemory> hosts,
+        List<string> attemptedArray,
+        bool? initialized,
+        LegacyShape shape,
+        string path)
+    {
+        foreach ((string key, HostMemory host) in hosts)
+        {
+            if (!TargetId.IsValidKey(key))
+            {
+                throw new HistoryUnavailableException($"pane history has an invalid host key '{key}', so it was not written by this scheme");
+            }
+
+            if (host is null || !IsWriterProducedHost(host))
+            {
+                throw new HistoryUnavailableException($"pane history has an impossible record for host '{key}'");
+            }
+        }
+
+        foreach ((string key, PaneMemory pane) in entries)
+        {
+            if (TargetId.HostOfComposite(key) is null || TargetId.IdOfComposite(key) is not { } id || !TmuxScanner.IsPaneId(id))
+            {
+                throw new HistoryUnavailableException($"pane history has an invalid pane key '{key}', so it was not written by this scheme");
+            }
+
+            if (pane is null || !IsWriterProducedPane(pane))
+            {
+                throw new HistoryUnavailableException($"pane history has an impossible record for pane '{key}'");
+            }
+        }
+
+        foreach (string key in attemptedArray)
+        {
+            if (!TargetId.IsValidKey(key))
+            {
+                throw new HistoryUnavailableException($"pane history has an invalid attempted host key '{key}', so it was not written by this scheme");
+            }
+        }
+
+        // The shape with an initialized member is the immediate pre-version scheme, which — like every
+        // versioned write — only ever persisted the flag true. A false there was hand-edited to re-enable
+        // the local bootstrap on an emptied fleet, so it fails closed rather than migrating.
+        if (shape is LegacyShape.PanesHostsAttemptedInitialized && initialized is not true)
+        {
+            throw new HistoryUnavailableException($"pane history at {path} has initialized = false, which this scheme never writes");
+        }
+
+        // Derive the attempted membership from every source of fleet identity the file holds: the
+        // attempted array (when the shape has one), every collected host, and every pane's composite host.
+        var attempted = new HashSet<string>(attemptedArray, StringComparer.Ordinal);
+        attempted.UnionWith(hosts.Keys);
+        foreach (string paneKey in entries.Keys)
+        {
+            if (TargetId.HostOfComposite(paneKey) is { } paneHost)
+            {
+                attempted.Add(paneHost.Key);
+            }
+        }
+
+        // Every derived remote alias must be one this build can hand to ssh, under the same
+        // HostTarget.Validate rule the versioned path enforces on host and attempted keys. An unusable
+        // alias — option-shaped, whitespace, or a NUL — fails closed with the bytes preserved, before any
+        // scanner is constructed. A NUL cannot be represented in an OS process argument, so no real
+        // invocation produced it: it is not upgrade skew to migrate, it is a file this scheme never wrote.
+        foreach (string key in attempted)
+        {
+            RequireUsableRemote(key, "target");
+        }
+
+        bool established = shape is LegacyShape.PanesHostsAttemptedInitialized
+            || attempted.Count > 0
+            || hosts.Count > 0
+            || entries.Count > 0;
+
+        return new(entries, hosts, attempted, established);
+    }
+
+    /// <summary>Deserializes an already raw-schema-validated document, turning the residual failure modes
+    /// (a value-kind mismatch the source-gen deserializer rejects, or a null root) into the unavailable
+    /// contract rather than an exception escaping the loader.</summary>
+    private static HistoryFile Deserialize(string text, string path)
+    {
+        HistoryFile? file;
+        try
+        {
+            file = JsonSerializer.Deserialize(text, PaneHistoryJsonContext.Default.HistoryFile);
+        }
+        catch (JsonException ex)
+        {
+            throw new HistoryUnavailableException($"could not read pane history from {path}: {ex.Message}", ex);
+        }
+
+        return file ?? throw new HistoryUnavailableException($"pane history at {path} is a null document, not an empty history");
+    }
+
+    /// <summary>The exact unversioned member sets earlier builds of this tool wrote, in the order they
+    /// gained members: panes+hosts before <c>attempted</c> existed, then +<c>attempted</c>, then
+    /// +<c>initialized</c> — the shape immediately before <c>version</c>.</summary>
+    private enum LegacyShape
+    {
+        PanesHosts,
+        PanesHostsAttempted,
+        PanesHostsAttemptedInitialized,
+    }
+
+    /// <summary>
+    /// Classifies an unversioned root as one of the exact known legacy member sets, or rejects it. The
+    /// match is on the exact set of member names — no unknown member, none missing, none repeated — so a
+    /// file resembling old JSON but carrying an extra member, a wrong-cased one, or an arbitrary subset is
+    /// refused rather than broadly accepted just because it looks old. Duplicate root members are a shape
+    /// no writer produced and are rejected here before the set is computed.
+    /// </summary>
+    private static LegacyShape ClassifyLegacyShape(JsonElement root, string path)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (JsonProperty member in root.EnumerateObject())
+        {
+            if (!names.Add(member.Name))
+            {
+                throw new HistoryUnavailableException($"pane history at {path}: the root has a duplicate '{member.Name}' member");
+            }
+        }
+
+        if (names.SetEquals(LegacyMembersPanesHosts))
+        {
+            return LegacyShape.PanesHosts;
+        }
+
+        if (names.SetEquals(LegacyMembersPanesHostsAttempted))
+        {
+            return LegacyShape.PanesHostsAttempted;
+        }
+
+        if (names.SetEquals(LegacyMembersPanesHostsAttemptedInitialized))
+        {
+            return LegacyShape.PanesHostsAttemptedInitialized;
+        }
+
+        string members = names.Count == 0 ? "none" : string.Join(", ", names.OrderBy(n => n, StringComparer.Ordinal));
+        throw new HistoryUnavailableException(
+            $"pane history at {path} has an unrecognised member set ({members}), so it was not written by any version of this scheme");
+    }
+
+    /// <summary>The exact members of a current versioned root: the version integer plus the two maps, the
+    /// attempted array and the initialized flag.</summary>
+    private static readonly string[] VersionedRootMembers = ["version", "panes", "hosts", "attempted", "initialized"];
+
+    /// <summary>The earliest unversioned shape: the two maps, before <c>attempted</c> existed.</summary>
+    private static readonly string[] LegacyMembersPanesHosts = ["panes", "hosts"];
+
+    /// <summary>The intermediate unversioned shape: the two maps plus the attempted array.</summary>
+    private static readonly string[] LegacyMembersPanesHostsAttempted = ["panes", "hosts", "attempted"];
+
+    /// <summary>The immediate pre-version shape: the two maps, the attempted array and the initialized
+    /// flag.</summary>
+    private static readonly string[] LegacyMembersPanesHostsAttemptedInitialized = ["panes", "hosts", "attempted", "initialized"];
+
+    private static readonly string[] HostMembers = ["epoch", "sweptAt", "continuous"];
+    private static readonly string[] PaneMembers = ["digest", "since", "pr", "claimedAt", "witnessed"];
 
     /// <summary>The attempted-host set on disk: a JSON array of unique strings. The writer emits target
     /// keys; a non-array, a non-string element, or a repeated key is a shape it never produced, so the
@@ -1139,7 +1412,7 @@ internal sealed class PaneHistory : IDisposable
         {
             Directory.CreateDirectory(dir);
             File.WriteAllText(tmp, JsonSerializer.Serialize(
-                new HistoryFile { Panes = _entries, Hosts = _hosts, Attempted = [.. _attempted], Initialized = _initialized },
+                new HistoryFile { Version = CurrentVersion, Panes = _entries, Hosts = _hosts, Attempted = [.. _attempted], Initialized = _initialized },
                 PaneHistoryJsonContext.Default.HistoryFile));
             File.Move(tmp, _path, overwrite: true);
         }
@@ -1175,9 +1448,16 @@ internal sealed class PaneHistory : IDisposable
 internal sealed class HistoryUnavailableException(string message, Exception? inner = null)
     : Exception(message, inner);
 
-/// <summary>The on-disk shape: what is known per window, per host, and every host ever attempted.</summary>
+/// <summary>The on-disk shape: the schema version, what is known per window, per host, and every host
+/// ever attempted.</summary>
 internal sealed record HistoryFile
 {
+    /// <summary>The schema version this file was written under. Declared first so it leads the document,
+    /// and nullable so an older unversioned file deserialises with it absent — the loader tells a versioned
+    /// file (validate exactly) from an unversioned one (migrate) by this member's presence.</summary>
+    [JsonPropertyName("version")]
+    public int? Version { get; init; }
+
     [JsonPropertyName("panes")]
     public Dictionary<string, PaneMemory>? Panes { get; init; }
 
