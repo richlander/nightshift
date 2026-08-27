@@ -1,31 +1,55 @@
 namespace Octoshift.GitHub;
 
 /// <summary>
-/// The three distinguishable outcomes of reading one PR from GitHub. Kept apart because collapsing them
-/// is exactly the defect: an affirmative <see cref="NotFound"/> (GitHub looked and there is no such PR)
-/// must never be confused with an <see cref="Unavailable"/> read (auth, rate limit, transport, a 5xx, a
-/// nonzero <c>gh</c> exit, or a body that cannot be parsed), where the PR's existence is simply unknown.
+/// The distinguishable outcomes of resolving one PR number across the repos the fleet touches. Kept apart
+/// because collapsing them is exactly the defect: an affirmative <see cref="NotFound"/> (every searched
+/// repo answered 404, so no such PR exists anywhere the tool looked) must never be confused with an
+/// <see cref="Unavailable"/> read (auth, rate limit, transport, a 5xx, a nonzero <c>gh</c> exit, or a body
+/// that cannot be parsed), where the PR's existence is simply unknown — nor with an
+/// <see cref="Ambiguous"/> resolution, where the same number exists in more than one searched repo and no
+/// single repo can be chosen without inventing one.
 /// </summary>
 internal enum PrFetchStatus
 {
-    /// <summary>GitHub answered and the PR exists; the facts are attached.</summary>
+    /// <summary>Exactly one searched repo has the PR; the facts (carrying that repo) are attached.</summary>
     Found,
 
-    /// <summary>GitHub answered 404: the PR affirmatively does not exist.</summary>
+    /// <summary>Every searched repo answered 404: the PR affirmatively does not exist in any of them.</summary>
     NotFound,
 
-    /// <summary>GitHub could not be read, or answered something that cannot be trusted as "no such PR".</summary>
+    /// <summary>At least one searched repo could not be read, and none affirmatively found the PR.</summary>
     Unavailable,
+
+    /// <summary>More than one searched repo has this PR number, so no single repo can be chosen truthfully.</summary>
+    Ambiguous,
 }
 
-/// <summary>One PR read reduced to its outcome and, when <see cref="PrFetchStatus.Found"/>, its facts.</summary>
-internal readonly record struct PrFetch(PrFetchStatus Status, PrFacts? Facts)
+/// <summary>
+/// One PR resolution reduced to its outcome, the facts when <see cref="PrFetchStatus.Found"/>, and the
+/// producer-owned repo labels: the ordered set of repos <see cref="Searched"/> and, of those, the ones the
+/// PR was <see cref="FoundIn"/>. The single-repo primitive leaves both empty; the fleet resolver fills them
+/// so a report can name where it looked and where it landed.
+/// </summary>
+internal readonly record struct PrFetch(
+    PrFetchStatus Status,
+    PrFacts? Facts,
+    IReadOnlyList<string> Searched,
+    IReadOnlyList<string> FoundIn)
 {
+    public PrFetch(PrFetchStatus status, PrFacts? facts)
+        : this(status, facts, [], [])
+    {
+    }
+
     public static readonly PrFetch NotFound = new(PrFetchStatus.NotFound, null);
 
     public static readonly PrFetch Unavailable = new(PrFetchStatus.Unavailable, null);
 
     public static PrFetch Found(PrFacts facts) => new(PrFetchStatus.Found, facts);
+
+    /// <summary>Attaches the searched/found repo labels the fleet resolver owns to an existing outcome.</summary>
+    public PrFetch WithRepos(IReadOnlyList<string> searched, IReadOnlyList<string> foundIn)
+        => this with { Searched = searched, FoundIn = foundIn };
 }
 
 /// <summary>One check run on a head sha, reduced to the fields a verdict turns on.</summary>
@@ -59,6 +83,12 @@ internal sealed record CheckRunFact(string Name, string Status, string? Conclusi
 internal sealed record PrFacts
 {
     public required int Number { get; init; }
+
+    /// <summary>
+    /// The <c>owner/name</c> repo these facts were read from. Stamped by the source that read them so a
+    /// cross-repo report can name where a PR resolved; null when a single-repo caller did not set it.
+    /// </summary>
+    public string? Repo { get; init; }
 
     /// <summary>Full head sha as GitHub has it.</summary>
     public required string HeadSha { get; init; }

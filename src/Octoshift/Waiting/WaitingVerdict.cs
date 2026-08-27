@@ -183,6 +183,52 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         };
 
     /// <summary>
+    /// Resolves a window's state against a multi-repo PR resolution, so the null-facts case can tell an
+    /// affirmative "no such PR in the repos I searched" from an unreadable GitHub — different facts with
+    /// different remedies (widen <c>--repo</c> versus wait out an outage) — and can flag a number that
+    /// collides across repos rather than silently picking one. A found PR joins exactly as the
+    /// <see cref="Resolve(AgentState, PrFacts?)"/> overload does, against the facts stamped with their repo.
+    /// </summary>
+    public static WaitingVerdict Resolve(AgentState state, PrFetch fetch)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+
+        // A found PR — or an issue window, which has no PR to look up across repos — joins through the
+        // single-facts table unchanged. Only the genuinely absent outcomes need the multi-repo wording.
+        if (fetch.Facts is { } facts)
+        {
+            return Resolve(state, facts);
+        }
+
+        if (state.IsIssue || fetch.Status == PrFetchStatus.Unavailable)
+        {
+            return Resolve(state, null);
+        }
+
+        string scope = fetch.Searched.Count > 0 ? string.Join(", ", fetch.Searched) : "the searched repo(s)";
+
+        if (fetch.Status == PrFetchStatus.Ambiguous)
+        {
+            string repos = fetch.FoundIn.Count > 0 ? string.Join(", ", fetch.FoundIn) : scope;
+            return new(WaitingState.NeedsOperator, RowOwner.Operator,
+                $"PR #{state.PrNumber} is ambiguous — found in {repos}; pass a single --repo to disambiguate",
+                Assurance.Low($"#{state.PrNumber} exists in more than one searched repo"));
+        }
+
+        // Affirmative not-found: every searched repo answered 404. Distinct from an outage, and its remedy
+        // is to widen the scope, not to wait. An explicit stop/approve escalation still reaches the operator.
+        Assurance absent = Assurance.Low($"searched {scope}; pass --repo if the PR is in another repo");
+        return state.Recommendation switch
+        {
+            Recommendation.Stop => new(WaitingState.NeedsOperator, RowOwner.Operator,
+                $"asking to stop, but PR #{state.PrNumber} is not in {scope}", absent),
+            Recommendation.Approve => new(WaitingState.NeedsOperator, RowOwner.Operator,
+                $"asking to authorise more rounds, but PR #{state.PrNumber} is not in {scope}", absent),
+            _ => new(WaitingState.Unknown, RowOwner.Operator, $"no such PR #{state.PrNumber} in {scope}", absent),
+        };
+    }
+
+    /// <summary>
     /// Resolves a window's state against GitHub's account of the same PR. Pure — the whole decision table
     /// is testable without a pane or a network.
     /// </summary>

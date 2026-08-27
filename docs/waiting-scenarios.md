@@ -263,6 +263,20 @@ collection failure leaves fleet ownership unknown, so it must not read as a quie
 `--json` form stays one truthful error document with the same unavailable exit, the token never prepended
 to it; a genuine cancellation propagates rather than being reported as a failure.
 
+**The fleet spans repositories; the scope must too.** Agents on these machines work across
+repositories, so resolving every claimed PR against the one repo inferred from the current directory
+declared any window working elsewhere unreadable by construction — and misread "no such PR in the repo I
+happened to be standing in" as "GitHub could not be read." Both `waiting` and `pr` take `--repo`
+**repeatably** and search each in order; with none given the scope is still inferred from the current
+worktree's `origin` remote, so the single-repo default is unchanged. A PR that resolves in exactly one
+searched repo is found (and the row names that repo); a number that exists in **two** is reported as a
+non-success `AMBIGUOUS`/ambiguous rather than awarded to an arbitrary repo (the remedy is a single
+`--repo`); a number in **none**, every searched repo answering 404, is an affirmative "no such PR in
+&lt;repos&gt;" — distinct from "could not be read," which stays reserved for a repo that genuinely could
+not be reached. Each searched repo keeps its own ETag cache and rate-limit budget; the report sums them
+and names the repos it searched, so a cross-repo miss is diagnosed as "widen the scope," not "wait out an
+outage." (#178.)
+
 **Aliases that cannot reach a process.** A `--host` value becomes an `ssh` argument, so beyond an
 option-shaped or whitespace alias the one validation rule also rejects any value carrying a control
 character — U+0000 above all, which truncates the argument on Unix and throws inside process construction
@@ -321,6 +335,14 @@ octoshift waiting --all
 
 # locate one PR and report what is happening to it
 octoshift pr 4537
+
+# a fleet that spans repositories: search each one until the PR resolves. Repeat
+# --repo; with none given the scope is inferred from the current directory's
+# origin remote (the single-repo default). A PR found in exactly one repo
+# resolves; a number that exists in two is reported AMBIGUOUS rather than guessed;
+# a number in none is "no such PR in <repos>", distinct from "could not be read".
+octoshift waiting --repo owner/service --repo owner/tools
+octoshift pr 4623 --repo owner/service --repo owner/tools
 
 # show, extend, or prune the declared fleet
 octoshift fleet

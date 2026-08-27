@@ -9,6 +9,34 @@ using System.Diagnostics;
 internal static class RepoScope
 {
     /// <summary>
+    /// Resolves the ordered, de-duplicated set of repo scopes to search. Explicit <c>--repo owner/name</c>
+    /// flags — repeatable — win and are searched in the order given; when none are supplied the scope is
+    /// inferred from the current worktree's <c>origin</c> remote, preserving the single-repo default. Any
+    /// flag that is not a well-formed <c>owner/name</c> is dropped. Returns empty when nothing resolves.
+    /// </summary>
+    public static IReadOnlyList<string> ResolveAll(IReadOnlyList<string> repoFlags)
+    {
+        ArgumentNullException.ThrowIfNull(repoFlags);
+
+        if (repoFlags.Count == 0)
+        {
+            return Resolve(null) is { } inferred ? [inferred] : [];
+        }
+
+        var ordered = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string flag in repoFlags)
+        {
+            if (NormalizeSlug(flag?.Trim()) is { } slug && seen.Add(slug))
+            {
+                ordered.Add(slug);
+            }
+        }
+
+        return ordered;
+    }
+
+    /// <summary>
     /// Resolves the scope from an optional <paramref name="repoFlag"/> (<c>owner/name</c>), falling back to
     /// the <c>origin</c> remote URL. Returns null when neither yields a well-formed <c>owner/name</c>.
     /// </summary>

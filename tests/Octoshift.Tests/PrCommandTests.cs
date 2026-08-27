@@ -193,6 +193,47 @@ public class PrCommandTests
     }
 
     [Fact]
+    public async Task Locate_AnAmbiguousNumberLeadsWithAmbiguousAndNamesBothRepos()
+    {
+        // #178: the same number resolves in two searched repos. The tool refuses to pick one — it leads
+        // with AMBIGUOUS, fails the exit, names both repos, and points at the --repo remedy.
+        PrLocationResult result = await LocateAsync(4623, Collection(
+            [],
+            [null]),
+            new PrFetch(PrFetchStatus.Ambiguous, null).WithRepos(["owner/first", "owner/second"], ["owner/first", "owner/second"]));
+
+        Assert.Equal(PrCommand.PrDisposition.Ambiguous, result.Located.Disposition);
+        Assert.Equal(ExitCode.Unavailable, result.Located.ExitCode);
+        Assert.StartsWith("AMBIGUOUS PR #4623", result.FirstLine(), StringComparison.Ordinal);
+        Assert.Contains("owner/first, owner/second", result.Report(), StringComparison.Ordinal);
+
+        using JsonDocument doc = JsonDocument.Parse(result.Json());
+        Assert.Equal("ambiguous", doc.RootElement.GetProperty("github").GetString());
+        Assert.Equal(
+            ["owner/first", "owner/second"],
+            doc.RootElement.GetProperty("foundIn").EnumerateArray().Select(e => e.GetString()!).ToArray());
+    }
+
+    [Fact]
+    public async Task Locate_ANotFoundNamesTheSearchedReposRatherThanASingleInferredScope()
+    {
+        // A not-found now says which repos were searched, so a wrong-scope miss is diagnosed as "widen the
+        // scope" instead of a bare "no such PR".
+        PrLocationResult result = await LocateAsync(4623, Collection(
+            [],
+            [null]),
+            PrFetch.NotFound.WithRepos(["owner/first", "owner/second"], []));
+
+        Assert.Equal(PrCommand.PrDisposition.NotFound, result.Located.Disposition);
+        Assert.Contains("no such PR in owner/first, owner/second", result.Report(), StringComparison.Ordinal);
+
+        using JsonDocument doc = JsonDocument.Parse(result.Json());
+        Assert.Equal(
+            ["owner/first", "owner/second"],
+            doc.RootElement.GetProperty("searched").EnumerateArray().Select(e => e.GetString()!).ToArray());
+    }
+
+    [Fact]
     public async Task Locate_AcompleteViewWithNeitherClaimNorPrLeadsWithNotFound()
     {
         // A complete view that turned up no claiming window, and GitHub affirmatively 404s: NOTFOUND, exit
@@ -648,7 +689,7 @@ public class PrCommandTests
         try
         {
             (int exit, string stdout, string stderr) = await RunWithCapturedConsoleAsync(
-                token => PrCommand.RunAsync(4448, "owner/name", [], json: false, token, historyPath: path), ct);
+                token => PrCommand.RunAsync(4448, ["owner/name"], [], json: false, token, historyPath: path), ct);
 
             Assert.Equal(ExitCode.Unavailable, exit);
             Assert.StartsWith("PARTIAL PR #4448", stdout, StringComparison.Ordinal);
@@ -675,7 +716,7 @@ public class PrCommandTests
         try
         {
             (int exit, string stdout, string stderr) = await RunWithCapturedConsoleAsync(
-                token => PrCommand.RunAsync(4448, "owner/name", [], json: false, token, historyPath: path), ct);
+                token => PrCommand.RunAsync(4448, ["owner/name"], [], json: false, token, historyPath: path), ct);
 
             Assert.Equal(ExitCode.Unavailable, exit);
             Assert.StartsWith("PARTIAL PR #4448", stdout, StringComparison.Ordinal);
@@ -698,7 +739,7 @@ public class PrCommandTests
         try
         {
             (int exit, string stdout, _) = await RunWithCapturedConsoleAsync(
-                token => PrCommand.RunAsync(4448, "owner/name", [], json: true, token, historyPath: path), ct);
+                token => PrCommand.RunAsync(4448, ["owner/name"], [], json: true, token, historyPath: path), ct);
 
             Assert.Equal(ExitCode.Unavailable, exit);
             Assert.DoesNotContain("PARTIAL", stdout, StringComparison.Ordinal);
@@ -731,7 +772,7 @@ public class PrCommandTests
             {
                 Console.SetOut(outWriter);
                 Console.SetError(new StringWriter());
-                Task<int> run = PrCommand.RunAsync(4448, "owner/name", [], json: false, cts.Token, historyPath: path);
+                Task<int> run = PrCommand.RunAsync(4448, ["owner/name"], [], json: false, cts.Token, historyPath: path);
                 await Task.Delay(150, ct);
                 await cts.CancelAsync();
 

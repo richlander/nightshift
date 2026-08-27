@@ -45,6 +45,9 @@ internal sealed class GhPrFactsSource
         _runGhAsync = runGhAsync;
     }
 
+    /// <summary>The <c>owner/name</c> scope this source reads.</summary>
+    public string Repo => _repo;
+
     /// <summary>Calls observed so far this run, and how many of those were free 304s.</summary>
     public int Calls { get; private set; }
 
@@ -79,6 +82,7 @@ internal sealed class GhPrFactsSource
         return new PrFacts
         {
             Number = pull.Number > 0 ? pull.Number : prNumber,
+            Repo = _repo,
             HeadSha = headSha,
             State = pull.State ?? "open",
             Merged = pull.Merged ?? false,
@@ -130,6 +134,7 @@ internal sealed class GhPrFactsSource
         {
             ChecksKnown = checksKnown,
             Number = pull.Number > 0 ? pull.Number : prNumber,
+            Repo = _repo,
             HeadSha = headSha,
             State = pull.State ?? "open",
             Merged = pull.Merged ?? false,
@@ -269,6 +274,128 @@ internal sealed class GhPrFactsSource
         {
             return null;
         }
+    }
+}
+
+/// <summary>
+/// Resolves one PR number across the ordered set of repos the fleet touches, so a lookup is not silently
+/// scoped to whichever repo the operator's current directory happens to sit in. Each repo has its own
+/// <see cref="GhPrFactsSource"/> — hence its own ETag cache path and its own rate-limit accounting — and
+/// this aggregates them into one budget and one truthful outcome.
+/// </summary>
+/// <remarks>
+/// Every claimed PR is searched in <em>every</em> repo, not merely until the first hit: stopping at the
+/// first match cannot tell a unique resolution from a collision, and awarding the PR to the first repo that
+/// happens to have that number is exactly the "select an arbitrary repo" failure this exists to prevent.
+/// The cost is bounded — a miss is a single <c>pulls/{n}</c> that 404s, and only the one repo that has the
+/// PR pays for its <c>check-runs</c> — and the repo set is small, so a truthful search is affordable. The
+/// resolved repo is remembered per PR so a follow-up mergeability re-read is spent only where the PR lives.
+/// </remarks>
+internal sealed class GhFleetPrFactsSource
+{
+    private readonly IReadOnlyList<GhPrFactsSource> _sources;
+    private readonly IReadOnlyList<string> _repos;
+    private readonly Dictionary<int, GhPrFactsSource> _resolved = [];
+
+    public GhFleetPrFactsSource(
+        IReadOnlyList<string> repos,
+        IConditionalCache cache,
+        Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> runGhAsync)
+    {
+        ArgumentNullException.ThrowIfNull(repos);
+        if (repos.Count == 0)
+        {
+            throw new ArgumentException("at least one repo is required", nameof(repos));
+        }
+
+        _repos = repos;
+        _sources = [.. repos.Select(repo => new GhPrFactsSource(repo, cache, runGhAsync))];
+    }
+
+    /// <summary>The repos this resolver searches, in scope order — the producer-owned label list.</summary>
+    public IReadOnlyList<string> Repos => _repos;
+
+    /// <summary>REST calls spent across every repo this run.</summary>
+    public int Calls => _sources.Sum(s => s.Calls);
+
+    /// <summary>Free 304s served across every repo this run.</summary>
+    public int NotModified => _sources.Sum(s => s.NotModified);
+
+    /// <summary>Mergeability re-reads across every repo this run.</summary>
+    public int Recomputed => _sources.Sum(s => s.Recomputed);
+
+    /// <summary>The smallest remaining budget any repo reported, or null when none did.</summary>
+    public int? RateLimitRemaining => _sources.Select(s => s.RateLimitRemaining).Where(r => r is not null).Min();
+
+    /// <summary>True once any repo reported the budget spent or GitHub pushed back.</summary>
+    public bool RateLimited => _sources.Any(s => s.RateLimited);
+
+    /// <summary>
+    /// Resolves a PR across all searched repos into one truthful outcome. A single affirmative hit is
+    /// <see cref="PrFetchStatus.Found"/>; more than one is <see cref="PrFetchStatus.Ambiguous"/>; none, when
+    /// every repo answered 404, is <see cref="PrFetchStatus.NotFound"/>; none, when any repo could not be
+    /// read, is <see cref="PrFetchStatus.Unavailable"/> — an outage never proves absence. Every outcome
+    /// carries the searched-repo labels so a report can say where it looked.
+    /// </summary>
+    public async Task<PrFetch> FetchDetailedAsync(int prNumber, CancellationToken ct)
+    {
+        var found = new List<(GhPrFactsSource Source, PrFacts Facts)>();
+        bool anyUnavailable = false;
+        foreach (GhPrFactsSource source in _sources)
+        {
+            PrFetch read = await source.FetchDetailedAsync(prNumber, ct);
+            switch (read.Status)
+            {
+                case PrFetchStatus.Found when read.Facts is { } facts:
+                    found.Add((source, facts));
+                    break;
+                case PrFetchStatus.Unavailable:
+                    anyUnavailable = true;
+                    break;
+            }
+        }
+
+        IReadOnlyList<string> foundIn = [.. found.Select(f => f.Source.Repo)];
+        if (found.Count == 1)
+        {
+            _resolved[prNumber] = found[0].Source;
+            return PrFetch.Found(found[0].Facts).WithRepos(_repos, foundIn);
+        }
+
+        if (found.Count > 1)
+        {
+            return new PrFetch(PrFetchStatus.Ambiguous, null).WithRepos(_repos, foundIn);
+        }
+
+        return (anyUnavailable ? PrFetch.Unavailable : PrFetch.NotFound).WithRepos(_repos, foundIn);
+    }
+
+    /// <summary>The sweep shape: the facts when exactly one repo resolved the PR, otherwise null — a 404,
+    /// an outage and an ambiguous collision all collapse here, since none yields facts to act on.</summary>
+    public async Task<PrFacts?> FetchAsync(int prNumber, CancellationToken ct)
+        => (await FetchDetailedAsync(prNumber, ct)).Facts;
+
+    /// <summary>
+    /// Re-reads mergeability in the repo the PR already resolved to, so the second read is spent where the
+    /// first found it and per-repo accounting stays honest. Falls back to the first repo that answers when
+    /// the PR was not previously resolved here.
+    /// </summary>
+    public async Task<PrFacts?> RefreshMergeabilityAsync(int prNumber, CancellationToken ct)
+    {
+        if (_resolved.TryGetValue(prNumber, out GhPrFactsSource? source))
+        {
+            return await source.RefreshMergeabilityAsync(prNumber, ct);
+        }
+
+        foreach (GhPrFactsSource candidate in _sources)
+        {
+            if (await candidate.RefreshMergeabilityAsync(prNumber, ct) is { } refreshed)
+            {
+                return refreshed;
+            }
+        }
+
+        return null;
     }
 }
 
