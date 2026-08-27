@@ -246,9 +246,10 @@ local`), and `--json` carries the same distinction structurally as `{"kind":"loc
 **Empty on purpose is not the same as fresh.** A never-established fleet scans the local machine by
 default; a fleet emptied by retiring its last member scans **nothing** until a target is added back —
 retiring local must not be silently undone by re-bootstrapping it next sweep. `fleet list` says which it
-is, and a bare `waiting`/`pr` over an emptied fleet leads with an `EMPTY` token and succeeds rather than
-sweeping local behind your back. The distinction is persisted (an `initialized` flag), so it survives
-across runs.
+is. A bare `waiting` over an emptied fleet leads with a new `EMPTY` token and succeeds rather than
+sweeping local behind your back; `pr` still locates the PR on GitHub, reporting `no windows collected`
+alongside whatever GitHub says, since a lookup does not depend on any window existing. The distinction is
+persisted (an `initialized` flag), so it survives across runs.
 
 `--json` emits the members, the added set, or the retired set as one document, each target a
 kind-preserving identity. The fleet is credential-free and GitHub-unaware: a set of `tmux` collection

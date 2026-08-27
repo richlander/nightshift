@@ -124,6 +124,41 @@ public class PrCommandTests
     }
 
     [Fact]
+    public async Task Locate_AnEmptiedFleetLocatesOnGithubWithNoLocalWindowsAndNoBootstrap()
+    {
+        // Round 11 / #2: `pr` over a fleet emptied by retirement does NOT re-bootstrap local and does NOT
+        // emit an EMPTY token (that is `waiting`'s contract) — it locates the PR on GitHub with no window
+        // rows, since a lookup does not depend on any window existing. The injected scan is never called:
+        // an emptied, initialized fleet attempts no target. A complete view (nothing unreachable, nothing
+        // known omitted) plus a found PR is the ordinary success.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-premptyfleet-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, "{\"panes\":{},\"hosts\":{},\"attempted\":[],\"initialized\":true}");
+        try
+        {
+            PrCommand.PrLocation located = await PrCommand.CollectAndLocateAsync(
+                4448,
+                [],
+                (_, _) => throw new Xunit.Sdk.XunitException("an emptied fleet must attempt no target"),
+                (_, _) => Task.FromResult(PrFetch.Found(Ready)),
+                (_, _) => Task.FromResult<PrFacts?>(null),
+                DateTimeOffset.UtcNow,
+                TestContext.Current.CancellationToken,
+                historyPath: path);
+
+            Assert.Empty(located.Claims);
+            Assert.True(located.ViewComplete);
+            Assert.Equal(PrCommand.PrDisposition.Found, located.Disposition);
+            Assert.Equal(ExitCode.Ok, located.ExitCode);
+            Assert.DoesNotContain("EMPTY", new PrLocationResult(located).Report(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
     public async Task Locate_AWindowsHistoryNarrowerThanBeforeLeadsWithNarrowed()
     {
         // A host was collected before but not in this run: no host was unreachable, yet the view is
