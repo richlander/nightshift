@@ -255,9 +255,12 @@ public class GitHubInstallationTokenProviderTests
 
         GitHubInstallationToken warm = await provider.GetTokenAsync(TestContext.Current.CancellationToken);
         Assert.Equal("tok-1", warm.Token);
+        Assert.True(provider.HasCachedToken);
 
         provider.Dispose();
 
+        // Disposal clears the cached token so a live credential is not retained in memory past disposal.
+        Assert.False(provider.HasCachedToken);
         await Assert.ThrowsAsync<ObjectDisposedException>(() => provider.GetTokenAsync(TestContext.Current.CancellationToken));
     }
 
@@ -297,6 +300,10 @@ public class GitHubInstallationTokenProviderTests
         // The operation that was already minting when Dispose landed finishes cleanly; its Release must not throw.
         GitHubInstallationToken minted = await inFlight;
         Assert.Equal("tok-1", minted.Token);
+
+        // Even though that refresh published a token, the race is resolved so the cache is not left populated
+        // after disposal — no in-flight refresh can repopulate it past Dispose.
+        Assert.False(provider.HasCachedToken);
 
         // The caller that was still queued behind the lock is refused once it acquires it.
         await Assert.ThrowsAsync<ObjectDisposedException>(() => queued);

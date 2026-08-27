@@ -100,6 +100,16 @@ internal sealed class GitHubAppInstallationTokenProvider : IGitHubInstallationTo
             bool refreshed = _cached is not null;
             GitHubInstallationToken minted = await MintTokenAsync(refreshed, ct);
             _cached = new CachedToken(minted);
+
+            // Publish, then re-check disposal. If Dispose landed while this refresh was in flight, its own
+            // clear may have run before this publish — so clear again here. Between the two, whichever store
+            // to _cached happens last leaves it null whenever _disposed is set, so no refresh can repopulate
+            // the cache after disposal. The in-flight caller still returns the token it fetched.
+            if (_disposed)
+            {
+                _cached = null;
+            }
+
             return minted;
         }
         finally
@@ -108,13 +118,21 @@ internal sealed class GitHubAppInstallationTokenProvider : IGitHubInstallationTo
         }
     }
 
+    /// <summary>Test-only view of whether a token is currently cached, so disposal-clearing is observable
+    /// without reflection.</summary>
+    internal bool HasCachedToken => _cached is not null;
+
     public void Dispose()
     {
         // Logical disposal only. The SemaphoreSlim is intentionally not disposed: it needs disposal solely to
         // release the ManualResetEvent behind AvailableWaitHandle, which this type never touches, so skipping
         // it leaks nothing. Not disposing it is what lets an in-flight refresh's finally-Release complete
         // without racing a disposed handle; the _disposed flag enforces disposal for every future entry.
+        //
+        // Order matters: mark disposed before clearing the cache so a concurrent refresh that observes the
+        // flag after its own publish will clear too, and no interleaving leaves a token cached past Dispose.
         _disposed = true;
+        _cached = null;
     }
 
     private bool NeedsRefresh(GitHubInstallationToken token, DateTimeOffset now)
