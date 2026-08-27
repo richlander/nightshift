@@ -31,8 +31,7 @@ One invariant sits above both and is the crux of the issue:
 > **The scaling signal never spawns workers.** Every scaling action is a *prompt to the operator*. The
 > signal informs; it never acts. (One bounded exception lives outside scaling: when the payroll is
 > *entirely empty*, the Coordinator may spawn a subagent-worker as a last resort so a ready order does
-> not stall — never as a response to the scaling number. See the
-> [coordinator skill](../../.github/skills/nightshift-coordinator/SKILL.md).)
+> not stall — never as a response to the scaling number.)
 
 ---
 
@@ -131,8 +130,7 @@ over-staffed frontier of your own: `R = 3`, nothing in flight (`I = 0`), five se
 
 ## 3. Backpressure — the graded signal
 
-Today's rule is a step function: `N = 0 ∧ R > 0` → tell the operator to start a worker
-([coordinator skill, the ready-set discussion](../../.github/skills/nightshift-coordinator/SKILL.md)).
+Today's rule is a step function: `N = 0 ∧ R > 0` → tell the operator to start a worker.
 This generalizes it to the **staffing deficit**:
 
 > **`D = W − N`**  (with `W = min(Rᵉ + I, C)`)
@@ -192,14 +190,13 @@ new session and tells it:
 
 > **you are a nightshift worker**
 
-That loads the `nightshift-worker` skill; the new worker sets up its own worktree, `join`s, and pulls
-work on its own. The Coordinator does **not** open the session, does **not** `join`, does **not** hand
+The new worker sets up its own worktree, `join`s, and pulls work on its own. The
+Coordinator does **not** open the session, does **not** `join`, does **not** hand
 out the order.
 
 This is not a limitation to route around; it is the same boundary stated everywhere else in the
-system. The coordinator skill puts it directly to the Coordinator — *"you never become one, and you
-spawn one only as the empty-payroll fallback"* ([coordinator skill](../../.github/skills/nightshift-coordinator/SKILL.md)); a Worker is
-*always a separate instance* ([workflow](workflow.md)). A scaling signal that spawned workers would collapse
+system. A Worker is *always a separate instance* ([workflow](workflow.md)). A
+scaling signal that spawned workers would collapse
 exactly the day-shift/night-shift and coordinator/worker partitions Nightshift exists to keep. The
 number tells the operator how many sessions to start; starting them stays a deliberate act on the
 human's side of the line — the one exception being an empty payroll, where the Coordinator may fall

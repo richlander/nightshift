@@ -84,7 +84,7 @@ Structural, not procedural.
 
 ## 3. Non-goals
 
-- **Wrap or intercept interactive agents.** Skill-first. Agents opt in by calling a CLI. Nightshift never competes for the launch surface (Squad, Conductor, `claude --worktree`, the Copilot app all want it; Nightshift composes with all of them). It *does* spawn headless agents at night — a supervisor role, not a wrapper.
+- **Wrap or intercept interactive agents.** CLI-first. Agents opt in by calling a CLI. Nightshift never competes for the launch surface (Squad, Conductor, `claude --worktree`, the Copilot app all want it; Nightshift composes with all of them). It *does* spawn headless agents at night — a supervisor role, not a wrapper.
 - **Define agent roles, personas, or charters.** That is Squad's job.
 - **Provide chat.** §6. No pub/sub, no topics, no social channel.
 - **Reimplement a merge queue.** GitHub's native queue, Mergify, and Graphite do speculative merge commits, batching, and bisection well. Nightshift feeds them and closes the loop they can't.
@@ -290,9 +290,15 @@ Loose GitHub issues are legitimate work. They are simply not *unattended* work.
 
 ## 6. Command surface
 
-Two vocabularies, opposite constraints. **Agent verbs are called constantly and must be memorizable from a short SKILL.md. Operator verbs are free and can be expressive.**
+Two vocabularies, opposite constraints. **Agent verbs are called constantly and
+must be discoverable from concise CLI help. Operator verbs are free and can be
+expressive.**
 
-Naming principle: **plain English on the CLI.** The factory vocabulary (standard work, first article, rework rate, jidoka) lives in the docs and the SKILL.md, where it does semantic work at zero token cost — models have absorbed a century of manufacturing literature and *"pull the andon cord"* means something to them that *"escalate"* doesn't. But **no `e-stop` when `stop` will do.**
+Naming principle: **plain English on the CLI.** The factory vocabulary (standard
+work, first article, rework rate, jidoka) lives in the docs, where it does
+semantic work without complicating the command surface — models have absorbed a
+century of manufacturing literature and *"pull the andon cord"* means something
+to them that *"escalate"* doesn't. But **no `e-stop` when `stop` will do.**
 
 > **Lineage.** `escalate` is the [andon cord](https://en.wikipedia.org/wiki/Andon_(manufacturing)) of the Toyota Production System: any worker may stop the line to surface a defect, and the line never hides a problem to keep moving. Commitment 1 — *"where judgment is required, the system does not guess; it halts and escalates with a safe default"* — is `jidoka` (autonomation: stop-on-defect, human decides). The convergence was independent, but the debt is real.
 
@@ -379,7 +385,8 @@ So **the agent never sees the lease.** The client owns it, keyed by worktree has
 
 **An agent whose context resets entirely does not lose its claim**, because the claim was never in its context. That property is unattainable if the lease ID is a token the model must carry.
 
-SKILL.md needs one line: *"Run `nightshift join` once. Everything after that is handled for you."*
+The onboarding guidance needs one line: *"Run `nightshift join` once.
+Everything after that is handled for you."*
 
 ---
 
@@ -451,7 +458,10 @@ The agent cannot detect this from inside. It has no representation for *"I am cu
 - **Night architect** — Claude Code `stream-json` session, hosted by `ns-spawn`, which supplies the wake. **The only harness supporting a resident, contextful, sleeping agent.**
 - **Day sessions** — interactive, either harness, sleep on `standby` with context intact.
 
-**2. `standby` behaves differently by mode — and the agent never needs to know.** `ns-spawn` knows which sessions it spawned. Headless callers get `USE_CHECK`. SKILL.md says: *"If you can background a process, use `standby`. Otherwise call `check` before each commit."*
+**2. `standby` behaves differently by mode — and the agent never needs to
+know.** `ns-spawn` knows which sessions it spawned. Headless callers get
+`USE_CHECK`. Repository guidance says: *"If you can background a process, use
+`standby`. Otherwise call `check` before each commit."*
 
 **3. The exit-code finding does not require a stdout wrapper.** The experiment concluded handoff must go through a wrapper parsing a `DECISION:` token from stdout. **It doesn't — Nightshift is the back-channel.** The agent calls `nightshift release --status refused`; the state lands in Turnstile; the agent exits with whatever code it likes. **Nothing reads stdout. Nothing inspects an exit code.** And if the agent dies without releasing, **the lease expires and the slice is reclaimed.** Crash handling for free, from a mechanism that already exists.
 
@@ -510,7 +520,7 @@ A rephrase **changes the artifact to satisfy a classifier.** These refusals are 
 
 **A dead shift costs you a night. A laundered safety analysis costs you the thing you were building.**
 
-SKILL.md, hard:
+The retry policy is explicit:
 
 > *The API rejected the previous request with a content-filter error. This is a known false positive on legitimate memory-safety and decompiler work. **Reissue the same request unchanged.** Do not rename identifiers, soften language, restructure the analysis, or otherwise alter content to satisfy the filter. After three retries, release with `--status refused` and exit.*
 
@@ -862,7 +872,9 @@ Squad's bet — accessible, legible multi-agent development without heavy orches
 
 **What Squad provides that Nightshift will not:** roles, personas, charters, team persistence, onboarding, the natural-language front door. **Nightshift has no opinion about who does the work.**
 
-**Integration:** Squad already scans Copilot CLI skill paths and configures MCP in `squad init`. **A Squad member is just a joined session** — it calls `nightshift next` like any other tool. No change to Squad's core.
+**Integration:** Squad configures MCP in `squad init`. **A Squad member is just a
+joined session** — it calls `nightshift next` like any other tool. No change to
+Squad's core.
 
 ### The divergence, stated plainly
 
@@ -879,7 +891,8 @@ Not the same philosophy, and worth saying so. The argument — and it holds — 
 - **Not a `dotnet-` tool.** Nothing here is .NET-specific. Prefixing it caps the audience exactly when the interesting adoption is cross-ecosystem.
 - **NuGet for credibility; npm because that's where Squad's users are.** Native AOT gives one binary; also brew and curl.
 - **Turnstile ships separately.** `turnstile-lock`, `turnstile-queue`, and `turnstile-elect` are **usable by anyone today with no agents involved** — a distributed mutex with automatic release-on-death, one binary, no cluster, is a real gap. **Turnstile can have its own adoption curve, and Nightshift becomes a consumer of it — exactly as Kubernetes is a consumer of etcd.**
-- **Also ships:** MCP server manifest, `SKILL.md`, a one-line `AGENTS.md` snippet, optional hooks JSON.
+- **Also ships:** MCP server manifest, a one-line `AGENTS.md` snippet, optional
+  hooks JSON.
 
 ### The pitch
 

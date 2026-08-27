@@ -2,16 +2,18 @@
 
 This document is the Nightshift engineering charter for this repository. It is written for a **planner**
 to import at the start of a shift and use to turn this repo's issues into **orders** that workers
-execute. Read the planner skill for *how* to plan; this charter carries only what is specific to this
-repo. Your authority is this charter **plus** whatever the operator told you this session — where both
-are silent, do not assume: post on the issue and wait.
+execute. Read [`docs/design/workflow.md`](docs/design/workflow.md) and
+[`docs/design/nightshift-spec.md`](docs/design/nightshift-spec.md) for the
+general planning model; this charter carries only what is specific to this repo.
+Your authority is this charter **plus** whatever the operator told you this
+session — where both are silent, do not assume: post on the issue and wait.
 
 Repository-wide engineering requirements are in [`AGENTS.md`](AGENTS.md).
 
 ## Scope — which issues become work
 
 Candidates are **open issues in this repository** that describe a concrete change to Nightshift,
-Turnstile, Octoshift, the skills, or the design docs. The **Product Manager tells you the theme at the
+Turnstile, Octoshift, or the design docs. The **Product Manager tells you the theme at the
 start of each session** — work the open issues that match that theme. Pure discussion, open design
 questions, and product-shape decisions with unresolved tradeoffs are **not** planned; they belong to the
 Product Manager (you may post to move them forward).
@@ -54,5 +56,6 @@ theme into orders:
   separate path-partitioned orders; only coupled ones stack. See
   [stacked orders](docs/design/stacked-orders.md).
 
-The mechanics of expressing an order and driving it to merge — the plan format, the two-clean review
-gate, landing — are standard Nightshift and belong to your skill.
+The mechanics of expressing an order and driving it to merge — the plan format,
+the two-clean review gate, and landing — are defined in the workflow and product
+specification linked above.

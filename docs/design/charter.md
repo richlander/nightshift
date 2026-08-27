@@ -26,8 +26,8 @@ Opening an agent session does **nothing** on its own. A charter is not a trigger
 agent "jump to action." The operational model is human-initiated:
 
 1. A person opens a terminal and says, in effect, *"you are a Nightshift planner for this repo."*
-2. The invoked planner reads its **skill** (how to plan, in general) and this repository's **charter**
-   (how *this* repo maps issues to orders).
+2. The invoked planner reads this repository's **charter** (how this repo maps
+   issues to orders) and the task-relevant design docs.
 3. The operator may add **session instructions** in that same conversation — a narrower focus, a
    priority, a one-off exception.
 
