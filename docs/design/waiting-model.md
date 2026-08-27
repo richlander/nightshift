@@ -216,6 +216,18 @@ because several of them were violated by code that passed its unit tests.
     Membership is therefore kept apart from successful collection — epoch,
     continuity, sweep time — which grow only with the hosts that answered.
     Modelled as `CompletenessCoversEveryAttemptedHost`.)*
+19. Fleet membership *shrinks* only through a deliberate operator **retirement**,
+    never through ordinary collection. A sweep covers the whole declared fleet
+    (local plus every remembered remote), so a member that is renamed,
+    decommissioned, or mistyped would otherwise be attempted forever and keep
+    every later sweep narrowed — completeness permanently unsatisfiable. Retiring
+    it removes it from the fleet and clears the host, pane and registration state
+    kept under it, and a retired host's stale claim can never remain actionable:
+    the window on it is no longer collected, and the fleet change drops the last
+    sweep's completeness until a fresh complete sweep re-earns it. *(The one
+    sanctioned way to forget a target, the mirror of invariant 18: collection must
+    never forget, retirement is how an operator does. Modelled as the `Retire`
+    action and the `NoOwnerFromRetiredHost` invariant.)*
 
 Invariants 9–14 are the ones unit tests cover least well, because they are
 statements about *sequences* of sweeps interleaved with fleet events rather than

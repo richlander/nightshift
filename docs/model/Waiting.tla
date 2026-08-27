@@ -28,10 +28,11 @@
    switch PRs for reasons this tool neither controls nor predicts.
 
    Status: parsed cleanly with SANY and model-checked with TLC 2.19 against Waiting.cfg --
-   no errors, 7,229,472 states generated, 1,470,689 distinct, depth 9, zero violations
-   (~8s, 12 workers; the per-host epoch, the empty sweep, modelling an empty host's first
+   no errors, 8,399,658 states generated, 1,539,916 distinct, depth 9, zero violations
+   (~11s, 12 workers; the per-host epoch, the empty sweep, modelling an empty host's first
    window as a server start, separating the hosts a sweep ATTEMPTED from the subset that
-   ANSWERED, and growing persistent fleet membership from ATTEMPTED all widen the space from
+   ANSWERED, growing persistent fleet membership from ATTEMPTED, and the operator Retire that
+   shrinks it all widen the space from
    the earlier single-epoch model, while the server-start
    advance prunes some by failing more first looks closed). Re-run TLC
    after any change here to regenerate the count
@@ -42,7 +43,9 @@
    SoleClaimantIsAlwaysOwner; growing knownHosts from collected instead of attempted -- the
    round-9 first-time-failed-host laundering, where a host that fails on its first attempt is
    forgotten and a later omission reads complete -- violates CompletenessCoversEveryAttemptedHost;
-   and dropping the regWitnessed clause from Observed -- or
+   a Retire that removes a host from knownHosts but leaves it in lastCollected with viewComplete
+   still TRUE -- so a retired host's stale sole claim stays actionable -- violates
+   NoOwnerFromRetiredHost; and dropping the regWitnessed clause from Observed -- or
    recomputing witness from the current sweep's coverage, the fleet-expansion laundering
    where the third sweep of a full fleet promotes a claim first recorded under a narrow
    view -- violates NoOwnerFromUnwitnessedRegistration, and doing the same recomputation
@@ -373,7 +376,52 @@ Sweep ==
          /\ lastCollected' = collected
     /\ UNCHANGED << claims, live, epoch >>
 
-Next == AgentActs \/ ServerRestarts \/ Sweep
+\* An operator retires a host from the declared fleet. This is the ONLY action that shrinks
+\* persistent membership -- ordinary collection never forgets an attempted target (that is the
+\* round-9 rule) -- so a decommissioned, renamed, or mistyped host that would otherwise be
+\* attempted forever, keeping every later sweep narrowed, can be removed on purpose. It is a
+\* deliberate act, not something a sweep does: only a host already IN knownHosts can be retired,
+\* which is how the implementation reports an unknown target as a non-success rather than a silent
+\* no-op.
+\*
+\* Retiring a host removes it from knownHosts, everAttempted and the last sweep's coverage, and
+\* clears the per-host registration state kept under it -- exactly what the implementation does
+\* when it drops the host from its maps and prunes its pane entries. Two things follow, and both
+\* are what NoOwnerFromRetiredHost turns on. First, a window on the retired host is no longer in
+\* lastCollected, so it is not a Claimant and cannot own -- ownership can never remain actionable
+\* from a retired host's stale claim. Second, changing the fleet invalidates the last sweep's
+\* completeness (an ordering established when the fleet was larger is not an ordering over the
+\* fleet now), so viewComplete drops to FALSE until a fresh complete sweep re-earns it, exactly as
+\* a Sweep would recompute it. everAttempted shrinks in lockstep with knownHosts, so a retired
+\* host does not leave CompletenessCoversEveryAttemptedHost demanding coverage of a host no longer
+\* in the fleet.
+Retire ==
+    /\ now < MaxTime
+    /\ now' = now + 1
+    /\ \E h \in knownHosts :
+         /\ knownHosts' = knownHosts \ {h}
+         /\ everAttempted' = everAttempted \ {h}
+         /\ lastCollected' = lastCollected \ {h}
+         /\ regTime' = [w \in Windows |-> IF HostOf(w) = h THEN NoTime ELSE regTime[w]]
+         /\ regPr' = [w \in Windows |-> IF HostOf(w) = h THEN NoPr ELSE regPr[w]]
+         \* The retired host's windows lose their registration fleet; a surviving window that was under
+         \* observation has its registration re-understood against the now-smaller fleet, exactly as the
+         \* implementation keeps a host it did not retire fully valid (it has no per-registration fleet
+         \* snapshot to invalidate). Without this, a surviving window's regFleet would stay pinned to the
+         \* pre-retirement fleet, its registration would read stale until the next sweep re-stamped it, and
+         \* that sweep -- over an otherwise unchanged fleet -- would flip Owner, an artifact the real tool
+         \* does not have. A surviving but uncollected window keeps its fleet, since the tool did not look
+         \* at it, and it is not a Claimant anyway.
+         /\ regFleet' = [w \in Windows |->
+                          IF HostOf(w) = h THEN {}
+                          ELSE IF HostOf(w) \in lastCollected \ {h} THEN knownHosts \ {h}
+                          ELSE regFleet[w]]
+         /\ regWitnessed' = [w \in Windows |-> IF HostOf(w) = h THEN FALSE ELSE regWitnessed[w]]
+         /\ regEpoch' = [g \in Hosts |-> IF g = h THEN 0 ELSE regEpoch[g]]
+         /\ viewComplete' = FALSE
+    /\ UNCHANGED << claims, live, epoch >>
+
+Next == AgentActs \/ ServerRestarts \/ Sweep \/ Retire
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Sweep)
 
@@ -456,6 +504,21 @@ NoOwnerFromUnwitnessedRegistration ==
 CompletenessCoversEveryAttemptedHost ==
     viewComplete => everAttempted \subseteq lastCollected
 
+\* Round 10: ownership can never remain actionable from a retired host's stale claim. Once a host
+\* leaves the declared fleet -- retired on purpose, or simply never attempted yet -- no window on it
+\* may own a PR. This is the manageable-fleet safety property: retirement must not be a way to strand
+\* an actionable ownership on a host the tool is no longer watching.
+\*
+\* It holds in every reachable state, not only after a Retire: a window on a host outside knownHosts
+\* is also outside lastCollected (lastCollected \subseteq the hosts a sweep collected, and a collected
+\* host is attempted, so it is in knownHosts), hence it is not a Claimant and cannot own. Stated over
+\* the underlying fact -- HostOf(w) \notin knownHosts -- rather than as a consequence of Retire, so it
+\* is not a restatement of the action. A deliberate mutation of Retire that removed a host from
+\* knownHosts while leaving it in lastCollected and viewComplete TRUE would make its stale sole claim
+\* actionable and is refuted here.
+NoOwnerFromRetiredHost ==
+    \A w \in live : HostOf(w) \notin knownHosts => ~OwnsClaim(w)
+
 (* ---- Step properties ---- *)
 
 \* Invariant 12: a window's registration is stable while it keeps claiming the same PR
@@ -479,17 +542,30 @@ CompletenessCoversEveryAttemptedHost ==
 \* registration is correct there and the property must not forbid it. Continuity
 \* (in-lastCollected) is exactly the condition under which the place in the queue is
 \* frozen; outside it, the reset is allowed.
+\*
+\* RegistrationStableStep and RegWitnessedStableStep below also require knownHosts' = knownHosts, so a
+\* RETIREMENT -- which clears the retired host's registration and witness deliberately -- is excluded
+\* just as a gap is; a fleet change legitimately resets both, and a sweep with an unchanged fleet still
+\* exercises the properties in full.
+\*
+\* The consequent also allows a change when the host has left knownHosts -- a RETIREMENT. Retiring a
+\* host clears the per-host registration state for windows on it while removing it from both
+\* lastCollected and knownHosts, so "HostOf(w) \notin knownHosts'" is the deliberate-forget escape,
+\* distinct from a sweep manufacturing a departure (which leaves the host in knownHosts and would
+\* still be caught). A partial sweep that rewrote an uncollected but still-known host's registration
+\* satisfies neither disjunct and is refuted, exactly as before.
 NoPhantomDepartureStep ==
     [][ \A w \in Windows :
           (regTime'[w] # regTime[w] \/ regPr'[w] # regPr[w] \/ regFleet'[w] # regFleet[w]
              \/ regWitnessed'[w] # regWitnessed[w])
-            => HostOf(w) \in lastCollected' ]_vars
+            => (HostOf(w) \in lastCollected' \/ HostOf(w) \notin knownHosts') ]_vars
 
 RegistrationStableStep ==
     [][ \A w \in Windows :
           (/\ w \in live /\ w \in live'
            /\ claims[w] # NoPr /\ claims'[w] = claims[w]
            /\ epoch'[HostOf(w)] = epoch[HostOf(w)]
+           /\ knownHosts' = knownHosts
            /\ HostOf(w) \in lastCollected
            /\ Registered(w) # NoTime)
              => regTime'[w] = regTime[w] ]_vars
@@ -506,11 +582,17 @@ RegistrationStableStep ==
 \* current sweep's coverage while the same claim continues under continuous observation --
 \* the laundering NoOwnerFromUnwitnessedRegistration rules out at a state -- is refuted
 \* here as a step; but a gap-return, where continuity is broken, is permitted to reset it.
+\*
+\* The antecedent also requires the known fleet to be unchanged (knownHosts' = knownHosts), which
+\* excludes a RETIREMENT: retiring the window's host clears its registration and its witness on
+\* purpose, so a fleet change is a legitimate reset just as a gap is. A sweep that leaves the fleet
+\* unchanged still exercises the property in full.
 RegWitnessedStableStep ==
     [][ \A w \in Windows :
           (/\ w \in live /\ w \in live'
            /\ claims[w] # NoPr /\ claims'[w] = claims[w]
            /\ epoch'[HostOf(w)] = epoch[HostOf(w)]
+           /\ knownHosts' = knownHosts
            /\ HostOf(w) \in lastCollected
            /\ Registered(w) # NoTime)
              => regWitnessed'[w] = regWitnessed[w] ]_vars

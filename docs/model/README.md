@@ -55,8 +55,8 @@ java -cp tla2tools.jar tlc2.TLC -config Waiting.cfg -workers auto Waiting.tla
 ```
 
 Current bounds — 3 windows, 2 hosts, 2 PRs, 8 steps — run in a few seconds: with TLC 2.19
-(12 workers) SANY parses cleanly and TLC reports 7,229,472 states generated, 1,470,689
-distinct, depth 9, zero violations (~8s). Raise `MaxTime` for a
+(12 workers) SANY parses cleanly and TLC reports 8,399,658 states generated, 1,539,916
+distinct, depth 9, zero violations (~11s). Raise `MaxTime` for a
 deeper search; hosts multiply the state space quickly, since every sweep branches over
 the subsets of hosts it might have collected and every host restarts on its own epoch —
 and opening the first window on an empty host is a server start that advances that host's
@@ -68,6 +68,10 @@ collected ones, so a host that fails on its very first attempt is still remember
 later sweep that omits it reads as narrowed rather than complete. A ghost `everAttempted`
 tracks that independently, so `CompletenessCoversEveryAttemptedHost` refutes a mutation
 that reverts the membership to collected-growth (the round-9 first-time-failed-host bug).
+Membership also *shrinks*, but only through the explicit `Retire` action — an operator act,
+never ordinary collection — which removes a host from the fleet and clears the registration
+state kept under it. `NoOwnerFromRetiredHost` is the safety this earns: a retired host's
+stale claim can never remain actionable.
 
 
 ## What is modelled, and what is not
@@ -104,6 +108,7 @@ implementation, named for what it mirrors:
 | `RegistrationStableStep` | `RegistrationStableStep` |
 | `OwnerStableAcrossSweepStep` | `OwnerStableAcrossSweepStep` |
 | `Observed` | `ObservedRequiresAWitnessedRegistration` |
+| `NoOwnerFromRetiredHost` | `RetiringAHostRemovesItAndClearsItsClaims` |
 
 The model is the authority on ordering and memory; those tests are the evidence the C#
 agrees with it.
@@ -123,6 +128,7 @@ here has a mutation that breaks it:
 | sort unregistered windows first instead of last | `OwnerStableAcrossSweepStep` |
 | drop the `viewComplete` guard from `OwnsClaim` | `NoOwnerWhileViewIncomplete` |
 | let a partial sweep rewrite registrations | `NoPhantomDepartureStep` |
+| retire a host but leave it in `lastCollected` with `viewComplete` still true | `NoOwnerFromRetiredHost` |
 | let a registration count against a fleet it was not made against | `OwnerStableAcrossSweepStep` |
 
 Every invariant and property in the config has an entry, which is the bar for calling
