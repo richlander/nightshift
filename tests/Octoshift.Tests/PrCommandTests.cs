@@ -229,6 +229,40 @@ public class PrCommandTests
     }
 
     [Fact]
+    public async Task Locate_ContestedIdleOwnerReleasingWithWorkingFollowerSuggestsPromotion()
+    {
+        // Blocker 3, promotion half at the surface. The owner is idle and asking to stop — a genuine
+        // release — while a follower is still working, so ownership is with the window doing the least. The
+        // report suggests promoting the follower.
+        PrLocationResult result = await LocateAsync(4448, Collection(
+            [
+                Pane("fernie", "%1", "cp:1", agentState: "pr=4448 head=abc1234 rec=stop", windowName: "pr4448", activity: PaneActivity.Idle),
+                Pane("fernie", "%2", "cp:2", agentState: "pr=4448 head=abc1234 reviews=2/2 rec=merge", windowName: "pr4448b", activity: PaneActivity.Working),
+            ],
+            ["fernie"]), Ready);
+
+        Assert.Equal(ClaimRank.Owner, result.Located.Claims[0].Claim.Rank);
+        Assert.Contains("consider promoting it", result.Report(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Locate_ContestedNonIdleOwnerWithStaleStopDoesNotSuggestPromotion()
+    {
+        // Blocker 3: the same shape, but the owner is mid-turn. A stale rec=stop under a working owner is
+        // not a release — the pane is not idle and has handed nothing over — so no follower promotion is
+        // suggested off a record the pane contradicts.
+        PrLocationResult result = await LocateAsync(4448, Collection(
+            [
+                Pane("fernie", "%1", "cp:1", agentState: "pr=4448 head=abc1234 rec=stop", windowName: "pr4448", activity: PaneActivity.Working, capture: "still working\n> "),
+                Pane("fernie", "%2", "cp:2", agentState: "pr=4448 head=abc1234 reviews=2/2 rec=merge", windowName: "pr4448b", activity: PaneActivity.Working),
+            ],
+            ["fernie"]), Ready);
+
+        Assert.Equal(ClaimRank.Owner, result.Located.Claims[0].Claim.Rank);
+        Assert.DoesNotContain("consider promoting it", result.Report(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Locate_APartialFleetFailsAndNamesTheUnreachableHostInJson()
     {
         // A partly invisible fleet cannot produce success-shaped output: the PR may be claimed on the host
@@ -300,6 +334,80 @@ public class PrCommandTests
 
         using JsonDocument doc = JsonDocument.Parse(result.Json());
         Assert.Equal("ready", doc.RootElement.GetProperty("claims")[0].GetProperty("verdict").GetProperty("state").GetString());
+    }
+
+    [Fact]
+    public Task Locate_WithoutGithubFacts_AWorkingClaimStillSurfacesItsVerdict()
+        => AssertVerdictSurfacesWithoutFacts(
+            "pr=4448 head=abc1234 reviews=2/2 rec=merge", PaneActivity.Working, "UNKNOWN", "unknown", "mid-turn");
+
+    [Fact]
+    public Task Locate_WithoutGithubFacts_ABlockedClaimSurfacesToOperator()
+        => AssertVerdictSurfacesWithoutFacts(
+            "pr=4448 head=abc1234", PaneActivity.Blocked, "NEEDSOPERATOR", "needsoperator", "prompt open");
+
+    [Fact]
+    public Task Locate_WithoutGithubFacts_AStalledClaimSurfacesToOperator()
+        => AssertVerdictSurfacesWithoutFacts(
+            "pr=4448 head=abc1234", PaneActivity.Stalled, "NEEDSOPERATOR", "needsoperator", "stalled");
+
+    [Fact]
+    public Task Locate_WithoutGithubFacts_AnUnreadablePaneSurfaces()
+        => AssertVerdictSurfacesWithoutFacts(
+            "pr=4448 head=abc1234", PaneActivity.Unreadable, "UNKNOWN", "unknown", "could not be captured");
+
+    [Fact]
+    public Task Locate_WithoutGithubFacts_AnIdleStopEscalationSurfaces()
+        => AssertVerdictSurfacesWithoutFacts(
+            "pr=4448 head=abc1234 rec=stop", PaneActivity.Idle, "NEEDSOPERATOR", "needsoperator", "asking to stop");
+
+    [Fact]
+    public Task Locate_WithoutGithubFacts_AnIdleApproveEscalationSurfaces()
+        => AssertVerdictSurfacesWithoutFacts(
+            "pr=4448 head=abc1234 rec=approve", PaneActivity.Idle, "NEEDSOPERATOR", "needsoperator", "authorise more rounds");
+
+    private static async Task AssertVerdictSurfacesWithoutFacts(
+        string agentState, PaneActivity activity, string humanState, string jsonState, string reasonFragment)
+    {
+        // Blocker 2: `octoshift pr` must apply the activity/escalation gate to every claim even when GitHub
+        // is unavailable. Working/blocked/stalled/unreadable activity is derived from the pane, not GitHub,
+        // and an idle explicit rec=stop/rec=approve escalation is the agent asking a person to decide — none
+        // of these need the PR to be legible, so suppressing the verdict when Facts is null (the old
+        // `if (facts is null) break;`) erased exactly the signals an operator most needs during an outage.
+        // Both the human report and the JSON must carry the verdict, with GitHub read as unavailable.
+        PrLocationResult result = await LocateAsync(4448, Collection(
+            [Pane("fernie", "%1", "cp:1", agentState: agentState, windowName: "pr4448",
+                activity: activity, capture: "Execution failed: boom\n> ")],
+            ["fernie"]));   // no facts: GitHub unavailable
+
+        string report = result.Report();
+        Assert.Contains($"verdict   {humanState}", report, StringComparison.Ordinal);
+        Assert.Contains(reasonFragment, report, StringComparison.Ordinal);
+
+        using JsonDocument doc = JsonDocument.Parse(result.Json());
+        JsonElement claim = doc.RootElement.GetProperty("claims")[0];
+        Assert.Equal(jsonState, claim.GetProperty("verdict").GetProperty("state").GetString());
+        Assert.Equal("unavailable", doc.RootElement.GetProperty("github").GetString());
+    }
+
+    [Fact]
+    public async Task Locate_WithoutGithubFacts_AGenuinelyGithubDependentIdleClaimStaysLowConfidenceUnknown()
+    {
+        // The complement of the escalation cases: an idle window whose readiness genuinely depends on
+        // GitHub (reviews=2/2 rec=merge) must NOT be invented into a READY when GitHub cannot be read. It
+        // surfaces as a low-confidence UNKNOWN — the verdict is present, but it does not claim a readiness
+        // the tool cannot verify.
+        PrLocationResult result = await LocateAsync(4448, Collection(
+            [Pane("fernie", "%1", "cp:1", agentState: "pr=4448 head=abc1234 reviews=2/2 rec=merge",
+                windowName: "pr4448", activity: PaneActivity.Idle)],
+            ["fernie"]));   // no facts
+
+        string report = result.Report();
+        Assert.Contains("verdict   UNKNOWN", report, StringComparison.Ordinal);
+        Assert.DoesNotContain("READY", report, StringComparison.Ordinal);
+
+        using JsonDocument doc = JsonDocument.Parse(result.Json());
+        Assert.Equal("unknown", doc.RootElement.GetProperty("claims")[0].GetProperty("verdict").GetProperty("state").GetString());
     }
 
     [Fact]

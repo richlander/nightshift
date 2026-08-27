@@ -82,8 +82,16 @@ internal readonly record struct Claim(
     /// acted on: `rec=stop` is a request awaiting an operator, and promoting on an unresolved request
     /// would settle a decision that is not the tool's to make.
     /// </summary>
-    public static bool IsReleasing(AgentState state, WaitingVerdict verdict)
-        => state.Recommendation == Recommendation.Stop
+    /// <remarks>
+    /// A published `rec=stop` is trusted only when the owner pane is idle and has actually handed over
+    /// (<see cref="WaitingVerdict.IsHandover"/>) — the same gate the verdict passes through. An owner
+    /// mid-turn, blocked on a prompt, stalled, or unreadable is not releasing whatever a stale record says,
+    /// so its stale `rec=stop` must not trigger follower promotion. The Merged/Closed half needs no extra
+    /// gate here: <paramref name="verdict"/> is already the activity-gated verdict, which reaches those
+    /// states only from an idle pane.
+    /// </remarks>
+    public static bool IsReleasing(AgentState state, WaitingVerdict verdict, PaneActivity activity)
+        => (WaitingVerdict.IsHandover(activity) && state.Recommendation == Recommendation.Stop)
             || verdict.State is WaitingState.Merged or WaitingState.Closed;
 
     /// <summary>

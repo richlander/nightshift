@@ -701,6 +701,112 @@ internal sealed class PaneHistory : IDisposable
         => _hosts.TryGetValue(TargetId.ForHost(host).Key, out HostMemory? known) ? known.SweptAt : null;
 
     /// <summary>
+    /// The declared fleet as target identities, in a stable order — the local machine first (when it is a
+    /// member), then remotes by key. This is <see cref="KnownHosts"/> wrapped as <see cref="TargetId"/>s
+    /// for display and for deciding what a sweep should reach; the keys are all writer-minted, so wrapping
+    /// them never throws.
+    /// </summary>
+    public IReadOnlyList<TargetId> FleetMembers()
+        => [.. KnownHosts
+            .Select(TargetId.FromKey)
+            .OrderBy(id => id.IsLocal ? 0 : 1)
+            .ThenBy(id => id.Key, StringComparer.Ordinal)];
+
+    /// <summary>Whether a target is a declared fleet member — the check the retire command uses so an
+    /// unknown target is reported rather than silently succeeding.</summary>
+    public bool IsFleetMember(string? host) => KnownHosts.Contains(TargetId.ForHost(host).Key);
+
+    /// <summary>
+    /// The hosts a sweep should reach: the whole declared fleet unioned with the run's extra <c>--host</c>
+    /// targets, so a normal sweep covers everything remembered rather than silently omitting a member and
+    /// reading its narrower view as complete. <c>null</c> stands for the local machine, first.
+    /// </summary>
+    /// <remarks>
+    /// This is the collect-the-declared-fleet half of the manageable-fleet fix: because the history is
+    /// opened before collection, the remembered members are decoded here and folded into the target set,
+    /// so once local and a host have each been attempted a later run reaches both together — the local-then
+    /// -<c>--host</c> ordering that used to leave completeness permanently unsatisfiable now converges on a
+    /// complete view. The local machine is included whenever it is a member; it joins the fleet the first
+    /// time a sweep reaches it, which is any bare run — a fresh fleet with nothing declared and nothing
+    /// requested defaults to the local machine (the bootstrap below), and thereafter every run that keeps
+    /// local a member reaches it alongside the remotes. Retiring local while remotes remain therefore keeps
+    /// it out of subsequent sweeps. Extra hosts are appended in first-seen order and deduplicated by target
+    /// key, so naming an alias that is already a member costs one connection, not two.
+    /// </remarks>
+    public IReadOnlyList<string?> FleetTargets(IReadOnlyList<string> extraHosts)
+    {
+        var targets = new List<string?>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        IReadOnlyCollection<string> declared = KnownHosts;
+        if (declared.Contains(TargetId.Local.Key))
+        {
+            targets.Add(null);
+            seen.Add(TargetId.Local.Key);
+        }
+
+        foreach (TargetId member in declared
+            .Select(TargetId.FromKey)
+            .Where(id => !id.IsLocal)
+            .OrderBy(id => id.Key, StringComparer.Ordinal))
+        {
+            if (seen.Add(member.Key))
+            {
+                targets.Add(member.Display);
+            }
+        }
+
+        foreach (string host in extraHosts)
+        {
+            if (seen.Add(TargetId.ForHost(host).Key))
+            {
+                targets.Add(host);
+            }
+        }
+
+        // A fresh fleet with nothing declared and nothing requested defaults to the local machine, so a
+        // first-ever bare sweep reads this machine and declares it. Once anything is a member or requested,
+        // the lines above have already chosen the target set and this does not fire.
+        if (targets.Count == 0)
+        {
+            targets.Add(null);
+        }
+
+        return targets;
+    }
+
+    /// <summary>
+    /// Retires a target from the declared fleet: an intentional operator act that removes it from
+    /// membership and forgets the host, pane and registration state kept under it. Returns whether it was
+    /// a member, so the command can report an unknown target as a non-success rather than a silent no-op.
+    /// </summary>
+    /// <remarks>
+    /// This is the deliberate way membership shrinks — the counterpart to the round-9 rule that ordinary
+    /// collection never forgets an attempted target. A decommissioned, renamed, or mistyped host would
+    /// otherwise stay in the fleet forever, so every later sweep that cannot reach it reads as narrowed and
+    /// completeness becomes permanently unsatisfiable; retiring it removes that hole. Removing it from both
+    /// <see cref="_attempted"/> and <see cref="_hosts"/> is what takes it out of <see cref="KnownHosts"/>
+    /// (their union), and dropping its pane entries clears any registration and witness recorded on it, so
+    /// no ownership can be derived from a retired host's stale claim. Runs under the same transaction lock
+    /// as a sweep — the command opens the history through <see cref="OpenAsync"/> and commits with
+    /// <see cref="Persist"/> — so a concurrent process cannot race it.
+    /// </remarks>
+    public bool Retire(string? host)
+    {
+        string key = TargetId.ForHost(host).Key;
+        bool known = _attempted.Contains(key) || _hosts.ContainsKey(key);
+
+        _attempted.Remove(key);
+        _hosts.Remove(key);
+        foreach (string pane in PaneKeysOn(key))
+        {
+            _entries.Remove(pane);
+        }
+
+        return known;
+    }
+
+    /// <summary>
     /// The timestamp a transaction stamps its observations with: the sampled wall clock, but never
     /// earlier than the greatest time already persisted in this loaded history. Registration order is the
     /// whole of contested ownership, so a timestamp that moved backwards would invert it — and two things
@@ -885,13 +991,33 @@ internal sealed class PaneHistory : IDisposable
             }
         }
 
-        // The history is load-bearing: it is where a witnessed order lives between runs, so a sweep whose
-        // memory does not reach disk has not narrowed the hosts it failed to see, and a later run could
-        // read a stale witnessed ownership as current. A write failure is therefore a real failure that
-        // the command surfaces as unavailable, not something to swallow. The write is atomic — a fresh
-        // temp file in the same directory, then a rename over the target — so a failure mid-write leaves
-        // the previous valid history intact rather than a truncated one. Only the specific I/O exceptions
-        // are caught, so a cancellation is never laundered into a persistence error.
+        WriteAndRelease();
+        return departed;
+    }
+
+    /// <summary>
+    /// Commits the current maps to disk and releases the transaction lock, without the departure and
+    /// continuity bookkeeping <see cref="Save"/> does for a collecting sweep. This is the commit for a
+    /// fleet-management mutation — <see cref="Retire"/> — which changes membership directly rather than by
+    /// observing a sweep, so it must not run Save's departure logic (which, given no live windows, would
+    /// forget every remembered pane). Like Save, a write failure surfaces as unavailable and keeps the
+    /// lock for the caller's dispose to release.
+    /// </summary>
+    public void Persist() => WriteAndRelease();
+
+    /// <summary>
+    /// The atomic write that is a transaction's commit point. The history is load-bearing: it is where a
+    /// witnessed order lives between runs, so a mutation whose memory does not reach disk has not taken
+    /// effect, and a later run could read a stale witnessed ownership as current. A write failure is
+    /// therefore a real failure the command surfaces as unavailable, not something to swallow. The write
+    /// is atomic — a fresh temp file in the same directory, then a rename over the target — so a failure
+    /// mid-write leaves the previous valid history intact rather than a truncated one. Only the specific
+    /// I/O exceptions are caught, so a cancellation is never laundered into a persistence error. The lock
+    /// is released here rather than held for whatever the caller does next (a report, a rename, a GitHub
+    /// read); a failed write keeps the lock, and the caller's dispose releases it.
+    /// </summary>
+    private void WriteAndRelease()
+    {
         string dir = Path.GetDirectoryName(_path)!;
         string tmp = _path + "." + Environment.ProcessId + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
@@ -908,13 +1034,8 @@ internal sealed class PaneHistory : IDisposable
             throw new HistoryUnavailableException($"could not persist pane history to {_path}: {ex.Message}", ex);
         }
 
-        // Save is the commit: the write has landed, so the transaction lock is released here rather than
-        // held for whatever the caller does next (a report, a rename, a GitHub read). A failed write above
-        // keeps the lock, and the caller's dispose releases it.
         _lock?.Dispose();
         _lock = null;
-
-        return departed;
     }
 
     private static void TryDelete(string path)

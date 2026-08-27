@@ -176,19 +176,50 @@ disposition before the details. A clean find keeps the `PR #…` lead; anything 
 $ octoshift pr 4999
 NOTFOUND PR #4999 — no window claims it and GitHub has no such PR
 
-$ octoshift pr 4537 --host fernie   # fernie answered, but merritt was collected before and is not in this run
-NARROWED PR #4537 — fewer hosts than collected before; a claim may be on a host not swept this run
-  ...
-  NARROWED  fewer hosts than have been collected before; a claim may be on a host not swept this run
-
-$ octoshift pr 4537 --host fernie --host merritt   # merritt was unreachable
+$ octoshift pr 4537   # merritt is a declared member and could not be reached
 PARTIAL PR #4537 — fleet partly unreachable; a claim may be on a host not swept
   ...
   UNREACHABLE merritt: no server running on /tmp/tmux-1000/default
 ```
 
+Every sweep covers the **declared fleet** — the local machine plus every remote ever attempted — not
+merely the hosts this invocation named, so a member is never silently omitted. `--host` *adds* to that
+set (and declares the host for next time); it does not narrow to it. That is what makes a complete view
+reachable: once local and a host have each been swept, a later run reaches both together. A member the
+sweep cannot reach surfaces as `PARTIAL`, and a member that should no longer count is retired (§9), so
+the `NARROWED` disposition — fewer hosts than have been collected before — is now reserved for the
+internal ownership guard rather than an ordinary run.
+
 The `--json` form carries the same truth in its `viewComplete` and `unreachable` fields with the same
 unavailable exit, so it stays a single valid JSON document — the token is never prepended to it.
+
+## 9. Managing the fleet — `octoshift fleet`
+
+The declared fleet grows on its own: attempting a target declares it, which is what keeps a first-time
+failure from being forgotten. The only manual step is retiring a member that should no longer count — a
+decommissioned box, a renamed alias, a typo — because otherwise it is attempted forever and every sweep
+that cannot reach it stays partial.
+
+```
+$ octoshift fleet
+FLEET 3 member(s)
+  local
+  fernie
+  merritt
+
+$ octoshift fleet retire merritt        # merritt was decommissioned
+RETIRED merritt
+
+$ octoshift fleet retire typoo
+UNKNOWN typoo not in the declared fleet   # exit Usage — a typo cannot silently retire the wrong thing
+```
+
+`fleet retire --host <alias>` (repeatable) retires remotes and `--local` retires this machine; an unknown
+target makes the whole command a non-success with nothing written. Retiring a member also prunes the
+host, pane, and registration state kept under it, so no ownership can be derived from a retired host's
+stale claim. `--json` emits the members or the retired set as one document. It is credential-free and
+GitHub-unaware: the fleet is a set of `tmux` collection targets kept in the same machine-local history the
+sweeps use, mutated under the same transaction lock so a retire cannot race a concurrent sweep.
 
 ---
 
@@ -225,7 +256,8 @@ at `4967/5000`.
 # this machine
 octoshift waiting
 
-# collected over ssh, nothing installed on the hosts
+# collected over ssh, nothing installed on the hosts — fernie and merritt join
+# the declared fleet, so later runs reach them (and this machine) automatically
 octoshift waiting --host fernie --host merritt
 
 # include the quiet and healthy windows too
@@ -235,14 +267,20 @@ octoshift waiting --all
 octoshift waiting --rename
 
 # locate one PR and report what is happening to it
-octoshift pr 4537 --host fernie --host merritt
+octoshift pr 4537
+
+# show or prune the declared fleet
+octoshift fleet
+octoshift fleet retire merritt
 
 # same rows, for a dashboard
 octoshift waiting --json
 ```
 
 Hosts are ssh destinations, so `~/.ssh/config` handles jump hosts and control
-sockets.
+sockets. Every sweep covers the whole declared fleet, so `--host` adds a target
+rather than restricting to it; retire a member with `octoshift fleet retire` when
+it is gone for good.
 
 Agents that publish a `@agent_state` tmux window option get richer rows — see
 [`AGENTS.md`](../AGENTS.md) — but the tool is useful before any agent does.

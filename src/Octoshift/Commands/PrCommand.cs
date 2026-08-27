@@ -110,7 +110,13 @@ internal static class PrCommand
         try
         {
             history = await PaneHistory.OpenAsync(historyPath, ct);
-            WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(hosts, scanAsync, ct, perTargetTimeout);
+
+            // Collect the whole declared fleet, not merely this run's --host arguments — the same
+            // decode-the-remembered-members step `waiting` performs. Locating a PR across the fleet is only
+            // as trustworthy as the view is complete, so a lookup must reach every host ever attempted
+            // (local plus remotes) rather than reading a narrower view of the fleet as the whole of it.
+            IReadOnlyList<string?> targets = history.FleetTargets(hosts);
+            WaitingCommand.Collection collected = await WaitingCommand.CollectTargetsAsync(targets, scanAsync, ct, perTargetTimeout);
 
             // Sample the registration clock inside the held transaction, after collection, and clamp it
             // above the greatest time already on disk — the same monotonicity waiting uses, so a pr sweep
@@ -394,8 +400,7 @@ internal static class PrCommand
             // follower is still working, so ownership is with the window that is doing the least. The
             // owner's verdict is read through the same pane-activity gate the verdict lines use, so a
             // working owner with a stale rec is never mistaken for one that has finished and handed over.
-            if (facts is not null
-                && Claim.IsReleasing(claims[0].State, VerdictFor(claims[0].Pane, claims[0].State, facts))
+            if (Claim.IsReleasing(claims[0].State, VerdictFor(claims[0].Pane, claims[0].State, facts), claims[0].Pane.Activity)
                 && claims.Skip(1).Any(c => c.Pane.Activity == PaneActivity.Working))
             {
                 output.WriteLine("            the owner is disengaging while a follower is active — consider promoting it");
@@ -405,14 +410,14 @@ internal static class PrCommand
         output.WriteLine($"  github    {Github(facts, located.Github, now)}");
 
         // One verdict per claim when contested: the disagreement between them is the finding, and
-        // collapsing it to a single row would hide which window the answer came from.
+        // collapsing it to a single row would hide which window the answer came from. Emitted for every
+        // claim even when GitHub could not be read: VerdictFor gates on pane activity first, so a
+        // working/blocked/stalled/unreadable pane resolves from what it is doing — no GitHub needed — and
+        // an idle pane's explicit `rec=stop`/`rec=approve` escalation still reaches the operator with the
+        // PR unread. Only the genuinely GitHub-dependent idle outcomes fall to a low-confidence Unknown,
+        // which is truthful rather than an invented readiness.
         foreach ((TmuxPane pane, AgentState state, _) in claims)
         {
-            if (facts is null)
-            {
-                break;
-            }
-
             WaitingVerdict verdict = VerdictFor(pane, state, facts);
             string from = claims.Count > 1 ? $" [{DisplayText.Safe(pane.Where)}]" : string.Empty;
             output.WriteLine($"  verdict   {verdict.State.ToString().ToUpperInvariant()} ({verdict.Assurance.Label}) — {DisplayText.Safe(verdict.Reason)}{from}");
@@ -601,17 +606,16 @@ internal static class PrCommand
 
             // The verdict, gated on pane activity exactly as the human report gates it, so the two surfaces
             // answer the same claim the same way — a working/blocked/stalled/unreadable pane never carries a
-            // resolved READY here while the human line shows UNKNOWN. Emitted only when GitHub was read,
-            // matching the human report, which prints no verdict line without facts to resolve against.
-            if (facts is not null)
-            {
-                WaitingVerdict verdict = VerdictFor(pane, state, facts);
-                writer.WriteStartObject("verdict");
-                writer.WriteString("state", verdict.State.ToString().ToLowerInvariant());
-                writer.WriteString("confidence", verdict.Assurance.Label);
-                writer.WriteString("reason", verdict.Reason);
-                writer.WriteEndObject();
-            }
+            // resolved READY here while the human line shows UNKNOWN. Emitted for every claim even when
+            // GitHub could not be read: VerdictFor resolves the non-idle activities and an idle explicit
+            // escalation without facts, and only the genuinely GitHub-dependent idle outcomes fall to a
+            // low-confidence unknown, matching the human report which now also prints a verdict per claim.
+            WaitingVerdict verdict = VerdictFor(pane, state, facts);
+            writer.WriteStartObject("verdict");
+            writer.WriteString("state", verdict.State.ToString().ToLowerInvariant());
+            writer.WriteString("confidence", verdict.Assurance.Label);
+            writer.WriteString("reason", verdict.Reason);
+            writer.WriteEndObject();
 
             writer.WriteEndObject();
         }

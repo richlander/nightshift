@@ -2412,6 +2412,57 @@ public class WaitingScanTests
         Assert.Contains("reuse the window", retirement.Advice, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void Retirement_ANonIdlePaneIsNeverRetiredFromAStaleDone()
+    {
+        // Blocker 3, retirement half. `rec=done` is trusted as the agent's final word only when the pane
+        // is idle and has actually handed over. A pane blocked on a prompt, stalled, unreadable, or
+        // mid-turn is not finished whatever it last published, so a stale `rec=done` under it must not
+        // clear the context out from under live work — the same activity gate the verdict passes through.
+        AgentState state = AgentState.Parse("pr=1 head=abc1234 reviews=2/2 rec=done", "pr1")!;
+        WaitingVerdict verdict = new(WaitingState.Holding, RowOwner.Nobody, "in progress", Assurance.High);
+
+        foreach (PaneActivity activity in new[] { PaneActivity.Blocked, PaneActivity.Stalled, PaneActivity.Unreadable, PaneActivity.Working })
+        {
+            Assert.False(Retirement.For(verdict, state, activity).IsRetirable);
+        }
+
+        // The identical record is retirable once the pane is idle, so the gate — not the record — is what
+        // suppressed it above.
+        Assert.True(Retirement.For(verdict, state, PaneActivity.Idle).IsRetirable);
+    }
+
+    [Fact]
+    public void IsReleasing_ANonIdleOwnerWithStaleStopDoesNotTriggerPromotion()
+    {
+        // Blocker 3, promotion half. A stale `rec=stop` under a non-idle owner is not a release: the owner
+        // is mid-turn, blocked, stalled, or unreadable, so it has not handed the claim over and a follower
+        // must not be promoted on the strength of a record the pane contradicts. The Merged/Closed half is
+        // gated separately by the activity-gated verdict.
+        AgentState state = AgentState.Parse("pr=1 head=abc1234 rec=stop", "pr1")!;
+        WaitingVerdict verdict = new(WaitingState.Unknown, RowOwner.Agent, "mid-turn", Assurance.Low("x"));
+
+        foreach (PaneActivity activity in new[] { PaneActivity.Blocked, PaneActivity.Stalled, PaneActivity.Unreadable, PaneActivity.Working })
+        {
+            Assert.False(Claim.IsReleasing(state, verdict, activity));
+        }
+
+        // Idle, the same `rec=stop` is a genuine release the tool may surface.
+        Assert.True(Claim.IsReleasing(state, verdict, PaneActivity.Idle));
+    }
+
+    [Fact]
+    public void IsReleasing_AMergedOrClosedVerdictReleasesRegardlessOfTheRecommendation()
+    {
+        // The other half of releasing: a window whose PR merged or closed is done even without a `rec=stop`.
+        // That verdict only reaches Merged/Closed from an idle pane (ForActivity gates it), so it needs no
+        // extra activity gate here.
+        AgentState state = AgentState.Parse("pr=1 head=abc1234 reviews=2/2 rec=merge", "pr1")!;
+        WaitingVerdict merged = new(WaitingState.Merged, RowOwner.Operator, "merged", Assurance.High);
+
+        Assert.True(Claim.IsReleasing(state, merged, PaneActivity.Idle));
+    }
+
     [Theory]
     [InlineData("✗ Execution failed: 422 This content was flagged for possible cybersecurity risk.")]
     [InlineData("Execution failed: Failed to get response from the AI model; retried 5 times")]

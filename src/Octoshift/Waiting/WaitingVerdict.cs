@@ -127,14 +127,27 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
     }
 
     /// <summary>
+    /// The single pane-activity policy: whether a pane's published record may be trusted as a
+    /// <em>handover</em>. Only an idle pane has stopped and left its status as its final word; a pane
+    /// mid-turn, holding a prompt, stalled, or unreadable is doing (or hiding) something its last published
+    /// record no longer describes. Every place that reads a published <c>rec=</c>/<c>reviews=</c> as fact —
+    /// the verdict gate (<see cref="ForActivity"/>), retirement (<see cref="Retirement.For"/>), and
+    /// follower promotion (<see cref="Claim.IsReleasing"/>) — asks this one predicate, so a stale record
+    /// under a non-idle pane can never drive one decision path while another blocks it. It is exactly the
+    /// set of activities <see cref="ForActivity"/> defers to <c>resolveIdle</c> for.
+    /// </summary>
+    public static bool IsHandover(PaneActivity activity) => activity == PaneActivity.Idle;
+
+    /// <summary>
     /// Wraps the idle-path resolution with the pane-activity gate, so a published record is only ever read
     /// as a handover when the pane is actually idle. A window mid-turn, one holding a prompt open, one whose
     /// runtime stalled, and one that could not be captured each resolve from what the pane is <em>doing</em>
     /// right now, never from what it last <em>published</em> — because a stale <c>reviews=2/2 rec=merge</c>
     /// under a spinner would otherwise reach a high-confidence, actionable verdict on evidence the pane
-    /// itself contradicts. Only the idle/handover case defers to <paramref name="resolveIdle"/>, which joins
-    /// the published state with GitHub. This is the single copy of that policy: both <c>waiting</c> and
-    /// <c>pr</c> call it, so the two surfaces cannot drift into answering the same pane differently.
+    /// itself contradicts. Only the idle/handover case (<see cref="IsHandover"/>) defers to
+    /// <paramref name="resolveIdle"/>, which joins the published state with GitHub. This is the single copy
+    /// of that policy: both <c>waiting</c> and <c>pr</c> call it, so the two surfaces cannot drift into
+    /// answering the same pane differently.
     /// </summary>
     /// <param name="activity">What the pane is doing now, from its capture — the gate.</param>
     /// <param name="capture">The pane body, for the one non-idle case (a stall) that names its reason from it.</param>

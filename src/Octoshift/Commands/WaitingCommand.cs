@@ -216,7 +216,14 @@ internal static class WaitingCommand
         {
             history = await PaneHistory.OpenAsync(historyPath, ct);
 
-            Collection collected = await CollectAsync(hosts, scanAsync, ct, perTargetTimeout);
+            // Collect the whole declared fleet, not merely the run's --host arguments. The history is open,
+            // so the remembered members are decoded and folded into the target set here: a bare sweep
+            // reaches every host ever attempted (local plus remotes), and a --host run adds to that rather
+            // than narrowing to it. This is what makes a complete view reachable — the local-then---host
+            // ordering that used to leave completeness permanently unsatisfiable now converges — while the
+            // attempted membership still grows, so the round-9 safety is intact.
+            IReadOnlyList<string?> targets = history.FleetTargets(hosts);
+            Collection collected = await CollectTargetsAsync(targets, scanAsync, ct, perTargetTimeout);
 
             // Sample the registration clock only now — inside the held transaction, after collection.
             // Sampling it in RunAsync, before the wait for the lock, is the bug: lock acquisition is not
@@ -304,29 +311,60 @@ internal static class WaitingCommand
 
     /// <summary>
     /// Collects from each distinct target in turn. Injectable scan so fan-out, deduplication and partial
-    /// failure are testable without ssh or a tmux server.
+    /// failure are testable without ssh or a tmux server. This overload takes the run's <c>--host</c>
+    /// arguments and reaches exactly those (the local machine when none are given); production goes through
+    /// <see cref="CollectTargetsAsync"/> with the full declared fleet instead, so a sweep covers everything
+    /// remembered rather than only what this invocation named.
     /// </summary>
     /// <remarks>
     /// Repeats are dropped in first-seen order: naming an alias twice is a typo, and honouring it would
     /// buy a second ssh connection and a duplicate of every row and count that host contributes.
-    ///
-    /// Each target runs under a linked token that also fires after <paramref name="perTargetTimeout"/>
-    /// (default <see cref="DefaultTargetTimeout"/>). A target that trips its own deadline is recorded as
-    /// unreachable and the sweep moves on, so one hung host cannot hold the others hostage. The caller's
-    /// <paramref name="ct"/> is different in kind: when it is what cancelled, the cancellation propagates
-    /// rather than being laundered into an unreachable host — and it escapes carrying exactly
-    /// <paramref name="ct"/>, never the internal linked token, so the caller sees its own token back.
-    /// <paramref name="perTargetTimeout"/> is an internal seam so a test can drive the deadline in
-    /// milliseconds without a wall-clock wait.
     /// </remarks>
-    internal static async Task<Collection> CollectAsync(
+    internal static Task<Collection> CollectAsync(
         IReadOnlyList<string> hosts,
+        Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> scanAsync,
+        CancellationToken ct,
+        TimeSpan? perTargetTimeout = null)
+        => CollectTargetsAsync(
+            hosts.Count > 0 ? [.. HostTarget.Distinct(hosts)] : [null],
+            scanAsync, ct, perTargetTimeout);
+
+    /// <summary>
+    /// Collects from an explicit target list — <c>null</c> for the local machine, an alias for a remote —
+    /// in order. This is the core the production path uses with the whole declared fleet
+    /// (<see cref="PaneHistory.FleetTargets"/>); <see cref="CollectAsync"/> is the thin wrapper that turns
+    /// a run's <c>--host</c> arguments into a target list for the tests that drive collection directly.
+    /// </summary>
+    /// <remarks>
+    /// Repeats are dropped by target identity in first-seen order, so a member that a <c>--host</c>
+    /// argument also names is reached once, not twice. Each target runs under a linked token that also
+    /// fires after <paramref name="perTargetTimeout"/> (default <see cref="DefaultTargetTimeout"/>). A
+    /// target that trips its own deadline is recorded as unreachable and the sweep moves on, so one hung
+    /// host cannot hold the others hostage. The caller's <paramref name="ct"/> is different in kind: when
+    /// it is what cancelled, the cancellation propagates rather than being laundered into an unreachable
+    /// host — and it escapes carrying exactly <paramref name="ct"/>, never the internal linked token, so
+    /// the caller sees its own token back. <paramref name="perTargetTimeout"/> is an internal seam so a
+    /// test can drive the deadline in milliseconds without a wall-clock wait.
+    /// </remarks>
+    internal static async Task<Collection> CollectTargetsAsync(
+        IReadOnlyList<string?> requested,
         Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> scanAsync,
         CancellationToken ct,
         TimeSpan? perTargetTimeout = null)
     {
         TimeSpan timeout = perTargetTimeout ?? DefaultTargetTimeout;
-        IReadOnlyList<string?> targets = hosts.Count > 0 ? [.. HostTarget.Distinct(hosts)] : [null];
+
+        // Deduplicate by target identity, not raw string, so the local sentinel and a remote alias cannot
+        // collide and a member already reached is not swept twice.
+        var targets = new List<string?>();
+        var seenTargets = new HashSet<string>(StringComparer.Ordinal);
+        foreach (string? host in requested)
+        {
+            if (seenTargets.Add(TargetId.ForHost(host).Key))
+            {
+                targets.Add(host);
+            }
+        }
 
         var panes = new List<TmuxPane>();
         var unreachable = new List<string>();

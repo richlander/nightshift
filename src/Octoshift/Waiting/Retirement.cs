@@ -49,8 +49,14 @@ internal readonly record struct Retirement(RetirementReason Reason, string Advic
     /// </summary>
     public static Retirement For(WaitingVerdict verdict, AgentState? state, PaneActivity activity)
     {
-        // An agent mid-turn is not finished, whatever it last published.
-        if (activity == PaneActivity.Working)
+        // Retirement says a window's work is over, and only an idle pane that has handed over can be spent.
+        // A pane mid-turn, holding a prompt, stalled, or unreadable is not finished whatever it last
+        // published, so neither a stale `rec=done` nor a Merged/Closed verdict it should never have reached
+        // while non-idle may clear the context out from under live work. This is the same activity gate the
+        // verdict and follower promotion pass through (WaitingVerdict.IsHandover), so the ancillary
+        // retirement decision cannot disagree with the verdict about whether the record still describes the
+        // pane. A non-idle window's disposition comes from its activity-derived verdict alone.
+        if (!WaitingVerdict.IsHandover(activity))
         {
             return None;
         }

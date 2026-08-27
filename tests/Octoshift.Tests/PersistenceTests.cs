@@ -159,32 +159,29 @@ public sealed class PersistenceTests
     }
 
     [Fact]
-    public async Task CollectAndResolveAsync_AFirstTimeFailedHostIsRememberedSoALaterOmissionNarrowsTheView()
+    public async Task CollectAndResolveAsync_AFirstTimeFailedHostIsRememberedAndReAttemptedSoTheViewStaysHonest()
     {
-        // Round 9, blocker 1 (waiting surface). The exact two-sweep laundering: a sweep attempts A and a
-        // never-before-seen B; B fails before it ever collects, so the sweep is partial and A is not owned.
-        // Because B has no epoch or continuity — it never answered — the earlier design forgot it entirely,
-        // and a LATER sweep of A alone read as a complete view and granted A sole ownership while a rival
-        // could still be running on the unreached B. Attempted fleet membership is now persisted apart from
-        // successful collection, so the A-only sweep sees B omitted and A's sole claim stays non-actionable.
+        // Round 9, blocker 1 (waiting surface), under the round-10 declared-fleet model. A sweep attempts A
+        // and a never-before-seen B; B fails before it ever collects, so the sweep is partial and A is not
+        // owned. Because B is now persistent fleet membership, a LATER sweep — even one whose --host names
+        // only A — re-attempts B (FleetTargets folds the declared fleet into the target set), so B cannot be
+        // silently omitted and read as a complete view. While B is still down the later sweep is PARTIAL and
+        // A's sole claim stays non-actionable; the round-9 laundering (forget B, then read A-alone as
+        // complete) is impossible because B is never dropped by ordinary collection.
         string path = Path.Combine(Path.GetTempPath(), $"octoshift-firsttimefail-{Guid.NewGuid():N}.json");
         DateTimeOffset t = new(2026, 8, 26, 3, 0, 0, TimeSpan.Zero);
         CancellationToken ct = TestContext.Current.CancellationToken;
 
-        // Sweep 1 attempts A and B: A claims 4448; B fails before it collects anything.
-        Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> sweep1 = (host, _) =>
+        // Both sweeps: A claims 4448; B fails before it collects anything.
+        Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> sweep = (host, _) =>
             host == "hb"
                 ? throw new TmuxUnavailableException("hb: no server running")
                 : Task.FromResult<IReadOnlyList<TmuxPane>>([Window("ha", "pr=4448 head=abc1234")]);
 
-        // Sweep 2 attempts only A, which answers with the same claim.
-        Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> sweep2 = (host, _) =>
-            Task.FromResult<IReadOnlyList<TmuxPane>>([Window("ha", "pr=4448 head=abc1234")]);
-
         try
         {
             WaitingCommand.FleetResult first = await WaitingCommand.CollectAndResolveAsync(
-                ["ha", "hb"], sweep1, None, None, t, ct, historyPath: path);
+                ["ha", "hb"], sweep, None, None, t, ct, historyPath: path);
             Assert.True(first.Collected.AnyFailure);                       // B failed: sweep 1 is partial
             Assert.False(first.Rows!.Single().Claim.OwnsClaim);           // and A is not owned
 
@@ -194,13 +191,15 @@ public sealed class PersistenceTests
             Assert.Contains(TargetId.ForHost("hb").Key, afterFirst.KnownHosts);
             Assert.Null(afterFirst.SweptAt("hb"));                         // no successful collection recorded
 
+            // A --host run naming only A still re-attempts B, because the declared fleet drives collection.
             WaitingCommand.FleetResult second = await WaitingCommand.CollectAndResolveAsync(
-                ["ha"], sweep2, None, None, t.AddMinutes(10), ct, historyPath: path);
+                ["ha"], sweep, None, None, t.AddMinutes(10), ct, historyPath: path);
 
-            // The A-only sweep is narrowed, not complete: B is omitted, and A's sole claim is not actionable.
-            Assert.Contains(TargetId.ForHost("hb").Display, WaitingCommand.Omitted);
+            // B is re-attempted and still down, so the second sweep is PARTIAL — not a complete view — and
+            // A's sole claim is not actionable.
+            Assert.True(second.Collected.AnyFailure);
+            Assert.Contains(second.Collected.Unreachable, m => m.Contains("hb", StringComparison.Ordinal));
             WaitingRow aRow = Assert.Single(second.Rows!);
-            Assert.Equal(ClaimBasis.PartialView, aRow.Claim.Basis);
             Assert.False(aRow.Claim.OwnsClaim);
             Assert.False(aRow.MayAct);
         }
@@ -212,39 +211,80 @@ public sealed class PersistenceTests
     }
 
     [Fact]
-    public async Task CollectAndLocateAsync_AFirstTimeFailedHostIsRememberedSoALaterOmissionNarrowsThePrView()
+    public async Task CollectAndResolveAsync_RetiringAFailedHostMakesTheViewCompleteAndTheSoleClaimActionable()
     {
-        // Round 9, blocker 1 (pr surface): the same two-sweep laundering, through `octoshift pr`. A+B
-        // attempted with B failing on first sight; a later A-only lookup must not report A as the located
-        // sole claimant of a complete view — B is remembered, so the view reads NARROWED and the order is
-        // unconfirmed.
-        string path = Path.Combine(Path.GetTempPath(), $"octoshift-prfirsttimefail-{Guid.NewGuid():N}.json");
+        // Round 10, blocker 1: retirement is the deliberate way a stale member leaves the fleet. B was
+        // attempted once and failed (a decommissioned box), so every later sweep re-attempts it and reads
+        // PARTIAL — completeness is unsatisfiable until an operator retires B. After `fleet retire`, B is no
+        // longer a member, the A-only sweep is a complete view, and A's sole claim becomes actionable.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-retirecomplete-{Guid.NewGuid():N}.json");
         DateTimeOffset t = new(2026, 8, 26, 3, 0, 0, TimeSpan.Zero);
         CancellationToken ct = TestContext.Current.CancellationToken;
 
-        Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> sweep1 = (host, _) =>
+        Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> sweep = (host, _) =>
             host == "hb"
                 ? throw new TmuxUnavailableException("hb: no server running")
                 : Task.FromResult<IReadOnlyList<TmuxPane>>([Window("ha", "pr=4448 head=abc1234")]);
 
-        Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> sweep2 = (host, _) =>
-            Task.FromResult<IReadOnlyList<TmuxPane>>([Window("ha", "pr=4448 head=abc1234")]);
+        try
+        {
+            WaitingCommand.FleetResult first = await WaitingCommand.CollectAndResolveAsync(
+                ["ha", "hb"], sweep, None, None, t, ct, historyPath: path);
+            Assert.True(first.Collected.AnyFailure);
+            Assert.False(first.Rows!.Single().Claim.OwnsClaim);
+
+            // Retire B under the same transaction the sweeps use.
+            int retire = await FleetCommand.RunRetireAsync(["hb"], local: false, json: false, ct, historyPath: path);
+            Assert.Equal(ExitCode.Ok, retire);
+
+            var afterRetire = new PaneHistory(path);
+            Assert.DoesNotContain(TargetId.ForHost("hb").Key, afterRetire.KnownHosts);
+
+            // The A-only sweep now covers the whole declared fleet, so the view is complete and A owns 4448.
+            WaitingCommand.FleetResult second = await WaitingCommand.CollectAndResolveAsync(
+                [], sweep, None, None, t.AddMinutes(10), ct, historyPath: path);
+            Assert.False(second.Collected.AnyFailure);
+            Assert.Empty(WaitingCommand.Omitted);
+            WaitingRow aRow = Assert.Single(second.Rows!);
+            Assert.True(aRow.Claim.OwnsClaim);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task CollectAndLocateAsync_AFirstTimeFailedHostIsRememberedAndReAttemptedOnThePrView()
+    {
+        // Round 9, blocker 1 (pr surface), under the round-10 declared-fleet model. A+B attempted with B
+        // failing on first sight; a later A-only lookup re-attempts B (the fleet drives collection), so the
+        // view stays PARTIAL while B is down rather than reporting A as the sole claimant of a complete view.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-prfirsttimefail-{Guid.NewGuid():N}.json");
+        DateTimeOffset t = new(2026, 8, 26, 3, 0, 0, TimeSpan.Zero);
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> sweep = (host, _) =>
+            host == "hb"
+                ? throw new TmuxUnavailableException("hb: no server running")
+                : Task.FromResult<IReadOnlyList<TmuxPane>>([Window("ha", "pr=4448 head=abc1234")]);
 
         try
         {
             PrCommand.PrLocation first = await PrCommand.CollectAndLocateAsync(
-                4448, ["ha", "hb"], sweep1, NoneFetch, None, t, ct, historyPath: path);
+                4448, ["ha", "hb"], sweep, NoneFetch, None, t, ct, historyPath: path);
             Assert.Equal(PrCommand.PrDisposition.Partial, first.Disposition);   // B unreachable
 
             var afterFirst = new PaneHistory(path);
             Assert.Contains(TargetId.ForHost("hb").Key, afterFirst.KnownHosts);
 
             PrCommand.PrLocation second = await PrCommand.CollectAndLocateAsync(
-                4448, ["ha"], sweep2, NoneFetch, None, t.AddMinutes(10), ct, historyPath: path);
+                4448, ["ha"], sweep, NoneFetch, None, t.AddMinutes(10), ct, historyPath: path);
 
-            // B is remembered, so the A-only lookup is narrowed rather than a complete Found, its exit is
-            // unavailable, and the located claim's order is left unconfirmed rather than observed.
-            Assert.Equal(PrCommand.PrDisposition.Narrowed, second.Disposition);
+            // B is re-attempted and still down, so the A-only lookup stays PARTIAL, its exit is unavailable,
+            // and the located claim's order is left unconfirmed rather than observed.
+            Assert.Equal(PrCommand.PrDisposition.Partial, second.Disposition);
             Assert.Equal(ExitCode.Unavailable, second.ExitCode);
             Assert.Equal(ClaimBasis.PartialView, Assert.Single(second.Claims).Claim.Basis);
         }

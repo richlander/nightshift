@@ -93,4 +93,33 @@ public class CliParseTests
     [Fact]
     public void For_RefusesToBuildSshArgumentsFromAnOptionShapedHost()
         => Assert.Throws<ArgumentException>(() => ShellRunner.For("-V"));
+
+    [Fact]
+    public void CreateRootCommand_ParsesTheFleetVerb()
+    {
+        var result = Cli.CreateRootCommand().Parse(["fleet"]);
+
+        Assert.Empty(result.Errors);
+        Assert.Equal("fleet", result.CommandResult.Command.Name);
+    }
+
+    [Theory]
+    [InlineData("list")]
+    [InlineData("retire")]
+    public void CreateRootCommand_ParsesTheFleetSubcommands(string sub)
+    {
+        var result = Cli.CreateRootCommand().Parse(["fleet", sub, .. sub == "retire" ? new[] { "--host", "fernie" } : []]);
+
+        Assert.Empty(result.Errors);
+        Assert.Equal(sub, result.CommandResult.Command.Name);
+    }
+
+    [Fact]
+    public void CreateRootCommand_FleetRetireRejectsAnOptionShapedHost()
+    {
+        var result = Cli.CreateRootCommand().Parse(["fleet", "retire", "--host=-V"]);
+
+        Assert.NotEmpty(result.Errors);
+        Assert.Contains(result.Errors, e => e.Message.Contains("--host", StringComparison.Ordinal));
+    }
 }

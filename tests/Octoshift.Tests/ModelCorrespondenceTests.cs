@@ -393,6 +393,54 @@ public class ModelCorrespondenceTests
     }
 
     /// <summary>
+    /// TLA+ <c>Retire</c> and the <c>NoOwnerFromRetiredHost</c> invariant. Membership shrinks only through
+    /// the explicit operator act — never ordinary collection — and retiring a host removes it from the
+    /// declared fleet and clears the registration state kept under it, so no ownership can be derived from a
+    /// retired host's stale claim. The code realises <c>Retire</c> as <see cref="PaneHistory.Retire"/>: it
+    /// drops the target from <see cref="PaneHistory.KnownHosts"/> and prunes its pane entries (its claim and
+    /// witness), while leaving every other host's registration intact. An unknown target is reported rather
+    /// than silently retired, which is what keeps the operator act unambiguous.
+    /// </summary>
+    [Fact]
+    public void RetiringAHostRemovesItAndClearsItsClaims()
+    {
+        string path = TempPath();
+        try
+        {
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+            TmuxPane onFernie = Window("%1", host: "fernie");
+            TmuxPane onMerritt = Window("%9", host: "merritt");
+
+            var first = new PaneHistory(path);
+            first.AdoptEpoch("fernie", "100:1", t);
+            first.AdoptEpoch("merritt", "200:1", t);
+            first.Observe(onFernie, t, claimedPr: 4448, registrationWitnessed: true);
+            first.Observe(onMerritt, t, claimedPr: 4449, registrationWitnessed: true);
+            first.Save([onFernie, onMerritt], ["fernie", "merritt"]);
+
+            // Retire fernie: it must be a known member (so an unknown target is a non-success), it leaves the
+            // fleet, its claim and witness are gone, and merritt is untouched.
+            var retiring = new PaneHistory(path);
+            Assert.True(retiring.IsFleetMember("fernie"));
+            Assert.False(retiring.IsFleetMember("banff"));
+            Assert.True(retiring.Retire("fernie"));           // known member: retired
+            Assert.False(retiring.Retire("banff"));           // unknown: reported, not a silent success
+            retiring.Persist();
+
+            var reopened = new PaneHistory(path);
+            Assert.DoesNotContain(TargetId.ForHost("fernie").Key, reopened.KnownHosts);
+            Assert.Null(reopened.ClaimedAt(onFernie));        // the retired host's registration is gone
+            Assert.False(reopened.IsWitnessed(onFernie));
+            Assert.Contains(TargetId.ForHost("merritt").Key, reopened.KnownHosts);
+            Assert.NotNull(reopened.ClaimedAt(onMerritt));    // an untouched host keeps its registration
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    /// <summary>
     /// TLA+ <c>Sweep</c> completeness, the round-8 clause: <c>viewComplete' = (attempted ⊆ collected) ∧
     /// (knownHosts ⊆ collected)</c>. A target attempted for the very first time — never in KnownHosts —
     /// that fails leaves the second conjunct holding vacuously (<c>{} ⊆ collected</c>), so deriving

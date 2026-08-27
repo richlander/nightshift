@@ -7,7 +7,7 @@ using Octoshift.Waiting;
 /// <summary>Entry dispatch for the <c>octoshift</c> GitHub-membrane CLI.</summary>
 public static class Cli
 {
-    private const string Usage = "usage: octoshift <reconcile|wait|watch|waiting|pr> ...";
+    private const string Usage = "usage: octoshift <reconcile|wait|watch|waiting|pr|fleet> ...";
 
     /// <summary>
     /// The global <c>--socket</c> override, inherited by every verb and passed through to the
@@ -19,7 +19,7 @@ public static class Cli
         Recursive = true,
     };
 
-    private static readonly HashSet<string> KnownVerbs = ["reconcile", "wait", "watch", "waiting", "pr"];
+    private static readonly HashSet<string> KnownVerbs = ["reconcile", "wait", "watch", "waiting", "pr", "fleet"];
 
     /// <summary>Parses and invokes the command line, preserving the exit-code contract.</summary>
     public static async Task<int> RunAsync(string[] args)
@@ -55,6 +55,7 @@ public static class Cli
         rootCommand.Subcommands.Add(CreateWatchCommand());
         rootCommand.Subcommands.Add(CreateWaitingCommand());
         rootCommand.Subcommands.Add(CreatePrCommand());
+        rootCommand.Subcommands.Add(CreateFleetCommand());
         return rootCommand;
     }
 
@@ -193,11 +194,49 @@ public static class Cli
         return command;
     }
 
-    private static Option<string[]> CreateHostOption()
+    private static Command CreateFleetCommand()
+    {
+        var command = new Command("fleet", "Show or retire the declared fleet of targets that waiting and pr sweep.");
+
+        // `octoshift fleet` with no subcommand lists the fleet — the reflex use — so the default action is
+        // the list. `list` is also spellable explicitly for symmetry with `retire`.
+        var listJson = new Option<bool>("--json") { Description = "Emit the fleet as JSON instead of a table." };
+        command.Options.Add(listJson);
+        command.SetAction(async (parseResult, cancellationToken) => await FleetCommand.RunListAsync(
+            parseResult.GetValue(listJson),
+            cancellationToken));
+
+        var list = new Command("list", "List the declared fleet members.");
+        var listSubJson = new Option<bool>("--json") { Description = "Emit the fleet as JSON instead of a table." };
+        list.Options.Add(listSubJson);
+        list.SetAction(async (parseResult, cancellationToken) => await FleetCommand.RunListAsync(
+            parseResult.GetValue(listSubJson),
+            cancellationToken));
+        command.Subcommands.Add(list);
+
+        var retire = new Command("retire", "Retire members from the declared fleet so sweeps stop expecting them.");
+        Option<string[]> retireHost = CreateHostOption("Retire this host alias from the fleet; repeatable.");
+        var retireLocal = new Option<bool>("--local") { Description = "Retire the local machine from the fleet." };
+        var retireJson = new Option<bool>("--json") { Description = "Emit the result as JSON instead of a token line." };
+        retire.Options.Add(retireHost);
+        retire.Options.Add(retireLocal);
+        retire.Options.Add(retireJson);
+        retire.SetAction(async (parseResult, cancellationToken) => await FleetCommand.RunRetireAsync(
+            parseResult.GetValue(retireHost) ?? [],
+            parseResult.GetValue(retireLocal),
+            parseResult.GetValue(retireJson),
+            cancellationToken));
+        command.Subcommands.Add(retire);
+
+        return command;
+    }
+
+    private static Option<string[]> CreateHostOption(
+        string description = "Collect from this host over ssh; repeatable. Omit to read this machine's tmux.")
     {
         var host = new Option<string[]>("--host")
         {
-            Description = "Collect from this host over ssh; repeatable. Omit to read this machine's tmux.",
+            Description = description,
             Arity = ArgumentArity.OneOrMore,
             AllowMultipleArgumentsPerToken = false,
         };
