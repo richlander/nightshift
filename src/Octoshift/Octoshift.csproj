@@ -6,6 +6,7 @@
     <RootNamespace>Octoshift</RootNamespace>
     <ToolCommandName>octoshift</ToolCommandName>
     <PublishAot>true</PublishAot>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>

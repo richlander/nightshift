@@ -5,11 +5,12 @@ using Octoshift.GitHub;
 using Xunit;
 
 /// <summary>
-/// How a <c>gh</c> subprocess is run. The retained runner has to take its whole process tree down when the
-/// caller cancels — an abandoned <c>gh</c> holds a token in its environment — and it has to drain both output
-/// streams concurrently with the wait so a burst larger than a pipe buffer is neither truncated nor able to
-/// deadlock the child. The program name is a seam so these facts are provable against a purpose-built child
-/// rather than only the real binary.
+/// How a <c>gh</c> subprocess is run. On Unix the runner puts the child in its own process group and tears
+/// that group down — every descendant, independent of the root's lifetime — before returning, so a cancelled
+/// or completed <c>gh</c> never leaves a token-bearing process behind. It also drains both output streams
+/// concurrently with the wait so a burst larger than a pipe buffer is neither truncated nor able to deadlock
+/// the child. The program name is a seam so these facts are provable against a purpose-built child rather than
+/// only the real binary.
 /// </summary>
 public class GhAuthenticatedRunnerTests
 {
@@ -80,8 +81,8 @@ public class GhAuthenticatedRunnerTests
         try
         {
             // $0 is the directory. The descendant writes its own pid and idles; the child writes its pid,
-            // waits for the descendant's pid to exist, signals ready, then idles. SIGKILL from a tree kill
-            // cannot be trapped, so nothing here can survive it.
+            // waits for the descendant's pid to exist, signals ready, then idles. Killing the process group
+            // with SIGKILL cannot be trapped, so nothing here can survive it.
             string script =
                 "d=\"$0\"; " +
                 "sh -c 'echo $$ > \"$0/desc.pid\"; while : ; do sleep 0.1; done' \"$d\" & " +
@@ -105,11 +106,85 @@ public class GhAuthenticatedRunnerTests
             await cts.CancelAsync();
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
 
-            // The runner has returned only now. The direct child is awaited to exit before it returns, so it
-            // is dead the instant the await unblocks; the descendant is SIGKILL'd as part of the tree, and a
+            // The runner has returned only now. The direct child is reaped before it returns, so it is dead
+            // the instant the await unblocks; the descendant is killed as part of the process group, and a
             // bounded wait-for-death (not a fixed sleep) absorbs only the kernel's reap latency. Neither is
             // left running behind a completed runner.
             Assert.False(IsAlive(childPid), "child was still alive after the runner completed cancellation");
+            await AssertDiesAsync(descPid, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch (IOException) { }
+        }
+    }
+
+    [Fact]
+    public async Task RunProcessAsync_RootExitsButDescendantHoldingThePipeIsContainedNotLeaked()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "The gh runner path starts a POSIX child here; there is nothing to start on Windows.");
+
+        // The hard case for a root-relative tree kill: the root (the direct child) exits, leaving a descendant
+        // that inherited the stdout pipe and idles forever. A snapshot rooted at the now-dead parent can no
+        // longer discover that descendant, so it would leak — and because it still holds the write end, the
+        // drain would never see EOF and the runner would hang. Real process-group containment sweeps it after
+        // the root exits, which both kills the leak and closes the pipe. Completion here is itself the proof
+        // the descendant died: the drain cannot finish while the descendant holds the pipe.
+        //
+        // The descendant publishes its pid and signals readiness before the root exits, so the pid is captured
+        // deterministically rather than racing the (correctly prompt) containment kill.
+        string dir = Path.Combine(AppContext.BaseDirectory, $"gh-runner-inherit-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        try
+        {
+            string script =
+                "d=\"$0\"; " +
+                "sh -c 'echo $$ > \"$0/desc.pid\"; : > \"$0/ready\"; while : ; do sleep 0.1; done' \"$d\" & " +
+                "while [ ! -f \"$d/ready\" ]; do sleep 0.01; done; " +
+                "exit 0";
+
+            Task<GhResult> run = GhAuthenticatedRunner.RunProcessAsync("/bin/sh", ["-c", script, dir], null, TestContext.Current.CancellationToken);
+
+            int descPid = await WaitForPidAsync(Path.Combine(dir, "desc.pid"), TestContext.Current.CancellationToken);
+
+            // If containment were missing, this would hang on the never-closing pipe; the timeout turns that
+            // into a clear failure instead of a hung suite.
+            GhResult result = await run.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+
+            Assert.Equal(0, result.ExitCode);
+            await AssertDiesAsync(descPid, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch (IOException) { }
+        }
+    }
+
+    [Fact]
+    public async Task RunProcessAsync_RootExitsAndDescendantThatClosedItsPipesIsStillContained()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "The gh runner path starts a POSIX child here; there is nothing to start on Windows.");
+
+        // Companion to the inherited-pipe case: here the descendant closes its inherited stdout/stderr before
+        // idling, so the drains reach EOF on their own and cannot prove anything. The descendant is
+        // nonetheless still alive after the root exits, and only group containment reaches it. The runner must
+        // have killed it before returning — not left it for a post-return sweep by the test.
+        string dir = Path.Combine(AppContext.BaseDirectory, $"gh-runner-closed-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        try
+        {
+            string script =
+                "d=\"$0\"; " +
+                "sh -c 'echo $$ > \"$0/desc.pid\"; exec 1>&- 2>&-; : > \"$0/ready\"; while : ; do sleep 0.1; done' \"$d\" & " +
+                "while [ ! -f \"$d/ready\" ]; do sleep 0.01; done; " +
+                "exit 0";
+
+            Task<GhResult> run = GhAuthenticatedRunner.RunProcessAsync("/bin/sh", ["-c", script, dir], null, TestContext.Current.CancellationToken);
+
+            int descPid = await WaitForPidAsync(Path.Combine(dir, "desc.pid"), TestContext.Current.CancellationToken);
+            GhResult result = await run.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+
+            Assert.Equal(0, result.ExitCode);
             await AssertDiesAsync(descPid, TestContext.Current.CancellationToken);
         }
         finally
