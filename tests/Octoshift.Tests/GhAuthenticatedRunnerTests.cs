@@ -144,19 +144,25 @@ public class GhAuthenticatedRunnerTests
         }
     }
 
-    [Fact]
-    public async Task RunProcessAsync_WhenTerminationCannotBeConfirmed_FailsPromptlyWithoutHanging()
+    [Theory]
+    // Kill "accepted" but the process never dies (the reviewer's accepted-but-unconfirmed defect): a bounded
+    // confirmation must not turn into an unbounded await.
+    [InlineData(true)]
+    // Kill could not even be requested: the same deterministic cleanup failure.
+    [InlineData(false)]
+    public async Task RunProcessAsync_WhenExitCannotBeConfirmed_FailsPromptlyWithoutHanging(bool killRequestSucceeds)
     {
         Assert.SkipWhen(OperatingSystem.IsWindows(), "The gh runner path starts a POSIX child here; there is nothing to start on Windows.");
 
-        // The injected strategy reports the launched process's termination as unconfirmable, so cleanup must
-        // not await its exit (or the completion task, which begins by awaiting that same exit) — doing so would
-        // deadlock forever, since the process is genuinely still alive and holding its output pipes. The runner
-        // must instead close the streams, observe the drains, and fail promptly with GhProcessCleanupException.
-        // A regression of the deadlock would hang until the timeout turned into a TimeoutException, which is not
-        // a GhProcessCleanupException — so this assertion is exactly the promptness check. The still-live
-        // process is not killed by cleanup on this path, so the test cleans it up itself.
-        string dir = Path.Combine(AppContext.BaseDirectory, $"gh-runner-noterm-{Guid.NewGuid():N}");
+        // The injected kill request reports its result but never actually kills, and the launched process is a
+        // genuinely live sleep still holding its output pipes — so the exit task never completes. Because a
+        // kill only requests termination (it returns before the process is signalled), cleanup must confirm
+        // exit with a bounded wait: with a short bound it must give up and fail promptly with
+        // GhProcessCleanupException rather than await the exit (or completion, which begins by awaiting it)
+        // forever. A regression of the unbounded await would hang until the outer 30s timeout turned into a
+        // TimeoutException — which is not a GhProcessCleanupException — so this assertion is exactly the
+        // promptness check. The still-live process is not killed on this path, so the test cleans it up itself.
+        string dir = Path.Combine(AppContext.BaseDirectory, $"gh-runner-noconfirm-{Guid.NewGuid():N}");
         Directory.CreateDirectory(dir);
         int pid = 0;
         try
@@ -165,7 +171,12 @@ public class GhAuthenticatedRunnerTests
 
             using var cts = new CancellationTokenSource();
             Task<GhResult> run = GhAuthenticatedRunner.RunProcessAsync(
-                "/bin/sh", ["-c", script, dir], null, static _ => false, cts.Token);
+                "/bin/sh",
+                ["-c", script, dir],
+                null,
+                (proc, tree) => killRequestSucceeds,
+                TimeSpan.FromMilliseconds(150),
+                cts.Token);
 
             pid = await WaitForPidAsync(Path.Combine(dir, "pid"), TestContext.Current.CancellationToken);
             Assert.True(IsAlive(pid), "launched process was not running before cancellation");

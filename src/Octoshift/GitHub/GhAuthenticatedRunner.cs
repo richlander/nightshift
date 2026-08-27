@@ -42,30 +42,43 @@ internal static class GhAuthenticatedRunner
     /// stdout/stderr. On ordinary completion the full output and exit code are returned. On cancellation the
     /// contract is scoped to the process we launch: the tree is asked to die (best-effort
     /// <see cref="Process.Kill(bool)"/>, so a descendant that outlived the root may not be reached — durable
-    /// descendant containment is tracked separately), but the direct token-bearing process is always
-    /// confirmed exited and both output reads are unblocked and observed before the cancellation propagates,
-    /// so the runner never returns with the launched process alive nor leaves a drain task running. The
-    /// program name is a parameter so this can be exercised against a purpose-built child rather than only the
-    /// real <c>gh</c> binary.
+    /// descendant containment is tracked separately), and the direct token-bearing process's exit is confirmed
+    /// by a bounded wait (a kill only requests termination, so exit is never assumed); if it cannot be
+    /// confirmed in time the runner fails deterministically with <see cref="GhProcessCleanupException"/> rather
+    /// than hanging. Either way both output reads are unblocked and observed before the runner returns, so it
+    /// never returns while the launched process is confirmed alive nor leaves a drain task running. The program
+    /// name is a parameter so this can be exercised against a purpose-built child rather than only the real
+    /// <c>gh</c> binary.
     /// </summary>
     internal static Task<GhResult> RunProcessAsync(
         string file,
         IReadOnlyList<string> args,
         IReadOnlyDictionary<string, string?>? environmentOverrides,
         CancellationToken ct)
-        => RunProcessAsync(file, args, environmentOverrides, RequestTermination, ct);
+        => RunProcessAsync(file, args, environmentOverrides, TryKill, DefaultTerminationConfirmation, ct);
 
     /// <summary>
-    /// Seam for tests: <paramref name="requestTermination"/> decides whether the launched process's exit can
-    /// be requested/confirmed during cancellation cleanup. Injecting it is how the "termination unconfirmed"
-    /// path is exercised deterministically, rather than trying to make the OS refuse a kill. Production passes
-    /// <see cref="RequestTermination"/>.
+    /// Per-attempt ceiling on confirming the launched process actually exited after a kill was requested.
+    /// <see cref="Process.Kill(bool)"/> only <em>requests</em> termination and returns immediately, so exit is
+    /// confirmed by a bounded wait on the exit task rather than assumed. A normal kill is reaped in
+    /// milliseconds, so this ceiling is only ever reached by a genuinely unkillable process, in which case
+    /// cleanup fails deterministically instead of hanging.
+    /// </summary>
+    private static readonly TimeSpan DefaultTerminationConfirmation = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Seam for tests: <paramref name="requestKill"/> performs a kill request for the given tree/direct scope
+    /// (production passes <see cref="TryKill"/>), and <paramref name="terminationConfirmation"/> bounds how
+    /// long each request is given to be confirmed by an actual exit. Injecting a request that "succeeds"
+    /// without killing, together with a short bound, is how the accepted-but-unconfirmed path is exercised
+    /// deterministically — rather than trying to make the OS accept a kill that never takes effect.
     /// </summary>
     internal static async Task<GhResult> RunProcessAsync(
         string file,
         IReadOnlyList<string> args,
         IReadOnlyDictionary<string, string?>? environmentOverrides,
-        Func<Process, bool> requestTermination,
+        Func<Process, bool, bool> requestKill,
+        TimeSpan terminationConfirmation,
         CancellationToken ct)
     {
         var psi = new ProcessStartInfo(file)
@@ -128,7 +141,7 @@ internal static class GhAuthenticatedRunner
         }
         catch (OperationCanceledException)
         {
-            await TerminateAndDrainAsync(proc, exit, completion, stdout, stderr, requestTermination).ConfigureAwait(false);
+            await TerminateAndDrainAsync(proc, exit, completion, stdout, stderr, requestKill, terminationConfirmation).ConfigureAwait(false);
             throw;
         }
     }
@@ -140,19 +153,20 @@ internal static class GhAuthenticatedRunner
     }
 
     /// <summary>
-    /// Cancellation cleanup, split by whether the launched process's termination could be
-    /// requested/confirmed.
+    /// Cancellation cleanup, split by whether the launched process's exit could actually be <em>confirmed</em>
+    /// after a kill was requested — not merely whether a kill was requested, since
+    /// <see cref="Process.Kill(bool)"/> returns before the process is signalled.
     ///
-    /// When it can: the exit — and therefore <paramref name="completion"/>, which begins by awaiting the same
-    /// exit task — will finish, so it awaits exit, closes the read streams to unblock any inherited-pipe drain,
-    /// and observes completion and both drains.
+    /// When exit is confirmed: <paramref name="completion"/> (which begins by awaiting the same exit task) will
+    /// finish, so it closes the read streams to unblock any inherited-pipe drain and observes completion and
+    /// both drains.
     ///
-    /// When it cannot: the exit task may never finish, so awaiting it — or completion, which starts by awaiting
-    /// it — would hang forever and the failure would never surface. Instead it closes the streams, observes the
-    /// two drain tasks synchronously (they finish once their streams are closed), attaches fault-observing
-    /// continuations to exit and completion so a later fault (for example when <see cref="Process.Dispose"/>
-    /// tears the handle down) is never left unobserved, and throws <see cref="GhProcessCleanupException"/>
-    /// promptly.
+    /// When exit cannot be confirmed within the bound: the exit task may never finish, so awaiting it — or
+    /// completion, which starts by awaiting it — would hang forever and the failure would never surface.
+    /// Instead it closes the streams, observes the two drain tasks synchronously (they finish once their
+    /// streams are closed), attaches fault-observing continuations to exit and completion so a later fault (for
+    /// example when <see cref="Process.Dispose"/> tears the handle down) is never left unobserved, and throws
+    /// <see cref="GhProcessCleanupException"/> promptly.
     /// </summary>
     private static async Task TerminateAndDrainAsync(
         Process proc,
@@ -160,13 +174,11 @@ internal static class GhAuthenticatedRunner
         Task completion,
         Task stdout,
         Task stderr,
-        Func<Process, bool> requestTermination)
+        Func<Process, bool, bool> requestKill,
+        TimeSpan terminationConfirmation)
     {
-        if (requestTermination(proc))
+        if (await TryConfirmTerminationAsync(proc, exit, requestKill, terminationConfirmation).ConfigureAwait(false))
         {
-            // Uncancellable: the launched process is being torn down, so confirm its exit before returning.
-            await exit.ConfigureAwait(false);
-
             // A descendant that outlived the root may still hold a write end, so a drain could hang on EOF;
             // closing the read streams forces them to end. Their captured output is discarded on this path.
             CloseStreams(proc);
@@ -176,9 +188,9 @@ internal static class GhAuthenticatedRunner
             return;
         }
 
-        // Termination could neither be requested nor exit confirmed. The exit task (and completion, which
-        // awaits it first) may never finish, so we must not await either or cleanup would deadlock and the
-        // failure would never surface.
+        // Exit could not be confirmed within the bound. The exit task (and completion, which awaits it first)
+        // may never finish, so we must not await either or cleanup would deadlock and the failure would never
+        // surface.
         CloseStreams(proc);
         await ObserveAsync(stdout).ConfigureAwait(false);
         await ObserveAsync(stderr).ConfigureAwait(false);
@@ -186,7 +198,48 @@ internal static class GhAuthenticatedRunner
         ObserveEventually(completion);
 
         throw new GhProcessCleanupException(
-            "octoshift: could not terminate the gh process on cancellation; refusing to wait on a process that may still be alive.");
+            "octoshift: could not confirm the gh process exited on cancellation; refusing to wait on a process that may still be alive.");
+    }
+
+    /// <summary>
+    /// Requests a tree kill and then, if exit is not confirmed within the bound, a direct kill, confirming
+    /// each by a bounded wait on the exit task. Returns true only once the process is observed to have exited,
+    /// and false when neither request produced a confirmed exit in time — so a kill that is accepted but never
+    /// takes effect drives the deterministic cleanup failure rather than an unbounded wait.
+    /// </summary>
+    private static async Task<bool> TryConfirmTerminationAsync(
+        Process proc,
+        Task exit,
+        Func<Process, bool, bool> requestKill,
+        TimeSpan terminationConfirmation)
+    {
+        _ = requestKill(proc, true);
+        if (await ConfirmExitedAsync(exit, terminationConfirmation).ConfigureAwait(false))
+        {
+            return true;
+        }
+
+        _ = requestKill(proc, false);
+        return await ConfirmExitedAsync(exit, terminationConfirmation).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Bounded confirmation that the process exited, by observing the shared exit task with a timeout.
+    /// <see cref="Task.WaitAsync(TimeSpan)"/> is a BCL primitive — cross-platform and NativeAOT-safe, no
+    /// P/Invoke or reflection — that waits on the task with a ceiling without cancelling or disturbing the
+    /// underlying uncancellable wait. A timeout means "not yet confirmed", never an error.
+    /// </summary>
+    private static async Task<bool> ConfirmExitedAsync(Task exit, TimeSpan timeout)
+    {
+        try
+        {
+            await exit.WaitAsync(timeout).ConfigureAwait(false);
+            return true;
+        }
+        catch (TimeoutException)
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -202,31 +255,10 @@ internal static class GhAuthenticatedRunner
             TaskScheduler.Default);
 
     /// <summary>
-    /// Asks the process tree to die, then the direct process, returning true once termination is requested or
-    /// the process is confirmed gone, and false only when termination could not be requested and exit could
-    /// not be confirmed. Every <see cref="Process.HasExited"/> probe is guarded, so an indeterminate result
-    /// after one kill drives the fallback rather than escaping.
+    /// Requests termination of the process (tree or direct). Returns true when the request was accepted or the
+    /// process is already confirmed gone; the caller confirms actual exit separately, so the return value only
+    /// reflects that a request could be made, never that the process has died.
     /// </summary>
-    private static bool RequestTermination(Process proc)
-    {
-        if (TryKill(proc, entireProcessTree: true))
-        {
-            return true;
-        }
-
-        if (IsConfirmedExited(proc))
-        {
-            return true;
-        }
-
-        if (TryKill(proc, entireProcessTree: false))
-        {
-            return true;
-        }
-
-        return IsConfirmedExited(proc);
-    }
-
     private static bool TryKill(Process proc, bool entireProcessTree)
     {
         try
@@ -238,7 +270,7 @@ internal static class GhAuthenticatedRunner
         {
             // A tree kill can fault (AggregateException), the platform may refuse to walk the tree, or the
             // process may already have exited (InvalidOperationException). Report success only if exit can be
-            // positively confirmed, so an indeterminate probe falls through to the fallback instead.
+            // positively confirmed, so an indeterminate probe still lets the bounded confirmation decide.
             return IsConfirmedExited(proc);
         }
     }
