@@ -1,8 +1,6 @@
 <Solution>
   <Project Path="src/Turnstile/Turnstile.csproj" />
   <Project Path="src/Octoshift/Octoshift.csproj" />
-  <Project Path="src/Nightsky/Nightsky.csproj" />
   <Project Path="tests/Turnstile.Tests/Turnstile.Tests.csproj" />
   <Project Path="tests/Octoshift.Tests/Octoshift.Tests.csproj" />
-  <Project Path="tests/Nightsky.Tests/Nightsky.Tests.csproj" />
 </Solution>

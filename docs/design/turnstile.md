@@ -355,13 +355,13 @@ An LLM has no durable state. It ceases and resumes. It resets, compacts, forgets
 So **the agent never sees the lease.** The client binary owns it:
 
 ```
-nightshift join
+join
   → POST /lease {ttl: 2700}                          → 0x9f3c…
   → POST /agent/dev-b ?lease=0x9f3c…
   → write $XDG_RUNTIME_DIR/ns/<worktree-hash>.json   {lease: "0x9f3c…"}   mode 0600
   → print "joined as dev-b"                          ← all the agent ever sees
 
-nightshift next                                       ← a fresh process
+next                                                  ← a fresh process
   → derive session key from cwd's worktree
   → read the session file
   → Txn-claim with lease 0x9f3c…
@@ -376,14 +376,14 @@ nightshift next                                       ← a fresh process
 | The token leaks | Lease IDs are **unguessable 128-bit random**, not sequential ints. Knowing yours tells you nothing about anyone else's. File is `0600`. |
 | The agent resets and forgets | **It never knew.** The next call re-reads the file. Nothing was in the model's context to lose. |
 
-Session file missing but the process lives → `nightshift check` returns `NO_SESSION → rejoin`. Visible and recoverable, not a silent hang.
+Session file missing but the process lives → a `check` call returns `NO_SESSION → rejoin`. Visible and recoverable, not a silent hang.
 
 ### Who keepalives?
 
 If the *agent* must renew, an agent 40 minutes into a build loses its claim while doing everything right. Unacceptable. So: **bind the lease to whatever actually dies.**
 
 - **Cattle (night, headless):** `ns-spawn` launched the process, so **`ns-spawn` holds the lease and keepalives it.** When the child exits — cleanly, crashed, OOM'd, content-filtered — the supervisor stops renewing. **The agent never touches the lease at all.** Free: the supervisor already has to know whether its child is alive.
-- **Pets (day, interactive):** `nightshift standby` — the backgrounded SSE stream — **also keepalives.** One background process, two jobs: renew the lease, stream directives. Backgrounded once at join; never thought about again. Session dies → child dies → keepalive stops → lease expires.
+- **Pets (day, interactive):** the client's `standby` — the backgrounded SSE stream — **also keepalives.** One background process, two jobs: renew the lease, stream directives. Backgrounded once at join; never thought about again. Session dies → child dies → keepalive stops → lease expires.
 - **Fallback, both:** any CLI call renews. Plus a generous TTL (45 min) so a long build survives a quiet stretch.
 
 | Event | Keepalive | Result |
@@ -552,7 +552,7 @@ turnstile-queue take /q/build --ttl 5m
 turnstile-queue done /q/build/0003
 ```
 
-**Proves:** prefix range + conditional claim + lease reclaim. This is `nightshift next` in miniature.
+**Proves:** prefix range + conditional claim + lease reclaim. This is `next` in miniature.
 
 **The demo:** start 8 takers. `kill -9` one mid-work. **Watch its item return to the queue automatically and get picked up.** No supervisor, no health check, no retry logic anywhere in the code.
 
