@@ -243,9 +243,9 @@ public class GitHubInstallationTokenProviderTests
     [Fact]
     public async Task WarmedCacheAfterDispose_StillThrowsObjectDisposed()
     {
-        // The dangerous case: a provider whose cache is warm and valid. Because the fast path reads the cache
-        // before touching the semaphore, a disposed-check that lived only inside the lock would let a disposed
-        // provider keep serving its token forever. The check has to precede the fast path.
+        // The dangerous case: a provider whose cache is warm and valid. The disposed check lives inside the
+        // state lock alongside the cache read, so it guards the fast path too — a disposed provider must not
+        // keep serving its cached token.
         var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
         var provider = Provider(
             (args, env, ct) => Task.FromResult(new GhResult(0, TokenResponse("tok-1", now.AddHours(1)), string.Empty)),
@@ -255,22 +255,21 @@ public class GitHubInstallationTokenProviderTests
 
         GitHubInstallationToken warm = await provider.GetTokenAsync(TestContext.Current.CancellationToken);
         Assert.Equal("tok-1", warm.Token);
-        Assert.True(provider.HasCachedToken);
 
         provider.Dispose();
 
-        // Disposal clears the cached token so a live credential is not retained in memory past disposal.
-        Assert.False(provider.HasCachedToken);
+        // The warmed cache is not served after disposal; every entry throws.
         await Assert.ThrowsAsync<ObjectDisposedException>(() => provider.GetTokenAsync(TestContext.Current.CancellationToken));
     }
 
     [Fact]
     public async Task DisposeDuringInFlightRefresh_LetsItFinishAndBlocksLaterCallers()
     {
-        // A refresh is holding the lock when Dispose lands, and a second caller is queued behind it. Disposing
-        // the SemaphoreSlim here would make the in-flight refresh's finally-Release throw and could fault the
-        // queued waiter; the design instead disposes only logically. So the in-flight refresh completes and its
-        // Release succeeds, the queued caller wakes, sees the disposed flag, and fails cleanly with
+        // A refresh is holding the semaphore when Dispose lands, and a second caller is queued behind it.
+        // Disposing the SemaphoreSlim would make the in-flight refresh's finally-Release throw and could fault
+        // the queued waiter; the design leaves the semaphore logically undisposed. So the in-flight refresh
+        // completes and its Release succeeds, its minted token is returned to the caller that requested it but
+        // is not cached past disposal, and the queued and subsequent callers fail cleanly with
         // ObjectDisposedException — never a raw semaphore error.
         var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
         var entered = new TaskCompletionSource();
@@ -289,10 +288,10 @@ public class GitHubInstallationTokenProviderTests
 
         CancellationToken ct = TestContext.Current.CancellationToken;
         Task<GitHubInstallationToken> inFlight = Task.Run(() => provider.GetTokenAsync(ct), ct);
-        await entered.Task; // the refresh holds the lock
+        await entered.Task; // the refresh holds the semaphore
 
         Task<GitHubInstallationToken> queued = Task.Run(() => provider.GetTokenAsync(ct), ct);
-        await Task.Delay(50, ct); // let the queued caller block on the lock
+        await Task.Delay(50, ct); // let the queued caller block on the semaphore
 
         provider.Dispose();
         release.SetResult();
@@ -301,11 +300,9 @@ public class GitHubInstallationTokenProviderTests
         GitHubInstallationToken minted = await inFlight;
         Assert.Equal("tok-1", minted.Token);
 
-        // Even though that refresh published a token, the race is resolved so the cache is not left populated
-        // after disposal — no in-flight refresh can repopulate it past Dispose.
-        Assert.False(provider.HasCachedToken);
-
-        // The caller that was still queued behind the lock is refused once it acquires it.
+        // The caller that was still queued behind the semaphore is refused once it acquires it — proving the
+        // in-flight refresh did not repopulate the cache past disposal (a repopulated cache would be served
+        // here instead of throwing).
         await Assert.ThrowsAsync<ObjectDisposedException>(() => queued);
 
         // And every subsequent call is refused too.

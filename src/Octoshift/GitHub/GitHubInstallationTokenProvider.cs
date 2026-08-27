@@ -29,19 +29,13 @@ internal sealed class GitHubAppInstallationTokenProvider : IGitHubInstallationTo
     private readonly IGitHubTokenAuditSink _auditSink;
     private readonly SemaphoreSlim _refreshLock = new(1, 1);
 
-    // Logical disposal, checked before the lock-free fast path and again after synchronization. A warmed
-    // provider must not keep serving its cached token after Dispose, and a Dispose that races an in-flight
-    // refresh must not turn the finally-Release into a throw. See Dispose for why the semaphore itself is not
-    // physically disposed.
-    private volatile bool _disposed;
-
-    // A single reference published through a volatile field, rather than a Nullable<GitHubInstallationToken>
-    // read outside the lock. The nullable struct is three fields (has-value, the token reference, the expiry)
-    // whose stores are not atomic together, so the fast-path reader could observe a new token string beside a
-    // stale expiry — a torn read. A CachedToken is immutable and fully constructed before it is published, and
-    // a reference store is atomic; the volatile write/read pair orders that publication so the fast path only
-    // ever sees a wholly initialized token or none at all.
-    private volatile CachedToken? _cached;
+    // Disposal and the cached token are the mutable shared state; a plain lock guards both. It is only ever
+    // held for a few synchronous field reads/writes (never across an await or the mint), so there is no torn
+    // publication and no memory-model reasoning to get wrong. The refresh SemaphoreSlim, separately, still
+    // serialises the token exchange itself.
+    private readonly object _stateLock = new();
+    private bool _disposed;
+    private CachedToken? _cached;
 
     public GitHubAppInstallationTokenProvider(GitHubAppCredentials credentials)
         : this(
@@ -77,37 +71,35 @@ internal sealed class GitHubAppInstallationTokenProvider : IGitHubInstallationTo
 
     public async Task<GitHubInstallationToken> GetTokenAsync(CancellationToken ct)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-
         DateTimeOffset now = _clock();
-        if (_cached is { } cached && !NeedsRefresh(cached.Token, now))
+        if (TryGetCached(now, out GitHubInstallationToken fastPath))
         {
-            return cached.Token;
+            return fastPath;
         }
 
         await _refreshLock.WaitAsync(ct);
         try
         {
-            // A Dispose may have landed while this caller waited for the lock; refuse to mint past it.
-            ObjectDisposedException.ThrowIf(_disposed, this);
-
             now = _clock();
-            if (_cached is { } current && !NeedsRefresh(current.Token, now))
+            if (TryGetCached(now, out GitHubInstallationToken current))
             {
-                return current.Token;
+                return current;
             }
 
-            bool refreshed = _cached is not null;
-            GitHubInstallationToken minted = await MintTokenAsync(refreshed, ct);
-            _cached = new CachedToken(minted);
+            bool refreshed = HasCached();
 
-            // Publish, then re-check disposal. If Dispose landed while this refresh was in flight, its own
-            // clear may have run before this publish — so clear again here. Between the two, whichever store
-            // to _cached happens last leaves it null whenever _disposed is set, so no refresh can repopulate
-            // the cache after disposal. The in-flight caller still returns the token it fetched.
-            if (_disposed)
+            // Mint outside the state lock (it must not be held across the await), while the refresh semaphore
+            // keeps this the only exchange in flight.
+            GitHubInstallationToken minted = await MintTokenAsync(refreshed, ct);
+
+            lock (_stateLock)
             {
-                _cached = null;
+                // Cache only if disposal did not land during the mint. Either way this caller returns the
+                // token it fetched; the cache simply is not repopulated past a Dispose.
+                if (!_disposed)
+                {
+                    _cached = new CachedToken(minted);
+                }
             }
 
             return minted;
@@ -118,21 +110,45 @@ internal sealed class GitHubAppInstallationTokenProvider : IGitHubInstallationTo
         }
     }
 
-    /// <summary>Test-only view of whether a token is currently cached, so disposal-clearing is observable
-    /// without reflection.</summary>
-    internal bool HasCachedToken => _cached is not null;
+    /// <summary>
+    /// Returns a still-valid cached token under the state lock, throwing if the provider has been disposed.
+    /// The disposed check lives here so it guards both the fast path and the post-semaphore recheck.
+    /// </summary>
+    private bool TryGetCached(DateTimeOffset now, out GitHubInstallationToken token)
+    {
+        lock (_stateLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_cached is { } cached && !NeedsRefresh(cached.Token, now))
+            {
+                token = cached.Token;
+                return true;
+            }
+        }
+
+        token = default;
+        return false;
+    }
+
+    private bool HasCached()
+    {
+        lock (_stateLock)
+        {
+            return _cached is not null;
+        }
+    }
 
     public void Dispose()
     {
-        // Logical disposal only. The SemaphoreSlim is intentionally not disposed: it needs disposal solely to
-        // release the ManualResetEvent behind AvailableWaitHandle, which this type never touches, so skipping
-        // it leaks nothing. Not disposing it is what lets an in-flight refresh's finally-Release complete
-        // without racing a disposed handle; the _disposed flag enforces disposal for every future entry.
-        //
-        // Order matters: mark disposed before clearing the cache so a concurrent refresh that observes the
-        // flag after its own publish will clear too, and no interleaving leaves a token cached past Dispose.
-        _disposed = true;
-        _cached = null;
+        // Logical disposal under the state lock: mark disposed and drop the cached token so a live credential
+        // is not retained in memory. The SemaphoreSlim is intentionally not disposed — it needs disposal only
+        // to release the ManualResetEvent behind AvailableWaitHandle, which this type never touches — so an
+        // in-flight refresh's finally-Release can never race a disposed handle.
+        lock (_stateLock)
+        {
+            _disposed = true;
+            _cached = null;
+        }
     }
 
     private bool NeedsRefresh(GitHubInstallationToken token, DateTimeOffset now)
