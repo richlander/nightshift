@@ -151,7 +151,8 @@ public class TxnTests : IDisposable
     public async Task Claim_UnderLease_AttachesAndExpires()
     {
         using KvStore store = Open();
-        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 1);
+        await LeaseClock.EnsureHeadroomAsync(TestContext.Current.CancellationToken);
+        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 5);
 
         TxnResult r = await store.TxnAsync([NotExist("/claim")], [Put("/claim", "dev-b", lease.Id)], []);
         Assert.True(r.Succeeded);

@@ -85,11 +85,12 @@ public class WatchTests : IDisposable
     public async Task LeaseExpiry_ProducesDeleteEvent()
     {
         using KvStore store = Open();
-        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 1);
+        await LeaseClock.EnsureHeadroomAsync(TestContext.Current.CancellationToken);
+        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 5);
         WriteResult created = await store.CreateAsync("/ephemeral", Bytes("v"), lease: lease.Id);
 
         // Force expiry deterministically rather than waiting on the sweeper's wall-clock tick.
-        await Task.Delay(TimeSpan.FromMilliseconds(1100), TestContext.Current.CancellationToken);
+        await LeaseClock.WaitPastExpiryAsync(lease, TestContext.Current.CancellationToken);
         int deleted = await store.SweepExpiredAsync();
         Assert.Equal(1, deleted);
 

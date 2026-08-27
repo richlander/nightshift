@@ -41,16 +41,17 @@ public class HelperTests : IDisposable
     [Fact]
     public async Task Lock_SweepOnOpen_ReclaimsDeadHolder()
     {
-        string leaseId;
+        LeaseInfo lease;
         using (LocalStore first = await Open())
         {
-            leaseId = (await first.CreateLeaseAsync(ttlSecs: 1, Ct)).Id;
-            Assert.True(await Helpers.TryClaimAsync(first, "/lock/y", "dead", leaseId, Ct));
+            await LeaseClock.EnsureHeadroomAsync(Ct);
+            lease = await first.CreateLeaseAsync(ttlSecs: 5, Ct);
+            Assert.True(await Helpers.TryClaimAsync(first, "/lock/y", "dead", lease.Id, Ct));
         }
 
         // The holder "dies" (store closed) without releasing. Past the TTL, the next open sweeps the
         // expired lease, tombstoning the leaked lock so a fresh contender can take it.
-        await Task.Delay(1200, Ct);
+        await LeaseClock.WaitPastExpiryAsync(lease, Ct);
 
         using LocalStore second = await Open();
         Assert.Null(await second.GetAsync("/lock/y", Ct));
