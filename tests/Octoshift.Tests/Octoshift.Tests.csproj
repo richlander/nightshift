@@ -16,7 +16,8 @@
 
   <!--
     Octoshift's tests reference only the Octoshift product (for its internals, via InternalsVisibleTo).
-    They inject fakes for the gh and nightshift seams, so no test hits the network or a live daemon.
+    They inject fakes for the gh runner and the tmux/ssh collection seams, so no test hits the network,
+    GitHub, or a live tmux server.
   -->
   <ItemGroup>
     <ProjectReference Include="../../src/Octoshift/Octoshift.csproj" />

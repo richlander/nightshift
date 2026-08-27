@@ -95,7 +95,7 @@ internal sealed class FileGitHubAppCredentialsSource : IGitHubAppCredentialsSour
             throw new InvalidOperationException($"octoshift: set {CredentialsPathEnvironmentVariable} to the GitHub App credentials file path.");
         }
 
-        string credentialsPath = Path.GetFullPath(configuredPath);
+        string credentialsPath = ResolveFullPath(configuredPath, "credentials");
         if (_enforceOutsideWorkingTree)
         {
             EnsureOutsideWorkingTree(credentialsPath, "credentials");
@@ -140,7 +140,7 @@ internal sealed class FileGitHubAppCredentialsSource : IGitHubAppCredentialsSour
         }
 
         string baseDirectory = Path.GetDirectoryName(credentialsPath) ?? _getWorkingDirectory();
-        string privateKeyPath = Path.GetFullPath(dto.PrivateKeyPath, baseDirectory);
+        string privateKeyPath = ResolveFullPath(dto.PrivateKeyPath, "private-key", baseDirectory);
         if (_enforceOutsideWorkingTree)
         {
             EnsureOutsideWorkingTree(privateKeyPath, "private-key");
@@ -158,6 +158,22 @@ internal sealed class FileGitHubAppCredentialsSource : IGitHubAppCredentialsSour
             dto.InstallationId.Value,
             privateKeyFile.Content,
             new GitHubActorIdentity(dto.Actor));
+    }
+
+    private static string ResolveFullPath(string path, string label, string? basePath = null)
+    {
+        try
+        {
+            return basePath is null ? Path.GetFullPath(path) : Path.GetFullPath(path, basePath);
+        }
+        catch (Exception ex) when (ex is ArgumentException or PathTooLongException or NotSupportedException)
+        {
+            // A configured path with a NUL or other invalid character reaches Path.GetFullPath as an
+            // ArgumentException (PathTooLong / NotSupported for the other malformed shapes) — outside the
+            // rest of Load's normalization. Fold it into the one auth-config exception the runner factory
+            // consumes so a broken credentials file surfaces as an unavailable read, never a raw crash.
+            throw new InvalidOperationException($"octoshift: {label} path is not a valid filesystem path.", ex);
+        }
     }
 
     private static void EnsureRestrictedPermissions(UnixFileMode? mode, string path, string label)

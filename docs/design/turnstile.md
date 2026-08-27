@@ -197,7 +197,7 @@ The log grows without bound. k3s users have grown 8 GB SQLite files, then found 
 curl --unix-socket /run/turnstile.sock -N 'localhost/watch?prefix=/esc/'
 ```
 
-**A watch is a `curl -N`.** A shell-native, backgroundable long-running process — exactly the mechanism verified to work with Claude Code's `run_in_background` and Copilot's background bash. The agent-facing `standby` primitive is an HTTP stream, and it works *because the protocol is boring*.
+**A watch is a `curl -N`.** A shell-native, backgroundable long-running process — exactly the mechanism verified to work with Claude Code's `run_in_background` and Copilot's background bash. The agent-facing watch is an HTTP stream, and it works *because the protocol is boring*.
 
 ### Conditional is the default
 
@@ -327,13 +327,13 @@ A lease has a TTL. Keys may be **attached** to it. On expiry or revoke, **all at
 
 Therefore:
 
-> **Agent death = lease expiry = key deletion = a watch event = a controller reacts.**
+> **Holder death = lease expiry = key deletion = a watch event = a controller reacts.**
 >
 > **One mechanism. No special case.**
 
-Phantom wait, process crash, OOM, machine reboot, harness hanging on a content filter — **all identical to the kernel.** Keepalive stops; the claim vanishes; a supervisor sees the delete and respawns.
+A hung process, a crash, an OOM, a machine reboot — **all identical to the kernel.** Keepalive stops; the attached keys vanish; a watcher sees the delete and reacts.
 
-**There is no dead-agent detector anywhere in the system. There is a lease.**
+**There is no dead-process detector anywhere in the system. There is a lease.**
 
 ### Lease groups lifetime. Txn groups mutation.
 
@@ -344,58 +344,7 @@ Different axes, and conflating them is the mistake:
 
 And a smell worth naming: **if a, b, c must always be mutated together by the same writer, they should be one key.** The only reason to split keys is to avoid contention between *different* writers. Same writer, always atomic, no race → you split for nothing and bought a transaction you didn't need.
 
-**Attach anything that should die with the agent to the agent's lease** — the claim, the registry entry, the reverse index. They vanish together. **Leases are the garbage collector.**
-
-### The lease credential — and the failure mode it avoids
-
-> **The lease belongs to the process, not the model.**
-
-An LLM has no durable state. It ceases and resumes. It resets, compacts, forgets. **Any design where the model must remember a token is broken by construction** — it is the phantom wait wearing a different hat.
-
-So **the agent never sees the lease.** The client binary owns it:
-
-```
-nightshift join
-  → POST /lease {ttl: 2700}                          → 0x9f3c…
-  → POST /agent/dev-b ?lease=0x9f3c…
-  → write $XDG_RUNTIME_DIR/ns/<worktree-hash>.json   {lease: "0x9f3c…"}   mode 0600
-  → print "joined as dev-b"                          ← all the agent ever sees
-
-nightshift next                                       ← a fresh process
-  → derive session key from cwd's worktree
-  → read the session file
-  → Txn-claim with lease 0x9f3c…
-  → print the slice
-```
-
-**Session identity = the worktree.** One agent per worktree is already an invariant of the design. So `hash(git rev-parse --show-toplevel)` is a stable, derivable key that survives *any* number of agent context resets.
-
-| Concern | Resolution |
-|---|---|
-| Where does the agent store the token? | **It doesn't.** The CLI does, in a file the agent never reads. |
-| The token leaks | Lease IDs are **unguessable 128-bit random**, not sequential ints. Knowing yours tells you nothing about anyone else's. File is `0600`. |
-| The agent resets and forgets | **It never knew.** The next call re-reads the file. Nothing was in the model's context to lose. |
-
-Session file missing but the process lives → `nightshift check` returns `NO_SESSION → rejoin`. Visible and recoverable, not a silent hang.
-
-### Who keepalives?
-
-If the *agent* must renew, an agent 40 minutes into a build loses its claim while doing everything right. Unacceptable. So: **bind the lease to whatever actually dies.**
-
-- **Cattle (night, headless):** `ns-spawn` launched the process, so **`ns-spawn` holds the lease and keepalives it.** When the child exits — cleanly, crashed, OOM'd, content-filtered — the supervisor stops renewing. **The agent never touches the lease at all.** Free: the supervisor already has to know whether its child is alive.
-- **Pets (day, interactive):** `nightshift standby` — the backgrounded SSE stream — **also keepalives.** One background process, two jobs: renew the lease, stream directives. Backgrounded once at join; never thought about again. Session dies → child dies → keepalive stops → lease expires.
-- **Fallback, both:** any CLI call renews. Plus a generous TTL (45 min) so a long build survives a quiet stretch.
-
-| Event | Keepalive | Result |
-|---|---|---|
-| Agent finishes cleanly | `release`, then exit | claim released explicitly |
-| Agent crashes | dies with the process | lease expires → delete event → respawn |
-| **Agent's context resets, process lives** | **unaffected — it's a child process** | **nothing happens. Correct.** |
-| Agent forgets it has work | still running | `check` returns its claim. It re-learns. |
-| Harness reaps the background process | stops | lease expires; work reclaimed. Conservative, safe. |
-| Machine sleeps | suspends | lease expires. Fine — the agent wasn't working either. |
-
-**Note row 3.** An agent that forgets everything and keeps running **does not lose its claim**, because the claim was never in its context. That is the property you want, and it is unattainable if the lease ID is a token the model must carry.
+**Attach anything that should die with the holder to its lease** — the claim, the registry entry, the reverse index. They vanish together. **Leases are the garbage collector.**
 
 ### Implementation notes
 
@@ -438,27 +387,15 @@ The client is **deliberately cold**, because it has nothing worth keeping warm. 
 
 ### Call volume is trivial
 
-Per agent, per slice (20–40 minutes of real work):
+Each client issues only a handful of calls per unit of work — an acquire, a few conditional writes and renews, a release. Even a busy fleet is **low hundreds of calls per active cycle, low thousands over a work day.** SQLite does that in seconds of wall clock and idles the rest of the time.
 
-```
-join     1
-next     1
-check   ~10      (at commit gates; mostly piggybacked on other calls)
-extend  0–2
-release  1
-──────────
-        ~15
-```
-
-Twelve agents ⇒ **~180 calls per slice-cycle; low thousands over an eight-hour shift.** SQLite does that in seconds of wall clock and idles for the other 7h59m.
-
-Plus **one long-lived SSE stream per pet** and **one per controller.** Those are connections, not calls — cheap to hold, and they're what makes polling unnecessary.
+Plus **one long-lived SSE stream per interactive client** and **one per controller.** Those are connections, not calls — cheap to hold, and they're what makes polling unnecessary.
 
 ### The design consequence
 
-> **Because the daemon holds all state and the client holds none, an agent's context reset costs nothing.**
+> **Because the daemon holds all state and the CLI holds none, restarting the CLI cannot leave a local cache out of sync.**
 
-The client re-derives identity from `cwd` on every invocation. **It doesn't matter that the agent forgot everything — the client never remembered anything either.** State lives in the daemon; identity lives in the filesystem; the model holds neither.
+Callers supply keys and lease handles explicitly on each invocation. Identity and lifecycle are caller policy; Turnstile does not infer them from `cwd`, a worktree, or any other local state.
 
 **A stateful client would be a client that could get out of sync. A stateless one can't.**
 
@@ -552,11 +489,11 @@ turnstile-queue take /q/build --ttl 5m
 turnstile-queue done /q/build/0003
 ```
 
-**Proves:** prefix range + conditional claim + lease reclaim. This is `nightshift next` in miniature.
+**Proves:** prefix range + conditional claim + lease reclaim — a pull-based work queue in miniature.
 
 **The demo:** start 8 takers. `kill -9` one mid-work. **Watch its item return to the queue automatically and get picked up.** No supervisor, no health check, no retry logic anywhere in the code.
 
-**That is the entire supervision story of Nightshift, in a 120-line program.**
+**That is the entire supervision story, in a 120-line program.**
 
 ### `turnstile-elect` (~60 lines)
 
@@ -565,7 +502,7 @@ turnstile-elect /cap/merge --ttl 15s -- ./merge-controller
 ```
 
 One instance runs. If it dies, another takes over within 15s.
-**Proves:** singleton lease + watch for takeover. **This is** `role:architect` and capability registration, verbatim.
+**Proves:** singleton lease + watch for takeover — leader election and capability registration, verbatim.
 
 ### `turnstile watch` (~20 lines — or zero, it's `curl`)
 
@@ -574,43 +511,20 @@ turnstile watch /order/ | jq -c '.'
 curl --unix-socket /run/turnstile.sock -N 'localhost/watch?prefix=/order/&from=0'
 ```
 
-**Proves:** SSE, cursor resume, shell-native streaming. **This is the `standby` primitive.** Background it from an agent's bash tool, go idle, get woken on completion. **Verify end-to-end against real Claude Code and Copilot sessions** — the day-shift design rests on this, and it should be proven against the kernel, not a mock.
-
-### `nightshift-burndown` — **the one you show Brady**
-
-1. **A work order** — JSON DAG, 12 slices, some parallel, some with predecessors, each with a `paths` scope.
-2. **`ns-plan`, in Python** (~100 lines) — a controller. Watches `/order/**`, computes the ready set (predecessors done AND paths disjoint from active claims), writes `/ready/*`. **Turnstile never learns what a DAG is.**
-3. **`ns-agent`, in bash** (~30 lines) — takes a slice, sleeps, releases.
-
-**The demo:**
-
-- Start 8 agents. They self-organize. Nobody was told what to do; **they pulled.**
-- Two slices with overlapping `paths` **serialize automatically** — never claimed concurrently. **The conflict was prevented, not detected.**
-- `kill -9` an agent mid-slice. The slice reappears in `/ready/` when its lease expires and is picked up. **No code anywhere handles this.**
-- Kill `ns-plan`. Restart it. It re-lists and reconciles. **No lost work, no drift.** Level-triggering, demonstrated.
-- Kill **Turnstile**. Restart. Everything resumes from the log.
-
-Three arguments at once: **coordination is a store**, **death is a lease**, and **orchestration is a controller in whatever language you like.**
+**Proves:** SSE, cursor resume, shell-native streaming. Background it from an agent's bash tool, go idle, get woken on completion. **Verify end-to-end against real Claude Code and Copilot sessions** — it should be proven against the kernel, not a mock.
 
 ---
 
 ## 11. The family
 
 ```
-nightshift        the CLI — agents and operator, all the recipes
-  ns-plan           DAG → ready set
-  ns-spawn          supervise agents; holds their leases
-  ns-git            conflict graph (git merge-tree)
-  ns-github         PR / CI state
-  ns-merge          the ONLY component holding a write token
-
 turnstile         coordination store: kv, lease, txn, watch
   turnstile-lock    distributed mutex
   turnstile-queue   work queue
   turnstile-elect   leader election
 ```
 
-**The threat model is the deployment.** Turnstile holds no credentials and makes no outbound calls, so a deployment of `turnstile` + `ns-git` (read-only, local) has *nothing* to compromise. Each controller you add is an explicit decision, and `ns-merge` — the one component that can land code — is a few hundred lines you can audit in an afternoon.
+**The threat model is the deployment.** Turnstile holds no credentials and makes no outbound calls, so a bare `turnstile` deployment has *nothing* to compromise. Each controller you build on top is an explicit decision, and any component that can act on the outside world — the one holding a write token — is a small, auditable surface you add deliberately.
 
 That is a structural fact, not a clever argument.
 
