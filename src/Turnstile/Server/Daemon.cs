@@ -218,7 +218,16 @@ public sealed class Daemon
         }
         catch (OperationCanceledException)
         {
-            // The client disconnected; a watch ending is normal, not an error.
+            // The client disconnected and the abort surfaced cleanly: a watch ending is normal, not an error.
+        }
+        catch (Exception ex) when (ct.IsCancellationRequested && ex is IOException or NotSupportedException or ObjectDisposedException)
+        {
+            // Same disconnect, surfaced through a different door. Once RequestAborted has fired, a write or
+            // dispose racing the torn-down response can throw an IOException (connection reset), a
+            // NotSupportedException (a stream operation against the closed response body), or an
+            // ObjectDisposedException — none of which are failures, just the stream closing under us. We only
+            // swallow these once the request is actually aborted; anything thrown while the watch is still
+            // live propagates so real failures stay visible.
         }
     }
 
