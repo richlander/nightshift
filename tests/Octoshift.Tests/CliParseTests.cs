@@ -52,6 +52,22 @@ public class CliParseTests
     }
 
     [Fact]
+    public void CreateRootCommand_WaitingRejectsAnUnpairedSurrogateHost()
+    {
+        // A lone surrogate has no UTF-8 encoding, so it would collapse onto U+FFFD's target key — the alias
+        // dialling a different host. The strings are built in-body, not via InlineData: xUnit serialises
+        // theory arguments and a lone surrogate does not survive that round trip (it is replaced with
+        // U+FFFD), which would silently defeat the case.
+        foreach (string host in new[] { "\ud800", "\udc00", "host\ud800" })
+        {
+            var result = Cli.CreateRootCommand().Parse(["waiting", "--host", host, "--repo", "owner/repo"]);
+
+            Assert.NotEmpty(result.Errors);
+            Assert.Contains(result.Errors, e => e.Message.Contains("--host", StringComparison.Ordinal));
+        }
+    }
+
+    [Fact]
     public void CreateRootCommand_BareHostCannotSwallowTheNextFlag()
     {
         // `--host --json` parsed `--json` as the hostname, so the flag vanished and ssh was handed an

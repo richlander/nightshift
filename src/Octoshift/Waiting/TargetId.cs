@@ -33,9 +33,16 @@ internal readonly record struct TargetId
     /// <summary>The local machine.</summary>
     public static TargetId Local { get; } = new(LocalKey);
 
-    /// <summary>The identity of a collection target: null is local, anything else is a remote alias.</summary>
+    /// <summary>
+    /// The identity of a collection target: null is local, anything else is a remote alias. The alias is
+    /// encoded strictly (see <see cref="Base64Url.EncodeText"/>): an alias that is not well-formed
+    /// UTF-16 — a lone surrogate — has no UTF-8 encoding and would otherwise collapse onto U+FFFD's key, so
+    /// key construction fails fast rather than minting a colliding identity. Callers validate first with
+    /// <see cref="HostTarget.Validate"/>, which rejects the same values, so in practice only a bypassed
+    /// caller ever trips the guard.
+    /// </summary>
     public static TargetId ForHost(string? host)
-        => host is null ? Local : new(RemoteTag + Base64Url.Encode(Encoding.UTF8.GetBytes(host)));
+        => host is null ? Local : new(RemoteTag + Base64Url.EncodeText(host));
 
     /// <summary>True for the local machine, never for a remote alias — even one named <c>local</c>.</summary>
     public bool IsLocal => Key == LocalKey;
@@ -132,10 +139,32 @@ internal static class Base64Url
 {
     // Strict: invalid bytes throw rather than being replaced with U+FFFD, so a payload that is not valid
     // UTF-8 is rejected instead of decoding to a mangled alias that differs from what it was written as.
+    // The same strictness holds on the encode side (GetBytes): an unpaired surrogate has no UTF-8 encoding
+    // and throws rather than being substituted with the U+FFFD bytes.
     private static readonly Encoding StrictUtf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
 
     public static string Encode(byte[] bytes)
         => Convert.ToBase64String(bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=');
+
+    /// <summary>
+    /// Encodes a string's canonical UTF-8 bytes as base64url. Strict on the encode side: a string that is
+    /// not well-formed UTF-16 — a lone surrogate — has no UTF-8 encoding, and the default encoder would
+    /// silently substitute the U+FFFD bytes, collapsing two distinct aliases onto one identity. Throwing an
+    /// <see cref="ArgumentException"/> instead makes target-key construction non-lossy: a caller that has
+    /// not validated its input fails fast here rather than minting a colliding key. The catch is narrow —
+    /// only the encoder's own <see cref="EncoderFallbackException"/> — so no other failure is masked.
+    /// </summary>
+    public static string EncodeText(string text)
+    {
+        try
+        {
+            return Encode(StrictUtf8.GetBytes(text));
+        }
+        catch (EncoderFallbackException ex)
+        {
+            throw new ArgumentException($"value is not well-formed UTF-16 and cannot be encoded as a target key: {ex.Message}", nameof(text), ex);
+        }
+    }
 
     /// <summary>
     /// Decodes a payload to the alias it encodes, but only when the payload is exactly the canonical

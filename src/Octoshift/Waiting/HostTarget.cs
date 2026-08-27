@@ -14,6 +14,12 @@ namespace Octoshift.Waiting;
 /// <c>ProcessStartInfo.ArgumentList</c>, where a NUL cannot survive the OS argument boundary — it
 /// truncates the argument on Unix and throws or corrupts on Windows — so a control-bearing alias must be
 /// refused before it is ever handed to ssh, not left to fail outside the unavailable contract mid-sweep.
+///
+/// And it rejects an unpaired UTF-16 surrogate, for the same reason one char up: such a value is not a
+/// Unicode scalar and has no UTF-8 encoding, so the target key it would be encoded into collapses onto
+/// U+FFFD's — an unrepresentable alias silently taking on the identity of a different one. Rejecting it
+/// here keeps the alias from ever reaching key construction or ssh; a valid surrogate pair is a real
+/// character and passes.
 /// </remarks>
 internal static class HostTarget
 {
@@ -55,7 +61,49 @@ internal static class HostTarget
             return $"--host requires a hostname or ssh-config alias; '{DisplayText.Safe(host)}' contains a control character that cannot be passed to a process.";
         }
 
+        // An unpaired UTF-16 surrogate is not a Unicode scalar value, so it has no UTF-8 encoding: the
+        // default encoder replaces each one with the U+FFFD bytes, which collapses an unrepresentable
+        // alias onto the identity of a different one — `\uD800` and a literal U+FFFD both persist under the
+        // same target key, so the alias dials, and is remembered as, a host it is not. `char.IsControl`
+        // does not catch a lone surrogate, so it is checked here in its own right. A valid surrogate pair
+        // — an astral-plane character such as an emoji — is a real scalar and passes.
+        if (HasUnpairedSurrogate(host))
+        {
+            return $"--host requires a hostname or ssh-config alias; '{DisplayText.Safe(host)}' contains an unpaired UTF-16 surrogate that cannot be represented as a target.";
+        }
+
         return null;
+    }
+
+    /// <summary>
+    /// Whether a value contains a lone UTF-16 surrogate — a high surrogate not followed by a low, or a low
+    /// surrogate not preceded by a high. Such a value is not well-formed UTF-16 and has no Unicode scalar
+    /// (and so no UTF-8 encoding) for the stray half, which is exactly what lets it collapse onto U+FFFD.
+    /// A matched high/low pair is a single supplementary scalar and is accepted.
+    /// </summary>
+    private static bool HasUnpairedSurrogate(string value)
+    {
+        for (int i = 0; i < value.Length; i++)
+        {
+            char c = value[i];
+            if (char.IsHighSurrogate(c))
+            {
+                // A high surrogate must be immediately followed by a low surrogate; skip the pair.
+                if (i + 1 >= value.Length || !char.IsLowSurrogate(value[i + 1]))
+                {
+                    return true;
+                }
+
+                i++;
+            }
+            else if (char.IsLowSurrogate(c))
+            {
+                // A low surrogate reached on its own — any valid pair would have skipped its low half.
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>

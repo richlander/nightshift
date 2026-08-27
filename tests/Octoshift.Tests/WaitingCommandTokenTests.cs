@@ -228,6 +228,24 @@ public sealed class WaitingCommandTokenTests
     }
 
     [Fact]
+    public async Task RunAsync_ALoneSurrogateHostIsAUsageErrorAndNeverConstructsTheScanner()
+    {
+        // #173, the surrogate gap: a lone-surrogate --host has no UTF-8 encoding and would otherwise mint
+        // the same target key as U+FFFD, so it must fail before collection. RunAsync validates every host
+        // up front, so the injected scanner is never reached, no key is minted, and the exit is Usage —
+        // there is no path on which the unrepresentable alias reaches ssh or a colliding identity.
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        (int exit, _, string stderr) = await RunWithCapturedConsoleAsync(
+            token => WaitingCommand.RunAsync(
+                "owner/name", ["\ud800"], all: false, json: false, token,
+                scanAsync: (_, _) => throw new Xunit.Sdk.XunitException("the scanner must never be constructed for an unrepresentable host")),
+            ct);
+
+        Assert.Equal(ExitCode.Usage, exit);
+        Assert.Contains("unpaired UTF-16 surrogate", stderr, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void EmptyFleetJson_IsOneSuccessDocumentMarkingTheFleetEmpty()
     {
         // The command writes JSON to the raw stdout stream Console redirection does not capture, so the
