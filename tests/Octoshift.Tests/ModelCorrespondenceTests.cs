@@ -1,5 +1,7 @@
 namespace Octoshift.Tests;
 
+using Octoshift.Commands;
+using Octoshift.GitHub;
 using Octoshift.Waiting;
 using Xunit;
 
@@ -351,6 +353,67 @@ public class ModelCorrespondenceTests
         finally
         {
             File.Delete(path);
+        }
+    }
+
+    /// <summary>
+    /// TLA+ <c>Sweep</c> completeness, the round-8 clause: <c>viewComplete' = (attempted ⊆ collected) ∧
+    /// (knownHosts ⊆ collected)</c>. A target attempted for the very first time — never in KnownHosts —
+    /// that fails leaves the second conjunct holding vacuously (<c>{} ⊆ collected</c>), so deriving
+    /// completeness from known coverage alone would read the view complete and own a sole claim. The
+    /// first conjunct is what production carries as <c>allHostsAnswered</c>; it is false for that failed
+    /// attempt, so the lone visible claimant is not owned.
+    /// </summary>
+    /// <remarks>
+    /// The history is fresh, so KnownHosts is empty and nothing can be omitted — the failure is a target
+    /// that did not answer, not a host left out. That is the case the earlier model missed: it is
+    /// invisible to the known-coverage half, and only the attempted-answered half rules it out. The
+    /// counterpart with the same fleet answering in full is complete, and the sole claim is owned — so
+    /// the difference is exactly <c>allHostsAnswered</c>.
+    /// </remarks>
+    [Fact]
+    public async Task ViewIsIncompleteWhenACurrentTargetFailsBeforeItIsEverKnown()
+    {
+        static Task<PrFacts?> None(int _, CancellationToken __) => Task.FromResult<PrFacts?>(null);
+        DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+        TmuxPane sole = Window("%1", host: "merritt") with { AgentStateOption = "pr=4448 head=abc1234" };
+
+        // A first-time target fails: with KnownHosts empty nothing is omitted, so only the
+        // attempted-answered half of completeness can make the view incomplete.
+        string failedPath = TempPath();
+        try
+        {
+            var history = new PaneHistory(failedPath);
+            Assert.Empty(history.KnownHosts);
+
+            IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+                [sole], None, None, t, all: true, TestContext.Current.CancellationToken,
+                collectedHosts: ["merritt"], allHostsAnswered: false, history: history);
+
+            Claim claim = Assert.Single(rows).Claim;
+            Assert.Equal(ClaimBasis.PartialView, claim.Basis);
+            Assert.False(claim.OwnsClaim);
+        }
+        finally
+        {
+            File.Delete(failedPath);
+        }
+
+        // The identical fleet with every attempted target answering IS complete, so the sole claim is owned.
+        string answeredPath = TempPath();
+        try
+        {
+            var history = new PaneHistory(answeredPath);
+
+            IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+                [sole], None, None, t, all: true, TestContext.Current.CancellationToken,
+                collectedHosts: ["merritt"], allHostsAnswered: true, history: history);
+
+            Assert.True(Assert.Single(rows).Claim.OwnsClaim);
+        }
+        finally
+        {
+            File.Delete(answeredPath);
         }
     }
 

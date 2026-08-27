@@ -28,10 +28,11 @@
    switch PRs for reasons this tool neither controls nor predicts.
 
    Status: parsed cleanly with SANY and model-checked with TLC 2.19 against Waiting.cfg --
-   no errors, 4,102,573 states generated, 1,241,739 distinct, depth 9, zero violations
-   (~13s, 12 workers; the per-host epoch, the empty sweep, and modelling an empty host's
-   first window as a server start widen the space from the earlier single-epoch model, and
-   the server-start advance prunes some by failing more first looks closed). Re-run TLC
+   no errors, 6,575,159 states generated, 1,371,381 distinct, depth 9, zero violations
+   (~8s, 12 workers; the per-host epoch, the empty sweep, modelling an empty host's first
+   window as a server start, and separating the hosts a sweep ATTEMPTED from the subset that
+   ANSWERED all widen the space from the earlier single-epoch model, while the server-start
+   advance prunes some by failing more first looks closed). Re-run TLC
    after any change here to regenerate the count
    and confirm zero violations. Validated by mutation:
    reintroducing the real pane-id-across-restart bug (dropping the epoch check in
@@ -268,12 +269,33 @@ ServerRestarts ==
 Sweep ==
     /\ now < MaxTime
     /\ now' = now + 1
-    \* The collected set ranges over EVERY subset of Hosts, the empty set included. An
-    \* empty sweep is a total failure -- nothing answered -- and it must be representable:
-    \* it records lastCollected = {}, so the next return of any host is a gap that resets
-    \* that host's continuity and witness, exactly as a run that collected nothing leaves
-    \* the fleet.
-    /\ \E collected \in SUBSET Hosts :
+    \* Two host sets, not one. The run REQUESTED a set of hosts (attempted) and some subset
+    \* of those ANSWERED (collected); a requested host that failed is in attempted \ collected.
+    \* Everything a sweep renews -- registrations, knownHosts, continuity -- keys on what
+    \* ANSWERED, so only completeness depends on the difference. Modelling attempted is the
+    \* round-8 correction: deriving completeness from knownHosts \subseteq collected ALONE let a
+    \* freshly requested host FAIL (attempted nonempty, knownHosts still {}) read as a complete
+    \* view -- {} \subseteq collected holds vacuously -- while production passes allHostsAnswered
+    \* = FALSE. Both sets range over EVERY subset (the empty set included): an empty collected is
+    \* a total failure that records lastCollected = {}, so the next return of any host is a gap
+    \* that resets its continuity and witness, exactly as a run that collected nothing leaves it.
+    /\ \E attempted \in SUBSET Hosts :
+       \E collected \in SUBSET attempted :
+         \* Completeness on TWO counts, exactly as production's `allHostsAnswered && omitted.Length == 0`.
+         \* First, every host the run ATTEMPTED must have answered (attempted \subseteq collected, i.e.
+         \* collected = attempted since collected \subseteq attempted): a requested host that failed is a
+         \* hole in the view, even one never seen before. Second, the run must cover everything it has
+         \* ALREADY collected (knownHosts \subseteq collected) -- a run over fewer hosts than it has seen
+         \* is looking at less of the fleet than it knows, and cannot tell that from its arguments alone
+         \* (a host it was not told about is indistinguishable from one that does not exist), only from
+         \* this memory. The first conjunct is the round-8 correction: deriving completeness from known
+         \* coverage ALONE let a freshly attempted host FAIL and still read complete -- attempted = {h},
+         \* collected = {}, knownHosts = {}, so {} \subseteq {} holds vacuously while production reports
+         \* allHostsAnswered = FALSE. Derived ONCE and threaded into both the view flag and the witness of
+         \* a fresh registration, exactly as production threads one `viewComplete` into both: a run whose
+         \* sibling host failed must not witness a claim on the host that did answer.
+         LET viewIsComplete == (attempted \subseteq collected) /\ (knownHosts \subseteq collected)
+         IN
          \* Registrations are renewed or dropped only by a sweep that looked at the host.
          \* A window on an uncollected host is unseen, not gone -- forgetting it would
          \* manufacture a departure and re-register it as new on the next full sweep.
@@ -296,11 +318,10 @@ Sweep ==
          /\ regFleet' = [w \in Windows |->
                            IF HostOf(w) \notin collected THEN regFleet[w]
                            ELSE knownHosts \union collected]
-         \* A run covering fewer hosts than it has already collected is looking at less
-         \* of the fleet than it has seen. It cannot tell that from its arguments -- a
-         \* host it was not told about is indistinguishable from one that does not
-         \* exist -- only from this memory.
-         /\ viewComplete' = (knownHosts \subseteq collected)
+         \* The view flag: complete exactly when every attempted host answered AND the run covers
+         \* everything already collected (see viewIsComplete above). Without the attempted-answered half,
+         \* a never-before-known host that failed would read complete -- the bug this round closes.
+         /\ viewComplete' = viewIsComplete
          \* Provenance, persisted with the registration. A window unseen this sweep keeps
          \* whatever it had. One that keeps the same claim ACROSS CONTINUOUS OBSERVATION on
          \* an UNCHANGED server keeps its witness -- so a first look stays a first look no
@@ -315,7 +336,7 @@ Sweep ==
                                ELSE IF w \in live /\ claims[w] # NoPr
                                     THEN IF regEpoch[HostOf(w)] = epoch[HostOf(w)] /\ regPr[w] = claims[w] /\ regTime[w] # NoTime /\ HostOf(w) \in lastCollected
                                          THEN regWitnessed[w]
-                                         ELSE (regEpoch[HostOf(w)] = epoch[HostOf(w)] /\ HostOf(w) \in lastCollected /\ knownHosts \subseteq collected)
+                                         ELSE (regEpoch[HostOf(w)] = epoch[HostOf(w)] /\ HostOf(w) \in lastCollected /\ viewIsComplete)
                                     ELSE FALSE]
          \* Each collected host adopts its live epoch, so a restart it has not yet been
          \* swept under is noticed the next time it is; an uncollected host keeps whatever
