@@ -206,6 +206,16 @@ because several of them were violated by code that passed its unit tests.
     every host it did not collect, even a total failure. Persistence is
     load-bearing, so a write that fails is reported as unavailable rather than
     left as a success a later run would read as current.
+18. Persistent fleet membership grows with every host a sweep *attempted*, not
+    only those that answered. A target that fails on its first attempt — no epoch,
+    no continuity, never collected — is still remembered as membership, so a later
+    sweep that omits it reads as *narrowed* rather than complete. *(Growing the
+    membership from the collected set alone forgets a first-time failure, so a
+    later sweep of the answering host alone reads complete and grants it sole
+    ownership while a rival may still run on the host that never answered.
+    Membership is therefore kept apart from successful collection — epoch,
+    continuity, sweep time — which grow only with the hosts that answered.
+    Modelled as `CompletenessCoversEveryAttemptedHost`.)*
 
 Invariants 9–14 are the ones unit tests cover least well, because they are
 statements about *sequences* of sweeps interleaved with fleet events rather than

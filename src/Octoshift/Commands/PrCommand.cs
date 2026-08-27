@@ -297,8 +297,10 @@ internal static class PrCommand
             viewComplete);
 
         // Persist history only for the hosts actually collected, so a partial sweep keeps what it did not
-        // look at rather than deleting the claim memory of unreachable or unrequested hosts.
-        history.Save(collected.Panes, collected.CollectedHosts);
+        // look at rather than deleting the claim memory of unreachable or unrequested hosts. The attempted
+        // set is recorded as persistent fleet membership — the same distinction `waiting` persists — so a
+        // target that failed on its first attempt is remembered and a later omission reads as narrowed.
+        history.Save(collected.Panes, collected.CollectedHosts, collected.AttemptedHosts);
 
         // This PR's claimants, owner first. The rank comes from Claim.Register, so followers sort after the
         // owner; ties break on the same fixed key the sweep uses, so the owner is the same window in both.
@@ -389,9 +391,11 @@ internal static class PrCommand
                 + order);
 
             // The one contested shape worth calling out: the owner is putting the claim down while a
-            // follower is still working, so ownership is with the window that is doing the least.
+            // follower is still working, so ownership is with the window that is doing the least. The
+            // owner's verdict is read through the same pane-activity gate the verdict lines use, so a
+            // working owner with a stale rec is never mistaken for one that has finished and handed over.
             if (facts is not null
-                && Claim.IsReleasing(claims[0].State, WaitingVerdict.Resolve(claims[0].State, facts))
+                && Claim.IsReleasing(claims[0].State, VerdictFor(claims[0].Pane, claims[0].State, facts))
                 && claims.Skip(1).Any(c => c.Pane.Activity == PaneActivity.Working))
             {
                 output.WriteLine("            the owner is disengaging while a follower is active — consider promoting it");
@@ -409,7 +413,7 @@ internal static class PrCommand
                 break;
             }
 
-            WaitingVerdict verdict = WaitingVerdict.Resolve(state, facts);
+            WaitingVerdict verdict = VerdictFor(pane, state, facts);
             string from = claims.Count > 1 ? $" [{DisplayText.Safe(pane.Where)}]" : string.Empty;
             output.WriteLine($"  verdict   {verdict.State.ToString().ToUpperInvariant()} ({verdict.Assurance.Label}) — {DisplayText.Safe(verdict.Reason)}{from}");
         }
@@ -491,6 +495,16 @@ internal static class PrCommand
 
         return string.Join(", ", parts);
     }
+
+    /// <summary>
+    /// The verdict for one claiming window, gated on what its pane is doing right now. A published record
+    /// is only ever read as a handover — and only then can it resolve to an actionable READY — when the
+    /// pane is idle; a working, blocked, stalled or unreadable pane keeps the corresponding UNKNOWN or
+    /// operator verdict instead. This is <see cref="WaitingVerdict.ForActivity"/>, the single copy of that
+    /// policy `octoshift waiting` uses, so `pr` cannot print a verdict `waiting` would not.
+    /// </summary>
+    private static WaitingVerdict VerdictFor(TmuxPane pane, AgentState state, PrFacts? facts)
+        => WaitingVerdict.ForActivity(pane.Activity, pane.Capture, () => WaitingVerdict.Resolve(state, facts));
 
     private static string Github(PrFacts? facts, PrFetchStatus outcome, DateTimeOffset now)
     {
@@ -583,6 +597,20 @@ internal static class PrCommand
             if (state.Round is { } round)
             {
                 writer.WriteNumber("round", round);
+            }
+
+            // The verdict, gated on pane activity exactly as the human report gates it, so the two surfaces
+            // answer the same claim the same way — a working/blocked/stalled/unreadable pane never carries a
+            // resolved READY here while the human line shows UNKNOWN. Emitted only when GitHub was read,
+            // matching the human report, which prints no verdict line without facts to resolve against.
+            if (facts is not null)
+            {
+                WaitingVerdict verdict = VerdictFor(pane, state, facts);
+                writer.WriteStartObject("verdict");
+                writer.WriteString("state", verdict.State.ToString().ToLowerInvariant());
+                writer.WriteString("confidence", verdict.Assurance.Label);
+                writer.WriteString("reason", verdict.Reason);
+                writer.WriteEndObject();
             }
 
             writer.WriteEndObject();

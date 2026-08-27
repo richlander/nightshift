@@ -55,14 +55,20 @@ java -cp tla2tools.jar tlc2.TLC -config Waiting.cfg -workers auto Waiting.tla
 ```
 
 Current bounds — 3 windows, 2 hosts, 2 PRs, 8 steps — run in a few seconds: with TLC 2.19
-(12 workers) SANY parses cleanly and TLC reports 6,575,159 states generated, 1,371,381
+(12 workers) SANY parses cleanly and TLC reports 7,229,472 states generated, 1,470,689
 distinct, depth 9, zero violations (~8s). Raise `MaxTime` for a
 deeper search; hosts multiply the state space quickly, since every sweep branches over
 the subsets of hosts it might have collected and every host restarts on its own epoch —
 and opening the first window on an empty host is a server start that advances that host's
 epoch too. A sweep also branches over the hosts it *attempted* against the subset that
 *answered*, so a host requested but failed is distinct from one never asked about: that is
-what keeps a never-before-known target that fails from reading as a complete view.
+what keeps a never-before-known target that fails from reading as a complete view. The
+persistent fleet membership (`knownHosts`) grows with the *attempted* hosts, not the
+collected ones, so a host that fails on its very first attempt is still remembered — a
+later sweep that omits it reads as narrowed rather than complete. A ghost `everAttempted`
+tracks that independently, so `CompletenessCoversEveryAttemptedHost` refutes a mutation
+that reverts the membership to collected-growth (the round-9 first-time-failed-host bug).
+
 
 ## What is modelled, and what is not
 

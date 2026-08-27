@@ -212,6 +212,17 @@ internal sealed class GhPrFactsSource
             RateLimitRemaining = left;
         }
 
+        // `X-RateLimit-Remaining: 0` records EXHAUSTION, not a failure of THIS response. The request that
+        // spends the last unit of the budget still returns a real answer — a fresh 200, a 304, or an
+        // affirmative 404 — and that answer must be classified truthfully. So the exhaustion is remembered
+        // (the guard at the top refuses the NEXT network read) and then classification proceeds; only
+        // genuine pushback (403/429/5xx) turns the current read itself into Unavailable. Conflating the two
+        // is what let a valid Found/NotFound at the moment the budget hit zero read as an outage.
+        if (GhResponse.RateBudgetDepleted(headers))
+        {
+            RateLimited = true;
+        }
+
         if (status == 304)
         {
             NotModified++;
@@ -220,7 +231,7 @@ internal sealed class GhPrFactsSource
             return cached is not null ? Read.Ok(cached) : Read.Unavailable;
         }
 
-        if (status is 403 or 429 || status >= 500 || GhResponse.RateBudgetDepleted(headers))
+        if (status is 403 or 429 || status >= 500)
         {
             RateLimited = true;
             return Read.Unavailable;

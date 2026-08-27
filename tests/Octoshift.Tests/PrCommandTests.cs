@@ -52,7 +52,7 @@ public class PrCommandTests
         IReadOnlyList<TmuxPane> panes,
         IReadOnlyList<string?> collectedHosts,
         params string[] unreachable)
-        => new(panes, unreachable, collectedHosts.Count + unreachable.Length, collectedHosts);
+        => new(panes, unreachable, collectedHosts.Count + unreachable.Length, collectedHosts, collectedHosts);
 
     private static PaneHistory FreshHistory()
         => new(Path.Combine(Path.GetTempPath(), $"octoshift-prtest-{Guid.NewGuid():N}.json"));
@@ -246,6 +246,60 @@ public class PrCommandTests
         Assert.Contains(
             "fernie: no server running",
             doc.RootElement.GetProperty("unreachable").EnumerateArray().Select(e => e.GetString()));
+    }
+
+    [Fact]
+    public Task Locate_AWorkingPaneNeverPrintsAResolvedReadyVerdict()
+        => AssertNonIdleVerdictIsGated(PaneActivity.Working, "UNKNOWN", "unknown");
+
+    [Fact]
+    public Task Locate_ABlockedPaneNeverPrintsAResolvedReadyVerdict()
+        => AssertNonIdleVerdictIsGated(PaneActivity.Blocked, "NEEDSOPERATOR", "needsoperator");
+
+    [Fact]
+    public Task Locate_AStalledPaneNeverPrintsAResolvedReadyVerdict()
+        => AssertNonIdleVerdictIsGated(PaneActivity.Stalled, "NEEDSOPERATOR", "needsoperator");
+
+    [Fact]
+    public Task Locate_AnUnreadablePaneNeverPrintsAResolvedReadyVerdict()
+        => AssertNonIdleVerdictIsGated(PaneActivity.Unreadable, "UNKNOWN", "unknown");
+
+    private static async Task AssertNonIdleVerdictIsGated(PaneActivity activity, string humanState, string jsonState)
+    {
+        // Round 9, blocker 3: `octoshift pr` gates the published verdict on what the pane is doing now,
+        // exactly as `octoshift waiting` does. A window mid-turn, one holding a prompt open, one stalled, and
+        // one that could not be captured all carry a stale reviews=2/2 rec=merge, but none has handed
+        // anything over — so none may resolve to an actionable READY off that stale state. The human report
+        // and the JSON must agree on the gated verdict.
+        PrLocationResult result = await LocateAsync(4448, Collection(
+            [Pane("fernie", "%1", "cp:1", agentState: "pr=4448 head=abc1234ff reviews=2/2 rec=merge",
+                windowName: "pr4448", activity: activity, capture: "agent output")],
+            ["fernie"]), Ready);
+
+        string report = result.Report();
+        Assert.DoesNotContain("READY", report, StringComparison.Ordinal);
+        Assert.Contains($"verdict   {humanState}", report, StringComparison.Ordinal);
+
+        using JsonDocument doc = JsonDocument.Parse(result.Json());
+        JsonElement verdict = doc.RootElement.GetProperty("claims")[0].GetProperty("verdict");
+        Assert.Equal(jsonState, verdict.GetProperty("state").GetString());
+    }
+
+    [Fact]
+    public async Task Locate_AnIdlePaneStillResolvesThePublishedVerdictToReady()
+    {
+        // The other half of the gate: an idle pane HAS handed over, so its published reviews=2/2 rec=merge
+        // on a clean, green PR still resolves to READY. The gate suppresses the verdict for non-idle panes
+        // only — it does not blunt the ordinary idle handover the tool exists to surface.
+        PrLocationResult result = await LocateAsync(4448, Collection(
+            [Pane("fernie", "%1", "cp:1", agentState: "pr=4448 head=abc1234ff reviews=2/2 rec=merge",
+                windowName: "pr4448", activity: PaneActivity.Idle)],
+            ["fernie"]), Ready);
+
+        Assert.Contains("verdict   READY", result.Report(), StringComparison.Ordinal);
+
+        using JsonDocument doc = JsonDocument.Parse(result.Json());
+        Assert.Equal("ready", doc.RootElement.GetProperty("claims")[0].GetProperty("verdict").GetProperty("state").GetString());
     }
 
     [Fact]

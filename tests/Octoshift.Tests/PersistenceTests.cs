@@ -159,6 +159,103 @@ public sealed class PersistenceTests
     }
 
     [Fact]
+    public async Task CollectAndResolveAsync_AFirstTimeFailedHostIsRememberedSoALaterOmissionNarrowsTheView()
+    {
+        // Round 9, blocker 1 (waiting surface). The exact two-sweep laundering: a sweep attempts A and a
+        // never-before-seen B; B fails before it ever collects, so the sweep is partial and A is not owned.
+        // Because B has no epoch or continuity — it never answered — the earlier design forgot it entirely,
+        // and a LATER sweep of A alone read as a complete view and granted A sole ownership while a rival
+        // could still be running on the unreached B. Attempted fleet membership is now persisted apart from
+        // successful collection, so the A-only sweep sees B omitted and A's sole claim stays non-actionable.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-firsttimefail-{Guid.NewGuid():N}.json");
+        DateTimeOffset t = new(2026, 8, 26, 3, 0, 0, TimeSpan.Zero);
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        // Sweep 1 attempts A and B: A claims 4448; B fails before it collects anything.
+        Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> sweep1 = (host, _) =>
+            host == "hb"
+                ? throw new TmuxUnavailableException("hb: no server running")
+                : Task.FromResult<IReadOnlyList<TmuxPane>>([Window("ha", "pr=4448 head=abc1234")]);
+
+        // Sweep 2 attempts only A, which answers with the same claim.
+        Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> sweep2 = (host, _) =>
+            Task.FromResult<IReadOnlyList<TmuxPane>>([Window("ha", "pr=4448 head=abc1234")]);
+
+        try
+        {
+            WaitingCommand.FleetResult first = await WaitingCommand.CollectAndResolveAsync(
+                ["ha", "hb"], sweep1, None, None, t, ct, historyPath: path);
+            Assert.True(first.Collected.AnyFailure);                       // B failed: sweep 1 is partial
+            Assert.False(first.Rows!.Single().Claim.OwnsClaim);           // and A is not owned
+
+            // B is on disk as attempted fleet membership even though it never collected — the persisted
+            // distinction the fix introduces.
+            var afterFirst = new PaneHistory(path);
+            Assert.Contains(TargetId.ForHost("hb").Key, afterFirst.KnownHosts);
+            Assert.Null(afterFirst.SweptAt("hb"));                         // no successful collection recorded
+
+            WaitingCommand.FleetResult second = await WaitingCommand.CollectAndResolveAsync(
+                ["ha"], sweep2, None, None, t.AddMinutes(10), ct, historyPath: path);
+
+            // The A-only sweep is narrowed, not complete: B is omitted, and A's sole claim is not actionable.
+            Assert.Contains(TargetId.ForHost("hb").Display, WaitingCommand.Omitted);
+            WaitingRow aRow = Assert.Single(second.Rows!);
+            Assert.Equal(ClaimBasis.PartialView, aRow.Claim.Basis);
+            Assert.False(aRow.Claim.OwnsClaim);
+            Assert.False(aRow.MayAct);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task CollectAndLocateAsync_AFirstTimeFailedHostIsRememberedSoALaterOmissionNarrowsThePrView()
+    {
+        // Round 9, blocker 1 (pr surface): the same two-sweep laundering, through `octoshift pr`. A+B
+        // attempted with B failing on first sight; a later A-only lookup must not report A as the located
+        // sole claimant of a complete view — B is remembered, so the view reads NARROWED and the order is
+        // unconfirmed.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-prfirsttimefail-{Guid.NewGuid():N}.json");
+        DateTimeOffset t = new(2026, 8, 26, 3, 0, 0, TimeSpan.Zero);
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> sweep1 = (host, _) =>
+            host == "hb"
+                ? throw new TmuxUnavailableException("hb: no server running")
+                : Task.FromResult<IReadOnlyList<TmuxPane>>([Window("ha", "pr=4448 head=abc1234")]);
+
+        Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>> sweep2 = (host, _) =>
+            Task.FromResult<IReadOnlyList<TmuxPane>>([Window("ha", "pr=4448 head=abc1234")]);
+
+        try
+        {
+            PrCommand.PrLocation first = await PrCommand.CollectAndLocateAsync(
+                4448, ["ha", "hb"], sweep1, NoneFetch, None, t, ct, historyPath: path);
+            Assert.Equal(PrCommand.PrDisposition.Partial, first.Disposition);   // B unreachable
+
+            var afterFirst = new PaneHistory(path);
+            Assert.Contains(TargetId.ForHost("hb").Key, afterFirst.KnownHosts);
+
+            PrCommand.PrLocation second = await PrCommand.CollectAndLocateAsync(
+                4448, ["ha"], sweep2, NoneFetch, None, t.AddMinutes(10), ct, historyPath: path);
+
+            // B is remembered, so the A-only lookup is narrowed rather than a complete Found, its exit is
+            // unavailable, and the located claim's order is left unconfirmed rather than observed.
+            Assert.Equal(PrCommand.PrDisposition.Narrowed, second.Disposition);
+            Assert.Equal(ExitCode.Unavailable, second.ExitCode);
+            Assert.Equal(ClaimBasis.PartialView, Assert.Single(second.Claims).Claim.Basis);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
     public void TransactionTime_ClampsASampleUpToTheGreatestPersistedTime()
     {
         // Blocker 2: the registration clock never runs backwards. A sample later than everything on disk is
@@ -298,7 +395,7 @@ public sealed class PersistenceTests
         (PaneHistory history, string blocker) = UnwritableHistory();
         try
         {
-            var collected = new WaitingCommand.Collection([Pane(null)], [], 1, [null]);
+            var collected = new WaitingCommand.Collection([Pane(null)], [], 1, [null], [null]);
             await Assert.ThrowsAsync<HistoryUnavailableException>(() => PrCommand.LocateAsync(
                 4448, collected, history, NoneFetch, None, DateTimeOffset.UtcNow, TestContext.Current.CancellationToken));
         }
@@ -402,56 +499,72 @@ public sealed class PersistenceTests
         string hostKey = TargetId.ForHost("banff").Key;
         string paneKey = TargetId.ForHost("banff").ComposeWith("%1");
         string hosts = $"\"hosts\":{{\"{hostKey}\":{ValidHost}}}";
+        string att = $"\"attempted\":[\"{hostKey}\"]";
+        const string attEmpty = "\"attempted\":[]";
 
         // --- Raw schema: shapes the source-gen deserializer would leniently accept and rewrite. ---
 
-        // The writer always emits both maps, so a file missing either was not written by this scheme.
+        // The writer always emits all three members, so a file missing any was not written by this scheme.
         yield return ["{}"];
         yield return ["{\"panes\":{}}"];
         yield return ["{\"hosts\":{}}"];
         yield return ["{\"panes\":null,\"hosts\":null}"];
+        yield return ["{\"panes\":{},\"hosts\":{}}"];                       // the two maps, but no attempted set
 
         // An extra root member, or the wrong casing, which case-insensitive matching would silently drop.
-        yield return ["{\"panes\":{},\"hosts\":{},\"version\":2}"];
-        yield return ["{\"Panes\":{},\"Hosts\":{}}"];
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{}},{attEmpty},\"version\":2}}"];
+        yield return ["{\"Panes\":{},\"Hosts\":{},\"Attempted\":[]}"];
 
         // A duplicate member at any level: root, a record, or a repeated dictionary key.
-        yield return ["{\"panes\":{},\"hosts\":{},\"panes\":{}}"];
-        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"1:1\",\"epoch\":\"2:2\",\"sweptAt\":\"2026-01-01T00:00:00+00:00\",\"continuous\":true}}}}}}"];
-        yield return [$"{{\"panes\":{{\"{paneKey}\":{ValidPane},\"{paneKey}\":{ValidPane}}},{hosts}}}"];
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{}},{attEmpty},\"panes\":{{}}}}"];
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"1:1\",\"epoch\":\"2:2\",\"sweptAt\":\"2026-01-01T00:00:00+00:00\",\"continuous\":true}}}},{att}}}"];
+        yield return [$"{{\"panes\":{{\"{paneKey}\":{ValidPane},\"{paneKey}\":{ValidPane}}},{hosts},{att}}}"];
 
         // An unknown nested member, and a record missing a required one.
-        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"1:1\",\"sweptAt\":\"2026-01-01T00:00:00+00:00\",\"continuous\":true,\"extra\":1}}}}}}"];
-        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"1:1\",\"continuous\":true}}}}}}"];
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"1:1\",\"sweptAt\":\"2026-01-01T00:00:00+00:00\",\"continuous\":true,\"extra\":1}}}},{att}}}"];
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"1:1\",\"continuous\":true}}}},{att}}}"];
 
         // A null value where a record must be — an object is required.
-        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":null}}}}"];
-        yield return [$"{{\"panes\":{{\"{paneKey}\":null}},\"hosts\":{{}}}}"];
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":null}},{att}}}"];
+        yield return [$"{{\"panes\":{{\"{paneKey}\":null}},\"hosts\":{{}},{attEmpty}}}"];
+
+        // --- Attempted set: shapes the persistent fleet membership never takes. ---
+
+        // Not an array; a non-string element; a repeated key; a key this scheme never minted.
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{}},\"attempted\":{{}}}}"];
+        yield return ["{\"panes\":{},\"hosts\":{},\"attempted\":[1]}"];
+        yield return ["{\"panes\":{},\"hosts\":{},\"attempted\":[\"L\",\"L\"]}"];
+        yield return ["{\"panes\":{},\"hosts\":{},\"attempted\":[\"RA\"]}"];
+
+        // A host that answered but is absent from the attempted set — a shape the writer, which records
+        // both on the same sweep, could never produce; reading past it would leave the membership invariant
+        // KnownHosts relies on unchecked.
+        yield return [$"{{\"panes\":{{}},{hosts},{attEmpty}}}"];
 
         // --- Semantic: full, well-formed records this implementation could never have written. ---
 
         // A pane whose host is absent from the hosts map — it would carry a registration for a host that
-        // never enters KnownHosts, defeating narrowed-fleet detection.
-        yield return [$"{{\"panes\":{{\"{paneKey}\":{ValidPane}}},\"hosts\":{{}}}}"];
+        // never enters the collected fleet, defeating narrowed-fleet detection.
+        yield return [$"{{\"panes\":{{\"{paneKey}\":{ValidPane}}},\"hosts\":{{}},{attEmpty}}}"];
 
         // An invalid host key: `RA` is not canonical base64url, so it is not a target this scheme minted.
-        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"RA\":{ValidHost}}}}}"];
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"RA\":{ValidHost}}},{attEmpty}}}"];
 
         // An impossible pane id in the composite key: `%01` has a leading zero, which tmux never emits.
-        yield return [$"{{\"panes\":{{\"{TargetId.ForHost("banff").ComposeWith("%01")}\":{ValidPane}}},\"hosts\":{{}}}}"];
+        yield return [$"{{\"panes\":{{\"{TargetId.ForHost("banff").ComposeWith("%01")}\":{ValidPane}}},\"hosts\":{{}},{attEmpty}}}"];
 
         // A witness with no claim.
-        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"2026-01-01T00:00:00+00:00\",\"pr\":null,\"claimedAt\":null,\"witnessed\":true}}}},\"hosts\":{{}}}}"];
+        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"2026-01-01T00:00:00+00:00\",\"pr\":null,\"claimedAt\":null,\"witnessed\":true}}}},\"hosts\":{{}},{attEmpty}}}"];
         // A claim number with no claim time.
-        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"2026-01-01T00:00:00+00:00\",\"pr\":4448,\"claimedAt\":null,\"witnessed\":false}}}},\"hosts\":{{}}}}"];
+        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"2026-01-01T00:00:00+00:00\",\"pr\":4448,\"claimedAt\":null,\"witnessed\":false}}}},\"hosts\":{{}},{attEmpty}}}"];
         // A default (unset) Since.
-        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"0001-01-01T00:00:00+00:00\",\"pr\":null,\"claimedAt\":null,\"witnessed\":false}}}},\"hosts\":{{}}}}"];
+        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"0001-01-01T00:00:00+00:00\",\"pr\":null,\"claimedAt\":null,\"witnessed\":false}}}},\"hosts\":{{}},{attEmpty}}}"];
         // A non-positive PR number.
-        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"2026-01-01T00:00:00+00:00\",\"pr\":0,\"claimedAt\":\"2026-01-01T00:00:00+00:00\",\"witnessed\":false}}}},\"hosts\":{{}}}}"];
+        yield return [$"{{\"panes\":{{\"{paneKey}\":{{\"digest\":\"a\",\"since\":\"2026-01-01T00:00:00+00:00\",\"pr\":0,\"claimedAt\":\"2026-01-01T00:00:00+00:00\",\"witnessed\":false}}}},\"hosts\":{{}},{attEmpty}}}"];
         // A host claiming continuity with no sweep time.
-        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"1:1\",\"sweptAt\":null,\"continuous\":true}}}}}}"];
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"1:1\",\"sweptAt\":null,\"continuous\":true}}}},{att}}}"];
         // A host carrying a non-canonical epoch.
-        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"0:0\",\"sweptAt\":\"2026-01-01T00:00:00+00:00\",\"continuous\":true}}}}}}"];
+        yield return [$"{{\"panes\":{{}},\"hosts\":{{\"{hostKey}\":{{\"epoch\":\"0:0\",\"sweptAt\":\"2026-01-01T00:00:00+00:00\",\"continuous\":true}}}},{att}}}"];
     }
 
     [Theory]
@@ -532,7 +645,7 @@ public sealed class PersistenceTests
                 collectedHosts: [null], allHostsAnswered: true, history: null, historyPath: path));
             Assert.Equal(content, File.ReadAllText(path));
 
-            var collected = new WaitingCommand.Collection([Pane(null)], [], 1, [null]);
+            var collected = new WaitingCommand.Collection([Pane(null)], [], 1, [null], [null]);
             await Assert.ThrowsAsync<HistoryUnavailableException>(() => PrCommand.LocateAsync(
                 4448, collected, history: null, NoneFetch, None, DateTimeOffset.UtcNow, ct, historyPath: path));
             Assert.Equal(content, File.ReadAllText(path));
@@ -636,7 +749,7 @@ public sealed class PersistenceTests
         File.WriteAllText(path, "{ bad ]");
         try
         {
-            var collected = new WaitingCommand.Collection([Pane(null)], [], 1, [null]);
+            var collected = new WaitingCommand.Collection([Pane(null)], [], 1, [null], [null]);
             await Assert.ThrowsAsync<HistoryUnavailableException>(() => PrCommand.LocateAsync(
                 4448, collected, history: null, NoneFetch, None, DateTimeOffset.UtcNow, TestContext.Current.CancellationToken, historyPath: path));
             Assert.Equal("{ bad ]", File.ReadAllText(path));

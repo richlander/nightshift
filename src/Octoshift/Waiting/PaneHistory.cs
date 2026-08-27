@@ -86,6 +86,19 @@ internal sealed class PaneHistory : IDisposable
     private readonly string _path;
     private readonly Dictionary<string, PaneMemory> _entries;
     private readonly Dictionary<string, HostMemory> _hosts;
+
+    /// <summary>
+    /// Every host this tool has ever <em>attempted</em> to collect — targeted over ssh (or the local
+    /// machine), whether or not it answered. This is the persistent fleet membership, kept apart from the
+    /// hosts that actually answered (<see cref="_hosts"/>, which carries epoch, continuity and sweep time).
+    /// A target attempted for the very first time and failing before it ever collected leaves nothing in
+    /// <see cref="_hosts"/>, so without this set it would be forgotten and a later sweep that omits it would
+    /// read as complete — granting a sole claim while a rival may still run on the unreached host. It grows
+    /// monotonically and is used only to decide whether a later view is narrower than the fleet already
+    /// known; continuity, epochs, panes and witnesses are never keyed on it.
+    /// </summary>
+    private readonly HashSet<string> _attempted;
+
     private FileStream? _lock;
 
     private static readonly TimeSpan LockTimeout = TimeSpan.FromSeconds(30);
@@ -117,7 +130,7 @@ internal sealed class PaneHistory : IDisposable
     {
         _path = path;
         _lock = lockStream;
-        (_entries, _hosts) = Load(path, strictLoad);
+        (_entries, _hosts, _attempted) = Load(path, strictLoad);
 
         // A strict (product) load has already reconciled its structure in Load — a missing map is a
         // rejection there. Here it rejects the whole file, bytes untouched, the moment any single record
@@ -128,7 +141,7 @@ internal sealed class PaneHistory : IDisposable
         // overwrites the evidence. Only the forgiving loader below drops key by key, and it is test-only.
         if (strictLoad)
         {
-            ValidateStrict(_entries, _hosts);
+            ValidateStrict(_entries, _hosts, _attempted);
             return;
         }
 
@@ -164,6 +177,16 @@ internal sealed class PaneHistory : IDisposable
         {
             _hosts[key] = SanitizeHost(_hosts[key]);
         }
+
+        // Attempted membership: drop any key not one this scheme minted, and fold in every collected host
+        // so the persisted invariant (a host that answered was, by definition, attempted) holds even for a
+        // hand-seeded fixture.
+        foreach (string key in _attempted.Where(k => !TargetId.IsValidKey(k)).ToArray())
+        {
+            _attempted.Remove(key);
+        }
+
+        _attempted.UnionWith(_hosts.Keys);
     }
 
     /// <summary>
@@ -176,7 +199,10 @@ internal sealed class PaneHistory : IDisposable
     /// was for a human to inspect. The invariants below are exactly the shapes <see cref="AdoptEpoch"/>,
     /// <see cref="RecordSweptEmpty"/>, <see cref="Observe"/> and <see cref="Save"/> can produce.
     /// </summary>
-    private static void ValidateStrict(Dictionary<string, PaneMemory> entries, Dictionary<string, HostMemory> hosts)
+    private static void ValidateStrict(
+        Dictionary<string, PaneMemory> entries,
+        Dictionary<string, HostMemory> hosts,
+        HashSet<string> attempted)
     {
         foreach ((string key, HostMemory host) in hosts)
         {
@@ -193,6 +219,24 @@ internal sealed class PaneHistory : IDisposable
             if (!IsWriterProducedHost(host))
             {
                 throw new HistoryUnavailableException($"pane history has an impossible record for host '{key}'");
+            }
+
+            // A host that answered was, by definition, attempted: the writer records both on the same
+            // sweep. A collected host missing from the attempted set is a shape this scheme never wrote,
+            // and reading past it would let the attempted-membership invariant it relies on go unchecked.
+            if (!attempted.Contains(key))
+            {
+                throw new HistoryUnavailableException($"pane history has collected host '{key}' absent from the attempted set");
+            }
+        }
+
+        // Attempted membership is a set of canonical target keys. An invalid one is not a target this
+        // scheme minted, so the whole file is untrustworthy rather than one key to drop.
+        foreach (string key in attempted)
+        {
+            if (!TargetId.IsValidKey(key))
+            {
+                throw new HistoryUnavailableException($"pane history has an invalid attempted host key '{key}', so it was not written by this scheme");
             }
         }
 
@@ -264,20 +308,20 @@ internal sealed class PaneHistory : IDisposable
     }
 
     /// <summary>
-    /// Reads the two dictionaries off disk. Absence of the file is a first run — a genuinely empty
-    /// history. An existing file that cannot be read or parsed, or that is a null JSON document, is NOT
-    /// empty: it is a history whose contents are unknown, and treating it as empty would forget the known
-    /// hosts and witnessed orders it held — letting a narrowed sweep read as complete and then overwrite
-    /// the evidence. So under a strict (product) load that case throws and the transaction is unavailable;
-    /// the forgiving loader used by unit tests tolerates it, since those seed corrupt files deliberately.
-    /// A well-formed file with entries this scheme never wrote is not a load failure — it parses — and is
-    /// left to the sanitiser above to drop key by key.
+    /// Reads the two dictionaries and the attempted-host set off disk. Absence of the file is a first
+    /// run — a genuinely empty history. An existing file that cannot be read or parsed, or that is a null
+    /// JSON document, is NOT empty: it is a history whose contents are unknown, and treating it as empty
+    /// would forget the known hosts and witnessed orders it held — letting a narrowed sweep read as
+    /// complete and then overwrite the evidence. So under a strict (product) load that case throws and the
+    /// transaction is unavailable; the forgiving loader used by unit tests tolerates it, since those seed
+    /// corrupt files deliberately. A well-formed file with entries this scheme never wrote is not a load
+    /// failure — it parses — and is left to the sanitiser above to drop key by key.
     /// </summary>
-    private static (Dictionary<string, PaneMemory>, Dictionary<string, HostMemory>) Load(string path, bool strict)
+    private static (Dictionary<string, PaneMemory>, Dictionary<string, HostMemory>, HashSet<string>) Load(string path, bool strict)
     {
         if (!File.Exists(path))
         {
-            return ([], []);
+            return ([], [], []);
         }
 
         string text;
@@ -292,7 +336,7 @@ internal sealed class PaneHistory : IDisposable
                 throw new HistoryUnavailableException($"could not read pane history from {path}: {ex.Message}", ex);
             }
 
-            return ([], []);
+            return ([], [], []);
         }
 
         // A strict (product) load validates the raw JSON shape before deserializing it, because the
@@ -320,7 +364,7 @@ internal sealed class PaneHistory : IDisposable
                 throw new HistoryUnavailableException($"could not read pane history from {path}: {ex.Message}", ex);
             }
 
-            return ([], []);
+            return ([], [], []);
         }
 
         if (file is null)
@@ -330,36 +374,38 @@ internal sealed class PaneHistory : IDisposable
                 throw new HistoryUnavailableException($"pane history at {path} is a null document, not an empty history");
             }
 
-            return ([], []);
+            return ([], [], []);
         }
 
-        // The writer always emits both maps (an empty first run writes `{"panes":{},"hosts":{}}`), so a
-        // file missing either — `{}`, `{"panes":{}}`, `{"hosts":null}` — was not written by this scheme.
-        // Under a strict load that is a rejection, not an empty history: reading it as empty would forget
-        // whatever the real file held. The forgiving loader treats an absent map as empty. (Strict never
-        // reaches here with a missing map — ValidateRawSchema already rejected it — but the guard stays as
-        // defence in depth.)
-        if (strict && (file.Panes is null || file.Hosts is null))
+        // The writer always emits all three members (an empty first run writes
+        // `{"panes":{},"hosts":{},"attempted":[]}`), so a file missing any — `{}`, `{"panes":{}}`,
+        // `{"hosts":null}`, a file with no attempted array — was not written by this scheme. Under a strict
+        // load that is a rejection, not an empty history: reading it as empty would forget whatever the
+        // real file held. The forgiving loader treats an absent member as empty. (Strict never reaches here
+        // with a missing member — ValidateRawSchema already rejected it — but the guard stays as defence in
+        // depth.)
+        if (strict && (file.Panes is null || file.Hosts is null || file.Attempted is null))
         {
-            throw new HistoryUnavailableException($"pane history at {path} is missing its panes or hosts map, so it was not written by this scheme");
+            throw new HistoryUnavailableException($"pane history at {path} is missing its panes, hosts or attempted member, so it was not written by this scheme");
         }
 
-        return (file.Panes ?? [], file.Hosts ?? []);
+        return (file.Panes ?? [], file.Hosts ?? [], [.. file.Attempted ?? []]);
     }
 
-    private static readonly string[] RootMembers = ["panes", "hosts"];
+    private static readonly string[] RootMembers = ["panes", "hosts", "attempted"];
     private static readonly string[] HostMembers = ["epoch", "sweptAt", "continuous"];
     private static readonly string[] PaneMembers = ["digest", "since", "pr", "claimedAt", "witnessed"];
 
     /// <summary>
     /// Validates the raw JSON shape of a strict load with <see cref="JsonDocument"/> — AOT-safe, no
     /// reflection — before the lenient source-generated deserializer sees it. The root must be an object
-    /// with exactly a <c>panes</c> object and a <c>hosts</c> object, exact casing, no unknown or duplicate
-    /// members; each host record exactly <c>epoch</c>/<c>sweptAt</c>/<c>continuous</c> and each pane record
-    /// exactly <c>digest</c>/<c>since</c>/<c>pr</c>/<c>claimedAt</c>/<c>witnessed</c>, again with no
-    /// unknown or duplicate members; and no dictionary key may repeat. Anything else is not a file this
-    /// scheme wrote, so it is rejected here — bytes untouched — rather than deserialized into a rewritten
-    /// approximation of itself.
+    /// with exactly a <c>panes</c> object, a <c>hosts</c> object and an <c>attempted</c> array, exact
+    /// casing, no unknown or duplicate members; each host record exactly
+    /// <c>epoch</c>/<c>sweptAt</c>/<c>continuous</c> and each pane record exactly
+    /// <c>digest</c>/<c>since</c>/<c>pr</c>/<c>claimedAt</c>/<c>witnessed</c>, again with no unknown or
+    /// duplicate members; no dictionary key may repeat; and the attempted array must be strings only, none
+    /// repeated. Anything else is not a file this scheme wrote, so it is rejected here — bytes untouched —
+    /// rather than deserialized into a rewritten approximation of itself.
     /// </summary>
     private static void ValidateRawSchema(string json, string path)
     {
@@ -378,6 +424,32 @@ internal sealed class PaneHistory : IDisposable
             RequireExactMembers(doc.RootElement, RootMembers, path, "the root");
             ValidateDictionary(doc.RootElement.GetProperty("hosts"), HostMembers, path, "host");
             ValidateDictionary(doc.RootElement.GetProperty("panes"), PaneMembers, path, "pane");
+            ValidateAttemptedArray(doc.RootElement.GetProperty("attempted"), path);
+        }
+    }
+
+    /// <summary>The attempted-host set on disk: a JSON array of unique strings. The writer emits target
+    /// keys; a non-array, a non-string element, or a repeated key is a shape it never produced, so the
+    /// whole file is rejected rather than one element dropped.</summary>
+    private static void ValidateAttemptedArray(JsonElement attempted, string path)
+    {
+        if (attempted.ValueKind != JsonValueKind.Array)
+        {
+            throw new HistoryUnavailableException($"pane history at {path} has an attempted member that is not an array");
+        }
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (JsonElement element in attempted.EnumerateArray())
+        {
+            if (element.ValueKind != JsonValueKind.String)
+            {
+                throw new HistoryUnavailableException($"pane history at {path} has a non-string attempted host key");
+            }
+
+            if (!seen.Add(element.GetString()!))
+            {
+                throw new HistoryUnavailableException($"pane history at {path} has a duplicate attempted host key '{element.GetString()}'");
+            }
         }
     }
 
@@ -605,9 +677,24 @@ internal sealed class PaneHistory : IDisposable
     /// Hosts this tool has collected before, by target key. A run that does not include one of them is
     /// looking at less of the fleet than it has already seen — which is not something the run can work out
     /// from its own arguments, because a host it was not told about is indistinguishable from a host that
-    /// does not exist.
+    /// <summary>
+    /// Hosts this tool has ever <em>attempted</em> — every target it tried to reach, whether or not the
+    /// host answered, unioned with every host that actually answered. This is the persistent fleet
+    /// membership: a run that does not include one of these is looking at less of the fleet than it has
+    /// already seen — which is not something the run can work out from its own arguments, because a host it
+    /// was not told about is indistinguishable from a host that does not exist. A target attempted once and
+    /// never yet collected is here even though it has no epoch or continuity, which is exactly what stops a
+    /// first-time failure from being forgotten and a later omission from reading as a complete view.
     /// </summary>
-    public IReadOnlyCollection<string> KnownHosts => _hosts.Keys;
+    public IReadOnlyCollection<string> KnownHosts
+    {
+        get
+        {
+            var known = new HashSet<string>(_attempted, StringComparer.Ordinal);
+            known.UnionWith(_hosts.Keys);
+            return known;
+        }
+    }
 
     /// <summary>When this host was last collected in full under the current server, if it was.</summary>
     public DateTimeOffset? SweptAt(string? host)
@@ -730,13 +817,44 @@ internal sealed class PaneHistory : IDisposable
     /// unreachable sweep. A previously-known host absent from this set has a gap recorded against it, so
     /// its registrations are invalidated when it is next collected.
     /// </param>
-    public IReadOnlyList<string> Save(IEnumerable<TmuxPane> live, IEnumerable<string?>? hosts = null)
+    /// <param name="attempted">
+    /// Hosts this sweep <em>attempted</em>, by raw alias (null local) — every target it tried, whether or
+    /// not it answered. Folded into the persistent <see cref="KnownHosts"/> membership so a target that
+    /// failed before it ever collected is still remembered, and a later run that omits it can tell its view
+    /// narrowed rather than reading it as complete. Grows monotonically and never carries an epoch,
+    /// continuity or pane on its own — those belong only to a host that answered (<paramref name="hosts"/>).
+    /// Defaults to the collected set when a caller does not distinguish the two (the tests that pass only
+    /// one host set), and the collected hosts are always folded in regardless, since a host that answered
+    /// was by definition attempted.
+    /// </param>
+    public IReadOnlyList<string> Save(
+        IEnumerable<TmuxPane> live,
+        IEnumerable<string?>? hosts = null,
+        IEnumerable<string?>? attempted = null)
     {
         var seen = live.ToArray();
         var keep = seen.Select(Key).ToHashSet(StringComparer.Ordinal);
         HashSet<string>? collected = hosts is null
             ? null
             : hosts.Select(h => TargetId.ForHost(h).Key).ToHashSet(StringComparer.Ordinal);
+
+        // Fleet membership grows with every attempted target — the last unit of state that must survive a
+        // host that failed on its very first attempt. It is recorded here, at the commit point, so it
+        // reaches disk on any sweep that gets far enough to Save, including a total or partial failure. The
+        // collected set (and every collected host already on disk) is folded in unconditionally, keeping
+        // the persisted invariant that a host which answered is also in attempted.
+        IEnumerable<string?> attemptedHosts = attempted ?? hosts ?? seen.Select(p => p.Host).Distinct();
+        foreach (string? host in attemptedHosts)
+        {
+            _attempted.Add(TargetId.ForHost(host).Key);
+        }
+
+        if (collected is not null)
+        {
+            _attempted.UnionWith(collected);
+        }
+
+        _attempted.UnionWith(_hosts.Keys);
 
         var departed = new List<string>();
         foreach (string gone in _entries.Keys.Where(k => !keep.Contains(k)).ToArray())
@@ -780,7 +898,7 @@ internal sealed class PaneHistory : IDisposable
         {
             Directory.CreateDirectory(dir);
             File.WriteAllText(tmp, JsonSerializer.Serialize(
-                new HistoryFile { Panes = _entries, Hosts = _hosts },
+                new HistoryFile { Panes = _entries, Hosts = _hosts, Attempted = [.. _attempted] },
                 PaneHistoryJsonContext.Default.HistoryFile));
             File.Move(tmp, _path, overwrite: true);
         }
@@ -821,7 +939,7 @@ internal sealed class PaneHistory : IDisposable
 internal sealed class HistoryUnavailableException(string message, Exception? inner = null)
     : Exception(message, inner);
 
-/// <summary>The on-disk shape: what is known per window, and per host.</summary>
+/// <summary>The on-disk shape: what is known per window, per host, and every host ever attempted.</summary>
 internal sealed record HistoryFile
 {
     [JsonPropertyName("panes")]
@@ -829,6 +947,11 @@ internal sealed record HistoryFile
 
     [JsonPropertyName("hosts")]
     public Dictionary<string, HostMemory>? Hosts { get; init; }
+
+    /// <summary>Every host ever targeted, answering or not — the persistent fleet membership, as a list of
+    /// canonical target keys.</summary>
+    [JsonPropertyName("attempted")]
+    public List<string>? Attempted { get; init; }
 }
 
 [JsonSourceGenerationOptions(PropertyNameCaseInsensitive = true)]

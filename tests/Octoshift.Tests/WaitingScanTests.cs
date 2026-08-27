@@ -523,6 +523,95 @@ public class WaitingScanTests
     }
 
     [Fact]
+    public async Task FetchDetailed_Remaining0OnA200StillClassifiesFound()
+    {
+        // The request that spends the last unit of the budget can still return a real answer. A 200 with
+        // `X-RateLimit-Remaining: 0` is a valid Found — the exhaustion refuses the NEXT read, it does not
+        // rewrite THIS one into an outage.
+        var gh = new FakeGh
+        {
+            ["repos/o/r/pulls/4595"] = Response(200, """
+                {"number":4595,"state":"open","mergeable_state":"clean","head":{"sha":"722512e25f0c1d4a9b8e7360a1c2d3e4f5061728"}}
+                """, "x-ratelimit-remaining: 0"),
+            [$"repos/o/r/commits/{Head}/check-runs?per_page=100"] = Response(200, """{"check_runs":[]}"""),
+        };
+
+        var source = new GhPrFactsSource("o/r", new FakeCache(), gh.RunAsync);
+        PrFetch fetch = await source.FetchDetailedAsync(4595, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.Found, fetch.Status);
+        Assert.NotNull(fetch.Facts);
+        Assert.Equal(Head, fetch.Facts.HeadSha);
+        Assert.True(source.RateLimited);
+        Assert.Equal(0, source.RateLimitRemaining);
+    }
+
+    [Fact]
+    public async Task FetchDetailed_Remaining0OnA304StillServesTheCachedBody()
+    {
+        // A conditional read answered 304 as the budget hits zero is still the cached body, current until
+        // the branch moves — the exhaustion is remembered, the answer is not thrown away.
+        var cache = new FakeCache();
+        cache.Put("repos/o/r/pulls/4595", "\"etag-pull\"", """
+            {"number":4595,"state":"open","mergeable_state":"clean","head":{"sha":"722512e25f0c1d4a9b8e7360a1c2d3e4f5061728"}}
+            """);
+        cache.Put($"repos/o/r/commits/{Head}/check-runs?per_page=100", "\"etag-checks\"", """{"check_runs":[]}""");
+
+        var gh = new FakeGh
+        {
+            ["repos/o/r/pulls/4595"] = Response(304, string.Empty, "x-ratelimit-remaining: 0"),
+            [$"repos/o/r/commits/{Head}/check-runs?per_page=100"] = Response(304, string.Empty, "x-ratelimit-remaining: 0"),
+        };
+
+        var source = new GhPrFactsSource("o/r", cache, gh.RunAsync);
+        PrFetch fetch = await source.FetchDetailedAsync(4595, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.Found, fetch.Status);
+        Assert.NotNull(fetch.Facts);
+        Assert.Equal(Head, fetch.Facts.HeadSha);
+        Assert.True(source.RateLimited);
+    }
+
+    [Fact]
+    public async Task FetchDetailed_Remaining0OnA404IsStillAnAffirmativeNotFound()
+    {
+        // An affirmative 404 is the one negative answer to trust, and the budget hitting zero on the same
+        // response does not make GitHub's "no such PR" any less true.
+        var gh = new FakeGh
+        {
+            ["repos/o/r/pulls/4595"] = Response(404, """{"message":"Not Found"}""", "x-ratelimit-remaining: 0"),
+        };
+
+        var source = new GhPrFactsSource("o/r", new FakeCache(), gh.RunAsync);
+        PrFetch fetch = await source.FetchDetailedAsync(4595, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.NotFound, fetch.Status);
+        Assert.Null(fetch.Facts);
+        Assert.True(source.RateLimited);
+    }
+
+    [Fact]
+    public async Task FetchDetailed_Remaining0RefusesTheNextNetworkRead()
+    {
+        // Classifying the current response truthfully must not spend the budget again: once a response has
+        // reported it exhausted, the very next call is refused before it reaches gh.
+        var gh = new FakeGh
+        {
+            ["repos/o/r/pulls/4595"] = Response(404, """{"message":"Not Found"}""", "x-ratelimit-remaining: 0"),
+        };
+
+        var source = new GhPrFactsSource("o/r", new FakeCache(), gh.RunAsync);
+
+        Assert.Equal(PrFetchStatus.NotFound, (await source.FetchDetailedAsync(4595, TestContext.Current.CancellationToken)).Status);
+
+        int spent = gh.Requests.Count;
+        Assert.Equal(PrFetchStatus.Unavailable, (await source.FetchDetailedAsync(4596, TestContext.Current.CancellationToken)).Status);
+
+        // The second lookup added no gh request: the exhausted budget refuses it before it is spent.
+        Assert.Equal(spent, gh.Requests.Count);
+    }
+
+    [Fact]
     public async Task FetchDetailed_FoundReturnsTheFacts()
     {
         // The happy path through the three-outcome seam: a 200 with a head yields Found and the facts.

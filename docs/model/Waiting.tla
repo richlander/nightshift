@@ -28,17 +28,21 @@
    switch PRs for reasons this tool neither controls nor predicts.
 
    Status: parsed cleanly with SANY and model-checked with TLC 2.19 against Waiting.cfg --
-   no errors, 6,575,159 states generated, 1,371,381 distinct, depth 9, zero violations
+   no errors, 7,229,472 states generated, 1,470,689 distinct, depth 9, zero violations
    (~8s, 12 workers; the per-host epoch, the empty sweep, modelling an empty host's first
-   window as a server start, and separating the hosts a sweep ATTEMPTED from the subset that
-   ANSWERED all widen the space from the earlier single-epoch model, while the server-start
+   window as a server start, separating the hosts a sweep ATTEMPTED from the subset that
+   ANSWERED, and growing persistent fleet membership from ATTEMPTED all widen the space from
+   the earlier single-epoch model, while the server-start
    advance prunes some by failing more first looks closed). Re-run TLC
    after any change here to regenerate the count
    and confirm zero violations. Validated by mutation:
    reintroducing the real pane-id-across-restart bug (dropping the epoch check in
    Registered) violates NoCrossEpochMemory; allowing two unwitnessed claimants to be
    ordered violates NeverActOnUnwitnessedOrder; making a sole claimant unownable violates
-   SoleClaimantIsAlwaysOwner; and dropping the regWitnessed clause from Observed -- or
+   SoleClaimantIsAlwaysOwner; growing knownHosts from collected instead of attempted -- the
+   round-9 first-time-failed-host laundering, where a host that fails on its first attempt is
+   forgotten and a later omission reads complete -- violates CompletenessCoversEveryAttemptedHost;
+   and dropping the regWitnessed clause from Observed -- or
    recomputing witness from the current sweep's coverage, the fleet-expansion laundering
    where the third sweep of a full fleet promotes a claim first recorded under a narrow
    view -- violates NoOwnerFromUnwitnessedRegistration, and doing the same recomputation
@@ -82,12 +86,14 @@ VARIABLES
     regPr,       \* window -> the PR it was seen claiming
     regFleet,    \* window -> the set of hosts known when its registration was made
     viewComplete, \* DERIVED by each sweep -- see Sweep
-    knownHosts,   \* hosts collected at least once before
+    knownHosts,   \* persistent fleet membership: every host ever ATTEMPTED, answering or not
     lastCollected, \* hosts the most recent sweep actually looked at
-    regWitnessed  \* window -> was the current registration witnessed (recorded under observation)
+    regWitnessed, \* window -> was the current registration witnessed (recorded under observation)
+    everAttempted \* GHOST: every host ever attempted, kept independently of knownHosts so a
+                  \* mutation that grew membership from collected instead of attempted is refutable
 
 vars == << now, claims, live, epoch, regEpoch, regTime, regPr, regFleet,
-            viewComplete, knownHosts, lastCollected, regWitnessed >>
+            viewComplete, knownHosts, lastCollected, regWitnessed, everAttempted >>
 
 TypeOK ==
     /\ now \in 0..MaxTime
@@ -102,6 +108,7 @@ TypeOK ==
     /\ knownHosts \subseteq Hosts
     /\ lastCollected \subseteq Hosts
     /\ regWitnessed \in [Windows -> BOOLEAN]
+    /\ everAttempted \subseteq Hosts
 
 (* ---- What the tool derives from what it remembers ---------------------------------
 
@@ -195,6 +202,7 @@ Init ==
     /\ knownHosts = {}
     /\ lastCollected = {}
     /\ regWitnessed = [w \in Windows |-> FALSE]
+    /\ everAttempted = {}
 
 \* Agents open windows, close them, and switch PRs on their own schedule. Exogenous:
 \* the tool observes this, it does not cause it.
@@ -231,7 +239,7 @@ AgentActs ==
                  /\ live' = live
                  /\ claims' = [claims EXCEPT ![w] = p]
             /\ UNCHANGED epoch
-    /\ UNCHANGED << regEpoch, regTime, regPr, regFleet, viewComplete, knownHosts, lastCollected, regWitnessed >>
+    /\ UNCHANGED << regEpoch, regTime, regPr, regFleet, viewComplete, knownHosts, lastCollected, regWitnessed, everAttempted >>
 
 \* One tmux server restarts: pane ids on THAT host restart, so its ids may now name
 \* different windows, while every other host is untouched. Restarts are per host because
@@ -252,7 +260,7 @@ ServerRestarts ==
     \* NoPhantomDepartureStep forbids -- and it is unnecessary, because Registered already
     \* fails the instant regEpoch[HostOf(w)] # epoch[HostOf(w)], so a stale witness confers
     \* nothing until the next collecting Sweep rewrites it under the new epoch.
-    /\ UNCHANGED << regEpoch, regTime, regPr, regFleet, viewComplete, knownHosts, lastCollected, regWitnessed >>
+    /\ UNCHANGED << regEpoch, regTime, regPr, regFleet, viewComplete, knownHosts, lastCollected, regWitnessed, everAttempted >>
 
 \* A sweep over some set of hosts. The set is nondeterministic because it is chosen by
 \* whoever ran the tool -- and because a host may fail to answer. Those two are the same
@@ -271,9 +279,11 @@ Sweep ==
     /\ now' = now + 1
     \* Two host sets, not one. The run REQUESTED a set of hosts (attempted) and some subset
     \* of those ANSWERED (collected); a requested host that failed is in attempted \ collected.
-    \* Everything a sweep renews -- registrations, knownHosts, continuity -- keys on what
-    \* ANSWERED, so only completeness depends on the difference. Modelling attempted is the
-    \* round-8 correction: deriving completeness from knownHosts \subseteq collected ALONE let a
+    \* Registrations, continuity and epochs key on what ANSWERED; persistent fleet membership
+    \* (knownHosts) keys on what was ATTEMPTED. That split is the round-9 correction: a host
+    \* attempted for the first time and failing has no epoch or continuity, but it is still fleet
+    \* membership, so a later sweep that omits it can tell its view narrowed. Modelling attempted at
+    \* all is the round-8 correction: deriving completeness from knownHosts \subseteq collected ALONE let a
     \* freshly requested host FAIL (attempted nonempty, knownHosts still {}) read as a complete
     \* view -- {} \subseteq collected holds vacuously -- while production passes allHostsAnswered
     \* = FALSE. Both sets range over EVERY subset (the empty set included): an empty collected is
@@ -285,15 +295,19 @@ Sweep ==
          \* First, every host the run ATTEMPTED must have answered (attempted \subseteq collected, i.e.
          \* collected = attempted since collected \subseteq attempted): a requested host that failed is a
          \* hole in the view, even one never seen before. Second, the run must cover everything it has
-         \* ALREADY collected (knownHosts \subseteq collected) -- a run over fewer hosts than it has seen
-         \* is looking at less of the fleet than it knows, and cannot tell that from its arguments alone
-         \* (a host it was not told about is indistinguishable from one that does not exist), only from
-         \* this memory. The first conjunct is the round-8 correction: deriving completeness from known
-         \* coverage ALONE let a freshly attempted host FAIL and still read complete -- attempted = {h},
-         \* collected = {}, knownHosts = {}, so {} \subseteq {} holds vacuously while production reports
-         \* allHostsAnswered = FALSE. Derived ONCE and threaded into both the view flag and the witness of
-         \* a fresh registration, exactly as production threads one `viewComplete` into both: a run whose
-         \* sibling host failed must not witness a claim on the host that did answer.
+         \* ALREADY attempted (knownHosts \subseteq collected, and knownHosts now accumulates attempted) --
+         \* a run over fewer hosts than it has seen is looking at less of the fleet than it knows, and
+         \* cannot tell that from its arguments alone (a host it was not told about is indistinguishable
+         \* from one that does not exist), only from this memory. The first conjunct is the round-8
+         \* correction: deriving completeness from known coverage ALONE let a freshly attempted host FAIL
+         \* and still read complete -- attempted = {h}, collected = {}, knownHosts = {}, so {} \subseteq {}
+         \* holds vacuously while production reports allHostsAnswered = FALSE. The second, now over an
+         \* attempted-grown knownHosts, is the round-9 correction: a host that failed on its FIRST attempt
+         \* (never collected, so absent from a collected-grown knownHosts) would be forgotten, and a later
+         \* A-only sweep would read complete and own a sole claim while a rival may run on it. Derived ONCE
+         \* and threaded into both the view flag and the witness of a fresh registration, exactly as
+         \* production threads one `viewComplete` into both: a run whose sibling host failed must not
+         \* witness a claim on the host that did answer.
          LET viewIsComplete == (attempted \subseteq collected) /\ (knownHosts \subseteq collected)
          IN
          \* Registrations are renewed or dropped only by a sweep that looked at the host.
@@ -315,9 +329,12 @@ Sweep ==
          /\ regPr' = [w \in Windows |->
                         IF HostOf(w) \notin collected THEN regPr[w]
                         ELSE IF w \in live THEN claims[w] ELSE NoPr]
+         \* The fleet a registration was made against. This is the KNOWN fleet -- the persistent
+         \* membership below, which grows with ATTEMPTED hosts -- so a registration made before a host
+         \* was ever attempted is not an order over the windows on it. It tracks knownHosts' exactly.
          /\ regFleet' = [w \in Windows |->
                            IF HostOf(w) \notin collected THEN regFleet[w]
-                           ELSE knownHosts \union collected]
+                           ELSE knownHosts \union attempted]
          \* The view flag: complete exactly when every attempted host answered AND the run covers
          \* everything already collected (see viewIsComplete above). Without the attempted-answered half,
          \* a never-before-known host that failed would read complete -- the bug this round closes.
@@ -343,7 +360,16 @@ Sweep ==
          \* it remembered, because the tool cannot learn a restart on a host it did not look
          \* at.
          /\ regEpoch' = [h \in Hosts |-> IF h \in collected THEN epoch[h] ELSE regEpoch[h]]
-         /\ knownHosts' = knownHosts \union collected
+         \* Persistent fleet membership grows with ATTEMPTED, not collected -- the round-9 correction.
+         \* A host attempted for the first time and FAILING before it ever collected has no epoch and no
+         \* continuity (those are keyed on collected, above), but it IS fleet membership: growing knownHosts
+         \* from collected alone would forget it, and a later sweep that omits it would read knownHosts
+         \* \subseteq collected as satisfied -- a complete view -- and own a sole claim while a rival may run
+         \* on the host that never answered. Growing it from attempted is what makes that later omission read
+         \* as narrowed. everAttempted mirrors this independently so the correspondence property below can
+         \* refute a mutation that reverts this union to collected.
+         /\ knownHosts' = knownHosts \union attempted
+         /\ everAttempted' = everAttempted \union attempted
          /\ lastCollected' = collected
     /\ UNCHANGED << claims, live, epoch >>
 
@@ -412,6 +438,23 @@ NoOwnerFromUnwitnessedRegistration ==
     \A w \in live :
         (claims[w] # NoPr /\ Cardinality(Claimants(claims[w])) > 1 /\ OwnsClaim(w))
           => \A c \in Claimants(claims[w]) : regWitnessed[c]
+
+\* Round 9: a complete view must cover every host EVER ATTEMPTED, not merely every host ever
+\* collected. This is the persistent-fleet-membership property. A host attempted for the first time
+\* and failing before it ever collected has no epoch and no continuity, so a knownHosts grown from
+\* collected alone forgets it -- and a later sweep that omits it reads knownHosts \subseteq collected
+\* as satisfied, a complete view, and owns a sole claim while a rival may still run on the host that
+\* never answered.
+\*
+\* Stated over everAttempted, the ghost that accumulates attempted independently of the knownHosts
+\* implementation, rather than over knownHosts itself: with the fix knownHosts = everAttempted, so
+\* "viewComplete => knownHosts \subseteq lastCollected" is satisfied by the buggy spec too (a
+\* collected-grown knownHosts is trivially \subseteq the hosts just collected) and refutes nothing.
+\* Against everAttempted the mutation is caught: revert knownHosts' to knownHosts \union collected and
+\* the two-sweep counterexample -- attempt A and a never-seen B, B fails, then sweep A alone -- makes
+\* viewComplete TRUE while everAttempted = {A,B} \not\subseteq {A} = lastCollected.
+CompletenessCoversEveryAttemptedHost ==
+    viewComplete => everAttempted \subseteq lastCollected
 
 (* ---- Step properties ---- *)
 

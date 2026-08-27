@@ -231,12 +231,15 @@ internal static class WaitingCommand
                 // A totally failed sweep is still a completed sweep: every previously known host went
                 // uncollected, so its continuity must be broken on disk — or a witnessed order would
                 // survive a run that saw nothing and be read as current next time. Persist that, under the
-                // same held transaction, before reporting. A persistence failure only adds to the failure
-                // already being reported, so it is folded into the same unavailable output.
+                // same held transaction, before reporting. The attempted set is recorded too, so a target
+                // that failed on its first ever attempt is remembered as fleet membership rather than lost
+                // with the sweep. A persistence failure only adds to the failure already being reported, so
+                // it is folded into the same unavailable output. (The stdout-token gap on this path is the
+                // separate #169; recording attempted membership here does not change that public behavior.)
                 var failures = new List<string>(collected.Unreachable);
                 try
                 {
-                    history.Save([], collected.CollectedHosts);
+                    history.Save([], collected.CollectedHosts, collected.AttemptedHosts);
                 }
                 catch (HistoryUnavailableException ex)
                 {
@@ -248,7 +251,8 @@ internal static class WaitingCommand
 
             IReadOnlyList<WaitingRow> resolved = await ResolveAllAsync(
                 collected.Panes, fetchAsync, refreshMergeabilityAsync, stamped, ct,
-                collected.CollectedHosts, allHostsAnswered: collected.Unreachable.Count == 0, history: history);
+                collected.CollectedHosts, allHostsAnswered: collected.Unreachable.Count == 0, history: history,
+                attemptedHosts: collected.AttemptedHosts);
 
             return new FleetResult(collected, resolved, []);
         }
@@ -268,11 +272,19 @@ internal static class WaitingCommand
     /// that was skipped. Bound to the exact successful set rather than inferred from pane presence, so a
     /// quiet host still counts toward a complete view and still has its history pruned.
     /// </param>
+    /// <param name="AttemptedHosts">
+    /// Every target this sweep <em>tried</em> to reach — <c>null</c> for the local machine — whether or not
+    /// it answered, so it is a superset of <see cref="CollectedHosts"/>. Carried as identities, not a
+    /// count, so a host attempted for the first time and failing before it ever collected can still be
+    /// persisted as fleet membership: that is what lets a later sweep that omits it tell its view narrowed
+    /// rather than reading a sole claim as owned while a rival may run on the unreached host.
+    /// </param>
     internal readonly record struct Collection(
         IReadOnlyList<TmuxPane> Panes,
         IReadOnlyList<string> Unreachable,
         int Targets,
-        IReadOnlyList<string?> CollectedHosts)
+        IReadOnlyList<string?> CollectedHosts,
+        IReadOnlyList<string?> AttemptedHosts)
     {
         /// <summary>Nothing was collected anywhere. Reported as a failure, never as a quiet fleet.</summary>
         public bool TotalFailure => Panes.Count == 0 && Unreachable.Count == Targets;
@@ -365,7 +377,9 @@ internal static class WaitingCommand
         // return — is still the caller's, and must surface rather than yield a quietly completed report.
         ct.ThrowIfCancellationRequested();
 
-        return new Collection(panes, unreachable, targets.Count, collectedHosts);
+        // Attempted membership is the full distinct target set — every host asked, answering or not — so a
+        // first-time failure is still persisted as fleet membership rather than forgotten.
+        return new Collection(panes, unreachable, targets.Count, collectedHosts, targets);
     }
 
     /// <summary>
@@ -450,7 +464,8 @@ internal static class WaitingCommand
         IReadOnlyList<string?>? collectedHosts,
         bool allHostsAnswered,
         PaneHistory? history = null,
-        string? historyPath = null)
+        string? historyPath = null,
+        IReadOnlyList<string?>? attemptedHosts = null)
     {
         Departed = [];
         Omitted = [];
@@ -562,10 +577,12 @@ internal static class WaitingCommand
 
         // Prune history only for the hosts actually collected. A window on a host that did not answer, or
         // that this run was not asked about, has not departed — it is merely unseen, and forgetting it
-        // would manufacture a departure and discard its registration on every partial sweep. Save is the
-        // commit: it releases the cross-process lock, so everything above ran under it and everything
-        // below — the GitHub reads — runs after it.
-        Departed = history.Save(panes, collected);
+        // would manufacture a departure and discard its registration on every partial sweep. The attempted
+        // set is recorded as fleet membership so a target that failed on its first attempt is not forgotten;
+        // it defaults to the collected set when a caller does not distinguish them. Save is the commit: it
+        // releases the cross-process lock, so everything above ran under it and everything below — the
+        // GitHub reads — runs after it.
+        Departed = history.Save(panes, collected, attemptedHosts);
         }
         finally
         {
@@ -615,42 +632,14 @@ internal static class WaitingCommand
         foreach ((TmuxPane pane, StateReading reading) in readings)
         {
             AgentState? record = reading.Identified;
-            WaitingVerdict verdict = pane.Activity switch
-            {
-                // A pane mid-turn has not handed anything over; there is nothing to resolve and nothing to
-                // do, but it still holds a claim, so it gets a row that is never actionable rather than
-                // vanishing from the contest.
-                PaneActivity.Working => new WaitingVerdict(
-                    WaitingState.Unknown, RowOwner.Agent, "agent is mid-turn; nothing handed over yet",
-                    Assurance.Low("the agent has not handed anything over")),
-
-                // The agent runtime failed. No GitHub lookup can explain it and none can clear it, so this
-                // goes straight to a person with the text that says why.
-                PaneActivity.Stalled => new WaitingVerdict(
-                    WaitingState.NeedsOperator, RowOwner.Operator,
-                    $"agent stalled: {TmuxScanner.StallReason(pane.Capture)}", Assurance.High),
-
-                // A held-open prompt is answered with a keystroke, not with a GitHub lookup. The pane
-                // itself is the evidence, and it is unambiguous: a prompt is open.
-                PaneActivity.Blocked => new WaitingVerdict(
-                    WaitingState.NeedsOperator, RowOwner.Operator, "prompt open; awaiting a keystroke", Assurance.High),
-
-                // A pane nobody could read is reported, never resolved. Its window options came from the
-                // manifest and are trustworthy, but whether the agent is mid-turn is exactly what the
-                // capture was for — so this must not reach the idle path, where a published record is taken
-                // as a handover and can reach a high-confidence, actionable verdict on unread evidence.
-                PaneActivity.Unreadable => new WaitingVerdict(
-                    WaitingState.Unknown, RowOwner.Operator, "pane could not be captured; its state is unread",
-                    Assurance.Low("the pane could not be read")),
-
-                _ => record is not null
+            WaitingVerdict verdict = WaitingVerdict.ForActivity(pane.Activity, pane.Capture, () =>
+                record is not null
                     ? WaitingVerdict.Resolve(record, record.IsIssue ? null : seen.GetValueOrDefault(record.PrNumber))
                     : reading.Unidentified is { } unusable
                         ? WaitingVerdict.Unidentified(unusable)
                         : new WaitingVerdict(
                             WaitingState.Unknown, RowOwner.Nobody, "no published state and no pr#### window name",
-                            Assurance.Low("nothing identifies this window")),
-            };
+                            Assurance.Low("nothing identifies this window")));
 
             rows.Add(Row(pane, reading, verdict, now) with
             {

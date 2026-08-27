@@ -357,6 +357,42 @@ public class ModelCorrespondenceTests
     }
 
     /// <summary>
+    /// TLA+ <c>Sweep</c>, the round-9 clause: <c>knownHosts' = knownHosts ∪ attempted</c> (was
+    /// <c>∪ collected</c>), the property <c>CompletenessCoversEveryAttemptedHost</c> refutes reverting.
+    /// Persistent fleet membership grows with the hosts a sweep ATTEMPTED, not only those that answered, so
+    /// a target that fails on its very first attempt — no epoch, no continuity, never in the hosts map — is
+    /// still remembered. The code keeps this attempted set apart from successful collection behind
+    /// <see cref="PaneHistory.KnownHosts"/>, so a later sweep that omits the failed target reads as narrowed
+    /// rather than complete.
+    /// </summary>
+    [Fact]
+    public void PersistentFleetMembershipGrowsWithAttemptedNotCollected()
+    {
+        string path = TempPath();
+        try
+        {
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+            TmuxPane onFernie = Window("%1", host: "fernie");
+
+            // A sweep attempts fernie and banff; only fernie answers, banff fails before it ever collects.
+            var first = new PaneHistory(path);
+            first.AdoptEpoch("fernie", "100:1", t);
+            first.Save([onFernie], hosts: ["fernie"], attempted: ["fernie", "banff"]);
+
+            // banff is remembered as fleet membership even though it never collected — it has no successful
+            // sweep time and no epoch, only membership. fernie, which answered, carries its collection.
+            var reopened = new PaneHistory(path);
+            Assert.Contains(TargetId.ForHost("banff").Key, reopened.KnownHosts);
+            Assert.Null(reopened.SweptAt("banff"));
+            Assert.NotNull(reopened.SweptAt("fernie"));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    /// <summary>
     /// TLA+ <c>Sweep</c> completeness, the round-8 clause: <c>viewComplete' = (attempted ⊆ collected) ∧
     /// (knownHosts ⊆ collected)</c>. A target attempted for the very first time — never in KnownHosts —
     /// that fails leaves the second conjunct holding vacuously (<c>{} ⊆ collected</c>), so deriving
