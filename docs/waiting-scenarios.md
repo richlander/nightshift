@@ -207,10 +207,10 @@ FLEET 3 member(s)
   fernie
   merritt
 
-$ octoshift fleet retire merritt        # merritt was decommissioned
+$ octoshift fleet retire --host merritt        # merritt was decommissioned
 RETIRED merritt
 
-$ octoshift fleet retire typoo
+$ octoshift fleet retire --host typoo
 UNKNOWN typoo not in the declared fleet   # exit Usage — a typo cannot silently retire the wrong thing
 ```
 
@@ -271,7 +271,7 @@ octoshift pr 4537
 
 # show or prune the declared fleet
 octoshift fleet
-octoshift fleet retire merritt
+octoshift fleet retire --host merritt
 
 # same rows, for a dashboard
 octoshift waiting --json
