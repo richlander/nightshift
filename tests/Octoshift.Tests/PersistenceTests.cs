@@ -19,7 +19,6 @@ public sealed class PersistenceTests
         => new()
         {
             PaneId = "%1",
-            WindowId = "@1",
             Target = "cp:1",
             Host = host,
             WindowName = "pr4448",
@@ -40,7 +39,6 @@ public sealed class PersistenceTests
         => new()
         {
             PaneId = "%1",
-            WindowId = "@1",
             Target = "cp:1",
             Host = host,
             WindowName = windowName,
@@ -334,8 +332,8 @@ public sealed class PersistenceTests
         DateTimeOffset t1 = t2.AddHours(-1);
         CancellationToken ct = TestContext.Current.CancellationToken;
 
-        TmuxPane W1 = Claiming("a", "%1", "@1", "win1");
-        TmuxPane W2 = Claiming("a", "%2", "@2", "win2");
+        TmuxPane W1 = Claiming("a", "%1", "win1");
+        TmuxPane W2 = Claiming("a", "%2", "win2");
         try
         {
             await WaitingCommand.CollectAndResolveAsync(
@@ -389,11 +387,10 @@ public sealed class PersistenceTests
 
     // A window that claims a PR through its published state, with a distinct name so a shared name is never
     // mistaken for an ambiguity.
-    private static TmuxPane Claiming(string? host, string paneId, string windowId, string windowName)
+    private static TmuxPane Claiming(string? host, string paneId, string windowName)
         => new()
         {
             PaneId = paneId,
-            WindowId = windowId,
             Target = "cp:1",
             Host = host,
             WindowName = windowName,
@@ -401,7 +398,6 @@ public sealed class PersistenceTests
             Activity = PaneActivity.Idle,
             Epoch = "1:1",
             AgentStateOption = "pr=4448 head=abc1234 reviews=2/2 rec=merge",
-            AgentStateRaw = "pr=4448 head=abc1234 reviews=2/2 rec=merge",
         };
 
     // A history whose file sits under a path that is a regular file, not a directory, so creating the
