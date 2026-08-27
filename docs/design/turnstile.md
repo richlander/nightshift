@@ -327,13 +327,13 @@ A lease has a TTL. Keys may be **attached** to it. On expiry or revoke, **all at
 
 Therefore:
 
-> **Agent death = lease expiry = key deletion = a watch event = a controller reacts.**
+> **Holder death = lease expiry = key deletion = a watch event = a controller reacts.**
 >
 > **One mechanism. No special case.**
 
-Phantom wait, process crash, OOM, machine reboot, harness hanging on a content filter — **all identical to the kernel.** Keepalive stops; the claim vanishes; a supervisor sees the delete and respawns.
+A hung process, a crash, an OOM, a machine reboot — **all identical to the kernel.** Keepalive stops; the attached keys vanish; a watcher sees the delete and reacts.
 
-**There is no dead-agent detector anywhere in the system. There is a lease.**
+**There is no dead-process detector anywhere in the system. There is a lease.**
 
 ### Lease groups lifetime. Txn groups mutation.
 
@@ -344,58 +344,7 @@ Different axes, and conflating them is the mistake:
 
 And a smell worth naming: **if a, b, c must always be mutated together by the same writer, they should be one key.** The only reason to split keys is to avoid contention between *different* writers. Same writer, always atomic, no race → you split for nothing and bought a transaction you didn't need.
 
-**Attach anything that should die with the agent to the agent's lease** — the claim, the registry entry, the reverse index. They vanish together. **Leases are the garbage collector.**
-
-### The lease credential — and the failure mode it avoids
-
-> **The lease belongs to the process, not the model.**
-
-An LLM has no durable state. It ceases and resumes. It resets, compacts, forgets. **Any design where the model must remember a token is broken by construction** — it is the phantom wait wearing a different hat.
-
-So **the agent never sees the lease.** The client binary owns it:
-
-```
-join
-  → POST /lease {ttl: 2700}                          → 0x9f3c…
-  → POST /agent/dev-b ?lease=0x9f3c…
-  → write $XDG_RUNTIME_DIR/ns/<worktree-hash>.json   {lease: "0x9f3c…"}   mode 0600
-  → print "joined as dev-b"                          ← all the agent ever sees
-
-next                                                  ← a fresh process
-  → derive session key from cwd's worktree
-  → read the session file
-  → Txn-claim with lease 0x9f3c…
-  → print the slice
-```
-
-**Session identity = the worktree.** One agent per worktree is already an invariant of the design. So `hash(git rev-parse --show-toplevel)` is a stable, derivable key that survives *any* number of agent context resets.
-
-| Concern | Resolution |
-|---|---|
-| Where does the agent store the token? | **It doesn't.** The CLI does, in a file the agent never reads. |
-| The token leaks | Lease IDs are **unguessable 128-bit random**, not sequential ints. Knowing yours tells you nothing about anyone else's. File is `0600`. |
-| The agent resets and forgets | **It never knew.** The next call re-reads the file. Nothing was in the model's context to lose. |
-
-Session file missing but the process lives → a `check` call returns `NO_SESSION → rejoin`. Visible and recoverable, not a silent hang.
-
-### Who keepalives?
-
-If the *agent* must renew, an agent 40 minutes into a build loses its claim while doing everything right. Unacceptable. So: **bind the lease to whatever actually dies.**
-
-- **Cattle (headless):** the supervisor that launched the process holds the lease and keepalives it. When the child exits — cleanly, crashed, OOM'd, content-filtered — the supervisor stops renewing. **The agent never touches the lease at all.** Free: the supervisor already has to know whether its child is alive.
-- **Pets (interactive):** the client's backgrounded SSE stream **also keepalives.** One background process, two jobs: renew the lease, stream change events. Backgrounded once at join; never thought about again. Session dies → child dies → keepalive stops → lease expires.
-- **Fallback, both:** any CLI call renews. Plus a generous TTL (45 min) so a long build survives a quiet stretch.
-
-| Event | Keepalive | Result |
-|---|---|---|
-| Agent finishes cleanly | `release`, then exit | claim released explicitly |
-| Agent crashes | dies with the process | lease expires → delete event → respawn |
-| **Agent's context resets, process lives** | **unaffected — it's a child process** | **nothing happens. Correct.** |
-| Agent forgets it has work | still running | `check` returns its claim. It re-learns. |
-| Harness reaps the background process | stops | lease expires; work reclaimed. Conservative, safe. |
-| Machine sleeps | suspends | lease expires. Fine — the agent wasn't working either. |
-
-**Note row 3.** An agent that forgets everything and keeps running **does not lose its claim**, because the claim was never in its context. That is the property you want, and it is unattainable if the lease ID is a token the model must carry.
+**Attach anything that should die with the holder to its lease** — the claim, the registry entry, the reverse index. They vanish together. **Leases are the garbage collector.**
 
 ### Implementation notes
 
@@ -438,27 +387,15 @@ The client is **deliberately cold**, because it has nothing worth keeping warm. 
 
 ### Call volume is trivial
 
-Per agent, per slice (20–40 minutes of real work):
+Each client issues only a handful of calls per unit of work — an acquire, a few conditional writes and renews, a release. Even a busy fleet is **low hundreds of calls per active cycle, low thousands over a work day.** SQLite does that in seconds of wall clock and idles the rest of the time.
 
-```
-join     1
-next     1
-check   ~10      (at commit gates; mostly piggybacked on other calls)
-extend  0–2
-release  1
-──────────
-        ~15
-```
-
-Twelve agents ⇒ **~180 calls per slice-cycle; low thousands over an eight-hour shift.** SQLite does that in seconds of wall clock and idles for the other 7h59m.
-
-Plus **one long-lived SSE stream per pet** and **one per controller.** Those are connections, not calls — cheap to hold, and they're what makes polling unnecessary.
+Plus **one long-lived SSE stream per interactive client** and **one per controller.** Those are connections, not calls — cheap to hold, and they're what makes polling unnecessary.
 
 ### The design consequence
 
-> **Because the daemon holds all state and the client holds none, an agent's context reset costs nothing.**
+> **Because the daemon holds all state and the client holds none, a client's restart or context reset costs nothing.**
 
-The client re-derives identity from `cwd` on every invocation. **It doesn't matter that the agent forgot everything — the client never remembered anything either.** State lives in the daemon; identity lives in the filesystem; the model holds neither.
+The client re-derives identity from `cwd` on every invocation. **It doesn't matter that the caller forgot everything — the client never remembered anything either.** State lives in the daemon; identity lives in the filesystem; the client holds neither.
 
 **A stateful client would be a client that could get out of sync. A stateless one can't.**
 
