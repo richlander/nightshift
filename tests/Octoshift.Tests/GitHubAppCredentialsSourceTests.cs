@@ -24,7 +24,6 @@ public class GitHubAppCredentialsSourceTests
                 ? data
                 : throw new InvalidOperationException($"octoshift: {label} file '{path}' does not exist.");
     }
-
     private static FileGitHubAppCredentialsSource SourceReading(string credentialsJson, UnixFileMode? mode = UnixFileMode.UserRead)
         => new(
             name => name == CredentialsPathVariable ? CredentialsPath : null,
@@ -224,4 +223,3 @@ public class GitHubAppCredentialsSourceTests
         Assert.Throws<InvalidOperationException>(() => OpenOnceProtectedFileReader.Instance.Read(path, "credentials"));
     }
 }
-

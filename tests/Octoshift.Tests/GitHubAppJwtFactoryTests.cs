@@ -23,7 +23,6 @@ public class GitHubAppJwtFactoryTests
         using RSA rsa = RSA.Create(2048);
         return rsa.ExportPkcs8PrivateKeyPem();
     }
-
     [Theory]
     [InlineData("not a pem at all")]
     [InlineData("-----BEGIN RSA PRIVATE KEY-----\nnot base64!!!\n-----END RSA PRIVATE KEY-----")]
@@ -117,4 +116,3 @@ public class GitHubAppJwtFactoryTests
         return Convert.FromBase64String(standard);
     }
 }
-
