@@ -1,17 +1,17 @@
 # Nightsky
 
-**One pane of glass over [Nightshift](nightshift-spec.md).**
+**One pane of glass over Nightshift.**
 *Turnstile coordinates. Octoshift translates. Nightsky shows you the whole sky — and touches nothing.*
 
 *Draft spec v0.1 — Rich Lander, July 2026*
-*Built on [Nightshift](nightshift-spec.md), [Turnstile](turnstile.md), and [Octoshift](octoshift.md). Not yet built — this is the map.*
+*Built on Nightshift, [Turnstile](turnstile.md), and [Octoshift](octoshift.md). Not yet built — this is the map.*
 
 ---
 
 ## Summary
 
 A running shift has three planes of truth, and today you read them one window at a time. [Turnstile](turnstile.md)
-holds live coordination — claims, leases, the ready set, directives, control flags. [Nightshift](nightshift-spec.md)
+holds live coordination — claims, leases, the ready set, directives, control flags. Nightshift
 projects that into orders — plans, states, branches, the roster, escalations. [Octoshift](octoshift.md) carries the
 GitHub reality — which PR opened, whether it is mergeable, whether it merged. `turnstile watch`, `nightshift watch`,
 and the planned `octoshift watch` (#34) each render **one** of these. Nobody renders all three at one address.
@@ -19,7 +19,7 @@ and the planned `octoshift watch` (#34) each render **one** of these. Nobody ren
 **Nightsky is that one pane.** It is the day-shift operator's dashboard: for every order, its Turnstile claim and
 lease liveness, its Nightshift state and branch, and its Octoshift PR and merge status — on **one row** — plus the
 roster, the ready set, the escalation queue, and the control flags, in one view. It answers the only question the
-[Coordinator](workflow.md) actually asks at a glance: *where is everything, and what needs me?*
+Coordinator actually asks at a glance: *where is everything, and what needs me?*
 
 And it holds one doctrine above all, the same one Octoshift's read-only verbs hold:
 
@@ -29,7 +29,7 @@ And it holds one doctrine above all, the same one Octoshift's read-only verbs ho
 > lives; Nightsky only reflects them.
 
 It reaches **one** end — the local Turnstile socket — and derives all three planes from what is already there.
-That keeps it a narrow building block in the [vision](nightshift-vision.md)'s sense, and it keeps it
+That keeps it a narrow building block in the vision's sense, and it keeps it
 **credential-free**: Nightsky never touches GitHub.
 
 ---
@@ -142,7 +142,7 @@ order            claim/lease           state     branch                         
 ```
 
 - **Claim / lease** (Turnstile plane): the holding agent and lease liveness — *fresh*, *expiring soon*, or *stale*
-  (swept). Liveness is **observed, never self-reported**, exactly as the [roster](nightshift-spec.md) is; a
+  (swept). Liveness is **observed, never self-reported**, exactly as the roster is; a
   wedged agent shows `⚠` here without having to answer.
 - **State + branch + directive** (Nightshift plane): the order's status from `{base}/state`, its branch from
   `{base}/branch`, whether it is in the ready set, and any standing `{base}/directive` (the same `QUERY` a worker
@@ -215,13 +215,13 @@ That is the entire topology. There is no second end to reach.
 The Octoshift plane arrives **pre-translated**. Octoshift is the one membrane that carries GitHub authority and
 writes PR/merge state into Turnstile's cache; Nightsky **consumes that already-translated state** and never speaks
 to GitHub itself. This is the direct payoff of the composition decision in §2 and of Nightshift's
-[credential split](nightshift-spec.md) — the single highest-value control in the threat model:
+credential split — the single highest-value control in the threat model:
 
 - The credential-carrying surface stays confined to Octoshift.
 - Nightsky, a surface a human leaves open all day on the day shift, holds **no** credentials — so leaving it open
   costs nothing and reveals nothing beyond local coordination state.
 
-This is what keeps Nightsky a **narrow building block** in the [vision](nightshift-vision.md)'s sense: it does one
+This is what keeps Nightsky a **narrow building block** in the vision's sense: it does one
 thing — render the shift — and it inherits its GitHub view from the component whose job is GitHub, rather than
 growing a second `gh` integration. The day shift gets its one pane; the night shift's credential boundary is
 untouched.
