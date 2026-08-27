@@ -106,7 +106,7 @@ One of thirteen, each paired with an owner and a confidence:
 | `Merged` / `Closed` | operator | the window's work is over |
 | `Conflicting` | agent | mid-work, and the branch does not merge |
 | `Holding` | nobody | in progress, or legitimately parked |
-| `Unknown` | operator | GitHub could not be read |
+| `Unknown` | operator | GitHub could not be read, or the claimed PR was not found in any searched repo |
 
 **Ordering is part of the meaning.** The gates are evaluated in a fixed sequence,
 and each one that fires ends the evaluation:

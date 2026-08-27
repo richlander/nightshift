@@ -72,8 +72,7 @@ public class AuthContractCommandTests
         try
         {
             (int exit, string stdout, _) = await RunWithBrokenAppCredentialsAsync(
-                token => WaitingCommand.RunAsync(
-                    "owner/name", [], all: false, json: false, token, historyPath: path,
+                token => WaitingCommand.RunAsync(["owner/name"], [], all: false, json: false, token, historyPath: path,
                     scanAsync: (_, _) => Task.FromResult<IReadOnlyList<TmuxPane>>([IdlePrPane(4595)])),
                 ct);
 
@@ -96,8 +95,7 @@ public class AuthContractCommandTests
         try
         {
             (int exit, string stdout, _) = await RunWithBrokenAppCredentialsAsync(
-                token => WaitingCommand.RunAsync(
-                    "owner/name", [], all: false, json: true, token, historyPath: path,
+                token => WaitingCommand.RunAsync(["owner/name"], [], all: false, json: true, token, historyPath: path,
                     scanAsync: (_, _) => Task.FromResult<IReadOnlyList<TmuxPane>>([IdlePrPane(4595)])),
                 ct);
 
@@ -123,7 +121,7 @@ public class AuthContractCommandTests
         try
         {
             (int exit, string stdout, _) = await RunWithBrokenAppCredentialsAsync(
-                token => PrCommand.RunAsync(4595, "owner/name", [], json: false, token, historyPath: path), ct);
+                token => PrCommand.RunAsync(4595, ["owner/name"], [], json: false, token, historyPath: path), ct);
 
             Assert.Equal(ExitCode.Unavailable, exit);
             Assert.StartsWith("PARTIAL PR #4595", stdout, StringComparison.Ordinal);
@@ -145,7 +143,7 @@ public class AuthContractCommandTests
         try
         {
             (int exit, _, _) = await RunWithBrokenAppCredentialsAsync(
-                token => PrCommand.RunAsync(4595, "owner/name", [], json: true, token, historyPath: path), ct);
+                token => PrCommand.RunAsync(4595, ["owner/name"], [], json: true, token, historyPath: path), ct);
 
             Assert.Equal(ExitCode.Unavailable, exit);
         }

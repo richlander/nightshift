@@ -45,6 +45,9 @@ internal sealed class GhPrFactsSource
         _runGhAsync = runGhAsync;
     }
 
+    /// <summary>The <c>owner/name</c> scope this source reads.</summary>
+    public string Repo => _repo;
+
     /// <summary>Calls observed so far this run, and how many of those were free 304s.</summary>
     public int Calls { get; private set; }
 
@@ -79,6 +82,7 @@ internal sealed class GhPrFactsSource
         return new PrFacts
         {
             Number = pull.Number > 0 ? pull.Number : prNumber,
+            Repo = _repo,
             HeadSha = headSha,
             State = pull.State ?? "open",
             Merged = pull.Merged ?? false,
@@ -130,6 +134,7 @@ internal sealed class GhPrFactsSource
         {
             ChecksKnown = checksKnown,
             Number = pull.Number > 0 ? pull.Number : prNumber,
+            Repo = _repo,
             HeadSha = headSha,
             State = pull.State ?? "open",
             Merged = pull.Merged ?? false,
@@ -269,6 +274,189 @@ internal sealed class GhPrFactsSource
         {
             return null;
         }
+    }
+}
+
+/// <summary>
+/// Resolves one PR number across the ordered set of repos the fleet touches, so a lookup is not silently
+/// scoped to whichever repo the operator's current directory happens to sit in. Each repo has its own
+/// <see cref="GhPrFactsSource"/> — hence its own repo-qualified ETag cache path — but all of them draw on
+/// one shared <c>gh</c> credential and therefore <em>one</em> REST rate-limit budget; this aggregates the
+/// per-repo call accounting and resolves one truthful outcome.
+/// </summary>
+/// <remarks>
+/// A unique resolution has to be <em>proven</em>, not assumed: a single hit only means "this PR lives
+/// here and nowhere else" when every other searched repo affirmatively answered 404. If any other repo
+/// could not be read — an outage, a 5xx, or a scope left unsearched because the shared budget was already
+/// spent — that repo may hold the same number, so one hit is reported <see cref="PrFetchStatus.Unavailable"/>
+/// (with the found repo preserved for diagnosis) rather than a false unique <see cref="PrFetchStatus.Found"/>.
+/// Two hits is a proven collision, reported <see cref="PrFetchStatus.Ambiguous"/> without picking either.
+///
+/// Because all repos share one budget, the moment any read observes exhaustion or pushback the fleet stops
+/// reading the rest — further calls are doomed and only deepen the hole for every other agent — and the
+/// unsearched scope counts as unavailable unless ambiguity is already proven. Subsequent PRs on an
+/// exhausted budget make no calls at all. The resolved repo is remembered per PR so a follow-up
+/// mergeability re-read is spent only where the PR lives.
+/// </remarks>
+internal sealed class GhFleetPrFactsSource
+{
+    private readonly IReadOnlyList<GhPrFactsSource> _sources;
+    private readonly IReadOnlyList<string> _repos;
+    private readonly Dictionary<int, GhPrFactsSource> _resolved = [];
+
+    public GhFleetPrFactsSource(
+        IReadOnlyList<string> repos,
+        IConditionalCache cache,
+        Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> runGhAsync)
+    {
+        ArgumentNullException.ThrowIfNull(repos);
+        if (repos.Count == 0)
+        {
+            throw new ArgumentException("at least one repo is required", nameof(repos));
+        }
+
+        _repos = repos;
+        _sources = [.. repos.Select(repo => new GhPrFactsSource(repo, cache, runGhAsync))];
+    }
+
+    /// <summary>The repos this resolver searches, in scope order — the producer-owned label list.</summary>
+    public IReadOnlyList<string> Repos => _repos;
+
+    /// <summary>REST calls spent across every repo this run.</summary>
+    public int Calls => _sources.Sum(s => s.Calls);
+
+    /// <summary>Free 304s served across every repo this run.</summary>
+    public int NotModified => _sources.Sum(s => s.NotModified);
+
+    /// <summary>Mergeability re-reads across every repo this run.</summary>
+    public int Recomputed => _sources.Sum(s => s.Recomputed);
+
+    /// <summary>The remaining shared REST budget, from whichever repo read it most recently and lowest.</summary>
+    public int? RateLimitRemaining => _sources.Select(s => s.RateLimitRemaining).Where(r => r is not null).Min();
+
+    /// <summary>True once any repo reported the one shared budget spent or GitHub pushed back.</summary>
+    public bool RateLimited => _sources.Any(s => s.RateLimited);
+
+    /// <summary>
+    /// Resolves a PR across the searched repos into one truthful outcome. Exactly one hit with every other
+    /// repo affirmatively 404 and the whole scope searched is <see cref="PrFetchStatus.Found"/>; two hits is
+    /// <see cref="PrFetchStatus.Ambiguous"/>; zero hits with the whole scope affirmatively 404 is
+    /// <see cref="PrFetchStatus.NotFound"/>; anything else — a repo unread, or the scope cut short by an
+    /// exhausted shared budget — is <see cref="PrFetchStatus.Unavailable"/>, since neither uniqueness nor
+    /// absence can be proven against a repo that was not truthfully read. Every outcome carries the
+    /// searched-repo labels so a report can say where it looked.
+    /// </summary>
+    public async Task<PrFetch> FetchDetailedAsync(int prNumber, CancellationToken ct)
+    {
+        var found = new List<GhPrFactsSource>();
+        var facts = new List<PrFacts>();
+        var attempted = new List<string>();
+        bool anyUnavailable = false;
+
+        // Search all repos, but stop the moment the shared budget is spent: with one credential behind
+        // every source, a read after exhaustion cannot succeed and only deepens the hole. A scope left
+        // unsearched this way is not "absent from it" — it is unread, and folds into anyUnavailable below.
+        // Only the repos actually queried are recorded as attempted, so the report never claims to have
+        // searched a repo the early exit skipped.
+        bool searchedAll = true;
+        for (int i = 0; i < _sources.Count; i++)
+        {
+            if (RateLimited)
+            {
+                searchedAll = false;
+                break;
+            }
+
+            GhPrFactsSource source = _sources[i];
+            attempted.Add(source.Repo);
+            PrFetch read = await source.FetchDetailedAsync(prNumber, ct);
+            switch (read.Status)
+            {
+                case PrFetchStatus.Found when read.Facts is { } hit:
+                    found.Add(source);
+                    facts.Add(hit);
+                    break;
+                case PrFetchStatus.Unavailable:
+                    anyUnavailable = true;
+                    break;
+            }
+
+            // A proven collision needs no further reads; the extra repos cannot make two hits fewer.
+            if (found.Count > 1)
+            {
+                searchedAll = false;
+                break;
+            }
+        }
+
+        IReadOnlyList<string> foundIn = [.. found.Select(s => s.Repo)];
+
+        if (found.Count > 1)
+        {
+            return new PrFetch(PrFetchStatus.Ambiguous, null).WithRepos(attempted, foundIn, _repos);
+        }
+
+        // Uniqueness and absence are only provable when the whole scope was read and every repo answered.
+        // One hit beside an unread repo cannot claim to be the only one; zero hits beside an unread repo
+        // cannot claim the PR does not exist.
+        bool wholeScopeAnswered = searchedAll && !anyUnavailable;
+
+        if (found.Count == 1)
+        {
+            if (wholeScopeAnswered)
+            {
+                _resolved[prNumber] = found[0];
+                return PrFetch.Found(facts[0]).WithRepos(attempted, foundIn, _repos);
+            }
+
+            return PrFetch.Unavailable.WithRepos(attempted, foundIn, _repos);
+        }
+
+        return (wholeScopeAnswered ? PrFetch.NotFound : PrFetch.Unavailable).WithRepos(attempted, foundIn, _repos);
+    }
+
+    /// <summary>The sweep shape: the facts when exactly one repo resolved the PR, otherwise null — a 404,
+    /// an outage and an ambiguous collision all collapse here, since none yields facts to act on.</summary>
+    public async Task<PrFacts?> FetchAsync(int prNumber, CancellationToken ct)
+        => (await FetchDetailedAsync(prNumber, ct)).Facts;
+
+    /// <summary>
+    /// Re-reads mergeability in the repo the PR already resolved to, so the second read is spent where the
+    /// first found it and per-repo accounting stays honest. Falls back to the first repo that answers when
+    /// the PR was not previously resolved here. Refuses outright once the one shared budget is spent — the
+    /// resolved repo's own per-source flag may still read false while a <em>different</em> repo exhausted
+    /// the credential, and spending another request against the shared budget is exactly what exhaustion
+    /// forbids.
+    /// </summary>
+    public async Task<PrFacts?> RefreshMergeabilityAsync(int prNumber, CancellationToken ct)
+    {
+        if (RateLimited)
+        {
+            return null;
+        }
+
+        if (_resolved.TryGetValue(prNumber, out GhPrFactsSource? source))
+        {
+            return await source.RefreshMergeabilityAsync(prNumber, ct);
+        }
+
+        foreach (GhPrFactsSource candidate in _sources)
+        {
+            // Re-check between candidates: a candidate can return null while spending the last unit of the
+            // shared budget (a 403/429, or a valid read reporting remaining=0), and calling the next one
+            // would spend a request the exhaustion forbids. The entry guard only covers the first candidate.
+            if (RateLimited)
+            {
+                return null;
+            }
+
+            if (await candidate.RefreshMergeabilityAsync(prNumber, ct) is { } refreshed)
+            {
+                return refreshed;
+            }
+        }
+
+        return null;
     }
 }
 
