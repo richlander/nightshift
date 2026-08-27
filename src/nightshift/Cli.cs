@@ -8,7 +8,7 @@ using Nightshift.Output;
 /// <summary>Entry dispatch for the <c>nightshift</c> agent/operator CLI.</summary>
 public static class Cli
 {
-    private const string Usage = "usage: nightshift <add|plan|land|rework|join|standby|leave|next|coordinate|show|recover|check|escalate|release|drain|stop|roster|where|watch|skill> ...";
+    private const string Usage = "usage: nightshift <add|plan|land|rework|join|standby|leave|next|coordinate|show|recover|check|escalate|release|drain|stop|roster|where|watch> ...";
 
     /// <summary>
     /// The global <c>--socket</c> override, inherited by every verb. Parsed once at dispatch and pinned via
@@ -24,7 +24,7 @@ public static class Cli
     private static readonly HashSet<string> KnownVerbs =
     [
         "add", "plan", "land", "rework", "join", "standby", "leave", "next", "show",
-        "coordinate", "recover", "check", "escalate", "release", "drain", "stop", "roster", "where", "watch", "skill",
+        "coordinate", "recover", "check", "escalate", "release", "drain", "stop", "roster", "where", "watch",
     ];
 
     /// <summary>Parses and invokes the command line, preserving Nightshift's exit-code contract.</summary>
@@ -81,7 +81,6 @@ public static class Cli
         rootCommand.Subcommands.Add(CreateRosterCommand());
         rootCommand.Subcommands.Add(CreateWhereCommand());
         rootCommand.Subcommands.Add(CreateWatchCommand());
-        rootCommand.Subcommands.Add(CreateSkillCommand());
 
         return rootCommand;
     }
@@ -297,18 +296,4 @@ public static class Cli
         return command;
     }
 
-    private static Command CreateSkillCommand()
-    {
-        var command = new Command("skill", "Print a packaged Nightshift skill: the general orientation, or a role's operating skill.");
-        var role = new Argument<string?>("role")
-        {
-            Description = "Role skill to print: planner, coordinator, worker, builder, or reviewer. Omit for the general orientation.",
-            Arity = ArgumentArity.ZeroOrOne,
-        };
-
-        command.Arguments.Add(role);
-        command.SetAction(async (parseResult, cancellationToken)
-            => await SkillCommand.RunAsync(parseResult.GetValue(role)));
-        return command;
-    }
 }

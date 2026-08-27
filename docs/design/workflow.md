@@ -2,11 +2,11 @@
 
 How one unit of work travels from an idea to a merged, landed commit — and which
 role owns each step. This is the operational spine the tools (`turnstile`,
-`nightshift`, `octoshift`) and the skills (`nightshift-coordinator`,
-`nightshift-worker`, `nightshift-builder`, `nightshift-reviewer`) serve. Read
+`nightshift`, `octoshift`) serve. Read
 [`nightshift-spec.md`](nightshift-spec.md) for the architecture, [`octoshift.md`](octoshift.md)
-for the GitHub membrane, and the `nightshift-reviewer` skill for the review gate;
-this note is the thread that ties them together.
+for the GitHub membrane, and the adversarial-review section of
+[`AGENTS.md`](../../AGENTS.md) for the review gate; this note is the thread that
+ties them together.
 
 ## What this is in service of
 
@@ -35,7 +35,7 @@ of the machine that holds it:
 - **Hold a high-confidence engineering bar.** *A strong coordinator.* It gates the work
   against what the project values; poor compliance wastes time and tokens but never
   reaches GitHub.
-- **Reduce time spent tending execution.** *Strong skills and specs.* Planner and
+- **Reduce time spent tending execution.** *Strong guidance and specs.* Planner and
   coordinator post on issues that need clarity; the product manager engages directly on
   the workflows and product shapes that need real tradeoff decisions. The clearer the
   guidance, the less anyone hovers over a running agent.
@@ -57,9 +57,8 @@ several — Planner and Coordinator commonly collapse, and a worker builds and
 reviews within its own session (via subagents). **One collapse never happens: a
 Worker is always a separate instance from the Coordinator/Planner.** The
 coordinator never claims, builds, or reviews, and does not spawn workers except
-as a last-resort fallback when no worker is on the payroll (see the coordinator
-skill) — normally workers are independent sessions that `join` and `next` on
-their own. The invariants hold
+as a last-resort fallback when no worker is on the payroll — normally workers
+are independent sessions that `join` and `next` on their own. The invariants hold
 regardless of the split: the builder never reviews its own work, the reviewer is a
 different model than the builder, and only the coordinator writes to GitHub.
 
@@ -77,15 +76,15 @@ contributions.
 ## The five roles
 
 Any role can be filled by a person or an agent; most sessions on a machine are
-workers. Each role's authoritative guidance lives in its skill.
+workers.
 
-| Role | Owns | Skill |
-|---|---|---|
-| **Product Manager** | The expanding shape of the product: new issues, taste, and where existing features must be re-shaped or composed to enable a UX or a non-obvious whole. Sets direction. | — |
-| **Planner** | Turns intent (often issues) into orders and registers them with nightshift. | `nightshift-coordinator` |
-| **Coordinator** | Keeps local work moving. First-level escalation with decision authority. Pushes worker branches, creates and updates PRs, and posts the one clearance note. Curates issues — files new ones, retires stale ones. | `nightshift-coordinator` |
-| **Worker** | Claims one order and takes it to a reviewed branch (handed back for the coordinator to push) — building it *and* reviewing it, spawning `nightshift-builder` / `nightshift-reviewer` subagents as an optimization. | `nightshift-worker` |
-| **PR Lander** | Holds merge authority; keeps sequenced PRs flowing; may be on another machine or a phone. | — |
+| Role | Owns |
+|---|---|
+| **Product Manager** | The expanding shape of the product: new issues, taste, and where existing features must be re-shaped or composed to enable a UX or a non-obvious whole. Sets direction. |
+| **Planner** | Turns intent (often issues) into orders and registers them with nightshift. |
+| **Coordinator** | Keeps local work moving. First-level escalation with decision authority. Pushes worker branches, creates and updates PRs, and posts the one clearance note. Curates issues — files new ones, retires stale ones. |
+| **Worker** | Claims one order and takes it to a reviewed branch (handed back for the coordinator to push) — building it and reviewing it, with specialized subagents as an optimization. |
+| **PR Lander** | Holds merge authority; keeps sequenced PRs flowing; may be on another machine or a phone. |
 
 ## Where the gate protocol matters
 
@@ -157,15 +156,14 @@ nightshift next            # blocks until one ready order is claimed, exclusivel
 
 `next` hands back one order, mints its branch name `nightshift/{plan}/{order}`, and
 records it in Turnstile. In **its own worktree** cut from fresh `origin/main` — and
-re-reading its guidance (SKILL.md + `AGENTS.md`) every order, which makes a
+re-reading `AGENTS.md` and task-relevant docs every order, which makes a
 long-lived worker self-healing — the worker builds and reviews the order. It may do
-both directly, or spawn `nightshift-builder` / `nightshift-reviewer` subagents — an
-optimization that preserves its context window and supplies model diversity, not a
-separate role. The `nightshift-worker` skill is the authoritative account; the shape
-below is the summary:
+both directly, or spawn specialized builder and reviewer subagents — an optimization
+that preserves its context window and supplies model diversity, not a separate role.
+The shape below is the summary:
 
-1. **Build.** Either directly, or by spawning a builder subagent (which reads the
-   `nightshift-builder` skill). The change touches only the order's `paths`, and
+1. **Build.** Either directly, or by spawning a builder subagent. The change
+   touches only the order's `paths`, and
    `nightshift check` runs before every commit — that renews the lease, the forcing
    function that proves the claim is alive.
 2. **Review.** Run the adversarial gate — **two clean reviews from two different

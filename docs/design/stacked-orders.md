@@ -36,7 +36,7 @@ coordination state the coordinator owns**, replacing the global constant
   not throughput.
 - **Not a merge-queue reimplementation.** A stack lands through the existing queue.
 - **Not a kernel change.** Turnstile's kv/lease/watch and the claim/lease/fence
-  machinery are untouched. This lives in **coordinator + builder-skill +
+  machinery are untouched. This lives in **coordinator + worker +
   plan-schema**, extending seams that already exist.
 
 ## 1. The base ref — per-order coordination state
@@ -111,8 +111,8 @@ coordinator provides it.
   beneficial generally (reproducible bases, a cleaner conflict graph).
 
 Independent orders are unaffected: a worker's branch, once cut, is frozen at its
-base; `main` advancing underneath it is fine (the builder skill already covers
-integrating fresh `main` — rebase while private, merge once public).
+base; `main` advancing underneath it is fine (integrate fresh `main` by rebasing
+while private and merging once public).
 
 ## 3. The readiness predicate shifts
 

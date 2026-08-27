@@ -2,23 +2,11 @@
 
 ## Start here
 
-Three things to hold at once — they are easy to conflate because all three are true here:
-
-- **(A) What Nightshift is.** Nightshift is a coordination system that drives many units of work to
-  completion in parallel by shifting the mechanical oversight onto the night-shift coordinator, so the
-  people setting direction don't have to spend attention on it. Work happens on a **night
-  shift** — orders built and reviewed to a clean bar — while direction-setting and the merge decision
-  stay deliberate acts on the **day shift**.
-- **(B) What you are.** You are an agent contributing features **to** Nightshift — this repository is
-  the design *and* implementation of that system. You are not a generic assistant here; you are playing
-  one **role** in a defined process (roles are below — read yours before you act).
-- **(C) How this repo builds.** This repository builds Nightshift **using** Nightshift — it is
-  self-hosted. Every feature ships as an **order** through the very process these docs describe: an
-  issue becomes an order, a worker builds and reviews it to a clean bar, and the coordinator lands it.
-  That is *why* you are playing a role at all — there is no side channel that bypasses the process.
-
-**Roles are responsibilities, not people:** any role can be filled by a person or an agent, and you are
-playing one of them (below).
+Nightshift is a coordination system that drives many units of work to completion in
+parallel while keeping direction-setting and merge decisions deliberate. This repository
+contains its design and implementation. Work directly on the task requested; do not assume
+a Nightshift role or load role-specific operating guidance unless the user explicitly
+provides it.
 
 Nightshift has three layers:
 
@@ -33,46 +21,14 @@ The unit of work is an **order**: one **landable PR**, the atomic unit of both
 claim and merge, bound to at most one GitHub issue. A **plan** is a DAG of
 orders for a feature, with order→order dependencies.
 
-Keep this file to repository-wide engineering and workflow rules. Role
-mechanics live in the skills; subsystem design lives in `docs/design/`. When the
-two disagree, the skills and current code win.
-
-## Roles and skills
-
-Nightshift has **five roles**, each a set of responsibilities fillable by a
-person or an agent (the full model is in
-[`docs/design/workflow.md`](docs/design/workflow.md)). You are playing one; read
-its guidance first. Roles can collapse into one session — Planner and Coordinator
-commonly do — but a **Worker is always a separate instance** (never the
-Coordinator/Planner session); most sessions on a machine are workers. The
-coordinator never claims, builds, or reviews, and does not spawn workers except
-as a last-resort fallback when no worker is on the payroll (see the coordinator
-skill) — normally workers `join` and `next` on their own.
-
-| Role | Owns | Read first |
-| --- | --- | --- |
-| **Product Manager** | The expanding shape of the product: new issues, taste, where features must be re-shaped or composed | `docs/design/workflow.md` |
-| **Planner** | Turns intent (often issues) into orders and registers them with nightshift | `.github/skills/nightshift-coordinator/SKILL.md` (§2–3) |
-| **Coordinator** | Run the shift: register a plan, keep the ready set live, own the GitHub surface (push branches, open PRs, post the one clearance note), first-level escalation, issue curation, land merged orders, drain/stop | `.github/skills/nightshift-coordinator/SKILL.md` |
-| **Worker** | Claim one order and take it to a reviewed branch (handed back for the coordinator to push) — orchestrating its build **and** review | `.github/skills/nightshift-worker/SKILL.md` |
-| **PR Lander** | Merge authority; keep sequenced PRs flowing | `docs/design/workflow.md` |
-
-The **Worker** builds and reviews by spawning subagents (an optimization that
-preserves its context window and supplies model diversity). Those two
-responsibilities each have their own skill the worker points a subagent at:
-
-- **Builder** — build one order into commits on its branch: `.github/skills/nightshift-builder/SKILL.md`
-- **Reviewer** — review one order's diff read-only and report inward: `.github/skills/nightshift-reviewer/SKILL.md`
-
-The `nightshift` tool also packages these skills: `nightshift skill` prints the
-general orientation (roles and how they fit together), and `nightshift skill
-<role>` (`worker`, `coordinator`, `builder`, `reviewer`) prints that role's skill
-— the same bytes as the files above, served from the binary.
+Keep this file to repository-wide engineering and workflow rules. Subsystem and
+workflow design lives in `docs/design/`; current code is authoritative when prose
+and implementation disagree.
 
 ## Where to read more
 
-New here? Read `docs/design/nightshift-vision.md`, then `docs/design/nightshift-spec.md`,
-then your role's skill (above). Reference the rest by topic:
+New here? Read `docs/design/nightshift-vision.md`, then
+`docs/design/nightshift-spec.md`. Reference the rest by topic:
 
 | Topic | Doc |
 | --- | --- |
@@ -106,7 +62,7 @@ then your role's skill (above). Reference the rest by topic:
     (`WORK` / `NOWORK` / `OK` / `HALT` / `DRAINING` / `QUERY` / `FENCE_STALE`
     and their siblings).
   Never change a token's spelling, meaning, or exit code without updating every
-  consumer (the skills and their shell loops). Adding a new token is fine;
+  shell-loop consumer. Adding a new token is fine;
   silently repurposing one is not.
 - Nightshift is **not GitHub-aware**. It coordinates branches and state over a
   local socket; the GitHub side (review, merge, telling Nightshift a merge
@@ -141,9 +97,6 @@ wait on it decides whether the loop keeps running:
 - **Headless** (`-p`, no next turn once you yield): a backgrounded shell is
   reaped the moment you yield, so **block in-turn** on the call and read its
   return, or exit and be relaunched. `NOWORK`/`DRAINING` mean *exit*, not *idle*.
-
-Each skill names the specific call its role waits on and points here for the
-shared technique.
 
 ## Stopping: publish your state
 
@@ -272,8 +225,8 @@ Documentation-only changes need Markdown review, not a product build or tests.
 - Start every change from the latest `origin/main`.
 - Never amend or rewrite history; create follow-up commits.
 - **Re-read your guidance after re-pulling `main`.** When you refresh from
-  `origin/main` at the start of a new order or change, re-read `AGENTS.md`, the
-  skill for your role, and task-relevant docs before continuing. Guidance
+  `origin/main` at the start of a new order or change, re-read `AGENTS.md` and
+  task-relevant docs before continuing. Guidance
   evolves during a shift, and a long-lived agent that keeps working from a copy
   it read at launch will keep making the old mistake. Re-reading is what makes
   agents self-healing.
@@ -281,7 +234,7 @@ Documentation-only changes need Markdown review, not a product build or tests.
   identity is the hash of its worktree root, and its claim and lease are filed
   under that identity. Run every gate verb (`next` / `check` / `recover` /
   `release`) from that one directory, and `git switch` onto each order's branch
-  there — never nest a per-order worktree. See the worker skill.
+  there — never nest a per-order worktree.
 - Reviewers work in isolated **read-only** checkouts at an exact head; they never
   `git reset`, `git add`, or commit in a review tree.
 - Don't mix unrelated changes into one commit or sweep another agent's
@@ -298,8 +251,8 @@ the models from:
 - GPT-5.x-Codex (e.g. `gpt-5.3-codex`)
 - Gemini Pro (e.g. Gemini 3.1 Pro) — add as a third for high-blast-radius orders
 
-This list is the single source of truth for the reviewer roster; the skills and
-`docs/design/workflow.md` reference this section rather than restating the models.
+This list is the single source of truth for the reviewer roster;
+`docs/design/workflow.md` references this section rather than restating the models.
 **Do not review with your own model** — a reviewer subagent runs on a model
 different from the builder's, and a single-model worker cannot review its own
 build (see below).
