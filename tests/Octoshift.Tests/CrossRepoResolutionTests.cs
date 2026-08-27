@@ -231,6 +231,65 @@ public class CrossRepoResolutionTests
         Assert.Single(gh.Requests);
     }
 
+    [Fact]
+    public async Task Refresh_MakesNoCallOnceAnotherRepoExhaustedTheSharedBudget()
+    {
+        // #178 round 2: the PR resolves uniquely to the first repo with mergeability still unknown, but the
+        // second repo's affirmative 404 spent the last unit of the one shared credential budget. A
+        // second-pass mergeability re-read must not spend another request against the first repo just
+        // because that repo's own per-source flag never saw the exhaustion — the budget is shared, so the
+        // fleet refuses outright and makes zero additional calls.
+        var gh = new FakeGh
+        {
+            ["repos/owner/first/pulls/4623"] = Response(200,
+                "{\"number\":4623,\"state\":\"open\",\"mergeable_state\":\"unknown\",\"head\":{\"sha\":\"" + HeadA + "\"}}"),
+            [$"repos/owner/first/commits/{HeadA}/check-runs?per_page=100"] = Checks(),
+            ["repos/owner/second/pulls/4623"] = Response(404, """{"message":"Not Found"}""", "x-ratelimit-remaining: 0"),
+        };
+
+        GhFleetPrFactsSource fleet = Fleet(gh, "owner/first", "owner/second");
+        PrFetch fetch = await fleet.FetchDetailedAsync(4623, TestContext.Current.CancellationToken);
+
+        // A proven unique resolution (the other repo affirmatively 404'd) whose mergeability is still
+        // unknown — exactly the shape the second pass exists to refresh — with the budget now spent.
+        Assert.Equal(PrFetchStatus.Found, fetch.Status);
+        Assert.Equal("owner/first", fetch.Facts!.Repo);
+        Assert.False(fetch.Facts.MergeabilityKnown);
+        Assert.True(fleet.RateLimited);
+
+        int spent = gh.Requests.Count;
+        PrFacts? refreshed = await fleet.RefreshMergeabilityAsync(4623, TestContext.Current.CancellationToken);
+
+        Assert.Null(refreshed);
+        Assert.Equal(spent, gh.Requests.Count);
+    }
+
+    [Fact]
+    public async Task Refresh_MakesNoCallAfterALaterPrExhaustsTheSharedBudget()
+    {
+        // The same guard across PRs: one PR resolves cleanly, then a later PR's read exhausts the shared
+        // budget. A refresh of the earlier PR must still spend nothing, since the credential is spent
+        // whichever PR emptied it.
+        var gh = new FakeGh
+        {
+            ["repos/owner/first/pulls/4623"] = Response(200,
+                "{\"number\":4623,\"state\":\"open\",\"mergeable_state\":\"unknown\",\"head\":{\"sha\":\"" + HeadA + "\"}}"),
+            [$"repos/owner/first/commits/{HeadA}/check-runs?per_page=100"] = Checks(),
+            ["repos/owner/second/pulls/4623"] = Response(404, """{"message":"Not Found"}"""),
+            ["repos/owner/first/pulls/4999"] = Response(404, """{"message":"Not Found"}""", "x-ratelimit-remaining: 0"),
+        };
+
+        GhFleetPrFactsSource fleet = Fleet(gh, "owner/first", "owner/second");
+        await fleet.FetchDetailedAsync(4623, TestContext.Current.CancellationToken);
+        await fleet.FetchDetailedAsync(4999, TestContext.Current.CancellationToken);
+
+        Assert.True(fleet.RateLimited);
+
+        int spent = gh.Requests.Count;
+        Assert.Null(await fleet.RefreshMergeabilityAsync(4623, TestContext.Current.CancellationToken));
+        Assert.Equal(spent, gh.Requests.Count);
+    }
+
     // ---- scope resolution --------------------------------------------------
 
     [Fact]

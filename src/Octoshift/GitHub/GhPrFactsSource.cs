@@ -418,10 +418,18 @@ internal sealed class GhFleetPrFactsSource
     /// <summary>
     /// Re-reads mergeability in the repo the PR already resolved to, so the second read is spent where the
     /// first found it and per-repo accounting stays honest. Falls back to the first repo that answers when
-    /// the PR was not previously resolved here.
+    /// the PR was not previously resolved here. Refuses outright once the one shared budget is spent — the
+    /// resolved repo's own per-source flag may still read false while a <em>different</em> repo exhausted
+    /// the credential, and spending another request against the shared budget is exactly what exhaustion
+    /// forbids.
     /// </summary>
     public async Task<PrFacts?> RefreshMergeabilityAsync(int prNumber, CancellationToken ct)
     {
+        if (RateLimited)
+        {
+            return null;
+        }
+
         if (_resolved.TryGetValue(prNumber, out GhPrFactsSource? source))
         {
             return await source.RefreshMergeabilityAsync(prNumber, ct);
