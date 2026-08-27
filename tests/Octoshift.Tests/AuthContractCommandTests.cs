@@ -6,22 +6,35 @@ using Octoshift.Waiting;
 using Xunit;
 
 /// <summary>
-/// The command-level auth contract. With GitHub App credentials configured but unusable — the exact repro
-/// <c>OCTOSHIFT_GITHUB_APP_CREDENTIALS_PATH=/missing octoshift waiting|pr …</c> — the commands must reach
-/// their normal unavailable contract (a human PARTIAL token / one JSON error document /
-/// <see cref="ExitCode.Unavailable"/>) rather than crashing with a stack trace and no output before their
-/// protected execution begins. Joining the ConsoleCapture collection serializes the console redirect and
-/// the process-wide environment mutation with the other command tests.
+/// The command-level auth contract with GitHub App credentials configured but unusable (the repro
+/// <c>OCTOSHIFT_GITHUB_APP_CREDENTIALS_PATH=/missing octoshift waiting|pr …</c>). Each test drives a
+/// <em>successful</em> collection so the GitHub read actually reaches the disabled runner, proving the
+/// broken credentials become a GitHub-unavailable fact rather than a crash — <c>waiting</c> degrades to a
+/// truthful exit-0 report with a per-row caveat over a complete fleet, and <c>pr</c> stays unavailable when
+/// it cannot resolve the PR. Joining the ConsoleCapture collection serializes the console redirect and the
+/// process-wide environment mutation with the other command tests.
 /// </summary>
 [Collection("ConsoleCapture")]
 public class AuthContractCommandTests
 {
     private const string CredentialsPathVariable = "OCTOSHIFT_GITHUB_APP_CREDENTIALS_PATH";
 
+    /// <summary>An idle window that names a PR and asks to stop — a row that needs a person and a GitHub read.</summary>
+    private static TmuxPane IdlePrPane(int pr) => new()
+    {
+        PaneId = "%1",
+        Target = "night:1",
+        WindowName = $"pr{pr}",
+        SessionAttached = false,
+        Activity = PaneActivity.Idle,
+        LastActivity = DateTimeOffset.UtcNow.AddHours(-2),
+        AgentStateOption = $"pr={pr} head=1234567890abcdef1234567890abcdef12345678 rec=stop reviews=1/2",
+        Capture = "$ ",
+    };
+
     /// <summary>
     /// Runs <paramref name="run"/> with a configured-but-missing App credentials path — the case that made
-    /// <c>GhRunnerFactory.Create</c> throw before the command could catch anything — capturing the console
-    /// and restoring both the environment and the streams afterwards.
+    /// the runner configured-but-broken — capturing the console and restoring the environment afterwards.
     /// </summary>
     private static async Task<(int Exit, string Out, string Err)> RunWithBrokenAppCredentialsAsync(
         Func<CancellationToken, Task<int>> run, CancellationToken ct)
@@ -49,24 +62,23 @@ public class AuthContractCommandTests
     }
 
     [Fact]
-    public async Task Waiting_BrokenAppCredentials_LeadsWithPartialToken_NotACrash()
+    public async Task Waiting_BrokenAppCredentials_DegradesToExitZeroReportWithGitHubCaveat()
     {
-        // A fresh history defaults the fleet to the local machine, whose injected scan fails, so the one
-        // target is unreachable and the human path leads with PARTIAL — reached only because the broken
-        // credentials no longer crash GhRunnerFactory.Create ahead of the command's try.
+        // A successful scan of one idle PR pane completes the fleet, so the read reaches the disabled runner;
+        // GitHub comes back unreadable and the row carries that caveat, but the collection is complete, so
+        // the report is a truthful degraded view and the exit stays 0.
         string path = Path.Combine(Path.GetTempPath(), $"octoshift-authwait-{Guid.NewGuid():N}.json");
         CancellationToken ct = TestContext.Current.CancellationToken;
         try
         {
-            (int exit, string stdout, string stderr) = await RunWithBrokenAppCredentialsAsync(
+            (int exit, string stdout, _) = await RunWithBrokenAppCredentialsAsync(
                 token => WaitingCommand.RunAsync(
                     "owner/name", [], all: false, json: false, token, historyPath: path,
-                    scanAsync: (_, _) => throw new TmuxUnavailableException("local: tmux is not running")),
+                    scanAsync: (_, _) => Task.FromResult<IReadOnlyList<TmuxPane>>([IdlePrPane(4595)])),
                 ct);
 
-            Assert.Equal(ExitCode.Unavailable, exit);
-            Assert.StartsWith("PARTIAL", stdout, StringComparison.Ordinal);
-            Assert.Contains("tmux is not running", stderr, StringComparison.Ordinal);
+            Assert.Equal(ExitCode.Ok, exit);
+            Assert.Contains("could not be read", stdout, StringComparison.Ordinal);
         }
         finally
         {
@@ -76,8 +88,9 @@ public class AuthContractCommandTests
     }
 
     [Fact]
-    public async Task Waiting_BrokenAppCredentials_JsonStaysOneErrorDocument_NotACrash()
+    public async Task Waiting_BrokenAppCredentials_JsonDegradesToExitZeroReport()
     {
+        // The JSON report is one document over the complete fleet with the same disposition; the exit stays 0.
         string path = Path.Combine(Path.GetTempPath(), $"octoshift-authwaitjson-{Guid.NewGuid():N}.json");
         CancellationToken ct = TestContext.Current.CancellationToken;
         try
@@ -85,10 +98,10 @@ public class AuthContractCommandTests
             (int exit, string stdout, _) = await RunWithBrokenAppCredentialsAsync(
                 token => WaitingCommand.RunAsync(
                     "owner/name", [], all: false, json: true, token, historyPath: path,
-                    scanAsync: (_, _) => throw new TmuxUnavailableException("local: tmux is not running")),
+                    scanAsync: (_, _) => Task.FromResult<IReadOnlyList<TmuxPane>>([IdlePrPane(4595)])),
                 ct);
 
-            Assert.Equal(ExitCode.Unavailable, exit);
+            Assert.Equal(ExitCode.Ok, exit);
             Assert.DoesNotContain("PARTIAL", stdout, StringComparison.Ordinal);
         }
         finally
@@ -99,22 +112,22 @@ public class AuthContractCommandTests
     }
 
     [Fact]
-    public async Task Pr_BrokenAppCredentials_LeadsWithPartialToken_NotACrash()
+    public async Task Pr_BrokenAppCredentials_StaysUnavailableWhenGitHubCannotResolveThePr()
     {
-        // A malformed history fails the strict load inside the command's protected execution — deterministic
-        // without ssh or GitHub. It exercises that the configured-but-broken credentials no longer crash
-        // GhRunnerFactory.Create ahead of that protected execution.
+        // An initialized, empty fleet is a complete view with no claimant, so LocateAsync's unconditional
+        // GitHub read reaches the disabled runner. GitHub is unreadable, so the PR's existence is unknown and
+        // the human path leads with the PARTIAL token at ExitCode.Unavailable.
         string path = Path.Combine(Path.GetTempPath(), $"octoshift-authpr-{Guid.NewGuid():N}.json");
-        File.WriteAllText(path, "{ not a history ]");
+        File.WriteAllText(path, "{\"panes\":{},\"hosts\":{},\"attempted\":[],\"initialized\":true}");
         CancellationToken ct = TestContext.Current.CancellationToken;
         try
         {
-            (int exit, string stdout, string stderr) = await RunWithBrokenAppCredentialsAsync(
-                token => PrCommand.RunAsync(4448, "owner/name", [], json: false, token, historyPath: path), ct);
+            (int exit, string stdout, _) = await RunWithBrokenAppCredentialsAsync(
+                token => PrCommand.RunAsync(4595, "owner/name", [], json: false, token, historyPath: path), ct);
 
             Assert.Equal(ExitCode.Unavailable, exit);
-            Assert.StartsWith("PARTIAL PR #4448", stdout, StringComparison.Ordinal);
-            Assert.NotEqual(string.Empty, stderr.Trim());
+            Assert.StartsWith("PARTIAL PR #4595", stdout, StringComparison.Ordinal);
+            Assert.Contains("could not be read", stdout, StringComparison.Ordinal);
         }
         finally
         {
@@ -124,15 +137,15 @@ public class AuthContractCommandTests
     }
 
     [Fact]
-    public async Task Pr_BrokenAppCredentials_JsonReturnsUnavailable_NotACrash()
+    public async Task Pr_BrokenAppCredentials_JsonStaysUnavailable()
     {
         string path = Path.Combine(Path.GetTempPath(), $"octoshift-authprjson-{Guid.NewGuid():N}.json");
-        File.WriteAllText(path, "{ not a history ]");
+        File.WriteAllText(path, "{\"panes\":{},\"hosts\":{},\"attempted\":[],\"initialized\":true}");
         CancellationToken ct = TestContext.Current.CancellationToken;
         try
         {
             (int exit, _, _) = await RunWithBrokenAppCredentialsAsync(
-                token => PrCommand.RunAsync(4448, "owner/name", [], json: true, token, historyPath: path), ct);
+                token => PrCommand.RunAsync(4595, "owner/name", [], json: true, token, historyPath: path), ct);
 
             Assert.Equal(ExitCode.Unavailable, exit);
         }

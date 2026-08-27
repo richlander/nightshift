@@ -87,8 +87,12 @@ internal sealed class GitHubAppJwtFactory
                 HashAlgorithmName.SHA256,
                 RSASignaturePadding.Pkcs1);
         }
-        catch (CryptographicException ex)
+        catch (Exception ex) when (ex is CryptographicException or ArgumentException or FormatException)
         {
+            // ImportFromPem throws ArgumentException when the content holds no PEM key (and FormatException
+            // on a malformed base64 body); a structurally valid but unusable key throws CryptographicException.
+            // All three are expected malformed-key inputs, so normalise them to the one auth-config exception
+            // the runner factory turns into an unavailable read rather than a crash.
             throw new InvalidOperationException("octoshift: failed to sign GitHub App JWT with configured private key.", ex);
         }
     }
