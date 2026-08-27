@@ -290,6 +290,28 @@ public class CrossRepoResolutionTests
         Assert.Equal(spent, gh.Requests.Count);
     }
 
+    [Fact]
+    public async Task Refresh_FallbackStopsBeforeTheSecondCandidateOnceTheFirstExhausts()
+    {
+        // #178 round 2 follow-up: for a PR the fleet never resolved (empty resolution map), the refresh
+        // falls back to trying each repo. If the first candidate exhausts the shared budget (a 403 that
+        // spends the last unit) and returns null, the loop must re-check the shared state and refuse the
+        // second candidate rather than spending another doomed request.
+        var gh = new FakeGh
+        {
+            ["repos/owner/first/pulls/4623"] = Response(403, string.Empty, "x-ratelimit-remaining: 0"),
+            ["repos/owner/second/pulls/4623"] = Response(200,
+                "{\"number\":4623,\"state\":\"open\",\"mergeable_state\":\"clean\",\"head\":{\"sha\":\"" + HeadB + "\"}}"),
+        };
+
+        GhFleetPrFactsSource fleet = Fleet(gh, "owner/first", "owner/second");
+        PrFacts? refreshed = await fleet.RefreshMergeabilityAsync(4623, TestContext.Current.CancellationToken);
+
+        Assert.Null(refreshed);
+        Assert.Single(gh.Requests);
+        Assert.DoesNotContain(gh.Requests, args => args.Contains("repos/owner/second/pulls/4623"));
+    }
+
     // ---- scope resolution --------------------------------------------------
 
     [Fact]

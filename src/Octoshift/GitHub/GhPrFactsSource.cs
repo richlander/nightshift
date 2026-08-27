@@ -437,6 +437,14 @@ internal sealed class GhFleetPrFactsSource
 
         foreach (GhPrFactsSource candidate in _sources)
         {
+            // Re-check between candidates: a candidate can return null while spending the last unit of the
+            // shared budget (a 403/429, or a valid read reporting remaining=0), and calling the next one
+            // would spend a request the exhaustion forbids. The entry guard only covers the first candidate.
+            if (RateLimited)
+            {
+                return null;
+            }
+
             if (await candidate.RefreshMergeabilityAsync(prNumber, ct) is { } refreshed)
             {
                 return refreshed;
