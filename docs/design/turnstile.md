@@ -393,9 +393,9 @@ Plus **one long-lived SSE stream per interactive client** and **one per controll
 
 ### The design consequence
 
-> **Because the daemon holds all state and the client holds none, a client's restart or context reset costs nothing.**
+> **Because the daemon holds all state and the CLI holds none, restarting the CLI cannot leave a local cache out of sync.**
 
-The client re-derives identity from `cwd` on every invocation. **It doesn't matter that the caller forgot everything — the client never remembered anything either.** State lives in the daemon; identity lives in the filesystem; the client holds neither.
+Callers supply keys and lease handles explicitly on each invocation. Identity and lifecycle are caller policy; Turnstile does not infer them from `cwd`, a worktree, or any other local state.
 
 **A stateful client would be a client that could get out of sync. A stateless one can't.**
 
