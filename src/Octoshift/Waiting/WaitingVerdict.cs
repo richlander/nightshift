@@ -127,6 +127,62 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
     }
 
     /// <summary>
+    /// The single pane-activity policy: whether a pane's published record may be trusted as a
+    /// <em>handover</em>. Only an idle pane has stopped and left its status as its final word; a pane
+    /// mid-turn, holding a prompt, stalled, or unreadable is doing (or hiding) something its last published
+    /// record no longer describes. Every place that reads a published <c>rec=</c>/<c>reviews=</c> as fact —
+    /// the verdict gate (<see cref="ForActivity"/>), retirement (<see cref="Retirement.For"/>), and
+    /// follower promotion (<see cref="Claim.IsReleasing"/>) — asks this one predicate, so a stale record
+    /// under a non-idle pane can never drive one decision path while another blocks it. It is exactly the
+    /// set of activities <see cref="ForActivity"/> defers to <c>resolveIdle</c> for.
+    /// </summary>
+    public static bool IsHandover(PaneActivity activity) => activity == PaneActivity.Idle;
+
+    /// <summary>
+    /// Wraps the idle-path resolution with the pane-activity gate, so a published record is only ever read
+    /// as a handover when the pane is actually idle. A window mid-turn, one holding a prompt open, one whose
+    /// runtime stalled, and one that could not be captured each resolve from what the pane is <em>doing</em>
+    /// right now, never from what it last <em>published</em> — because a stale <c>reviews=2/2 rec=merge</c>
+    /// under a spinner would otherwise reach a high-confidence, actionable verdict on evidence the pane
+    /// itself contradicts. Only the idle/handover case (<see cref="IsHandover"/>) defers to
+    /// <paramref name="resolveIdle"/>, which joins the published state with GitHub. This is the single copy
+    /// of that policy: both <c>waiting</c> and <c>pr</c> call it, so the two surfaces cannot drift into
+    /// answering the same pane differently.
+    /// </summary>
+    /// <param name="activity">What the pane is doing now, from its capture — the gate.</param>
+    /// <param name="capture">The pane body, for the one non-idle case (a stall) that names its reason from it.</param>
+    /// <param name="resolveIdle">The idle-path verdict, evaluated only when the pane has handed something over.</param>
+    public static WaitingVerdict ForActivity(PaneActivity activity, string capture, Func<WaitingVerdict> resolveIdle)
+        => activity switch
+        {
+            // A pane mid-turn has not handed anything over; there is nothing to resolve and nothing to do,
+            // but it still holds a claim, so it gets a row that is never actionable rather than vanishing.
+            PaneActivity.Working => new WaitingVerdict(
+                WaitingState.Unknown, RowOwner.Agent, "agent is mid-turn; nothing handed over yet",
+                Assurance.Low("the agent has not handed anything over")),
+
+            // The agent runtime failed. No GitHub lookup can explain it and none can clear it, so this goes
+            // straight to a person with the text that says why.
+            PaneActivity.Stalled => new WaitingVerdict(
+                WaitingState.NeedsOperator, RowOwner.Operator,
+                $"agent stalled: {TmuxScanner.StallReason(capture)}", Assurance.High),
+
+            // A held-open prompt is answered with a keystroke, not a GitHub lookup. The pane itself is the
+            // evidence, and it is unambiguous: a prompt is open.
+            PaneActivity.Blocked => new WaitingVerdict(
+                WaitingState.NeedsOperator, RowOwner.Operator, "prompt open; awaiting a keystroke", Assurance.High),
+
+            // A pane nobody could read is reported, never resolved. Whether the agent is mid-turn is exactly
+            // what the capture was for, so this must not reach the idle path, where a published record is
+            // taken as a handover and can reach a high-confidence, actionable verdict on unread evidence.
+            PaneActivity.Unreadable => new WaitingVerdict(
+                WaitingState.Unknown, RowOwner.Operator, "pane could not be captured; its state is unread",
+                Assurance.Low("the pane could not be read")),
+
+            _ => resolveIdle(),
+        };
+
+    /// <summary>
     /// Resolves a window's state against GitHub's account of the same PR. Pure — the whole decision table
     /// is testable without a pane or a network.
     /// </summary>

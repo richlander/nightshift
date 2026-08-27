@@ -1,0 +1,181 @@
+namespace Octoshift.Waiting;
+
+/// <summary>Where a window stands in the queue of windows claiming one PR.</summary>
+/// <remarks>
+/// Modelled on how a keybinding service handles two components binding the same key. Rejecting the
+/// second registration loses work that is really happening; accepting it silently gives two owners and
+/// a fight. The workable answer is to accept it as second-class: <b>first one wins, the rest are
+/// followed.</b> The owner is the one anything may be said to; the followers are watched, reported, and
+/// never driven — because driving two agents on one PR is a worse architecture than either agent alone,
+/// and pretending the second does not exist is equally bad.
+/// </remarks>
+internal enum ClaimRank
+{
+    /// <summary>The only window claiming this PR.</summary>
+    Sole,
+
+    /// <summary>Registered first. This is the window that may be acted on.</summary>
+    Owner,
+
+    /// <summary>Registered later. Observed and reported, never interacted with.</summary>
+    Follower,
+}
+
+/// <summary>How ownership between two claims was decided.</summary>
+internal enum ClaimBasis
+{
+    /// <summary>Only one window claims it; nothing had to be decided.</summary>
+    Uncontested,
+
+    /// <summary>
+    /// The fleet could not be collected in full, so "only one window claims this" is not a fact — the
+    /// other claimant may simply be on a host that did not answer.
+    /// </summary>
+    PartialView,
+
+    /// <summary>The tool watched them register, so the order is a fact.</summary>
+    Observed,
+
+    /// <summary>
+    /// Both claims were already in place when the tool first looked, so the order is inferred from
+    /// seniority. Rivals rarely appear in the same moment, which is what makes registration order
+    /// meaningful — and also what makes it unavailable to a run that started after both.
+    /// </summary>
+    Inferred,
+}
+
+/// <summary>A window's standing among the windows claiming its PR.</summary>
+/// <param name="Rank">Sole, owner, or follower.</param>
+/// <param name="Others">The other windows claiming the same PR.</param>
+/// <param name="SinceRegistered">When this window first claimed it, if known.</param>
+internal readonly record struct Claim(
+    ClaimRank Rank,
+    IReadOnlyList<TmuxPane> Others,
+    DateTimeOffset? SinceRegistered,
+    ClaimBasis Basis = ClaimBasis.Uncontested)
+{
+    public static Claim Sole { get; } = new(ClaimRank.Sole, [], null);
+
+    /// <summary>
+    /// True when this window may be spoken to as the claim's owner. Ownership decided by inference is
+    /// not ownership decided: if the tool cannot tell which agent started first, driving either of them
+    /// is a coin toss, and a wrong guess drives the agent that is not doing the work.
+    /// </summary>
+    public bool OwnsClaim
+        => Basis switch
+        {
+            ClaimBasis.Uncontested => Rank == ClaimRank.Sole,
+            ClaimBasis.Observed => Rank is ClaimRank.Sole or ClaimRank.Owner,
+            _ => false,
+        };
+
+    /// <summary>True when this window must never be spoken to because another owns the PR.</summary>
+    public bool IsFollower => Rank == ClaimRank.Follower;
+
+    /// <summary>True when more than one window claims the PR at all.</summary>
+    public bool IsContested => Rank is ClaimRank.Owner or ClaimRank.Follower;
+
+    /// <summary>
+    /// True when the window holding the claim is trying to put it down — asking to stop, or already
+    /// finished. Registration order decides ownership between two live claims, but an owner on its way
+    /// out should not keep the claim away from a follower that is still working. Reported rather than
+    /// acted on: `rec=stop` is a request awaiting an operator, and promoting on an unresolved request
+    /// would settle a decision that is not the tool's to make.
+    /// </summary>
+    /// <remarks>
+    /// A published `rec=stop` is trusted only when the owner pane is idle and has actually handed over
+    /// (<see cref="WaitingVerdict.IsHandover"/>) — the same gate the verdict passes through. An owner
+    /// mid-turn, blocked on a prompt, stalled, or unreadable is not releasing whatever a stale record says,
+    /// so its stale `rec=stop` must not trigger follower promotion. The Merged/Closed half needs no extra
+    /// gate here: <paramref name="verdict"/> is already the activity-gated verdict, which reaches those
+    /// states only from an idle pane.
+    /// </remarks>
+    public static bool IsReleasing(AgentState state, WaitingVerdict verdict, PaneActivity activity)
+        => (WaitingVerdict.IsHandover(activity) && state.Recommendation == Recommendation.Stop)
+            || verdict.State is WaitingState.Merged or WaitingState.Closed;
+
+    /// <summary>
+    /// Ranks every window claiming a PR by when it registered, so the ordering is stable across sweeps.
+    /// Windows the tool has not seen register yet sort last, and ties break on a fixed key rather than
+    /// collection order — an owner that changes identity between runs would be worse than no owner.
+    /// </summary>
+    /// <param name="registeredAt">When a window was first seen claiming its PR, or null if never seen.</param>
+    /// <param name="witnessed">
+    /// Whether a window's current registration was <em>witnessed</em> — recorded while its host was
+    /// already under continuous observation and the fleet view was complete. Persisted with the
+    /// registration and preserved while the same claim continues, so it is read here rather than
+    /// recomputed from this run's coverage: a claim first recorded under a narrow view stays untrusted
+    /// across every later sweep, which is what stops fleet expansion promoting it once every host is
+    /// finally collected. Only two windows whose registrations were both witnessed can be ordered against
+    /// each other as an observed fact.
+    /// </param>
+    /// <param name="viewComplete">
+    /// Whether every host answered. When one did not, a window that appears to be the only claimant of
+    /// its PR may simply be the only one visible — measured live: with two hosts claiming one PR and one
+    /// host unreachable, the remaining window was a follower and looked sole. Since a sole claim is the
+    /// one shape that is always actionable, a partial view is exactly the condition under which the tool
+    /// would drive the wrong agent, so no claim is owned while the fleet is incompletely seen.
+    /// </param>
+    public static IReadOnlyDictionary<string, Claim> Register(
+        IEnumerable<(TmuxPane Pane, int PrNumber, int? Round)> claims,
+        Func<TmuxPane, DateTimeOffset?> registeredAt,
+        Func<TmuxPane, bool>? witnessed = null,
+        bool viewComplete = true)
+    {
+        var ranked = new Dictionary<string, Claim>(StringComparer.Ordinal);
+
+        foreach (IGrouping<int, (TmuxPane Pane, int PrNumber, int? Round)> group in claims.GroupBy(c => c.PrNumber))
+        {
+            (TmuxPane Pane, int PrNumber, int? Round)[] contenders = [.. group];
+            if (contenders.Length == 1)
+            {
+                ranked[Key(contenders[0].Pane)] = viewComplete
+                    ? Sole
+                    : new Claim(ClaimRank.Sole, [], registeredAt(contenders[0].Pane), ClaimBasis.PartialView);
+                continue;
+            }
+
+            DateTimeOffset?[] recorded = [.. contenders.Select(c => registeredAt(c.Pane))];
+            int unrecorded = recorded.Count(r => r is null);
+            DateTimeOffset[] known = [.. recorded.OfType<DateTimeOffset>()];
+
+            // The order is a fact only when every contender's registration was witnessed — recorded while
+            // the tool was already watching its host under a complete view. Witness is persisted with the
+            // registration and read here, not recomputed from this run: a claim first recorded under a
+            // narrow view stays untrusted forever after, so expanding the fleet and re-collecting cannot
+            // turn a first look into a witnessed appearance and promote it. Given that, the order also has
+            // to be unambiguous: every contender recorded, and every recorded time distinct. A window that
+            // was never seen registering cannot be placed, and two identical times cannot be separated.
+            bool everyWitnessed = contenders.All(c => witnessed?.Invoke(c.Pane) ?? false);
+            bool observed = unrecorded == 0
+                && known.Length == known.Distinct().Count()
+                && everyWitnessed;
+
+            (TmuxPane Pane, int PrNumber, int? Round)[] ordered = [.. contenders
+                .OrderBy(c => registeredAt(c.Pane) ?? DateTimeOffset.MaxValue)
+
+                // Failing that, seniority: an agent at round 15 has held this work longer than one that
+                // just arrived. Self-reported and therefore weak, which is why it only breaks a tie and
+                // never by itself grants the right to be driven.
+                .ThenByDescending(c => c.Round ?? -1)
+
+                // Then a fixed key, so an owner does not change identity between sweeps.
+                .ThenBy(c => c.Pane.Host ?? string.Empty, StringComparer.Ordinal)
+                .ThenBy(c => c.Pane.PaneId, StringComparer.Ordinal)];
+
+            for (int i = 0; i < ordered.Length; i++)
+            {
+                TmuxPane pane = ordered[i].Pane;
+                ranked[Key(pane)] = new Claim(
+                    i == 0 ? ClaimRank.Owner : ClaimRank.Follower,
+                    [.. ordered.Select(c => c.Pane).Where(p => Key(p) != Key(pane))],
+                    registeredAt(pane),
+                    observed && viewComplete ? ClaimBasis.Observed : ClaimBasis.Inferred);
+            }
+        }
+
+        return ranked;
+    }
+
+    internal static string Key(TmuxPane pane) => TargetId.ForHost(pane.Host).ComposeWith(pane.PaneId);
+}

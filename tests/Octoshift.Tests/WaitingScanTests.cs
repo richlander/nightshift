@@ -30,6 +30,7 @@ public class WaitingScanTests
     {
         string[] rows = [.. manifest];
         var sb = new System.Text.StringBuilder();
+        sb.Append(Nonce).Append(":epoch 4242:1755900000\n");
         sb.Append(Nonce).Append(":manifest\n");
         foreach (string row in rows)
         {
@@ -54,19 +55,100 @@ public class WaitingScanTests
             sb.Append(Hex(text)).Append('\n').Append(Nonce).Append(":read ").Append(paneId).Append('\n');
         }
 
+        // The closing epoch bracket, equal to the opening one — a collection that did not restart.
+        sb.Append(Nonce).Append(":epoch 4242:1755900000\n");
         return sb.ToString();
     }
 
     /// <summary>Encodes one field the way the script's <c>printf | od | tr</c> pipeline does.</summary>
     private static string Hex(string text) => Convert.ToHexStringLower(System.Text.Encoding.UTF8.GetBytes(text));
 
-    /// <summary>One manifest row, from the readable pipe form to the six encoded fields on the wire.</summary>
+    /// <summary>One manifest row, from the readable pipe form to the seven encoded fields on the wire.</summary>
     private static string Row(string fields, string nonce = Nonce)
-        => $"{nonce}:w|" + string.Join('|', fields.Split('|', 6).Select(Hex));
+    {
+        string[] parts = fields.Split('|', 6);
+        // Synthesise a window id from the pane id, so a readable six-field fixture yields a valid row.
+        string windowId = "@" + (parts[0].StartsWith('%') ? parts[0][1..] : parts[0]);
+        return $"{nonce}:w|" + string.Join('|', parts.Append(windowId).Select(Hex));
+    }
 
     /// <summary>A row built field by field, for fixtures whose values contain the separator itself.</summary>
     private static string EncodedRow(params string[] fields)
         => $"{Nonce}:w|" + string.Join('|', fields.Select(Hex));
+
+    /// <summary>A collection stream with the observation-second line the real script emits, inserted after
+    /// the opening epoch (before the manifest, where the parser reads it). A null value omits the line
+    /// entirely, modelling a sweep that carried no observation second at all.</summary>
+    private static string StreamWithObs(string? observation, params string[] rows)
+    {
+        string baseStream = Stream(rows);
+        const string EpochLine = Nonce + ":epoch 4242:1755900000\n";
+        return observation is null ? baseStream : baseStream.Insert(EpochLine.Length, $"{Nonce}:obs {observation}\n");
+    }
+
+    [Fact]
+    public void ParseCollection_AttachesTheTargetObservationSecondToEveryPane()
+    {
+        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
+            StreamWithObs("1755900005", "%1|night:3|1|1755900000||pr4595", "%2|night:4|0|1755800000||i158"),
+            host: null,
+            Nonce);
+
+        Assert.All(panes, p => Assert.Equal("1755900005", p.ObservationSecond));
+    }
+
+    [Theory]
+    [InlineData(null)]              // no observation line at all (an older-format or clock-failed sweep)
+    [InlineData("")]               // present but empty (date +%s failed)
+    [InlineData("17559x0000")]     // non-canonical
+    [InlineData("017559")]         // leading zero
+    public void ParseCollection_DropsAMalformedOrAbsentObservationSecondToEmpty(string? observation)
+    {
+        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
+            StreamWithObs(observation, "%1|night:3|1|1755900000||pr4595"),
+            host: null,
+            Nonce);
+
+        // An untrusted observation second reads as empty, which the rename treats as "no whole-second proof"
+        // and fails closed — the pane is never renamed on a clock read it could not validate.
+        Assert.Equal(string.Empty, panes[0].ObservationSecond);
+        Assert.False(TmuxScanner.ActivityStrictlyPredatesObservation(panes[0]));
+    }
+
+    [Fact]
+    public void ParseCollection_DropsADoubledObservationSecondToEmpty()
+    {
+        // Two observation lines are a shape the script never produces; rather than pick one, the whole
+        // observation is dropped and the rename fails closed for every pane.
+        string doubled = StreamWithObs("1755900005", "%1|night:3|1|1755900000||pr4595")
+            .Replace($"{Nonce}:obs 1755900005\n", $"{Nonce}:obs 1755900005\n{Nonce}:obs 1755900006\n", StringComparison.Ordinal);
+
+        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(doubled, host: null, Nonce);
+
+        Assert.Equal(string.Empty, panes[0].ObservationSecond);
+    }
+
+    [Theory]
+    [InlineData("100", "101", true)]   // strictly older by a second — eligible
+    [InlineData("100", "100", false)]  // same second — the blind spot, refused
+    [InlineData("101", "100", false)]  // activity AFTER observation — a clock step, refused
+    [InlineData("100", "", false)]     // no observation second — refused
+    [InlineData("", "101", false)]     // no activity stamp — refused
+    [InlineData("100", "01", false)]   // non-canonical observation — refused
+    public void ActivityStrictlyPredatesObservation_IsTrueOnlyForAStrictlyOlderCanonicalPair(string activity, string observation, bool expected)
+    {
+        var pane = new TmuxPane
+        {
+            PaneId = "%1",
+            Target = "s:1",
+            WindowName = "pr4448",
+            SessionAttached = false,
+            ActivityStamp = activity,
+            ObservationSecond = observation,
+        };
+
+        Assert.Equal(expected, TmuxScanner.ActivityStrictlyPredatesObservation(pane));
+    }
 
     [Fact]
     public void ParseCollection_ReadsTargetAttachmentAndActivity()
@@ -87,6 +169,22 @@ public class WaitingScanTests
         Assert.Equal("pr=4595 head=abc1234 reviews=2/2 rec=merge", windows[0].AgentStateOption);
         Assert.Null(windows[1].AgentStateOption);
         Assert.False(windows[1].SessionAttached);
+    }
+
+    [Fact]
+    public void ParseCollection_ReadsAndValidatesTheWindowId()
+    {
+        // Blocker 4: the window id is the stable rename target, so it is scanned and validated like the
+        // pane id. A well-formed `@8` is kept verbatim.
+        IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:3", "1", "1755900000", "pr=4595 head=abc1234", "pr4595", "@8")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n{Nonce}:epoch 4242:1755900000\n",
+            host: null,
+            Nonce);
+
+        TmuxPane window = Assert.Single(windows);
+        Assert.Equal("%1", window.PaneId);
+        Assert.Equal("@8", window.WindowId);
     }
 
     [Fact]
@@ -111,8 +209,8 @@ public class WaitingScanTests
         const string hostile = "pr=4595 head=abc1234\ndeadbeefcafe0123:manifest\n%9|fake:9|1|1|pr=9999|pr9999";
 
         IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
-            $"{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", hostile, "pr4595")}\n{Nonce}:end\n"
-                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", hostile, "pr4595", "@1")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n{Nonce}:epoch 4242:1755900000\n",
             host: null,
             Nonce);
 
@@ -130,8 +228,8 @@ public class WaitingScanTests
         const string hostile = "pr4595\r\n%9|fake:9|1|1||forged\u0007and still the name";
 
         IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
-            $"{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, hostile)}\n{Nonce}:end\n"
-                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, hostile, "@1")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n{Nonce}:epoch 4242:1755900000\n",
             host: null,
             Nonce);
 
@@ -148,6 +246,7 @@ public class WaitingScanTests
     [InlineData("deadbeefcafe0123:w|2531|nothex|31|31|31|31")]            // not encoded
     [InlineData("deadbeefcafe0123:w|2531|616|31|31|31|31")]               // truncated mid-byte
     [InlineData("deadbeefcafe0123:w|6e69676874|6e|31|31|31|31")]          // first field is not a pane id
+    [InlineData("deadbeefcafe0123:w|2531|6e|31|31|31|31|6e69676874")]     // last field is not a window id
     public void ParseCollection_RejectsAMalformedManifestRow(string row)
     {
         // Dropping a row loses a window, and a lost window is indistinguishable from a window that is not
@@ -155,6 +254,176 @@ public class WaitingScanTests
         // unreadable, and it is reported as that.
         Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
             $"{Nonce}:manifest\n{row}\n{Nonce}:end\n", host: null, Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_RejectsAManifestWithPanesButNoEpoch()
+    {
+        // The epoch binds each pane id to the server that minted it. Without it a pane could carry an
+        // empty epoch straight past AdoptEpoch's continuity and restart checks, so a manifest that lists
+        // any window and names no server generation is not this collection's and is unreadable.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595", "@1")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
+            host: null,
+            Nonce));
+    }
+
+    [Theory]
+    [InlineData("notanepoch")]     // no colon
+    [InlineData("4242:")]          // no start time
+    [InlineData(":1755900000")]    // no pid
+    [InlineData("4242:12:34")]     // an extra colon
+    [InlineData("42x2:1755900000")] // a non-decimal pid
+    public void ParseCollection_RejectsAMalformedEpoch(string epoch)
+    {
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch {epoch}\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595", "@1")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
+            host: null,
+            Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_RejectsADuplicateEpochEvenWhenIdentical()
+    {
+        // Two epoch lines are two accounts of the server generation; the output is then not the one this
+        // script writes, and trusting either copy is a guess — so a repeat is invalid even if it matches.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n"
+                + $"{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595", "@1")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
+            host: null,
+            Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_AllowsAnEmptySuccessfulManifestWithNoEpoch()
+    {
+        // A host with no active tmux server answers with a complete but empty manifest and no epoch — it
+        // is observed to hold no windows, which is a success, not a malformed collection.
+        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
+            $"{Nonce}:manifest\n{Nonce}:end\n", host: null, Nonce);
+
+        Assert.Empty(panes);
+    }
+
+    [Theory]
+    [InlineData("notanepoch")]
+    [InlineData("")]
+    [InlineData("4242:")]
+    public void ParseCollection_RejectsAMalformedEpochEvenOnAnEmptyManifest(string epoch)
+    {
+        // Missing is allowed for an empty manifest, but a present epoch must still be canonical: an empty
+        // or malformed one is not something this script writes, so it is not accepted just because the
+        // manifest carried no windows.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch {epoch}\n{Nonce}:manifest\n{Nonce}:end\n", host: null, Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_AllowsAnEmptyManifestThatCarriesAValidEpoch()
+    {
+        // A running server with no windows is also an empty success, and it reports its epoch — bracketed
+        // by an equal opening and closing line, since no restart happened during the collection.
+        IReadOnlyList<TmuxPane> panes = TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{Nonce}:end\n{Nonce}:epoch 4242:1755900000\n", host: null, Nonce);
+
+        Assert.Empty(panes);
+    }
+
+    [Fact]
+    public void ParseCollection_RejectsACollectionWhoseServerRestartedMidway()
+    {
+        // Blocker 1: the opening and closing epochs differ, so the server restarted somewhere during the
+        // collection — after the opening bracket but before the fields, or during the captures. Its rows
+        // may then mix two generations and preserve a witnessed history that no longer exists, so the
+        // whole account is rejected rather than parsed.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595", "@1")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n{Nonce}:epoch 9999:1755900001\n",
+            host: null,
+            Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_RejectsPanesWithNoClosingEpoch()
+    {
+        // The closing bracket is what proves the server did not restart during the collection, so a
+        // manifest with windows and only an opening epoch is not this collection's complete account.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595", "@1")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n",
+            host: null,
+            Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_RejectsContentAfterTheClosingEpoch()
+    {
+        // The closing epoch is the last thing the collection writes; anything after it is not the shape
+        // this script produces.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{Nonce}:end\n{Nonce}:epoch 4242:1755900000\n{Nonce}:epoch 4242:1755900000\n",
+            host: null,
+            Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_RejectsTwoOpeningEpochs()
+    {
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{Nonce}:end\n{Nonce}:epoch 4242:1755900000\n",
+            host: null,
+            Nonce));
+    }
+
+    [Theory]
+    [InlineData("%01", "@1")]     // leading-zero pane id
+    [InlineData("%00", "@1")]     // zero with a leading zero
+    [InlineData("%1", "@01")]     // leading-zero window id
+    [InlineData("%1", "@00")]
+    public void ParseCollection_RejectsANonCanonicalId(string paneId, string windowId)
+    {
+        // Blocker 4: tmux mints an id as a canonical non-negative decimal — a lone 0, otherwise no leading
+        // zero — so `%01`, `%00`, `@01` are ids it never prints and are rejected.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow(paneId, "night:1", "1", "1755900000", string.Empty, "pr4595", windowId)}\n{Nonce}:end\n"
+                + $"{Nonce}:pane {paneId}\n{Hex("> ")}\n{Nonce}:read {paneId}\n{Nonce}:epoch 4242:1755900000\n",
+            host: null,
+            Nonce));
+    }
+
+    [Fact]
+    public void ParseCollection_AcceptsZeroAsALoneIdForPaneAndWindow()
+    {
+        // A lone 0 IS canonical — `%0` and `@0` are the first ids tmux mints — so they are kept verbatim.
+        IReadOnlyList<TmuxPane> windows = TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch 4242:1755900000\n{Nonce}:manifest\n{EncodedRow("%0", "night:1", "1", "1755900000", string.Empty, "pr4595", "@0")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %0\n{Hex("> ")}\n{Nonce}:read %0\n{Nonce}:epoch 4242:1755900000\n",
+            host: null,
+            Nonce);
+
+        TmuxPane w = Assert.Single(windows);
+        Assert.Equal("%0", w.PaneId);
+        Assert.Equal("@0", w.WindowId);
+    }
+
+    [Theory]
+    [InlineData("0:0")]    // zero components
+    [InlineData("4242:0")]
+    [InlineData("01:02")]  // leading zeros
+    [InlineData("042:1")]
+    public void ParseCollection_RejectsANonCanonicalEpoch(string epoch)
+    {
+        // Blocker 4: an epoch's pid and start_time are canonical positive decimals — never zero, never a
+        // leading zero — so an impossible pair like `0:0` or `01:02` is rejected even when it brackets the
+        // collection on both sides.
+        Assert.Throws<TmuxUnavailableException>(() => TmuxScanner.ParseCollection(
+            $"{Nonce}:epoch {epoch}\n{Nonce}:manifest\n{EncodedRow("%1", "night:1", "1", "1755900000", string.Empty, "pr4595", "@1")}\n{Nonce}:end\n"
+                + $"{Nonce}:pane %1\n{Hex("> ")}\n{Nonce}:read %1\n{Nonce}:epoch {epoch}\n",
+            host: null,
+            Nonce));
     }
 
     [Fact]
@@ -325,6 +594,167 @@ public class WaitingScanTests
         Assert.Null(await source.FetchAsync(4595, TestContext.Current.CancellationToken));
         Assert.True(source.RateLimited);
         Assert.Equal(0, source.RateLimitRemaining);
+    }
+
+    [Fact]
+    public async Task FetchDetailed_Remaining0OnA200StillClassifiesFound()
+    {
+        // The request that spends the last unit of the budget can still return a real answer. A 200 with
+        // `X-RateLimit-Remaining: 0` is a valid Found — the exhaustion refuses the NEXT read, it does not
+        // rewrite THIS one into an outage.
+        var gh = new FakeGh
+        {
+            ["repos/o/r/pulls/4595"] = Response(200, """
+                {"number":4595,"state":"open","mergeable_state":"clean","head":{"sha":"722512e25f0c1d4a9b8e7360a1c2d3e4f5061728"}}
+                """, "x-ratelimit-remaining: 0"),
+            [$"repos/o/r/commits/{Head}/check-runs?per_page=100"] = Response(200, """{"check_runs":[]}"""),
+        };
+
+        var source = new GhPrFactsSource("o/r", new FakeCache(), gh.RunAsync);
+        PrFetch fetch = await source.FetchDetailedAsync(4595, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.Found, fetch.Status);
+        Assert.NotNull(fetch.Facts);
+        Assert.Equal(Head, fetch.Facts.HeadSha);
+        Assert.True(source.RateLimited);
+        Assert.Equal(0, source.RateLimitRemaining);
+    }
+
+    [Fact]
+    public async Task FetchDetailed_Remaining0OnA304StillServesTheCachedBody()
+    {
+        // A conditional read answered 304 as the budget hits zero is still the cached body, current until
+        // the branch moves — the exhaustion is remembered, the answer is not thrown away.
+        var cache = new FakeCache();
+        cache.Put("repos/o/r/pulls/4595", "\"etag-pull\"", """
+            {"number":4595,"state":"open","mergeable_state":"clean","head":{"sha":"722512e25f0c1d4a9b8e7360a1c2d3e4f5061728"}}
+            """);
+        cache.Put($"repos/o/r/commits/{Head}/check-runs?per_page=100", "\"etag-checks\"", """{"check_runs":[]}""");
+
+        var gh = new FakeGh
+        {
+            ["repos/o/r/pulls/4595"] = Response(304, string.Empty, "x-ratelimit-remaining: 0"),
+            [$"repos/o/r/commits/{Head}/check-runs?per_page=100"] = Response(304, string.Empty, "x-ratelimit-remaining: 0"),
+        };
+
+        var source = new GhPrFactsSource("o/r", cache, gh.RunAsync);
+        PrFetch fetch = await source.FetchDetailedAsync(4595, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.Found, fetch.Status);
+        Assert.NotNull(fetch.Facts);
+        Assert.Equal(Head, fetch.Facts.HeadSha);
+        Assert.True(source.RateLimited);
+    }
+
+    [Fact]
+    public async Task FetchDetailed_Remaining0OnA404IsStillAnAffirmativeNotFound()
+    {
+        // An affirmative 404 is the one negative answer to trust, and the budget hitting zero on the same
+        // response does not make GitHub's "no such PR" any less true.
+        var gh = new FakeGh
+        {
+            ["repos/o/r/pulls/4595"] = Response(404, """{"message":"Not Found"}""", "x-ratelimit-remaining: 0"),
+        };
+
+        var source = new GhPrFactsSource("o/r", new FakeCache(), gh.RunAsync);
+        PrFetch fetch = await source.FetchDetailedAsync(4595, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.NotFound, fetch.Status);
+        Assert.Null(fetch.Facts);
+        Assert.True(source.RateLimited);
+    }
+
+    [Fact]
+    public async Task FetchDetailed_Remaining0RefusesTheNextNetworkRead()
+    {
+        // Classifying the current response truthfully must not spend the budget again: once a response has
+        // reported it exhausted, the very next call is refused before it reaches gh.
+        var gh = new FakeGh
+        {
+            ["repos/o/r/pulls/4595"] = Response(404, """{"message":"Not Found"}""", "x-ratelimit-remaining: 0"),
+        };
+
+        var source = new GhPrFactsSource("o/r", new FakeCache(), gh.RunAsync);
+
+        Assert.Equal(PrFetchStatus.NotFound, (await source.FetchDetailedAsync(4595, TestContext.Current.CancellationToken)).Status);
+
+        int spent = gh.Requests.Count;
+        Assert.Equal(PrFetchStatus.Unavailable, (await source.FetchDetailedAsync(4596, TestContext.Current.CancellationToken)).Status);
+
+        // The second lookup added no gh request: the exhausted budget refuses it before it is spent.
+        Assert.Equal(spent, gh.Requests.Count);
+    }
+
+    [Fact]
+    public async Task FetchDetailed_FoundReturnsTheFacts()
+    {
+        // The happy path through the three-outcome seam: a 200 with a head yields Found and the facts.
+        var gh = new FakeGh
+        {
+            ["repos/o/r/pulls/4595"] = Response(200, """
+                {"number":4595,"state":"open","mergeable_state":"clean","head":{"sha":"722512e25f0c1d4a9b8e7360a1c2d3e4f5061728"}}
+                """),
+            [$"repos/o/r/commits/{Head}/check-runs?per_page=100"] = Response(200, """{"check_runs":[]}"""),
+        };
+
+        PrFetch fetch = await new GhPrFactsSource("o/r", new FakeCache(), gh.RunAsync)
+            .FetchDetailedAsync(4595, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.Found, fetch.Status);
+        Assert.NotNull(fetch.Facts);
+        Assert.Equal(Head, fetch.Facts.HeadSha);
+    }
+
+    [Fact]
+    public async Task FetchDetailed_AnAffirmative404IsNotFound()
+    {
+        // The one negative answer to trust: GitHub looked and there is no such PR. This — and only this —
+        // is NotFound, which is what lets `pr` reserve NOTFOUND for a real 404.
+        var gh = new FakeGh { ["repos/o/r/pulls/4595"] = Response(404, """{"message":"Not Found"}""") };
+
+        PrFetch fetch = await new GhPrFactsSource("o/r", new FakeCache(), gh.RunAsync)
+            .FetchDetailedAsync(4595, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.NotFound, fetch.Status);
+        Assert.Null(fetch.Facts);
+    }
+
+    [Theory]
+    [InlineData(401, "", "")]                                    // authentication failure
+    [InlineData(403, "", "x-ratelimit-remaining: 0")]            // rate limit / forbidden
+    [InlineData(429, "", "")]                                    // too many requests
+    [InlineData(500, "", "")]                                    // server error
+    [InlineData(502, "", "")]                                    // bad gateway
+    [InlineData(200, "{ not json", "")]                          // a 200 body that cannot be parsed
+    [InlineData(200, """{"state":"open"}""", "")]                // a 200 with no head sha
+    public async Task FetchDetailed_UnreadableOutcomesAreUnavailableNotNotFound(int status, string body, string header)
+    {
+        // Every read that is not an affirmative 404 and not a usable body is Unavailable — auth, rate
+        // limit, a 5xx, or a body that cannot be trusted. None of these may collapse to NotFound, or an
+        // outage reads as "no such PR".
+        string[] extra = header.Length == 0 ? [] : [header];
+        var gh = new FakeGh { ["repos/o/r/pulls/4595"] = Response(status, body, extra) };
+
+        PrFetch fetch = await new GhPrFactsSource("o/r", new FakeCache(), gh.RunAsync)
+            .FetchDetailedAsync(4595, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.Unavailable, fetch.Status);
+        Assert.Null(fetch.Facts);
+    }
+
+    [Fact]
+    public async Task FetchDetailed_ANonzeroExitWithNoStatusIsUnavailable()
+    {
+        // A transport failure: gh exits nonzero and there is no HTTP status line to read. The existence of
+        // the PR is unknown, so this is Unavailable — never a not-found inferred from silence.
+        Task<GhResult> Gh(IReadOnlyList<string> args, CancellationToken ct)
+            => Task.FromResult(new GhResult(1, string.Empty, "dial tcp: connection refused"));
+
+        PrFetch fetch = await new GhPrFactsSource("o/r", new FakeCache(), Gh)
+            .FetchDetailedAsync(4595, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PrFetchStatus.Unavailable, fetch.Status);
+        Assert.Null(fetch.Facts);
     }
 
     [Fact]
@@ -1059,6 +1489,7 @@ public class WaitingScanTests
         string nonce = NonceOf(script);
         string[] rows = [.. manifest];
         var sb = new System.Text.StringBuilder();
+        sb.Append(nonce).Append(":epoch 4242:1755900000\n");
         sb.Append(nonce).Append(":manifest\n");
         foreach (string row in rows)
         {
@@ -1078,13 +1509,1109 @@ public class WaitingScanTests
               .Append(nonce).Append(text is null ? ":lost " : ":read ").Append(paneId).Append('\n');
         }
 
+        sb.Append(nonce).Append(":epoch 4242:1755900000\n");
         return sb.ToString();
+    }
+
+    [Fact]
+    public async Task BuildRows_RanksTwoClaimsOnOnePrRatherThanRejectingEither()
+    {
+        // Observed live: PR 4448 claimed by a working window on one host and a blocked one on another.
+        // Rejecting the second loses work that is really happening; treating them as equals gives two
+        // owners and a fight. First registration owns it, the rest are followed.
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [
+                Pane("cp:9", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234 reviews=0/2", windowName: "pr4448"),
+                Pane("cp:17", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234 round=15 reviews=0/2", windowName: "pr4448"),
+                Pane("cp:3", "", PaneActivity.Idle, agentState: "pr=4600 head=abc1234 reviews=0/2", windowName: "pr4600"),
+            ],
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            DateTimeOffset.UtcNow,
+            all: true,
+            ct: TestContext.Current.CancellationToken);
+
+        WaitingRow[] contested = [.. rows.Where(r => r.Record?.PrNumber == 4448)];
+        Assert.Equal(2, contested.Length);
+        Assert.Single(contested, r => r.Claim.Rank == ClaimRank.Owner);
+        Assert.Single(contested, r => r.Claim.Rank == ClaimRank.Follower);
+        Assert.All(contested, r => Assert.Single(r.Claim.Others));
+
+        // The uncontested one is unaffected.
+        Assert.Equal(ClaimRank.Sole, rows.Single(r => r.Record?.PrNumber == 4600).Claim.Rank);
+    }
+
+    [Fact]
+    public async Task BuildRows_EveryActivityClaimantContestsNotOnlyIdleOnes()
+    {
+        // The blocking finding: a working window and a blocked window each claim PR 4448 alongside an idle
+        // one. All three hold the same claim; leaving the two busy ones out of the contest would hand the
+        // idle rival sole, actionable ownership of a PR three agents are on. Distinct names, so identity
+        // comes from the published state rather than the window name.
+        PrFacts ready = new()
+        {
+            Number = 4448,
+            HeadSha = "abc1234ff",
+            State = "open",
+            MergeableState = "clean",
+            Checks = [new CheckRunFact("ci", "completed", "success")],
+        };
+
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [
+                Pane("cp:1", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234 reviews=2/2 rec=merge", windowName: "a"),
+                Pane("cp:2", "mid turn", PaneActivity.Working, agentState: "pr=4448 head=abc1234", windowName: "b"),
+                Pane("cp:3", "answer? (esc to cancel)", PaneActivity.Blocked, agentState: "pr=4448 head=abc1234", windowName: "c"),
+            ],
+            (_, _) => Task.FromResult<PrFacts?>(ready),
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            DateTimeOffset.UtcNow,
+            all: true,
+            ct: TestContext.Current.CancellationToken);
+
+        WaitingRow idle = rows.Single(r => r.Pane.Target == "cp:1");
+        Assert.True(idle.Claim.IsContested);
+
+        // Both the working and the blocked window contest it, so its rivals number two, not zero.
+        Assert.Equal(2, idle.Claim.Others.Count);
+
+        // And it is never acted on, however good its evidence — the fix for three agents on one PR is not
+        // to drive one of them carefully.
+        Assert.False(idle.MayAct);
+    }
+
+    [Fact]
+    public async Task CollectAsync_AHostThatAnswersEmptyIsCollectedNotOmitted()
+    {
+        // A host that answered with no windows is evidence it was observed, not a host that was skipped.
+        // It must appear in CollectedHosts so a quiet host still counts toward a complete view.
+        WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(
+            ["fernie", "banff"],
+            (host, _) => host == "banff"
+                ? Task.FromResult<IReadOnlyList<TmuxPane>>([Pane("banff:1", "", PaneActivity.Idle)])
+                : Task.FromResult<IReadOnlyList<TmuxPane>>([]),
+            TestContext.Current.CancellationToken);
+
+        Assert.False(collected.AnyFailure);
+        Assert.Contains("fernie", collected.CollectedHosts);
+        Assert.Contains("banff", collected.CollectedHosts);
+    }
+
+    [Fact]
+    public void History_PartialSweepPrunesOnlyCollectedHostsAndRetainsTheRest()
+    {
+        // On a partial collection only the successfully collected hosts' partitions are updated. A window
+        // that vanished from a collected host has departed; a window on a host not swept this run is merely
+        // unseen, and its registration must survive rather than being deleted.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-partial-{Guid.NewGuid():N}.json");
+        try
+        {
+            TmuxPane onFernie = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "fernie" };
+            TmuxPane onBanff = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4600") with { Host = "banff" };
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+            var first = new PaneHistory(path);
+            first.Observe(onFernie, t, claimedPr: 4448);
+            first.Observe(onBanff, t, claimedPr: 4600);
+            first.Save([onFernie, onBanff], ["fernie", "banff"]);
+
+            // A later sweep collects only fernie, where the window is now gone. banff was not swept at all.
+            var second = new PaneHistory(path);
+            string gone = Assert.Single(second.Save([], ["fernie"]));
+
+            Assert.Contains("#4448", gone, StringComparison.Ordinal);
+            Assert.NotNull(new PaneHistory(path).ClaimedAt(onBanff));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void History_SamePaneIdOnTwoHostsDoesNotCollide()
+    {
+        // A pane id is unique only within one tmux server, so `%3` on two hosts is two windows. Keyed by
+        // host and pane id together, each keeps its own registration; a host-local key would let one
+        // overwrite the other.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-collide-{Guid.NewGuid():N}.json");
+        try
+        {
+            TmuxPane onFernie = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "fernie", PaneId = "%3" };
+            TmuxPane onBanff = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4600") with { Host = "banff", PaneId = "%3" };
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+            var history = new PaneHistory(path);
+            history.Observe(onFernie, t, claimedPr: 4448);
+            history.Observe(onBanff, t.AddHours(1), claimedPr: 4600);
+
+            Assert.Equal(t, history.ClaimedAt(onFernie));
+            Assert.Equal(t.AddHours(1), history.ClaimedAt(onBanff));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void History_LocalAndAnAliasNamedLocalDoNotShareMemory()
+    {
+        // Blocker 3: the real local machine and an ssh alias literally named `local` are distinct targets,
+        // so the same pane id on each keeps its own registration and both are known separately.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-local-{Guid.NewGuid():N}.json");
+        try
+        {
+            TmuxPane localPane = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = null, PaneId = "%3" };
+            TmuxPane aliasPane = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4600") with { Host = "local", PaneId = "%3" };
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+            var history = new PaneHistory(path);
+            history.AdoptEpoch(null, "1:1", t);
+            history.AdoptEpoch("local", "2:2", t);
+            history.Observe(localPane, t, claimedPr: 4448);
+            history.Observe(aliasPane, t.AddHours(1), claimedPr: 4600);
+
+            Assert.Equal(t, history.ClaimedAt(localPane));
+            Assert.Equal(t.AddHours(1), history.ClaimedAt(aliasPane));
+
+            Assert.Contains(TargetId.Local.Key, history.KnownHosts);
+            Assert.Contains(TargetId.ForHost("local").Key, history.KnownHosts);
+            Assert.Equal(2, history.KnownHosts.Count);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void History_AnEmptySuccessfulHostIsRememberedSoALaterOmissionNarrows()
+    {
+        // Finding 3, across runs: a host that answered with no windows must still enter KnownHosts, or a
+        // later run that omits it cannot tell the fleet narrowed and reads its view as complete.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-empty-{Guid.NewGuid():N}.json");
+        try
+        {
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+            TmuxPane onBanff = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "banff" };
+
+            var first = new PaneHistory(path);
+            first.AdoptEpoch("banff", "1:1", t);
+            first.Observe(onBanff, t, claimedPr: 4448);
+            first.RecordSweptEmpty("fernie", t);
+            first.Save([onBanff], ["fernie", "banff"]);
+
+            // A later run reads the same history: fernie is remembered even though it had no windows. Its
+            // key is the structured target id, not the raw alias.
+            var second = new PaneHistory(path);
+            string fernieKey = TargetId.ForHost("fernie").Key;
+            Assert.Contains(fernieKey, second.KnownHosts);
+
+            // The omitted set both commands compute -- KnownHosts not collected this run -- flags it.
+            var collectedThisRun = new HashSet<string>([TargetId.ForHost("banff").Key], StringComparer.Ordinal);
+            Assert.Contains(fernieKey, second.KnownHosts.Where(k => !collectedThisRun.Contains(k)));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void History_AHostSweptEmptyDoesNotLendEpochContinuityToALaterSweep()
+    {
+        // The empty sweep records no epoch, so a window reappearing on the host next run is registered
+        // fresh rather than treated as continuous across a gap the tool never watched.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-emptyepoch-{Guid.NewGuid():N}.json");
+        try
+        {
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+            var first = new PaneHistory(path);
+            first.RecordSweptEmpty("fernie", t);
+            first.Save([], ["fernie"]);
+
+            var second = new PaneHistory(path);
+            Assert.False(second.AdoptEpoch("fernie", "1:1", t.AddHours(1)));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void History_AWindowThatStopsClaimingClearsItsRegistrationAndCannotInheritOwnership()
+    {
+        // Blocker 3: A owned PR 4448, then published no usable identity while B claimed it, then reclaimed
+        // it. Observing A with a null claim while it was quiet cleared its registration, so the reclaim is
+        // a fresh, later registration — A cannot jump the queue ahead of B, which claimed it in the
+        // meantime. Without the clear, A's stale time would keep it the owner.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-clear-{Guid.NewGuid():N}.json");
+        try
+        {
+            TmuxPane a = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "h" };
+            TmuxPane b = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "h" };
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+            var history = new PaneHistory(path);
+
+            history.Observe(a, t, claimedPr: 4448, registrationWitnessed: true);
+            history.Observe(a, t.AddMinutes(10), claimedPr: null);
+            Assert.Null(history.ClaimedAt(a));
+            Assert.False(history.IsWitnessed(a));
+
+            history.Observe(b, t.AddMinutes(10), claimedPr: 4448, registrationWitnessed: true);
+            history.Observe(a, t.AddMinutes(20), claimedPr: 4448, registrationWitnessed: true);
+            Assert.Equal(t.AddMinutes(20), history.ClaimedAt(a));
+
+            IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
+                [(a, 4448, null), (b, 4448, null)], history.ClaimedAt, history.IsWitnessed);
+
+            Assert.Equal(ClaimRank.Owner, ranked[Claim.Key(b)].Rank);
+            Assert.Equal(ClaimRank.Follower, ranked[Claim.Key(a)].Rank);
+            Assert.True(ranked[Claim.Key(b)].OwnsClaim);
+            Assert.False(ranked[Claim.Key(a)].OwnsClaim);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void History_AnIssueOrMalformedStateClearsAPriorPrRegistration()
+    {
+        // The other shapes blocker 3 covers: a window that had claimed a PR now tracks an issue, or
+        // publishes a record that names nothing. Both are observed with a null claim, so the stale PR
+        // registration and its provenance are cleared while the digest and silence survive.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-clear2-{Guid.NewGuid():N}.json");
+        try
+        {
+            TmuxPane w = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "h" };
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+            var history = new PaneHistory(path);
+
+            history.Observe(w, t, claimedPr: 4448, registrationWitnessed: true);
+            Assert.NotNull(history.ClaimedAt(w));
+
+            // Now the window tracks an issue (an issue-state resolves to a null claim) or a malformed
+            // record — the command passes claimedPr null in both cases.
+            TimeSpan? silence = history.Observe(w, t.AddMinutes(30), claimedPr: null);
+
+            Assert.Null(history.ClaimedAt(w));
+            Assert.False(history.IsWitnessed(w));
+
+            // The silence measurement survives the claim being cleared: the digest is unchanged.
+            Assert.Equal(TimeSpan.FromMinutes(30), silence);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task BuildRows_AGapBreaksAWitnessedOrderSoAnUnseenReclaimIsNotTheObservedOwner()
+    {
+        // Blocker 2: A and B both claim 4448, witnessed, A first — so A is the observed owner. A's host is
+        // then omitted for a sweep (a gap), during which A could have released and reclaimed unseen. On the
+        // next full sweep at the same epoch A's remembered order and witness are invalidated, so it is
+        // registered fresh and cannot stay the actionable observed owner. No departure is reported for A
+        // while it is merely unseen.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-gap-{Guid.NewGuid():N}.json");
+        try
+        {
+            var history = new PaneHistory(path);
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+            TmuxPane aQuiet = Pane("ha:1", "", PaneActivity.Idle, agentState: null, windowName: "a") with { Host = "ha", Epoch = "1:1" };
+            TmuxPane aClaims = Pane("ha:1", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234", windowName: "a") with { Host = "ha", Epoch = "1:1" };
+            TmuxPane bQuiet = Pane("hb:1", "", PaneActivity.Idle, agentState: null, windowName: "b") with { Host = "hb", Epoch = "2:1" };
+            TmuxPane bClaims = Pane("hb:1", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234", windowName: "b") with { Host = "hb", Epoch = "2:1" };
+            static Task<PrFacts?> None(int _, CancellationToken __) => Task.FromResult<PrFacts?>(null);
+            CancellationToken ct = TestContext.Current.CancellationToken;
+
+            // Sweep 1: full fleet, no claims — establishes continuous observation of both hosts.
+            await WaitingCommand.BuildRowsAsync([aQuiet, bQuiet], None, None, t, all: true, ct, collectedHosts: ["ha", "hb"], history: history);
+            // Sweep 2: A claims, witnessed (ha was observed before, view complete).
+            await WaitingCommand.BuildRowsAsync([aClaims, bQuiet], None, None, t.AddMinutes(10), all: true, ct, collectedHosts: ["ha", "hb"], history: history);
+            // Sweep 3: B claims, witnessed; A continues. A registered first, so A is the owner.
+            IReadOnlyList<WaitingRow> beforeGap = await WaitingCommand.BuildRowsAsync(
+                [aClaims, bClaims], None, None, t.AddMinutes(20), all: true, ct, collectedHosts: ["ha", "hb"], history: history);
+            Assert.Equal(ClaimRank.Owner, beforeGap.Single(r => r.Pane.PaneId == aClaims.PaneId).Claim.Rank);
+
+            // Sweep 4: omit ha — A is unseen, not departed.
+            await WaitingCommand.BuildRowsAsync([bClaims], None, None, t.AddMinutes(30), all: true, ct, collectedHosts: ["hb"], history: history);
+            Assert.DoesNotContain(WaitingCommand.Departed, d => d.Contains("#4448", StringComparison.Ordinal) && d.Contains(TargetId.ForHost("ha").Display, StringComparison.Ordinal));
+
+            // Sweep 5: full fleet again, same epoch. A reappears; the gap invalidated its order and witness.
+            IReadOnlyList<WaitingRow> afterGap = await WaitingCommand.BuildRowsAsync(
+                [aClaims, bClaims], None, None, t.AddMinutes(40), all: true, ct, collectedHosts: ["ha", "hb"], history: history);
+
+            WaitingRow aRow = afterGap.Single(r => r.Pane.PaneId == aClaims.PaneId);
+            WaitingRow bRow = afterGap.Single(r => r.Pane.PaneId == bClaims.PaneId);
+            Assert.Equal(ClaimRank.Follower, aRow.Claim.Rank);
+            Assert.Equal(ClaimRank.Owner, bRow.Claim.Rank);
+            Assert.False(aRow.MayAct);
+            Assert.False(bRow.MayAct);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void History_AnOlderHistoryFileFailsClosedRatherThanTrustingItsRegistrations()
+    {
+        // Blocker 2/3, backward compatibility: an older, differently-keyed history file — a pane keyed by
+        // the raw `fernie|%3`, a host keyed by the raw alias — is not this scheme's, so its entries are
+        // dropped on load. Nothing it recorded can become a witnessed order.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-oldfile-{Guid.NewGuid():N}.json");
+        try
+        {
+            File.WriteAllText(path, """
+                {
+                  "panes": { "fernie|%3": { "digest": "d", "since": "2026-08-25T12:00:00+00:00", "pr": 4448, "claimedAt": "2026-08-25T12:00:00+00:00", "witnessed": true } },
+                  "hosts": { "fernie": { "epoch": "1:1", "sweptAt": "2026-08-25T12:00:00+00:00" } }
+                }
+                """);
+
+            var history = new PaneHistory(path);
+            TmuxPane onFernie = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "fernie", PaneId = "%3" };
+
+            Assert.Empty(history.KnownHosts);
+            Assert.Null(history.ClaimedAt(onFernie));
+            Assert.False(history.IsWitnessed(onFernie));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void History_ACorruptedHistoryFileFailsClosedAndCannotCrashLoadingOrReporting()
+    {
+        // Follow-up 1: a history file whose keys are this scheme's tag but corrupted payloads — a host key
+        // `RA` (impossible base64), a pane key `R_w|%3` (byte 0xFF, not valid UTF-8) carrying a witnessed
+        // claim. None is a canonical target key, so all are dropped on load: KnownHosts is empty, nothing
+        // is witnessed, and neither loading nor a subsequent Save/report throws trying to display them.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-corrupt-{Guid.NewGuid():N}.json");
+        try
+        {
+            File.WriteAllText(path, """
+                {
+                  "panes": { "R_w|%3": { "digest": "d", "since": "2026-08-25T12:00:00+00:00", "pr": 4448, "claimedAt": "2026-08-25T12:00:00+00:00", "witnessed": true } },
+                  "hosts": {
+                    "RA": { "epoch": "1:1", "sweptAt": "2026-08-25T12:00:00+00:00", "continuous": true },
+                    "RQR": { "epoch": "2:1", "sweptAt": "2026-08-25T12:00:00+00:00", "continuous": true }
+                  }
+                }
+                """);
+
+            var history = new PaneHistory(path);
+            Assert.Empty(history.KnownHosts);
+
+            // Reporting over a fresh live pane must not touch the dropped corrupt entries, and Save must
+            // not throw trying to render a departure or an omission from a key it cannot decode.
+            TmuxPane live = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4600") with { Host = "banff", PaneId = "%9" };
+            history.AdoptEpoch("banff", "9:1", new DateTimeOffset(2026, 8, 26, 12, 0, 0, TimeSpan.Zero));
+            history.Observe(live, new DateTimeOffset(2026, 8, 26, 12, 0, 0, TimeSpan.Zero), claimedPr: 4600);
+            IReadOnlyList<string> departed = history.Save([live], ["banff"]);
+
+            Assert.False(history.IsWitnessed(live) && history.ClaimedAt(live) is null);
+            Assert.DoesNotContain(departed, d => d.Contains("4448", StringComparison.Ordinal));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void History_DropsAnEntryWhosePaneIdIsNotCanonical()
+    {
+        // Blocker 4: the composite pane key's suffix is validated with the exact IsPaneId, not merely a
+        // non-empty string, so an entry keyed by `%01` — an id tmux never mints — is dropped on load
+        // rather than kept as a witnessed order.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-canon-{Guid.NewGuid():N}.json");
+        try
+        {
+            string good = TargetId.ForHost("fernie").ComposeWith("%3");
+            string bad = TargetId.ForHost("fernie").ComposeWith("%01");
+            File.WriteAllText(path, $$"""
+                {
+                  "panes": {
+                    "{{good}}": { "digest": "d", "since": "2026-08-25T12:00:00+00:00", "pr": 4448, "claimedAt": "2026-08-25T12:00:00+00:00", "witnessed": true },
+                    "{{bad}}": { "digest": "d", "since": "2026-08-25T12:00:00+00:00", "pr": 4600, "claimedAt": "2026-08-25T12:00:00+00:00", "witnessed": true }
+                  },
+                  "hosts": {}
+                }
+                """);
+
+            var history = new PaneHistory(path);
+            TmuxPane goodPane = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "fernie", PaneId = "%3" };
+            TmuxPane badPane = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4600") with { Host = "fernie", PaneId = "%01" };
+
+            Assert.True(history.IsWitnessed(goodPane));
+            Assert.False(history.IsWitnessed(badPane));
+            Assert.Null(history.ClaimedAt(badPane));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void History_NullValuesAndImpossibleRecordsAreDroppedRatherThanTrusted()
+    {
+        // Blocker 2: the deserializer can hand back null values and records this implementation never
+        // wrote — a witnessed claim with no time, a host claiming continuity it never swept. None may
+        // crash Save/report or confer ownership, so nulls are dropped and impossible combinations fail
+        // closed: the claim and its witness go, the continuity goes.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-sanitize-{Guid.NewGuid():N}.json");
+        try
+        {
+            string paneKey = TargetId.ForHost("fernie").ComposeWith("%3");
+            string nullPaneKey = TargetId.ForHost("fernie").ComposeWith("%4");
+            string hostKey = TargetId.ForHost("fernie").Key;
+            string nullHostKey = TargetId.ForHost("banff").Key;
+            string uncontinuousKey = TargetId.ForHost("merritt").Key;
+
+            File.WriteAllText(path, $$"""
+                {
+                  "panes": {
+                    "{{paneKey}}": { "digest": "d", "since": "2026-08-25T12:00:00+00:00", "pr": 4448, "claimedAt": null, "witnessed": true },
+                    "{{nullPaneKey}}": null
+                  },
+                  "hosts": {
+                    "{{hostKey}}": { "epoch": "1:1", "sweptAt": "2026-08-25T12:00:00+00:00", "continuous": true },
+                    "{{nullHostKey}}": null,
+                    "{{uncontinuousKey}}": { "epoch": "3:1", "sweptAt": null, "continuous": true }
+                  }
+                }
+                """);
+
+            var history = new PaneHistory(path);
+            TmuxPane pane = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "fernie", PaneId = "%3" };
+            DateTimeOffset t = new(2026, 8, 26, 12, 0, 0, TimeSpan.Zero);
+
+            // A claim with a PR but no time is not well-formed: registration and witness are cleared.
+            Assert.Null(history.ClaimedAt(pane));
+            Assert.False(history.IsWitnessed(pane));
+
+            // A host claiming continuity with no sweep time cannot have been observed continuously, so its
+            // continuity is dropped and AdoptEpoch reports it as not continuous.
+            Assert.False(history.AdoptEpoch("merritt", "3:1", t));
+
+            // Null records are gone; the well-formed host survives; nothing crashed on load or on Save.
+            Assert.Contains(hostKey, history.KnownHosts);
+            Assert.DoesNotContain(nullHostKey, history.KnownHosts);
+            history.Save([pane], ["fernie", "merritt"]);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task BuildRows_ATotalFailureBreaksContinuitySoTheNextFullSweepIsNotOwned()
+    {
+        // Blocker 1: a witnessed contested order (A owner, B follower), then a sweep that collected
+        // nothing — a total failure, which persists discontinuity for every known host exactly as
+        // WaitingCommand does — then a full sweep at the same epoch. The gap invalidates both
+        // registrations, so the order is inferred and nobody is the actionable observed owner.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-totalfail-{Guid.NewGuid():N}.json");
+        try
+        {
+            var history = new PaneHistory(path);
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+            TmuxPane aQuiet = Pane("ha:1", "", PaneActivity.Idle, agentState: null, windowName: "a") with { Host = "ha", Epoch = "1:1" };
+            TmuxPane aClaims = Pane("ha:1", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234", windowName: "a") with { Host = "ha", Epoch = "1:1" };
+            TmuxPane bQuiet = Pane("hb:1", "", PaneActivity.Idle, agentState: null, windowName: "b") with { Host = "hb", Epoch = "2:1" };
+            TmuxPane bClaims = Pane("hb:1", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234", windowName: "b") with { Host = "hb", Epoch = "2:1" };
+            static Task<PrFacts?> None(int _, CancellationToken __) => Task.FromResult<PrFacts?>(null);
+            CancellationToken ct = TestContext.Current.CancellationToken;
+
+            await WaitingCommand.BuildRowsAsync([aQuiet, bQuiet], None, None, t, all: true, ct, collectedHosts: ["ha", "hb"], history: history);
+            await WaitingCommand.BuildRowsAsync([aClaims, bQuiet], None, None, t.AddMinutes(10), all: true, ct, collectedHosts: ["ha", "hb"], history: history);
+            IReadOnlyList<WaitingRow> beforeFailure = await WaitingCommand.BuildRowsAsync(
+                [aClaims, bClaims], None, None, t.AddMinutes(20), all: true, ct, collectedHosts: ["ha", "hb"], history: history);
+            Assert.Equal(ClaimBasis.Observed, beforeFailure.Single(r => r.Pane.PaneId == aClaims.PaneId).Claim.Basis);
+
+            // A total collection failure: nothing collected, so every known host's continuity is broken on
+            // disk — the persistence WaitingCommand.RunAsync performs before reporting the failure.
+            history.Save([], []);
+
+            IReadOnlyList<WaitingRow> afterFailure = await WaitingCommand.BuildRowsAsync(
+                [aClaims, bClaims], None, None, t.AddMinutes(30), all: true, ct, collectedHosts: ["ha", "hb"], history: history);
+
+            WaitingRow aRow = afterFailure.Single(r => r.Pane.PaneId == aClaims.PaneId);
+            WaitingRow bRow = afterFailure.Single(r => r.Pane.PaneId == bClaims.PaneId);
+            Assert.NotEqual(ClaimBasis.Observed, aRow.Claim.Basis);
+            Assert.False(aRow.MayAct);
+            Assert.False(bRow.MayAct);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task BuildRows_AReclaimAfterGoingQuietDoesNotInheritOldOwnership()
+    {
+        // Blocker 3, end to end through waiting: across three sweeps sharing one history, A claims 4448,
+        // goes quiet (no identity) while B claims it, then reclaims. B claimed it first of the two live
+        // registrations, so B owns and A follows — A does not inherit its original ownership.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-reclaim-{Guid.NewGuid():N}.json");
+        try
+        {
+            var history = new PaneHistory(path);
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+            TmuxPane aClaims = Pane("cp:1", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234", windowName: "a") with { Host = "h", Epoch = "1:1" };
+            TmuxPane aQuiet = Pane("cp:1", "", PaneActivity.Idle, agentState: null, windowName: "worker") with { Host = "h", Epoch = "1:1" };
+            TmuxPane bClaims = Pane("cp:2", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234", windowName: "b") with { Host = "h", Epoch = "1:1" };
+
+            static Task<PrFacts?> None(int _, CancellationToken __) => Task.FromResult<PrFacts?>(null);
+
+            await WaitingCommand.BuildRowsAsync([aClaims], None, None, t, all: true, TestContext.Current.CancellationToken, collectedHosts: ["h"], history: history);
+            await WaitingCommand.BuildRowsAsync([aQuiet, bClaims], None, None, t.AddMinutes(10), all: true, TestContext.Current.CancellationToken, collectedHosts: ["h"], history: history);
+            IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+                [aClaims, bClaims], None, None, t.AddMinutes(20), all: true, TestContext.Current.CancellationToken, collectedHosts: ["h"], history: history);
+
+            WaitingRow aRow = rows.Single(r => r.Pane.PaneId == aClaims.PaneId);
+            WaitingRow bRow = rows.Single(r => r.Pane.PaneId == bClaims.PaneId);
+
+            Assert.Equal(ClaimRank.Owner, bRow.Claim.Rank);
+            Assert.Equal(ClaimRank.Follower, aRow.Claim.Rank);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task BuildRows_AnOmittedKnownHostNarrowsTheViewAndIsReported()
+    {
+        // Blocker 5, waiting: a run that omits a previously-collected host is narrower than the fleet has
+        // been, so Omitted names it and the first line leads with NARROWED rather than QUIET.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-narrow-{Guid.NewGuid():N}.json");
+        try
+        {
+            var seed = new PaneHistory(path);
+            seed.AdoptEpoch("fernie", "1:1", DateTimeOffset.UtcNow);
+            seed.AdoptEpoch("banff", "2:1", DateTimeOffset.UtcNow);
+            seed.Save([], ["fernie", "banff"]);
+
+            var history = new PaneHistory(path);
+            static Task<PrFacts?> None(int _, CancellationToken __) => Task.FromResult<PrFacts?>(null);
+            TmuxPane onBanff = Pane("cp:1", "$ ", PaneActivity.Idle, windowName: "w") with { Host = "banff", Epoch = "2:1" };
+
+            IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+                [onBanff], None, None, DateTimeOffset.UtcNow, all: true, TestContext.Current.CancellationToken,
+                collectedHosts: ["banff"], history: history);
+
+            Assert.Contains("fernie", WaitingCommand.Omitted);
+            Assert.StartsWith("NARROWED", WaitingCommand.Summary(rows, [], WaitingCommand.Omitted), StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void Claim_OrdersByRegistrationNotByCollectionOrder()
+    {
+        // An owner that changes identity between sweeps is worse than no owner, so ranking is by when
+        // each window first claimed the PR — remembered, not derived from this sweep's ordering. The order
+        // is observed only because both windows' host was swept in full before this run, so the recorded
+        // times are witnessed appearances rather than first looks.
+        TmuxPane late = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448");
+        TmuxPane early = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4448");
+        DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+        IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
+            [(late, 4448, null), (early, 4448, null)],
+            p => p.PaneId == early.PaneId ? t : t.AddHours(1),
+            _ => true);
+
+        Assert.Equal(ClaimRank.Owner, ranked[Claim.Key(early)].Rank);
+        Assert.Equal(ClaimBasis.Observed, ranked[Claim.Key(early)].Basis);
+        Assert.True(ranked[Claim.Key(early)].OwnsClaim);
+        Assert.Equal(ClaimRank.Follower, ranked[Claim.Key(late)].Rank);
+    }
+
+    [Fact]
+    public void Claim_AWindowNeverSeenRegisteringSortsLast()
+    {
+        TmuxPane known = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448");
+        TmuxPane unknown = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4448");
+
+        IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
+            [(unknown, 4448, null), (known, 4448, null)],
+            p => p.PaneId == known.PaneId ? DateTimeOffset.UnixEpoch : null);
+
+        Assert.Equal(ClaimRank.Owner, ranked[Claim.Key(known)].Rank);
+        Assert.Equal(ClaimRank.Follower, ranked[Claim.Key(unknown)].Rank);
+    }
+
+    [Fact]
+    public void Claim_OwnershipNobodyWatchedIsNotOwnershipDecided()
+    {
+        // Rivals rarely appear in the same moment, so registration order is real — and unavailable to a
+        // run that started after both. Guessing which agent began first and then driving it is a coin
+        // toss whose losing side drives the agent that is not doing the work.
+        TmuxPane senior = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448");
+        TmuxPane junior = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4448");
+
+        IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
+            [(junior, 4448, 1), (senior, 4448, 15)],
+            _ => null);
+
+        // Seniority still orders them, so the report names a likely owner...
+        Assert.Equal(ClaimRank.Owner, ranked[Claim.Key(senior)].Rank);
+        Assert.Equal(ClaimBasis.Inferred, ranked[Claim.Key(senior)].Basis);
+
+        // ...but neither is entitled to be driven.
+        Assert.False(ranked[Claim.Key(senior)].OwnsClaim);
+        Assert.False(ranked[Claim.Key(junior)].OwnsClaim);
+    }
+
+    [Fact]
+    public void ParseCollection_CarriesTheServerEpoch()
+    {
+        TmuxPane pane = Assert.Single(TmuxScanner.ParseCollection(
+            Stream(["%1|night:1|1|1755900000||pr4595"]), host: null, Nonce));
+
+        Assert.Equal("4242:1755900000", pane.Epoch);
+    }
+
+    [Fact]
+    public void History_ForgetsAHostWhoseTmuxServerRestarted()
+    {
+        // Pane ids restart at %0 with the server, so keeping the old ones would attribute a departed
+        // window's registration to whatever now holds its id — and present that as observed fact.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-epoch-{Guid.NewGuid():N}.json");
+        try
+        {
+            TmuxPane before = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "fernie", Epoch = "100:1" };
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+            var first = new PaneHistory(path);
+            Assert.False(first.AdoptEpoch("fernie", "100:1", t));
+            first.Observe(before, t, claimedPr: 4448);
+            first.Save([before]);
+
+            // Same pane id, new server: the registration must not survive.
+            var second = new PaneHistory(path);
+            Assert.False(second.AdoptEpoch("fernie", "200:2", t.AddHours(1)));
+            Assert.Null(second.ClaimedAt(before));
+
+            // An unchanged server keeps it, and reports the host as continuously swept.
+            var third = new PaneHistory(path);
+            second.Observe(before, t.AddHours(1), claimedPr: 4448);
+            second.Save([before]);
+            Assert.True(new PaneHistory(path).AdoptEpoch("fernie", "200:2", t.AddHours(2)));
+            Assert.NotNull(new PaneHistory(path).ClaimedAt(before));
+            _ = third;
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void Claim_AnUnwitnessedRivalCannotBeOrderedSoTheContestStaysInferred()
+    {
+        // The stricter rule: an ownership order is a fact only when BOTH claims were witnessed
+        // registering. A window watched registering cannot be ranked against one that was not — the
+        // unwatched one may be older, not newer — so the contest stays inferred until both are witnessed.
+        TmuxPane seen = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448");
+        TmuxPane fresh = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4448");
+        DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+        IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
+            [(fresh, 4448, null), (seen, 4448, null)],
+            p => p.PaneId == seen.PaneId ? t : null,
+            p => p.PaneId == seen.PaneId);
+
+        Assert.All(ranked.Values, c => Assert.Equal(ClaimBasis.Inferred, c.Basis));
+        Assert.All(ranked.Values, c => Assert.False(c.OwnsClaim));
+    }
+
+    [Fact]
+    public void Claim_TwoWindowsBothUnseenCannotBeOrdered()
+    {
+        // Neither was watched registering, so nothing distinguishes them but a guess.
+        TmuxPane a = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448");
+        TmuxPane b = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4448");
+
+        IReadOnlyDictionary<string, Claim> ranked = Claim.Register(
+            [(a, 4448, 3), (b, 4448, 9)], _ => null, _ => false);
+
+        Assert.All(ranked.Values, c => Assert.Equal(ClaimBasis.Inferred, c.Basis));
+        Assert.All(ranked.Values, c => Assert.False(c.OwnsClaim));
+    }
+
+    [Fact]
+    public void Claim_ASoleClaimIsAlwaysItsOwnOwner()
+    {
+        TmuxPane only = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448");
+
+        Assert.True(Claim.Register([(only, 4448, null)], _ => null)[Claim.Key(only)].OwnsClaim);
+    }
+
+    [Fact]
+    public async Task BuildRows_AContestedPrSurfacesEvenWhenNothingElseIsWrong()
+    {
+        // Both windows are legitimately in progress, so neither is an attention row on its own. The
+        // contest is the finding, and it must not need --all to be seen.
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [
+                Pane("cp:1", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234 reviews=0/2", windowName: "pr4448"),
+                Pane("cp:2", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234 reviews=0/2", windowName: "pr4448"),
+            ],
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            DateTimeOffset.UtcNow,
+            all: false,
+            ct: TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, rows.Count);
+    }
+
+    [Fact]
+    public async Task BuildRows_AContestedPrIsNeverActedOnHoweverGoodItsEvidence()
+    {
+        // The fix for two agents on one PR is not to drive both of them carefully.
+        PrFacts ready = new()
+        {
+            Number = 4448,
+            HeadSha = "abc1234ff",
+            State = "open",
+            MergeableState = "clean",
+            Checks = [new CheckRunFact("ci", "completed", "success")],
+        };
+
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [
+                // Distinct window names: the contest is established by the published state, and two
+                // windows sharing a name is a different defect with its own test.
+                Pane("cp:1", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234 reviews=2/2 rec=merge", windowName: "pr4448"),
+                Pane("cp:2", "", PaneActivity.Idle, agentState: "pr=4448 head=abc1234 reviews=2/2 rec=merge", windowName: "pr4448-b"),
+            ],
+            (_, _) => Task.FromResult<PrFacts?>(ready),
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            DateTimeOffset.UtcNow,
+            all: true,
+            ct: TestContext.Current.CancellationToken);
+
+        // Both rows are READY on identical evidence, and neither may be acted on: the follower because
+        // it is a follower, the owner because this sweep is the first to see either of them, so which
+        // registered first is inferred rather than known.
+        Assert.All(rows, r => Assert.Equal(WaitingState.Ready, r.Verdict.State));
+        Assert.All(rows, r => Assert.False(r.MayAct));
+        Assert.All(rows, r => Assert.Equal(ClaimBasis.Inferred, r.Claim.Basis));
+    }
+
+    [Fact]
+    public void WindowNaming_DoesNotPublishFleetGlobalOwnershipAsAName()
+    {
+        // Ownership (owner/follower) is decided across the whole fleet, over state that can change in the
+        // unguardable gap between the sweep and the rename — a concurrent retire or a new rival can flip it
+        // without the guarded window itself moving. So it is no longer written into a window name, which is
+        // read at a glance and believed: SuffixFor is a pure function of the verdict, and a follower whose
+        // PR is ready earns the same `-ready` its verdict warrants. The follower standing stays in the row,
+        // not the status bar.
+        var ready = new WaitingVerdict(WaitingState.Ready, RowOwner.Operator, "reviews 2/2", Assurance.High);
+        Assert.Equal("ready", WindowNaming.SuffixFor(ready));
+    }
+
+    [Fact]
+    public async Task CollectAsync_OneBadHostDoesNotStopTheOthers()
+    {
+        // One host unreachable, another quiet: the sweep still returns, reporting the failure rather than
+        // being condemned by it. Injected so it costs no ssh and no tmux server.
+        WaitingCommand.Collection collected = await WaitingCommand.CollectAsync(
+            ["nosuchbox", "banff"],
+            (host, _) => host == "nosuchbox"
+                ? throw new TmuxUnavailableException("nosuchbox: no server running")
+                : Task.FromResult<IReadOnlyList<TmuxPane>>([Pane("banff:1", "", PaneActivity.Idle)]),
+            TestContext.Current.CancellationToken);
+
+        Assert.Single(collected.Panes);
+        Assert.Single(collected.Unreachable);
+        Assert.False(collected.TotalFailure);
+        Assert.True(collected.AnyFailure);
+    }
+
+    [Fact]
+    public void DigestBody_IgnoresTheFooterSoASpinnerIsNotProgress()
+    {
+        // Measured: a window advanced window_activity and changed on screen while its body was
+        // byte-identical. Only the body distinguishes producing output from animating.
+        const string Body = "● Round 3 is complete for PR 4616.\n  Fix description: authenticated every hop.";
+
+        string first = TmuxScanner.DigestBody($"{Body}\n~/git/dotnet-inspect\n────────\n· Working (esc to interrupt) ⠋");
+        string second = TmuxScanner.DigestBody($"{Body}\n~/git/dotnet-inspect\n────────\n· Working (esc to interrupt) ⠙");
+
+        Assert.Equal(first, second);
+    }
+
+    [Fact]
+    public void DigestBody_ChangesWhenTheAgentActuallyEmits()
+    {
+        string before = TmuxScanner.DigestBody("● Round 3 complete.\nfooter\nfooter\nfooter");
+        string after = TmuxScanner.DigestBody("● Round 3 complete.\n● Round 4 starting.\nfooter\nfooter\nfooter");
+
+        Assert.NotEqual(before, after);
+    }
+
+    [Theory]
+    [InlineData("pr4448-blocked", "pr4448")]
+    [InlineData("pr4448-merged", "pr4448")]
+    [InlineData("pr4448", "pr4448")]
+    [InlineData("tune-performance-triage", "tune-performance-triage")]
+    public void WindowNaming_StripsOnlyItsOwnSuffixes(string name, string expected)
+        => Assert.Equal(expected, WindowNaming.Strip(name));
+
+    [Fact]
+    public void WindowNaming_ReplacesAStaleSuffixRatherThanAppending()
+    {
+        // Three of six `-blocked` windows on one fleet had no prompt open. The suffix was believed and
+        // wrong, which is worse than absent.
+        Assert.Equal("pr4448-merged", WindowNaming.Apply("pr4448-blocked", "merged"));
+        Assert.Equal("pr4448", WindowNaming.Apply("pr4448-blocked", null));
+    }
+
+    [Fact]
+    public void WindowNaming_NeverPublishesALowConfidenceVerdictAsAName()
+    {
+        // A row can say "probably"; a name is read at a glance and believed.
+        WaitingVerdict unsure = new(WaitingState.Ready, RowOwner.Operator, "reviews 2/2", Assurance.Low("contradicts itself"));
+
+        Assert.Null(WindowNaming.SuffixFor(unsure));
+        Assert.Equal("ready", WindowNaming.SuffixFor(new(WaitingState.Ready, RowOwner.Operator, "reviews 2/2", Assurance.High)));
+    }
+
+    [Fact]
+    public void History_ReportsAWindowThatDepartedRatherThanPruningItSilently()
+    {
+        // A window vanishing is an event: an agent finished and reclaimed, one that crashed, or a
+        // session killed by hand. Pruning it quietly makes all three the same nothing.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-depart-{Guid.NewGuid():N}.json");
+        try
+        {
+            TmuxPane a = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448");
+            TmuxPane b = Pane("cp:2", "", PaneActivity.Idle, windowName: "pr4600");
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+            var first = new PaneHistory(path);
+            first.Observe(a, t, claimedPr: 4448);
+            first.Observe(b, t, claimedPr: 4600);
+            Assert.Empty(first.Save([a, b], [null]));
+
+            var second = new PaneHistory(path);
+            second.Observe(a, t.AddMinutes(10), claimedPr: 4448);
+            string gone = Assert.Single(second.Save([a], [null]));
+
+            Assert.Contains("#4600", gone, StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void History_AWindowOnAnUnreachableHostHasNotDeparted()
+    {
+        // It is unseen, not gone. Forgetting it would manufacture a departure on every failed sweep.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-unseen-{Guid.NewGuid():N}.json");
+        try
+        {
+            TmuxPane onFernie = Pane("cp:1", "", PaneActivity.Idle, windowName: "pr4448") with { Host = "fernie" };
+            DateTimeOffset t = new(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
+
+            var first = new PaneHistory(path);
+            first.Observe(onFernie, t, claimedPr: 4448);
+            first.Save([onFernie], ["fernie"]);
+
+            // A sweep that only reached merritt must not conclude the fernie window is gone.
+            var second = new PaneHistory(path);
+            Assert.Empty(second.Save([], ["merritt"]));
+            Assert.NotNull(second.ClaimedAt(onFernie));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Theory]
+    [InlineData("pr=1 head=abc1234 reviews=2/2 rec=done", true)]
+    [InlineData("pr=1 head=abc1234 reviews=2/2 rec=merge", false)]
+    public void Retirement_ReadsTheAgentsOwnReportOfBeingFinished(string record, bool retirable)
+    {
+        // `done` is a report, not a request: the work is finished, so what it asks for is not a decision
+        // but a reclamation. `merge` is still asking for something.
+        AgentState state = AgentState.Parse(record, "pr1")!;
+        WaitingVerdict verdict = new(WaitingState.Holding, RowOwner.Nobody, "in progress", Assurance.High);
+
+        Assert.Equal(retirable, Retirement.For(verdict, state, PaneActivity.Idle).IsRetirable);
+    }
+
+    [Fact]
+    public void Retirement_AWorkingWindowIsNeverRetirableWhateverItLastPublished()
+    {
+        AgentState state = AgentState.Parse("pr=1 head=abc1234 reviews=2/2 rec=done", "pr1")!;
+        WaitingVerdict merged = new(WaitingState.Merged, RowOwner.Operator, "merged", Assurance.High);
+
+        Assert.False(Retirement.For(merged, state, PaneActivity.Working).IsRetirable);
+    }
+
+    [Fact]
+    public void Retirement_AdvisesClearingTheContextNotKillingTheWindow()
+    {
+        // The window and its session are worth keeping; a transcript of work that already merged is not.
+        WaitingVerdict merged = new(WaitingState.Merged, RowOwner.Operator, "merged", Assurance.High);
+        Retirement retirement = Retirement.For(merged, null, PaneActivity.Idle);
+
+        Assert.True(retirement.IsRetirable);
+        Assert.Contains("clear the context", retirement.Advice, StringComparison.Ordinal);
+        Assert.Contains("reuse the window", retirement.Advice, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Retirement_ANonIdlePaneIsNeverRetiredFromAStaleDone()
+    {
+        // Blocker 3, retirement half. `rec=done` is trusted as the agent's final word only when the pane
+        // is idle and has actually handed over. A pane blocked on a prompt, stalled, unreadable, or
+        // mid-turn is not finished whatever it last published, so a stale `rec=done` under it must not
+        // clear the context out from under live work — the same activity gate the verdict passes through.
+        AgentState state = AgentState.Parse("pr=1 head=abc1234 reviews=2/2 rec=done", "pr1")!;
+        WaitingVerdict verdict = new(WaitingState.Holding, RowOwner.Nobody, "in progress", Assurance.High);
+
+        foreach (PaneActivity activity in new[] { PaneActivity.Blocked, PaneActivity.Stalled, PaneActivity.Unreadable, PaneActivity.Working })
+        {
+            Assert.False(Retirement.For(verdict, state, activity).IsRetirable);
+        }
+
+        // The identical record is retirable once the pane is idle, so the gate — not the record — is what
+        // suppressed it above.
+        Assert.True(Retirement.For(verdict, state, PaneActivity.Idle).IsRetirable);
+    }
+
+    [Fact]
+    public void IsReleasing_ANonIdleOwnerWithStaleStopDoesNotTriggerPromotion()
+    {
+        // Blocker 3, promotion half. A stale `rec=stop` under a non-idle owner is not a release: the owner
+        // is mid-turn, blocked, stalled, or unreadable, so it has not handed the claim over and a follower
+        // must not be promoted on the strength of a record the pane contradicts. The Merged/Closed half is
+        // gated separately by the activity-gated verdict.
+        AgentState state = AgentState.Parse("pr=1 head=abc1234 rec=stop", "pr1")!;
+        WaitingVerdict verdict = new(WaitingState.Unknown, RowOwner.Agent, "mid-turn", Assurance.Low("x"));
+
+        foreach (PaneActivity activity in new[] { PaneActivity.Blocked, PaneActivity.Stalled, PaneActivity.Unreadable, PaneActivity.Working })
+        {
+            Assert.False(Claim.IsReleasing(state, verdict, activity));
+        }
+
+        // Idle, the same `rec=stop` is a genuine release the tool may surface.
+        Assert.True(Claim.IsReleasing(state, verdict, PaneActivity.Idle));
+    }
+
+    [Fact]
+    public void IsReleasing_AMergedOrClosedVerdictReleasesRegardlessOfTheRecommendation()
+    {
+        // The other half of releasing: a window whose PR merged or closed is done even without a `rec=stop`.
+        // That verdict only reaches Merged/Closed from an idle pane (ForActivity gates it), so it needs no
+        // extra activity gate here.
+        AgentState state = AgentState.Parse("pr=1 head=abc1234 reviews=2/2 rec=merge", "pr1")!;
+        WaitingVerdict merged = new(WaitingState.Merged, RowOwner.Operator, "merged", Assurance.High);
+
+        Assert.True(Claim.IsReleasing(state, merged, PaneActivity.Idle));
+    }
+
+    [Theory]
+    [InlineData("✗ Execution failed: 422 This content was flagged for possible cybersecurity risk.")]
+    [InlineData("Execution failed: Failed to get response from the AI model; retried 5 times")]
+    [InlineData("  Rate limit reached for this model, try again later")]
+    public void ClassifyActivity_NoticesTheAgentItselfFailing(string line)
+    {
+        // A different beast from every other state: the work is fine and the worker is not. Nothing
+        // about the PR explains it, and nothing about the PR will clear it.
+        Assert.Equal(PaneActivity.Stalled, TmuxScanner.ClassifyActivity($"● Round 3 complete.\n{line}\n> "));
+        Assert.Contains("Execution failed", TmuxScanner.StallReason("x\nExecution failed: 422 flagged\n> ")!, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ClassifyActivity_AStallOutranksAnInterruptHint()
+    {
+        // A pane that failed mid-turn can still be showing "esc to interrupt", which would otherwise
+        // read as an agent hard at work.
+        const string Capture = "Execution failed: 422 This content was flagged\n· Working (esc to interrupt)";
+
+        Assert.Equal(PaneActivity.Stalled, TmuxScanner.ClassifyActivity(Capture));
+    }
+
+    [Fact]
+    public void ClassifyActivity_OrdinaryOutputIsNotAStall()
+    {
+        Assert.Null(TmuxScanner.StallReason("● Round 3 is complete for PR 4616.\n  Fix description: ...\n> "));
+    }
+
+    [Fact]
+    public async Task BuildRows_TwoWindowsSharingANameCannotBeIdentifiedByIt()
+    {
+        // Observed live on fernie: windows 0 and 6 both named pr4551-blocked, with window 0 actually
+        // working on 4663. An agent had renamed a neighbour. The one with published state is still
+        // identified correctly; the one without is not identified at all, because the only evidence it
+        // had was a name that demonstrably belongs to someone else.
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [
+                Pane("cp:0", "", PaneActivity.Idle, agentState: "pr=4663 head=abc1234 reviews=0/2 rec=wait", windowName: "pr4551-blocked"),
+                Pane("cp:6", "", PaneActivity.Idle, windowName: "pr4551-blocked"),
+            ],
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            (_, _) => Task.FromResult<PrFacts?>(null),
+            DateTimeOffset.UtcNow,
+            all: true,
+            ct: TestContext.Current.CancellationToken);
+
+        WaitingRow stated = rows.Single(r => r.Record?.PrNumber == 4663);
+        Assert.Contains(stated.Record!.Defects, d => d.Contains("shares the name", StringComparison.Ordinal));
+
+        WaitingRow nameless = rows.Single(r => r.Record is null);
+        Assert.Contains("no published state", nameless.Verdict.Reason, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("● Round 2 is complete for PR 4663.", 4448, true)]   // talks about a different PR
+    [InlineData("● Round 2 is complete for PR 4448.", 4448, false)]  // talks about this one
+    [InlineData("~/git/dotnet-inspect\n❯ ", 4448, false)]            // says nothing about any PR
+    public void PaneContradictsPr_TellsDisagreementFromSilence(string capture, int pr, bool contradicts)
+        => Assert.Equal(contradicts, TmuxScanner.PaneContradictsPr(capture, pr));
+
+    [Fact]
+    public void MentionsPr_IsBoundedByNonDigits()
+    {
+        // 4663 must not match inside 46631 or a sha-like run of digits.
+        Assert.True(TmuxScanner.MentionsPr("work on PR 4663 now", 4663));
+        Assert.False(TmuxScanner.MentionsPr("build 46631 failed", 4663));
     }
 
     private static TmuxPane Pane(string target, string capture, PaneActivity activity, DateTimeOffset? lastActivity = null, string? agentState = null, string windowName = "w")
         => new()
         {
-            PaneId = "%" + target.GetHashCode().ToString("x", System.Globalization.CultureInfo.InvariantCulture),
+            PaneId = "%" + ((uint)target.GetHashCode()).ToString(System.Globalization.CultureInfo.InvariantCulture),
             Host = null,
             Target = target,
             AgentStateOption = agentState,

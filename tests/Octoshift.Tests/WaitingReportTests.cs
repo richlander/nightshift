@@ -86,6 +86,19 @@ public class WaitingReportTests
     }
 
     [Fact]
+    public void Summary_AnOmittedHostIsNarrowedNeverQuiet()
+    {
+        // Blocker 5: a run that omits a previously-collected host is looking at less of the fleet than it
+        // has seen, so its first line must not say QUIET. It leads with NARROWED — the same token the
+        // trailer line and the exit code use — even when nothing it could see needs a person.
+        string summary = WaitingCommand.Summary([Row(Holding())], [], ["fernie"]);
+
+        Assert.StartsWith("NARROWED", summary, StringComparison.Ordinal);
+        Assert.DoesNotContain("QUIET", summary, StringComparison.Ordinal);
+        Assert.Contains("1 host(s) not collected this run", summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Summary_RowsBesideAnUnreachableHostStillLeadWithThePartialSweep()
     {
         string summary = WaitingCommand.Summary([Row(Ready()), Row(Holding(), "night:2")], ["fernie: no server running"]);
@@ -341,5 +354,20 @@ public class WaitingReportTests
         Assert.Equal("needsoperator", row.GetProperty("state").GetString());
         Assert.False(row.GetProperty("mayAct").GetBoolean());
         Assert.NotEmpty(row.GetProperty("defects").EnumerateArray().ToArray());
+    }
+
+    [Fact]
+    public void WriteJson_ARenameDoesNotWriteToTheJsonStream()
+    {
+        // The blocking finding, from the JSON side: `--json --rename` must leave a single valid JSON
+        // document on stdout. WriteJson is the only thing that writes stdout, and it emits nothing but the
+        // document — the rename diagnostics are written to a separate sink (stderr in production).
+        using var stream = new MemoryStream();
+        WaitingCommand.WriteJson(stream, [Row(Ready())], NoBudget, []);
+        string stdout = Encoding.UTF8.GetString(stream.ToArray());
+
+        Assert.DoesNotContain("RENAMED", stdout, StringComparison.Ordinal);
+        using JsonDocument parsed = JsonDocument.Parse(stdout);
+        Assert.True(parsed.RootElement.TryGetProperty("rows", out _));
     }
 }

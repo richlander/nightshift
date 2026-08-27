@@ -24,6 +24,13 @@ internal enum Recommendation
     /// <summary>Still working; nothing is being asked of anyone.</summary>
     Continue,
 
+    /// <summary>
+    /// The work is finished and there is nothing further to do on it. Distinct from <c>Stop</c>, which
+    /// is a request to be released from work that is not finished. This is a report, not a request: what
+    /// it asks for is not a decision but a reclamation.
+    /// </summary>
+    Done,
+
     /// <summary>A <c>rec=</c> value outside the four. Recorded so it can be reported, never acted on.</summary>
     Unrecognised,
 }
@@ -104,13 +111,30 @@ internal sealed partial record AgentState
     /// window name identifies a PR or an issue. Callers that must also report a record which identified
     /// nothing read it through <see cref="Read"/>.
     /// </summary>
-    public static AgentState? Parse(string? agentState, string? windowName)
-        => Read(agentState, windowName).Identified;
+    public static AgentState? Parse(
+        string? agentState,
+        string? windowName,
+        bool nameIsAmbiguous = false,
+        Func<int, bool>? paneContradictsPr = null)
+        => Read(agentState, windowName, nameIsAmbiguous, paneContradictsPr).Identified;
 
     /// <summary>
     /// Reads a window's state. <paramref name="agentState"/> is the <c>@agent_state</c> option and
     /// <paramref name="windowName"/> the tmux window name.
     /// </summary>
+    /// <param name="nameIsAmbiguous">
+    /// True when another window on the same host carries this name. A duplicated name means a rename
+    /// landed somewhere it did not belong, so the name identifies nothing — observed live: an agent
+    /// working on one PR renamed a neighbour's window to its own PR, leaving two windows with one name
+    /// and one of them describing work it was not doing.
+    /// </param>
+    /// <param name="paneContradictsPr">
+    /// Whether the window's own output mentions the PR its state claims. Corroboration only, never
+    /// identity: pane text is the one channel another agent cannot write, because a process writes to
+    /// its own terminal and nowhere else. An untargeted publish clobbers a neighbour's state AND name
+    /// together, so those two agree with each other about a PR the window is not working on — and there
+    /// is nothing in them to notice. Its own output is what disagrees.
+    /// </param>
     /// <remarks>
     /// Identity is settled first and the rest of the record is read the same way whatever settled it.
     /// Identity used to short-circuit the read: a window named <c>i4613</c> publishing <c>pr=none
@@ -127,7 +151,11 @@ internal sealed partial record AgentState
     /// identity is itself recorded as a defect, and the row reaches the operator with no number attached
     /// and nothing a tool may act on. Only a window that published nothing at all reads as absent.
     /// </remarks>
-    public static StateReading Read(string? agentState, string? windowName)
+    public static StateReading Read(
+        string? agentState,
+        string? windowName,
+        bool nameIsAmbiguous = false,
+        Func<int, bool>? paneContradictsPr = null)
     {
         (int Number, bool IsIssue)? fromName = PrFromWindowName(windowName);
         var defects = new List<string>();
@@ -174,7 +202,9 @@ internal sealed partial record AgentState
             // The window name is the fallback identity and a good one: it is set once, survives the report
             // scrolling away, and cannot be confused by prose. Scraping the pane for a PR reference is
             // deliberately not attempted — it produced "PR #37" from the phrase "in PR 37 lines".
-            if (fromName is { } named)
+            // With no published identity the name is the only identity available, and a duplicated name is
+            // not one: reporting nothing beats reporting somebody else's PR with confidence.
+            if (fromName is { } named && !nameIsAmbiguous)
             {
                 number = named.Number;
                 isIssue = named.IsIssue;
@@ -183,9 +213,23 @@ internal sealed partial record AgentState
                 // record, and any defect that got us here is kept rather than forgotten.
                 source = StateSource.WindowName;
             }
+            else if (fromName is not null && nameIsAmbiguous)
+            {
+                // The name is shared with another window, so it identifies nothing: a rename landed where
+                // it did not belong. The defect is recorded and the name is not adopted, so the read
+                // carries on with no identity rather than confidently reporting the wrong PR.
+                defects.Add($"another window shares the name '{windowName}' — a rename landed on the wrong window");
+            }
 
             // Otherwise the read carries on with no identity at all. The remaining fields are still the
             // agent's account of itself, and grading them is what lets the row say what is wrong.
+        }
+        else if (nameIsAmbiguous)
+        {
+            // The record identified itself, but its window name is shared with another window, so a rename
+            // landed on the wrong window. The name cannot corroborate the record, so the two-halves check
+            // below is skipped and the disagreement is recorded instead.
+            defects.Add($"another window shares the name '{windowName}' — a rename landed on the wrong window");
         }
         else if (fromName is { } window)
         {
@@ -204,6 +248,17 @@ internal sealed partial record AgentState
             {
                 defects.Add($"window is named {WindowLabel(window)} but the record says {(isIssue ? "issue" : "pr")}={number}");
             }
+        }
+
+        // Disagreement, not absence. Pane text is noisy — an earlier version of this reader took "PR 37"
+        // from the phrase "in PR 37 lines" — so requiring an exact match would manufacture
+        // disagreements. Asking only whether the claimed PR appears at all keeps the false-positive rate
+        // near zero while still catching a window whose state describes work it never did. Only a
+        // declared PR is checked: pane text is the one channel another agent cannot write, so it can only
+        // contradict a number the record itself asserted.
+        if (declaredPr is { } panePr && paneContradictsPr?.Invoke(panePr) == true)
+        {
+            defects.Add($"the window's own output never mentions pr={panePr} — its state may have been written by another agent");
         }
 
         (int? clean, int? required) = ParseReviews(fields.GetValueOrDefault("reviews"), defects);
@@ -441,8 +496,9 @@ internal sealed partial record AgentState
             case "approve": return Recommendation.Approve;
             case "stop": return Recommendation.Stop;
             case "continue": return Recommendation.Continue;
+            case "done": return Recommendation.Done;
             default:
-                defects.Add($"rec={value} is not one of continue|wait|merge|approve|stop");
+                defects.Add($"rec={value} is not one of continue|wait|merge|approve|stop|done");
                 return Recommendation.Unrecognised;
         }
     }

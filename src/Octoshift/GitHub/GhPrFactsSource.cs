@@ -66,8 +66,10 @@ internal sealed class GhPrFactsSource
     /// </summary>
     public async Task<PrFacts?> RefreshMergeabilityAsync(int prNumber, CancellationToken ct)
     {
-        string? body = await GetAsync($"repos/{_repo}/pulls/{prNumber}", ct, bypassCache: true);
-        PullDetailDto? pull = body is null ? null : Deserialize(body, GhPrFactsJsonContext.Default.PullDetailDto);
+        Read read = await GetAsync($"repos/{_repo}/pulls/{prNumber}", ct, bypassCache: true);
+        PullDetailDto? pull = read is { Outcome: ReadOutcome.Ok, Body: { } refreshedBody }
+            ? Deserialize(refreshedBody, GhPrFactsJsonContext.Default.PullDetailDto)
+            : null;
         if (pull?.Head?.Sha is not { Length: > 0 } headSha)
         {
             return null;
@@ -84,24 +86,39 @@ internal sealed class GhPrFactsSource
         };
     }
 
-    /// <summary>Reads a PR's facts, or null when GitHub could not be read.</summary>
-    public async Task<PrFacts?> FetchAsync(int prNumber, CancellationToken ct)
+    /// <summary>
+    /// Reads a PR's facts as one of three outcomes — <see cref="PrFetchStatus.Found"/> with the facts, an
+    /// affirmative <see cref="PrFetchStatus.NotFound"/> on a 404, or <see cref="PrFetchStatus.Unavailable"/>
+    /// when GitHub could not be read (auth, rate limit, transport, a 5xx, a nonzero exit) or answered a body
+    /// that cannot be trusted as "no such PR". <c>pr</c> needs all three kept apart; the sweep does not, so
+    /// it uses the <see cref="FetchAsync"/> shape below.
+    /// </summary>
+    public async Task<PrFetch> FetchDetailedAsync(int prNumber, CancellationToken ct)
     {
-        string? pullBody = await GetAsync($"repos/{_repo}/pulls/{prNumber}", ct);
-        if (pullBody is null)
+        Read pullRead = await GetAsync($"repos/{_repo}/pulls/{prNumber}", ct);
+        if (pullRead.Outcome == ReadOutcome.NotFound)
         {
-            return null;
+            return PrFetch.NotFound;
+        }
+
+        if (pullRead is not { Outcome: ReadOutcome.Ok, Body: { } pullBody })
+        {
+            return PrFetch.Unavailable;
         }
 
         PullDetailDto? pull = Deserialize(pullBody, GhPrFactsJsonContext.Default.PullDetailDto);
         if (pull?.Head?.Sha is not { Length: > 0 } headSha)
         {
-            return null;
+            // A 200 we could not parse is a read we cannot trust — unavailable, never an affirmative
+            // not-found. Reporting "no such PR" off a malformed body is the same lie as reporting it off an
+            // outage.
+            return PrFetch.Unavailable;
         }
 
         // Checks are keyed by sha, so this read stays valid until the branch actually moves — which is
         // what lets a rerun on an unchanged head be watched for the price of a 304.
-        string? checksBody = await GetAsync($"repos/{_repo}/commits/{headSha}/check-runs?per_page=100", ct);
+        Read checksRead = await GetAsync($"repos/{_repo}/commits/{headSha}/check-runs?per_page=100", ct);
+        string? checksBody = checksRead.Outcome == ReadOutcome.Ok ? checksRead.Body : null;
         CheckRunsDto? checks = checksBody is null ? null : Deserialize(checksBody, GhPrFactsJsonContext.Default.CheckRunsDto);
 
         // total_count above what one page returned means the rest were never seen, which is the same
@@ -109,13 +126,15 @@ internal sealed class GhPrFactsSource
         bool checksKnown = checks is not null
             && (checks.TotalCount is null or 0 || checks.TotalCount <= (checks.CheckRuns?.Length ?? 0));
 
-        return new PrFacts
+        return PrFetch.Found(new PrFacts
         {
             ChecksKnown = checksKnown,
             Number = pull.Number > 0 ? pull.Number : prNumber,
             HeadSha = headSha,
             State = pull.State ?? "open",
             Merged = pull.Merged ?? false,
+            MergedAt = DateTimeOffset.TryParse(pull.MergedAt, out DateTimeOffset mergedAt) ? mergedAt : null,
+            Title = pull.Title,
             MergeableState = pull.MergeableState,
             Checks = PrFacts.LatestPerName((checks?.CheckRuns ?? [])
                 .Where(c => !string.IsNullOrWhiteSpace(c.Name))
@@ -124,17 +143,53 @@ internal sealed class GhPrFactsSource
                     c.Status ?? "queued",
                     c.Conclusion,
                     DateTimeOffset.TryParse(c.StartedAt, out DateTimeOffset started) ? started : null))),
-        };
+        });
     }
 
-    /// <summary>One conditional GET. Returns the body — from the response, or from cache on a 304.</summary>
-    private async Task<string?> GetAsync(string path, CancellationToken ct, bool bypassCache = false)
+    /// <summary>
+    /// Reads a PR's facts, or null when GitHub had no such PR <em>or</em> could not be read — the shape the
+    /// sweep uses, where a missing row and an unreadable one are handled the same. Callers that must tell a
+    /// 404 from an outage (notably <c>pr</c>) use <see cref="FetchDetailedAsync"/>.
+    /// </summary>
+    public async Task<PrFacts?> FetchAsync(int prNumber, CancellationToken ct)
+        => (await FetchDetailedAsync(prNumber, ct)).Facts;
+
+    /// <summary>The classification of one conditional GET, kept apart so a 404 is never told from an outage.</summary>
+    private enum ReadOutcome
+    {
+        /// <summary>A usable body (fresh, or a 304 served from cache).</summary>
+        Ok,
+
+        /// <summary>An affirmative 404: the resource does not exist.</summary>
+        NotFound,
+
+        /// <summary>The read failed or cannot be trusted — auth, rate limit, transport, 5xx, nonzero exit, empty body.</summary>
+        Unavailable,
+    }
+
+    /// <summary>One GET reduced to its <see cref="ReadOutcome"/> and, when <see cref="ReadOutcome.Ok"/>, its body.</summary>
+    private readonly record struct Read(ReadOutcome Outcome, string? Body)
+    {
+        public static readonly Read NotFound = new(ReadOutcome.NotFound, null);
+
+        public static readonly Read Unavailable = new(ReadOutcome.Unavailable, null);
+
+        public static Read Ok(string? body) => new(ReadOutcome.Ok, body);
+    }
+
+    /// <summary>
+    /// One conditional GET, classified into the three outcomes a caller must keep apart: a usable body, an
+    /// affirmative 404, or an unavailable read (auth, rate limit, transport, a 5xx, a nonzero gh exit, or a
+    /// body that cannot be parsed). Collapsing 404 into "unavailable" — or the reverse — is what let an
+    /// outage read as "no such PR".
+    /// </summary>
+    private async Task<Read> GetAsync(string path, CancellationToken ct, bool bypassCache = false)
     {
         // Once GitHub has pushed back, further calls cannot succeed and only deepen the hole for every
         // other agent drawing on the same budget.
         if (RateLimited)
         {
-            return null;
+            return Read.Unavailable;
         }
 
         (string? etag, string? cached) = bypassCache ? (null, null) : _cache.Get(path);
@@ -157,25 +212,46 @@ internal sealed class GhPrFactsSource
             RateLimitRemaining = left;
         }
 
+        // `X-RateLimit-Remaining: 0` records EXHAUSTION, not a failure of THIS response. The request that
+        // spends the last unit of the budget still returns a real answer — a fresh 200, a 304, or an
+        // affirmative 404 — and that answer must be classified truthfully. So the exhaustion is remembered
+        // (the guard at the top refuses the NEXT network read) and then classification proceeds; only
+        // genuine pushback (403/429/5xx) turns the current read itself into Unavailable. Conflating the two
+        // is what let a valid Found/NotFound at the moment the budget hit zero read as an outage.
+        if (GhResponse.RateBudgetDepleted(headers))
+        {
+            RateLimited = true;
+        }
+
         if (status == 304)
         {
             NotModified++;
-            return cached;
+            // A 304 says the cached body is still current; without a cached body there is nothing to serve,
+            // which is an unavailable read, not an affirmative not-found.
+            return cached is not null ? Read.Ok(cached) : Read.Unavailable;
         }
 
-        if (status is 403 or 429 || status >= 500 || GhResponse.RateBudgetDepleted(headers))
+        if (status is 403 or 429 || status >= 500)
         {
             RateLimited = true;
-            return null;
+            return Read.Unavailable;
+        }
+
+        // An affirmative 404 is the one negative answer to trust: GitHub looked and there is no such
+        // resource. Checked before the generic-failure bucket (a 404 also carries a nonzero gh exit) so it
+        // stays distinct from every read that merely could not be completed.
+        if (status == 404)
+        {
+            return Read.NotFound;
         }
 
         if (gh.ExitCode != 0 || status is < 200 or >= 300 || string.IsNullOrWhiteSpace(body))
         {
-            return null;
+            return Read.Unavailable;
         }
 
         _cache.Put(path, GhResponse.HeaderValue(headers, "etag"), body);
-        return body;
+        return Read.Ok(body);
     }
 
     private static bool IsUnknownMergeability(string? mergeableState)
@@ -270,6 +346,12 @@ internal sealed record PullDetailDto
 
     [JsonPropertyName("merged")]
     public bool? Merged { get; init; }
+
+    [JsonPropertyName("merged_at")]
+    public string? MergedAt { get; init; }
+
+    [JsonPropertyName("title")]
+    public string? Title { get; init; }
 
     [JsonPropertyName("mergeable_state")]
     public string? MergeableState { get; init; }
