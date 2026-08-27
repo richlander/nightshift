@@ -29,6 +29,12 @@ internal sealed class GitHubAppInstallationTokenProvider : IGitHubInstallationTo
     private readonly IGitHubTokenAuditSink _auditSink;
     private readonly SemaphoreSlim _refreshLock = new(1, 1);
 
+    // Logical disposal, checked before the lock-free fast path and again after synchronization. A warmed
+    // provider must not keep serving its cached token after Dispose, and a Dispose that races an in-flight
+    // refresh must not turn the finally-Release into a throw. See Dispose for why the semaphore itself is not
+    // physically disposed.
+    private volatile bool _disposed;
+
     // A single reference published through a volatile field, rather than a Nullable<GitHubInstallationToken>
     // read outside the lock. The nullable struct is three fields (has-value, the token reference, the expiry)
     // whose stores are not atomic together, so the fast-path reader could observe a new token string beside a
@@ -71,6 +77,8 @@ internal sealed class GitHubAppInstallationTokenProvider : IGitHubInstallationTo
 
     public async Task<GitHubInstallationToken> GetTokenAsync(CancellationToken ct)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
         DateTimeOffset now = _clock();
         if (_cached is { } cached && !NeedsRefresh(cached.Token, now))
         {
@@ -80,6 +88,9 @@ internal sealed class GitHubAppInstallationTokenProvider : IGitHubInstallationTo
         await _refreshLock.WaitAsync(ct);
         try
         {
+            // A Dispose may have landed while this caller waited for the lock; refuse to mint past it.
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
             now = _clock();
             if (_cached is { } current && !NeedsRefresh(current.Token, now))
             {
@@ -99,7 +110,11 @@ internal sealed class GitHubAppInstallationTokenProvider : IGitHubInstallationTo
 
     public void Dispose()
     {
-        _refreshLock.Dispose();
+        // Logical disposal only. The SemaphoreSlim is intentionally not disposed: it needs disposal solely to
+        // release the ManualResetEvent behind AvailableWaitHandle, which this type never touches, so skipping
+        // it leaks nothing. Not disposing it is what lets an in-flight refresh's finally-Release complete
+        // without racing a disposed handle; the _disposed flag enforces disposal for every future entry.
+        _disposed = true;
     }
 
     private bool NeedsRefresh(GitHubInstallationToken token, DateTimeOffset now)
