@@ -219,9 +219,13 @@ have no image here, and a passing run says nothing about them:
   speaks only to the watch, not range.)
 - **#198 — revision overflow.** `rev` is bounded by `MaxRevision` to keep the search finite;
   the Int64 wrap of the real counter is out of scope.
-- **#199 — multiple writers.** `rev` is global and singular; two `KvStore`/`LocalStore`
-  instances over one file, each caching its own revision base, is a distinct hazard the
-  single-writer model cannot see.
+- **#199 — multiple writers (allocation fixed; notification is the remaining gap).**
+  Revision *allocation* across independently opened `KvStore`/`LocalStore` instances over one
+  file is now globally serialized — each writer reads the durable committed revision under
+  `BEGIN IMMEDIATE` as its base, never a cached value — so the model's single global `rev`
+  faithfully abstracts it. What the model still does not cover is *notification*: each
+  instance's change signal is in-memory, so a watcher on one instance is not woken by another
+  instance's commit. That is a distinct gap #199 does not address.
 - **#195 / #196 — wire omissions.** The abstract state vector carries no serialization, so
   `immutable` being dropped from txn `GET` results and watch events is invisible here.
 

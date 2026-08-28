@@ -5,12 +5,18 @@ using System.Globalization;
 using Microsoft.Data.Sqlite;
 
 /// <summary>
-/// The single-writer actor. All mutations funnel through one connection on one dedicated thread,
-/// so writes are serialized without scattering BEGIN IMMEDIATE discipline across the codebase.
-/// Revisions are allocated transaction-locally — strictly monotonic, gapless across commits, never
-/// reused by a committed row — and the public counter is advanced only after the transaction commits.
-/// A rolled-back write therefore never publishes a revision (nor a phantom one mid-flight), and its
-/// allocated numbers are reused by the next transaction.
+/// The single-writer actor for one <see cref="KvStore"/> instance: all of this instance's mutations funnel
+/// through one connection on one dedicated thread, so they serialize without scattering BEGIN IMMEDIATE
+/// discipline across the codebase.
+///
+/// Revisions are NOT allocated from any cached in-memory value. Each job opens BEGIN IMMEDIATE — SQLite's
+/// cross-connection, cross-process writer lock — and reads the durable <c>meta.committed_revision</c> under
+/// that lock as its allocation base. That makes allocation globally serialized: two independently opened
+/// instances (or daemons) over one database file can never both hand out N+1, because only one holds the
+/// write lock at a time and each reads the true latest committed revision before allocating. Allocation is
+/// transaction-local and the counter advances in the same transaction as the rows it counts, so a rollback
+/// consumes nothing and a multi-row transaction stays contiguous. The local change signal still pulses after
+/// commit — that notifies this instance's watchers only; cross-instance notification is out of scope here.
 /// </summary>
 internal sealed class WriteActor : IDisposable
 {
@@ -18,24 +24,19 @@ internal sealed class WriteActor : IDisposable
     private readonly BlockingCollection<Job> _queue = new(new ConcurrentQueue<Job>());
     private readonly Thread _thread;
     private readonly Action? _onCommitted;
-    private long _revision;
 
-    public WriteActor(SqliteConnection conn, long startRevision, Action? onCommitted = null)
+    public WriteActor(SqliteConnection conn, Action? onCommitted = null)
     {
         _conn = conn;
-        _revision = startRevision;
         _onCommitted = onCommitted;
         _thread = new Thread(Loop) { IsBackground = true, Name = "turnstile-writer" };
         _thread.Start();
     }
 
-    /// <summary>The highest revision committed so far. Safe to read from any thread.</summary>
-    public long Revision => Interlocked.Read(ref _revision);
-
     /// <summary>
     /// Runs <paramref name="work"/> inside a serialized write transaction. The delegate receives the
     /// write connection and a revision allocator; it must perform its reads and inserts on that
-    /// connection. The transaction commits on return and rolls back (restoring the revision) on throw.
+    /// connection. The transaction commits on return and rolls back on throw.
     /// </summary>
     public Task<T> ExecuteAsync<T>(Func<SqliteConnection, Func<long>, T> work)
     {
@@ -50,22 +51,25 @@ internal sealed class WriteActor : IDisposable
     {
         foreach (Job job in _queue.GetConsumingEnumerable())
         {
-            // The revision counter is allocated transaction-locally and published only on commit. The public
-            // _revision field (read cross-thread via Revision, /status, and watch sync) therefore never shows
-            // a number belonging to an in-flight transaction, and a rolled-back write neither advances it nor
-            // needs to restore it — so a reused revision cannot be skipped by a resume cursor that observed a
-            // phantom. The single writer thread means `allocated` needs no synchronization.
-            long committed = Interlocked.Read(ref _revision);
-            long allocated = committed;
-            using SqliteTransaction tx = _conn.BeginTransaction(deferred: false);
+            // BEGIN IMMEDIATE is inside the try: on contention SQLite waits up to busy_timeout and then throws
+            // SQLITE_BUSY, which must surface to the caller as a bounded, visible failure — not crash the
+            // writer thread nor retry forever nor fall through to success-shaped output.
+            SqliteTransaction? tx = null;
             try
             {
+                tx = _conn.BeginTransaction(deferred: false);
+
+                // The allocation base is the durable committed revision read UNDER the write lock, never a
+                // cached startup value. Under BEGIN IMMEDIATE this is the latest committed revision across all
+                // connections and processes, so allocation is globally unique and gapless.
+                long committed = CommittedRevision.Read(_conn);
+                long allocated = committed;
                 long AllocateRevision() => ++allocated;
+
                 object? result = job.Work(_conn, AllocateRevision);
 
-                // Persist the committed revision in the SAME transaction as the rows it counts, so the durable
-                // meta counter and the kv rows commit and roll back together — a reader can never see one
-                // without the other. A no-op transaction (nothing allocated) leaves the counter untouched.
+                // Persist the counter in the SAME transaction as the rows it counts, so they commit and roll
+                // back together. A no-op/read-only transaction allocates nothing and leaves the counter alone.
                 if (allocated > committed)
                 {
                     PersistRevision(tx, allocated);
@@ -73,24 +77,19 @@ internal sealed class WriteActor : IDisposable
 
                 tx.Commit();
 
-                // The in-memory field is now only the writer-private allocation cursor (the external truth is
-                // the meta counter). Advance it and notify watchers only after the commit succeeds.
+                // Post-commit ordering: hand the result back, then pulse this instance's watchers, only when
+                // the log actually advanced.
+                job.Tcs.SetResult(result);
                 if (allocated > committed)
                 {
-                    Interlocked.Exchange(ref _revision, allocated);
-                    job.Tcs.SetResult(result);
                     _onCommitted?.Invoke();
-                }
-                else
-                {
-                    job.Tcs.SetResult(result);
                 }
             }
             catch (Exception ex)
             {
                 try
                 {
-                    tx.Rollback();
+                    tx?.Rollback();
                 }
                 catch
                 {
@@ -98,9 +97,11 @@ internal sealed class WriteActor : IDisposable
                     // writer; surfacing the original error to the caller is the useful signal.
                 }
 
-                // Nothing was published, so _revision is already correct; the allocated numbers are discarded
-                // and reused by the next transaction.
                 job.Tcs.SetException(ex);
+            }
+            finally
+            {
+                tx?.Dispose();
             }
         }
     }

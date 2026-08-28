@@ -4,8 +4,15 @@ namespace Turnstile.Storage;
 /// Library-mode <see cref="ITurnstile"/>: opens the SQLite file directly and adapts <see cref="KvStore"/>.
 /// This is the degraded-but-useful path — no daemon, no always-on sweeper. Correctness of lease expiry
 /// is therefore <em>eventual</em>: <see cref="OpenAsync"/> sweeps once on open so a leaked lock from a
-/// dead process is reclaimed the next time any process touches the store. WAL makes this safe alongside
-/// a running daemon against the same file.
+/// dead process is reclaimed the next time any process touches the store.
+///
+/// WAL plus globally serialized revision allocation (each writer reads the durable committed revision under
+/// BEGIN IMMEDIATE, never a cached value) makes this safe alongside a running daemon or another instance
+/// against the same file <em>for storage integrity</em>: revisions stay globally unique, monotonic and
+/// gapless, and every committed row persists (#199). It does <em>not</em> make watch notification
+/// cross-process: each instance's change signal is in-memory, so a watcher here is not woken by a commit
+/// another instance made. A watcher needing another writer's events must poll or run against the daemon —
+/// tracked separately; #199 is revision allocation only, not notification.
 /// </summary>
 public sealed class LocalStore : ITurnstile
 {
