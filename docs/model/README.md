@@ -226,10 +226,11 @@ have no image here, and a passing run says nothing about them:
   faithfully abstracts it. What the model still does not cover is *notification*: each
   instance's change signal is in-memory, so a watcher on one instance is not woken by another
   instance's commit. That is a distinct gap #199 does not address.
-- **#196 — watch event wire omission.** The abstract state vector carries no serialization,
-  so `immutable` being dropped from watch events on the wire is invisible here. (The matching
-  txn `GET` omission, #195, has since been fixed in the implementation; the model modelled the
-  wire in neither case.)
+- **#196 — watch event wire serialization.** The abstract state vector carries no
+  serialization, so whether `immutable` rides the wire on watch events is invisible here.
+  Both that omission (#196) and the matching txn `GET` omission (#195) have since been fixed
+  in the implementation; the model modelled the wire in neither case, and asserts nothing
+  about serialization fidelity either way.
 
 These are named so the model is read for what it proves and not for what it is silent on.
 
