@@ -124,6 +124,11 @@ Not a kernel feature — a **design vocabulary** — but it determines what the 
 
 **Only one class needs mandatory CAS.**
 
+> **Immutable and ephemeral are mutually exclusive.** An immutable key cannot be attached to a lease.
+> Immutability means the key is *never* deleted; a lease exists precisely to *delete* what it holds when the
+> holder dies. The two contracts contradict — an immutable leased key would outlive its lease as an orphan —
+> so the combination is rejected at write time (`400`), on every path that could create it (see §6).
+
 A controller reconciling its own derived state is the *sole* authority. There is no one to race. CAS there is pure ceremony. **Where there's no race, CAS is noise. Where there is one, it's mandatory. Where there shouldn't be a writer at all, the key is immutable.**
 
 So the question is never "is this key transactional." It's **who is allowed to write this, and is there anyone to race with.**
@@ -221,7 +226,7 @@ A lint that fires loudly at development time, against a class of bug your author
 ```
 GET    /kv/{key}                          → value, create_revision, mod_revision, lease
 GET    /kv?prefix=P[&limit=N][&keys_only] → range scan, lexicographic order
-POST   /kv/{key}         [?lease=L] [?immutable]     create
+POST   /kv/{key}         [?lease=L] [?immutable]     create (lease and immutable are mutually exclusive → 400)
 PUT    /kv/{key}         If-Match | ?unconditional   update
 DELETE /kv/{key}         If-Match
 POST   /txn                               general CAS — multi-key
@@ -323,7 +328,7 @@ loop:
 
 **This is the most important idea in Turnstile.**
 
-A lease has a TTL. Keys may be **attached** to it. On expiry or revoke, **all attached keys are deleted** — which writes tombstones, which **emit `delete` events on the watch.**
+A lease has a TTL. Keys may be **attached** to it. On expiry or revoke, **all attached keys are deleted** — every one of them, since an immutable key can never be attached to a lease (§3), so nothing attached is exempt from deletion — which writes tombstones, which **emit `delete` events on the watch.**
 
 Therefore:
 
@@ -418,12 +423,13 @@ The things the tests exist to prove.
 2. **Conditional writes are linearizable.** N concurrent claimants of one key ⇒ exactly one succeeds.
 3. **No lost events.** A watcher from revision `R` sees *every* matching mutation with `id > R`, exactly once, in revision order.
 4. **No phantom events.** A watcher never sees a rolled-back mutation.
-5. **Lease expiry emits exactly one delete event per attached key.**
+5. **Lease expiry emits exactly one delete event per attached key.** Every attached key is deletable, because immutable+lease is rejected at write time (invariant 11), so none is left orphaned.
 6. **Compaction never destroys the latest live row for any key.**
 7. **A watch from a compacted revision fails loudly (`410`)** rather than silently skipping history.
 8. **Crash recovery is clean.** `kill -9` mid-write leaves no torn state; the revision counter resumes correctly.
 9. **Immutable keys cannot be mutated by anyone, ever.**
 10. **Turnstile opens no outbound sockets.**
+11. **Immutable and lease are mutually exclusive.** Creating or attaching a key that is both immutable and leased — via create, txn put, or making a leased key immutable — is rejected (`400`) before any state change, so no immutable key can outlive its lease.
 
 ---
 
@@ -458,6 +464,7 @@ Priority order. **The first four are where the bugs will actually be.**
 - Oversized values rejected.
 - `PUT` without `If-Match` → **428**. With a stale one → **412**.
 - Immutable key mutation → **409**, always.
+- Immutable + lease (create, txn put, or making a leased key immutable) → **400**, on every path, before any state change.
 - SSE survives a slow consumer without unbounded server-side buffering.
 
 ### If you have the appetite
