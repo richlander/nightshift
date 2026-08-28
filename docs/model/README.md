@@ -65,21 +65,31 @@ from `HardeningTests`:
 Four things came out of checking it, and the first is a defect in shipped code.
 
 **A lease does not last as long as it says.** `KvStore.Now()` truncates to whole
-seconds, but the instant a lease is granted at does not, so `Now() + ttlSecs` is short
-by however much of the current second has already elapsed. A one-second lease granted
-partway through a second is live for less than a second — in the limit, for
-microseconds. `Grain` is the number of clock sub-ticks per stored second; at `Grain = 1`
-the two collapse and `LeaseHonoursItsTtl` holds trivially, which is why the base
-configuration does not catch it. `TurnstileSubSecond.cfg` sets `Grain = 2` and the
-invariant fails against `Mutation = "None"` — the real design — in three steps: tick to
-mid-second, grant, and the lease is half the length it was asked for.
+seconds, but the instant a lease is granted at does not, so the stored deadline
+`floor(now) + ttlSecs` is short by however much of the current second has already
+elapsed. A one-second lease granted partway through a second has a stored deadline less
+than a second out — in the limit, microseconds. `Grain` is the number of clock sub-ticks
+per stored second; at `Grain = 1` the two collapse and `LeaseHonoursItsTtl` holds
+trivially, which is why the base configuration does not catch it. `TurnstileSubSecond.cfg`
+sets `Grain = 2` and the invariant fails against `Mutation = "None"` — the real design —
+in three steps: tick to mid-second, grant, and the stored deadline is half the length it
+was asked for.
+
+`LeaseHonoursItsTtl` is about that **stored** deadline versus the requested TTL, measured
+from the grant instant — a defect in the store's own arithmetic, bounded by one second.
+The **caller-observed** lifetime is a weaker, separate thing the model does not attempt:
+the enqueue on the write actor, the commit, and the response's trip back to the caller all
+elapse between the grant and the moment the caller can first act on the lease, and none is
+bounded — so the lifetime a caller actually gets has no positive lower bound at all. The
+two must not be conflated: the counterexample proves the sub-second arithmetic shortfall,
+not a floor on caller-observed time.
 
 This is not hypothetical. It is the root cause of the flaky suite fixed in #177, where
 five tests created one-second leases and did setup work under them. Those were repaired
 on the test side; the store behaviour is unchanged, and the consequence for a *client*
 is the part that has not been addressed — a renewal cadence derived from the TTL must
-assume `Ttl - 1` seconds, not `Ttl`, or the holder can lose its lease early. Tracked in
-#189.
+assume `Ttl - 1` seconds, not `Ttl`, and budget for the unmodeled delay above besides, or
+the holder can lose its lease early. Tracked in #189.
 
 **The clock is not monotonic, and the design survives that anyway.** Expiry is evaluated
 against `DateTimeOffset.UtcNow`, which is wall time: NTP or an operator can move it
@@ -136,6 +146,53 @@ single state can separate them — the difference exists only as an event that d
 happen. `KvStore` makes the same point in prose: "expiry produces delete events — lazy
 expiry would be correct but silent."
 
+### Correspondence
+
+`ModelCorrespondenceTests` in `Turnstile.Tests` mirrors these properties against the real
+store, so the model is not describing a system nobody built:
+
+| TLA+ property | Test |
+| --- | --- |
+| `LogIsGapless` | `LogIsGapless_RejectedWriteConsumesNoRevision` |
+| `NoWriteUnderExpiredLease` | `NoWriteUnderExpiredLease_PutUnderAnExpiredLeaseIsRefused` |
+| `RemovalIsLoggedStep` | `RemovalIsLoggedStep_ExpiryTombstonesThroughTheLog` |
+| `LiveKeysHaveALeaseRow` | `LiveKeysHaveALeaseRow_RevokeTakesTheKeysWithIt` |
+| `NoLostWakeup` | `NoLostWakeup_SignalCapturedBeforeTheDrainStillFires` |
+| `BeliefMatchesStoredDeadline` | `BeliefMatchesStoredDeadline_LocalLeaseReportsTheDeadlineItEnforces` |
+
+`LogIsGapless_RejectedWriteConsumesNoRevision` is the correspondence for #192's
+transaction-local allocation: a rejected write (`Exists`, `NotFound`) returns without
+advancing `CurrentRevision`, exactly as the model's `PutRejected` exists only under the
+`FailedWriteConsumesRevision` mutation. The committed revision that #192 now persists
+atomically with its rows is the concrete form of the model's single `rev` advancing only
+on a logged write.
+
+### Scope and known gaps
+
+The model earns its keep on the lease/log/wake-signal core; it is not a certificate for
+the whole store. Four open defects have no image in it, and a passing run says nothing
+about any of them:
+
+- **#197 — the watch sync boundary.** `NoLostWakeup` covers the wake *signal*, which the
+  shipped `WatchAsync` gets right (it captures `WaitForChangeAsync()` before draining).
+  But `WatchAsync` also emits its one-shot caught-up revision — `WatchSyncMessage(CurrentRevision)`
+  — sampled *after* the drain, on a snapshot separate from the one the events were read on.
+  A commit landing between the final `ReadEvents` and that sample makes the sync advertise a
+  revision whose events were never delivered, so a client resuming from it skips them. `rev`
+  is a single atomic value here that both the drain and the capture read, so the two-snapshot
+  gap is unrepresentable. This model does **not** claim the watch is free of lost events.
+- **#198 — revision overflow.** `rev` is bounded by `MaxRevision` to keep the search finite;
+  the Int64 wrap of the real counter is out of scope.
+- **#199 — multiple writers.** `rev` is global and singular; two `KvStore`/`LocalStore`
+  instances over one file, each caching its own revision base, is a distinct hazard the
+  single-writer model cannot see.
+- **#195 / #196 — wire omissions.** The abstract state vector carries no serialization, so
+  `immutable` being dropped from txn `GET` results and watch events is invisible here.
+
+These are named so the model is read for what it proves and not for what it is silent on.
+Until #197 lands, the honest reading of the watch guarantees is exactly the wake-signal
+property above — nothing broader.
+
 ### Runs
 
 ```sh
@@ -145,13 +202,13 @@ java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers 1 -cleanup \
 ```
 
 Two keys, two leases, `Ttl = 1`, `Skew = 1`, clock bound 3, revision bound 4. With TLC
-2.19 the base configuration generates 390,517 states, 72,163 distinct, depth 18, zero
+2.19 the base configuration generates 558,208 states, 106,978 distinct, depth 18, zero
 violations, in a few seconds.
 
 | Configuration | Clock may step back | Result |
 | --- | --- | --- |
 | `Turnstile.cfg` | yes | No error — 558,208 states, 106,978 distinct, depth 18 |
-| `TurnstileSplitSweepMonotonic.cfg` | no | No error — 315,718 states, 88,849 distinct, depth 18 |
+| `TurnstileSplitSweepMonotonic.cfg` | no | No error — 396,796 states, 113,895 distinct, depth 18 |
 
 The base configuration runs at `Grain = 1`, which assumes every TTL is full length. That
 assumption is false on the real clock, and removing it is what

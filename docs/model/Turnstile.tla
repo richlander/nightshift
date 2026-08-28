@@ -34,7 +34,18 @@
    and the capture is neither drained nor counted as a reason to wake, so the watcher
    parks holding a cursor it knows to be stale. `NoLostWakeup` states that a parked
    watcher which is behind always has a pending reason to wake, which is checkable
-   without any liveness machinery.
+   without any liveness machinery. This is the wake-*signal* ordering only, and the
+   shipped code gets it right: `WaitForChangeAsync()` is captured before the drain.
+
+   It is NOT the whole watch story. `WatchAsync` also emits a one-shot "caught up"
+   revision -- `WatchSyncMessage(CurrentRevision)` -- sampled *after* the drain, on a
+   read connection separate from the one the drain read events on. A commit landing
+   between the final `ReadEvents` and that sample makes the sync advertise a revision N
+   whose events were never delivered, so a client that resumes from N skips them. That
+   is a real, current defect (nightshift #197), and this model does not represent it:
+   `rev` here is a single atomic value that both the drain and the capture read, so the
+   two-snapshot gap has no image in the state vector. `NoLostWakeup` must therefore be
+   read as covering the wake signal, not as certifying the watch free of lost events.
 
    Scope: keys, leases and revisions are abstract. Deliberately NOT modeled -- SQLite
    semantics, WAL behaviour, the txn compare/branch language, prefix ranges, key and
@@ -44,6 +55,21 @@
    HardeningTests claim -- that a failed keepalive must not be followed by
    re-acquisition -- is a rule about client code, not about the store, and stays with
    the tests that exercise it.
+
+   Also out of scope, so the model must not be read as covering them:
+     - the watch sync boundary (#197): the caught-up revision is sampled on a snapshot
+       separate from the event drain, so it can advertise events it did not deliver.
+       `rev` is one atomic value here, which has no image of that two-snapshot gap.
+     - revision overflow (#198): `rev` is bounded by MaxRevision for a finite state
+       space; the Int64 wrap of the real counter is not represented.
+     - a single writer/counter is assumed. Two KvStore/LocalStore instances over one
+       file, each caching its own revision base, is a distinct hazard (#199) with no
+       image here -- `rev` is global and singular.
+     - the wire: fields dropped in serialization (txn GET and watch events omitting
+       `immutable`, #195/#196) are a protocol concern the abstract state vector does
+       not carry.
+   These are honest gaps, not claims -- a passing run of this model says nothing about
+   any of them.
 
    The fourth question is the clock's resolution. KvStore.Now() truncates to whole
    seconds, but the instant a lease is granted at does not, so a deadline of
@@ -407,10 +433,19 @@ NeverReapBelievedLease == ~reapedBelieved
 \* asking for a TTL believes it is buying, and it is the assumption behind any renewal
 \* cadence derived from the TTL.
 \*
-\* It holds trivially at Grain = 1. It does not hold on the real clock: KvStore stores
-\* `Now() + ttlSecs` with Now() truncated to whole seconds, so a lease granted partway
-\* through a second is short by exactly the part already elapsed. See
-\* TurnstileSubSecond.cfg -- this one fails against the real design, not a mutation.
+\* This is the *stored* semantics: it compares the deadline the store computed and wrote
+\* -- `floor(now) + ttlSecs`, measured from the grant instant `grantedAt` -- against the
+\* requested Ttl. It holds trivially at Grain = 1. It does not hold on the real clock:
+\* Now() truncates to whole seconds, so a lease granted partway through a second is short
+\* by exactly the fraction already elapsed, bounded by one second. See TurnstileSubSecond.cfg
+\* -- this fails against the real design, not a mutation.
+\*
+\* The *caller-observed* lifetime is weaker still and is deliberately NOT modeled: the
+\* enqueue on the write actor, the commit, and the response's trip back all elapse between
+\* `grantedAt` and the moment the caller can first act on the lease, and none is bounded.
+\* So even a full-length stored deadline gives the caller no positive lower bound on the
+\* time it actually holds the lock; a renewal cadence must budget for Ttl - 1 seconds and
+\* for that unmodeled delay besides (#189).
 LeaseHonoursItsTtl ==
     \A l \in Leases : Exists(l) => (expiry[l] * Grain) - grantedAt[l] >= Ttl * Grain
 
