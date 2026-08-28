@@ -123,14 +123,23 @@ number computed on the client clock (`Skew` is the client's offset from the serv
 positive meaning it leads), and `BeliefMatchesStoredDeadline` fails because that number is
 not the stored deadline the store will enforce.
 
-That is the whole finding — a hazard in the type's shape, not a reaping harm. An earlier
-draft claimed the holder believes it holds the lock past the point the server reaps, and
-that does not hold up: a constant client/server offset **cancels** when the same client
-both computes `clientNow + ttl` and later checks its own clock against that deadline, so
-at the server's physical expiry the client's clock has reached its computed deadline too.
-Asserting otherwise compares a client-clock timestamp to a server-clock instant across
-domains, which is not a real contract, so the model makes no such claim (the
-`NeverReapBelievedLease` property and its config were removed for exactly this reason).
+What that counterexample proves is exactly the **numeric mismatch** — with a nonzero clock
+offset the two are different numbers. It does not, by itself, prove early reaping: a
+*constant* offset cancels when the same client both computes `clientNow + ttl` and later
+checks its own clock against it, so an earlier draft's claim that the holder is reaped
+while still believing it holds the lock was removed (with the `NeverReapBelievedLease`
+property and its config).
+
+But that is not a general "no harm" result, and the harm is not only the sub-second
+truncation above. There is a real **overstatement window** from response delay: the server
+stores `expires_at` and only then returns, while `RemoteStore` computes `clientNow + ttl`
+*after* awaiting that round trip — so even at zero clock skew the fabricated deadline is
+later than the enforced one by the request/queue/write/response delay (the same delay the
+caller-visible lifetime note describes). This model does not represent it: `CreateLease`
+is one atomic step with no request/response delivery, so it neither certifies nor refutes
+that consequence. The takeaway stands regardless: `RemoteStore.ExpiresAt` is informational
+and must never be treated as the enforced server deadline — keepalive's authoritative
+remaining TTL is the only safe basis for a renewal decision.
 
 ### Checked properties
 

@@ -151,9 +151,12 @@ public class ModelCorrespondenceTests : IDisposable
     /// <summary>
     /// TLA+ <c>BeliefMatchesStoredDeadline</c>: the deadline a holder is handed is the deadline the store
     /// will actually enforce. <c>KvStore</c> satisfies this by returning the value it stored.
-    /// <c>RemoteStore</c> does not — it fabricates one from the <em>client</em> clock, which is what the
-    /// <c>ClientComputedDeadline</c> mutation models, so a caller cannot tell from
-    /// <see cref="LeaseInfo.ExpiresAt"/> alone which of the two it is holding.
+    /// <c>RemoteStore</c> does not — it fabricates one from the <em>client</em> clock (<c>clientNow + ttl</c>,
+    /// computed after the POST returns), which is what the <c>ClientComputedDeadline</c> mutation models as a
+    /// numeric mismatch. Because that value is also later than the enforced deadline by the response delay —
+    /// even at zero clock skew — it is informational only, never the enforced server deadline; a caller cannot
+    /// tell from <see cref="LeaseInfo.ExpiresAt"/> alone which of the two it holds. This test pins the local
+    /// side that does honour the contract.
     /// </summary>
     [Fact]
     public async Task BeliefMatchesStoredDeadline_LocalLeaseReportsTheDeadlineItEnforces()

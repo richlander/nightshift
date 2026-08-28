@@ -100,10 +100,13 @@
    deletes it violates NoWriteUnderExpiredLease; letting a rejected write consume a
    revision violates LogIsGapless; and computing the holder's deadline on a client clock
    -- what RemoteStore does -- makes the handed-back deadline a different number from the
-   stored one, violating BeliefMatchesStoredDeadline. That is a value-shape mismatch, not
-   a reaping harm: a constant client/server offset cancels when the same client both
-   computes and later checks its deadline, so the model makes no claim that the holder is
-   reaped while still believing the lease live.
+   stored one, violating BeliefMatchesStoredDeadline. That counterexample proves the
+   numeric mismatch only (a constant clock offset), not early reaping. It is NOT a general
+   "no harm" result: RemoteStore computes client-Now + ttl only after the server has
+   already stored expiry and returned, so response delay makes the value later than the
+   enforced deadline even at zero skew. This atomic CreateLease model has no request/
+   response delivery step, so it neither certifies nor refutes that consequence -- it only
+   shows the value is informational, never the enforced server deadline.
 
    Re-run TLC after any change here to regenerate the counts and confirm zero
    violations. *)
@@ -172,8 +175,10 @@ Second(t) == t \div Grain
 \* the value is "informational only". Nothing in the LeaseInfo type says which of the
 \* two a caller is holding, so ClientComputedDeadline hands back a number computed on the
 \* client clock. Skew is that clock's offset from the server (positive = the client leads),
-\* so the fabricated deadline differs from the stored one by exactly Skew. This is a
-\* value-shape mismatch, not a claim that the holder outlives the server's reap.
+\* so the fabricated deadline differs from the stored one by exactly Skew. That is the
+\* constant-offset mismatch this counterexample models; the separate response-delay
+\* overstatement (real even at zero skew, but not modeled here) is discussed at
+\* BeliefMatchesStoredDeadline below.
 HandedBack == IF Mutation = "ClientComputedDeadline"
               THEN Second(now) + Ttl + Skew
               ELSE Second(now) + Ttl
@@ -423,16 +428,22 @@ NoLostWakeup == (wstate = "park" /\ rev > cursor) => rev > captured
 \* KvStore returns the value it stored; RemoteStore fabricates one from the client
 \* clock, and this is the invariant that separates the two.
 \*
-\* This is a numeric/type-shape distinction, not a harm claim. RemoteStore computes
-\* ExpiresAt as `client-Now + ttl` rather than echoing the server's stored `expires_at`,
-\* so the two are different numbers derived from different bases (Skew models the client
-\* clock's offset from the server; positive = client leads). A caller cannot tell from
-\* LeaseInfo.ExpiresAt alone which of the two it is holding. We deliberately do NOT model
-\* a "holder reaped while still believing live" consequence: a constant client/server
-\* offset cancels when the same client both computes `client-Now + ttl` and later checks
-\* its own clock against it, so at the server's physical expiry the client's clock has
-\* reached its own computed deadline too. Asserting otherwise would compare a client-clock
-\* timestamp to a server-clock instant across domains, which is not a real contract.
+\* What the ClientComputedDeadline counterexample proves is a numeric/type-shape mismatch
+\* only: RemoteStore computes ExpiresAt as `client-Now + ttl` rather than echoing the
+\* server's stored `expires_at`, so with a nonzero clock offset (Skew, positive = client
+\* leads) the two are different numbers. It does NOT, by itself, prove early reaping -- a
+\* constant offset cancels for a holder that both computes and later checks on its own
+\* clock.
+\*
+\* But do not read that as "no reaping hazard". There is a real overstatement window this
+\* model does not represent. `CreateLeaseAsync` stores expiry on the server and only then
+\* returns; RemoteStore computes `client-Now + ttl` *after* awaiting that round trip, so
+\* even at zero clock skew the fabricated deadline is later than the enforced one by the
+\* request/queue/write/response delay -- the same delay the README's caller-visible
+\* lifetime note describes. CreateLease here is a single atomic step with no request/
+\* response delivery, so the model neither certifies nor refutes that consequence. It
+\* establishes only that RemoteStore's value is a different number, and therefore
+\* informational -- never safe to treat as the enforced server deadline.
 BeliefMatchesStoredDeadline ==
     \A l \in Leases : Exists(l) => belief[l] = expiry[l]
 
