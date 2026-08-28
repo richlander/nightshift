@@ -187,17 +187,36 @@ internal sealed record PrFacts
     /// The one fail-closed head-alignment policy shared by <c>waiting</c> and <c>pr</c> so both report the
     /// same head and the same confidence after a mergeability re-read. <paramref name="current"/> is the
     /// complete facts from the initial detailed read; <paramref name="refreshed"/> is the second, mergeability
-    /// re-read of the same PR (which may observe a moved head).
+    /// re-read of the same PR (which may observe a moved head, and may itself still answer <c>unknown</c>
+    /// mergeability — normal immediately after a push). Every non-null re-read is reconciled here; the caller
+    /// does not pre-screen on <see cref="MergeabilityKnown"/>.
     ///
-    /// When the head is unchanged, the freshly computed mergeability is grafted onto the complete facts. When
-    /// the head moved between the two reads, the newer head is adopted — continuing to report the older head
-    /// would be a known-stale lie — together with the mergeability freshly read for it; but the check runs in
-    /// hand were gathered on the <em>old</em> head, so their confidence is cleared
-    /// (<see cref="ChecksKnown"/> = false, no check runs) until facts for the new head are complete. The PR
-    /// title is head-independent identity, so it is carried across rather than blanked by a moved head.
+    /// When the head moved between the two reads, the newer head is adopted — continuing to report the older
+    /// head would be a known-stale lie — together with the re-read's current-status fields
+    /// (<see cref="MergeableState"/>, <see cref="State"/>, <see cref="Merged"/>, <see cref="MergedAt"/>). The
+    /// check runs in hand were gathered on the <em>old</em> head, so they are dropped and their confidence is
+    /// cleared (<see cref="Checks"/> empty, <see cref="ChecksKnown"/> = false) — a moved head must never stay
+    /// actionable on the previous head's checks, even when the re-read's own mergeability is still unknown. The
+    /// resolved repo and the head-independent PR title are carried across so a moved head does not blank them.
+    ///
+    /// When the head is unchanged, the complete facts are kept — including the title and the check runs, which
+    /// remain valid on the same head — while the current-status fields that the re-read can legitimately have
+    /// moved (mergeability, and an open→merged/closed transition with its merge time) are grafted from it.
     /// </summary>
     public static PrFacts AlignToRefreshedMergeability(PrFacts current, PrFacts refreshed)
         => string.Equals(current.HeadSha, refreshed.HeadSha, StringComparison.OrdinalIgnoreCase)
-            ? current with { MergeableState = refreshed.MergeableState }
-            : refreshed with { ChecksKnown = false, Title = current.Title };
+            ? current with
+            {
+                MergeableState = refreshed.MergeableState,
+                State = refreshed.State,
+                Merged = refreshed.Merged,
+                MergedAt = refreshed.MergedAt,
+            }
+            : refreshed with
+            {
+                Checks = [],
+                ChecksKnown = false,
+                Title = current.Title,
+                Repo = current.Repo,
+            };
 }

@@ -752,15 +752,17 @@ internal static class WaitingCommand
         // is that moment. Re-reading immediately just collects `unknown` a second time.
         foreach (int prNumber in seen.Where(e => e.Value.Facts is { MergeabilityKnown: false, Merged: false }).Select(e => e.Key).ToArray())
         {
-            if (await refreshMergeabilityAsync(prNumber, ct) is not { } refreshed || !refreshed.MergeabilityKnown)
+            if (await refreshMergeabilityAsync(prNumber, ct) is not { } refreshed)
             {
                 continue;
             }
 
-            // Reconcile the re-read under the one shared fail-closed head-alignment policy: graft the fresh
-            // mergeability when the head held, or adopt the newer head and clear check confidence when it
-            // moved. The resolution wrapper (searched/found repos) is preserved either way, so the row still
-            // names where the PR was located.
+            // Reconcile every non-null re-read under the one shared fail-closed head-alignment policy: keep the
+            // complete facts and graft the current-status fields when the head held, or adopt the newer head
+            // and clear check confidence when it moved — even if the re-read's own mergeability is still
+            // unknown, so a moved head can never stay actionable on the old head's trusted checks. The
+            // resolution wrapper (searched/found repos) is preserved either way, so the row still names where
+            // the PR was located.
             PrFetch located = seen[prNumber];
             PrFacts current = located.Facts!;
             seen[prNumber] = located with
