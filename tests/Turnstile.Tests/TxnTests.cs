@@ -196,6 +196,38 @@ public class TxnTests : IDisposable
     }
 
     [Fact]
+    public async Task Txn_ValidOpStagedThenInheritedImmutableLease_RollsBackWholeBatch_NoPhantomRevisionOrWatchGap()
+    {
+        // A batch whose earlier op stages a real row, then a later op turns an existing leased mutable key
+        // immutable — invalid only once its live lease is read, so it cannot be caught up front. The whole
+        // transaction must roll back: the staged row vanishes, the public revision does not move (no phantom),
+        // and a watcher resuming from the pre-batch cursor sees no gap — the allocated revisions are reused by
+        // the next committed write.
+        using KvStore store = Open();
+        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 3600);
+        await store.TxnAsync([NotExist("/leased")], [Put("/leased", "v", lease.Id)], []);
+        long revBefore = store.CurrentRevision;
+
+        var stagedValidPut = new TxnOp(TxnOpKind.Put, "/staged", Bytes("1"), null, false);
+        var inheritedImmutable = new TxnOp(TxnOpKind.Put, "/leased", Bytes("v2"), null, true);
+        await Assert.ThrowsAsync<TurnstileValidationException>(
+            () => store.TxnAsync([], [stagedValidPut, inheritedImmutable], []));
+
+        Assert.Null(store.Get("/staged"));                    // the staged valid op rolled back too
+        Assert.False(store.Get("/leased")!.Immutable);        // target unchanged
+        Assert.Equal(lease.Id, store.Get("/leased")!.Lease);
+        Assert.Equal(revBefore, store.CurrentRevision);       // no phantom revision published
+        Assert.Empty(store.ReadEvents("/", fromExclusive: revBefore, limit: 0));   // nothing committed to skip
+
+        // The next valid write reuses revBefore+1, and a watcher resuming at revBefore sees exactly it.
+        WriteResult after = await store.CreateAsync("/after", Bytes("3"));
+        Assert.Equal(revBefore + 1, after.Revision);
+        WatchEvent only = Assert.Single(store.ReadEvents("/", fromExclusive: revBefore, limit: 0));
+        Assert.Equal("/after", only.Key);
+        Assert.Equal(revBefore + 1, only.Revision);
+    }
+
+    [Fact]
     public async Task Claim_UnderLease_AttachesAndExpires()
     {
         using KvStore store = Open();
