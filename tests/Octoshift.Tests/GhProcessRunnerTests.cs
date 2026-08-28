@@ -5,24 +5,26 @@ using Octoshift.GitHub;
 using Xunit;
 
 /// <summary>
-/// How a <c>gh</c> subprocess is run. The runner drains both output streams concurrently with the wait so a
-/// burst larger than a pipe buffer is neither truncated nor able to deadlock the child, returns the full
-/// output and exit code on ordinary completion, and on cancellation confirms the launched process itself has
-/// exited and unblocks both reads before the cancellation propagates. Descendant containment is best-effort
-/// (a tree kill that cannot reach a process that outlived the root), and is not claimed here. The program name
-/// is a seam so these facts are provable against a purpose-built child rather than only the real binary.
+/// How an ambient <c>gh</c> subprocess is run. The runner injects no credentials of its own — the child
+/// inherits octoshift's environment, so the caller's own <c>gh</c> auth (ambient credential storage or an
+/// externally supplied <c>GH_TOKEN</c>) reaches gh untouched. Beyond that it drains both output streams
+/// concurrently with the wait so a burst larger than a pipe buffer is neither truncated nor able to deadlock
+/// the child, returns the full output and exit code on ordinary completion, and on cancellation confirms the
+/// launched process itself has exited and unblocks both reads before the cancellation propagates. Descendant
+/// containment is best-effort (a tree kill that cannot reach a process that outlived the root), and is not
+/// claimed here. The program name is a seam so these facts are provable against a purpose-built child rather
+/// than only the real binary.
 /// </summary>
-public class GhAuthenticatedRunnerTests
+public class GhProcessRunnerTests
 {
     [Fact]
     public async Task RunProcessAsync_ReturnsExitCodeAndBothStreams()
     {
         Assert.SkipWhen(OperatingSystem.IsWindows(), "The gh runner path starts a POSIX child here; there is nothing to start on Windows.");
 
-        GhResult result = await GhAuthenticatedRunner.RunProcessAsync(
+        GhResult result = await GhProcessRunner.RunProcessAsync(
             "/bin/sh",
             ["-c", "printf 'to-out\\n'; printf 'to-err\\n' >&2; exit 7"],
-            null,
             TestContext.Current.CancellationToken);
 
         Assert.Equal(7, result.ExitCode);
@@ -38,10 +40,9 @@ public class GhAuthenticatedRunnerTests
         // A busy child writes far more than one pipe buffer to both streams. Reading either stream only after
         // exit would truncate it, and a child whose stdout pipe fills stops making progress — so the reads
         // have to run concurrently with the wait. The last line of each stream is the witness that they did.
-        GhResult result = await GhAuthenticatedRunner.RunProcessAsync(
+        GhResult result = await GhProcessRunner.RunProcessAsync(
             "/bin/sh",
             ["-c", "i=0; while [ $i -lt 5000 ]; do printf 'out %s\\n' \"$i\"; printf 'err %s\\n' \"$i\" >&2; i=$((i+1)); done"],
-            null,
             TestContext.Current.CancellationToken);
 
         Assert.Equal(0, result.ExitCode);
@@ -50,20 +51,39 @@ public class GhAuthenticatedRunnerTests
     }
 
     [Fact]
-    public async Task RunProcessAsync_AppliesEnvironmentOverridesToTheChild()
+    public async Task RunProcessAsync_InheritsAmbientAuthentication_AndInjectsNoTokenOfItsOwn()
     {
         Assert.SkipWhen(OperatingSystem.IsWindows(), "The gh runner path starts a POSIX child here; there is nothing to start on Windows.");
 
-        var environment = new Dictionary<string, string?>(StringComparer.Ordinal) { ["GH_TOKEN"] = "injected-token" };
+        // The credential boundary: octoshift owns no token and injects none. An externally provisioned
+        // GH_TOKEN in octoshift's own environment must reach the child unchanged (ambient auth is preserved,
+        // never unset or replaced) — and with none provisioned, the child must see none, proving octoshift
+        // adds nothing of its own.
+        const string ambientToken = "externally-provisioned-token";
+        string? previous = Environment.GetEnvironmentVariable("GH_TOKEN");
+        try
+        {
+            Environment.SetEnvironmentVariable("GH_TOKEN", ambientToken);
+            GhResult inherited = await GhProcessRunner.RunProcessAsync(
+                "/bin/sh",
+                ["-c", "printf 'token=%s\\n' \"$GH_TOKEN\""],
+                TestContext.Current.CancellationToken);
+            Assert.Equal(0, inherited.ExitCode);
+            Assert.Contains($"token={ambientToken}", inherited.Stdout, StringComparison.Ordinal);
 
-        GhResult result = await GhAuthenticatedRunner.RunProcessAsync(
-            "/bin/sh",
-            ["-c", "printf 'token=%s\\n' \"$GH_TOKEN\""],
-            environment,
-            TestContext.Current.CancellationToken);
-
-        Assert.Equal(0, result.ExitCode);
-        Assert.Contains("token=injected-token", result.Stdout, StringComparison.Ordinal);
+            Environment.SetEnvironmentVariable("GH_TOKEN", null);
+            GhResult none = await GhProcessRunner.RunProcessAsync(
+                "/bin/sh",
+                ["-c", "printf 'token=%s\\n' \"$GH_TOKEN\""],
+                TestContext.Current.CancellationToken);
+            Assert.Equal(0, none.ExitCode);
+            Assert.Contains("token=", none.Stdout, StringComparison.Ordinal);
+            Assert.DoesNotContain(ambientToken, none.Stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("GH_TOKEN", previous);
+        }
     }
 
     [Fact]
@@ -82,7 +102,7 @@ public class GhAuthenticatedRunnerTests
             string script = "echo $$ > \"$0/pid\"; exec sleep 60";
 
             using var cts = new CancellationTokenSource();
-            Task<GhResult> run = GhAuthenticatedRunner.RunProcessAsync("/bin/sh", ["-c", script, dir], null, cts.Token);
+            Task<GhResult> run = GhProcessRunner.RunProcessAsync("/bin/sh", ["-c", script, dir], cts.Token);
 
             int pid = await WaitForPidAsync(Path.Combine(dir, "pid"), TestContext.Current.CancellationToken);
             Assert.True(IsAlive(pid), "launched process was not running before cancellation");
@@ -124,7 +144,7 @@ public class GhAuthenticatedRunnerTests
                 "exit 0";
 
             using var cts = new CancellationTokenSource();
-            Task<GhResult> run = GhAuthenticatedRunner.RunProcessAsync("/bin/sh", ["-c", script, dir], null, cts.Token);
+            Task<GhResult> run = GhProcessRunner.RunProcessAsync("/bin/sh", ["-c", script, dir], cts.Token);
 
             descPid = await WaitForPidAsync(Path.Combine(dir, "desc.pid"), TestContext.Current.CancellationToken);
             await WaitForFileAsync(Path.Combine(dir, "ready"), TestContext.Current.CancellationToken);
@@ -170,10 +190,9 @@ public class GhAuthenticatedRunnerTests
             string script = "echo $$ > \"$0/pid\"; exec sleep 60";
 
             using var cts = new CancellationTokenSource();
-            Task<GhResult> run = GhAuthenticatedRunner.RunProcessAsync(
+            Task<GhResult> run = GhProcessRunner.RunProcessAsync(
                 "/bin/sh",
                 ["-c", script, dir],
-                null,
                 (proc, tree) => killRequestSucceeds,
                 TimeSpan.FromMilliseconds(150),
                 cts.Token);
@@ -259,36 +278,10 @@ public class GhAuthenticatedRunnerTests
     [Fact]
     public async Task RunProcessAsync_AProgramThatIsNotThereIsReportedRatherThanThrown()
     {
-        GhResult result = await GhAuthenticatedRunner.RunProcessAsync(
-            "octoshift-no-such-gh", [], null, TestContext.Current.CancellationToken);
+        GhResult result = await GhProcessRunner.RunProcessAsync(
+            "octoshift-no-such-gh", [], TestContext.Current.CancellationToken);
 
         Assert.Equal(127, result.ExitCode);
         Assert.NotEmpty(result.Stderr);
-    }
-
-    [Fact]
-    public async Task Create_InjectsTheProviderTokenAsGhTokenForEveryInvocation()
-    {
-        IReadOnlyDictionary<string, string?>? capturedEnvironment = null;
-        var provider = new FixedTokenProvider(new GitHubInstallationToken("secret-token", DateTimeOffset.UtcNow.AddHours(1)));
-
-        Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> run = GhAuthenticatedRunner.Create(
-            provider,
-            (args, environment, ct) =>
-            {
-                capturedEnvironment = environment;
-                return Task.FromResult(new GhResult(0, string.Empty, string.Empty));
-            });
-
-        await run(["api", "/rate_limit"], TestContext.Current.CancellationToken);
-
-        Assert.NotNull(capturedEnvironment);
-        Assert.True(capturedEnvironment!.TryGetValue("GH_TOKEN", out string? value));
-        Assert.Equal("secret-token", value);
-    }
-
-    private sealed class FixedTokenProvider(GitHubInstallationToken token) : IGitHubInstallationTokenProvider
-    {
-        public Task<GitHubInstallationToken> GetTokenAsync(CancellationToken ct) => Task.FromResult(token);
     }
 }
