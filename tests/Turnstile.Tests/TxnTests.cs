@@ -148,6 +148,86 @@ public class TxnTests : IDisposable
     }
 
     [Fact]
+    public async Task Txn_PutImmutableWithLease_RejectedBeforeAnyStateChange()
+    {
+        // A txn put is another entry path onto the shared write point, so it enforces the same invariant: an
+        // immutable key cannot be attached to a lease. The whole transaction rolls back — no key, no revision.
+        using KvStore store = Open();
+        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 3600);
+        long revBefore = store.CurrentRevision;
+
+        var immutableLeased = new TxnOp(TxnOpKind.Put, "/spec", Bytes("frozen"), lease.Id, true);
+        await Assert.ThrowsAsync<TurnstileValidationException>(
+            () => store.TxnAsync([NotExist("/spec")], [immutableLeased], []));
+
+        Assert.Null(store.Get("/spec"));
+        Assert.Equal(revBefore, store.CurrentRevision);
+    }
+
+    [Fact]
+    public async Task Txn_MakingALeasedKeyImmutable_Rejected()
+    {
+        // The subtler path the shared enforcement catches: a txn put that flips an existing leased mutable key
+        // to immutable would produce an immutable+leased row. It is rejected, and the key stays as it was.
+        using KvStore store = Open();
+        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 3600);
+        await store.TxnAsync([NotExist("/claim")], [Put("/claim", "dev-b", lease.Id)], []);
+
+        var flipToImmutable = new TxnOp(TxnOpKind.Put, "/claim", Bytes("dev-b"), null, true);
+        await Assert.ThrowsAsync<TurnstileValidationException>(
+            () => store.TxnAsync([], [flipToImmutable], []));
+
+        KeyState s = store.Get("/claim")!;
+        Assert.False(s.Immutable);          // unchanged: still the ephemeral leased key it was
+        Assert.Equal(lease.Id, s.Lease);
+    }
+
+    [Fact]
+    public async Task Txn_PutImmutableWithoutLease_StillSucceeds()
+    {
+        // No regression: creating an immutable key with no lease via a txn put is unaffected.
+        using KvStore store = Open();
+        TxnResult r = await store.TxnAsync([NotExist("/spec")], [new TxnOp(TxnOpKind.Put, "/spec", Bytes("frozen"), null, true)], []);
+
+        Assert.True(r.Succeeded);
+        KeyState s = store.Get("/spec")!;
+        Assert.True(s.Immutable);
+        Assert.Null(s.Lease);
+    }
+
+    [Fact]
+    public async Task Txn_ValidOpStagedThenInheritedImmutableLease_RollsBackWholeBatch_NoPhantomRevisionOrWatchGap()
+    {
+        // A batch whose earlier op stages a real row, then a later op turns an existing leased mutable key
+        // immutable — invalid only once its live lease is read, so it cannot be caught up front. The whole
+        // transaction must roll back: the staged row vanishes, the public revision does not move (no phantom),
+        // and a watcher resuming from the pre-batch cursor sees no gap — the allocated revisions are reused by
+        // the next committed write.
+        using KvStore store = Open();
+        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 3600);
+        await store.TxnAsync([NotExist("/leased")], [Put("/leased", "v", lease.Id)], []);
+        long revBefore = store.CurrentRevision;
+
+        var stagedValidPut = new TxnOp(TxnOpKind.Put, "/staged", Bytes("1"), null, false);
+        var inheritedImmutable = new TxnOp(TxnOpKind.Put, "/leased", Bytes("v2"), null, true);
+        await Assert.ThrowsAsync<TurnstileValidationException>(
+            () => store.TxnAsync([], [stagedValidPut, inheritedImmutable], []));
+
+        Assert.Null(store.Get("/staged"));                    // the staged valid op rolled back too
+        Assert.False(store.Get("/leased")!.Immutable);        // target unchanged
+        Assert.Equal(lease.Id, store.Get("/leased")!.Lease);
+        Assert.Equal(revBefore, store.CurrentRevision);       // no phantom revision published
+        Assert.Empty(store.ReadEvents("/", fromExclusive: revBefore, limit: 0));   // nothing committed to skip
+
+        // The next valid write reuses revBefore+1, and a watcher resuming at revBefore sees exactly it.
+        WriteResult after = await store.CreateAsync("/after", Bytes("3"));
+        Assert.Equal(revBefore + 1, after.Revision);
+        WatchEvent only = Assert.Single(store.ReadEvents("/", fromExclusive: revBefore, limit: 0));
+        Assert.Equal("/after", only.Key);
+        Assert.Equal(revBefore + 1, only.Revision);
+    }
+
+    [Fact]
     public async Task Claim_UnderLease_AttachesAndExpires()
     {
         using KvStore store = Open();
