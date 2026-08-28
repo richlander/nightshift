@@ -120,7 +120,7 @@ public sealed class RemoteStore : ITurnstile
         foreach (TxnOpResponseDto r in dto.Responses)
         {
             KeyState? state = r.Found
-                ? new KeyState(r.Key, r.CreateRevision, r.ModRevision, r.Lease, false, r.Value is null ? null : Convert.FromBase64String(r.Value))
+                ? new KeyState(r.Key, r.CreateRevision, r.ModRevision, r.Lease, r.Immutable, r.Value is null ? null : Convert.FromBase64String(r.Value))
                 : null;
             responses.Add(new TxnOpResult(ParseOpKind(r.Op), r.Key, state));
         }
