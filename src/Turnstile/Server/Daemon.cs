@@ -179,6 +179,7 @@ public sealed class Daemon
                     CreateRevision: s?.CreateRevision ?? 0,
                     ModRevision: s?.ModRevision ?? 0,
                     Lease: s?.Lease,
+                    Immutable: s?.Immutable ?? false,
                     Value: s?.Value is null ? null : Convert.ToBase64String(s.Value));
             }
 

@@ -45,7 +45,7 @@ public sealed record TxnOpDto(string Op, string Key, string? Value, string? Leas
 public sealed record TxnRequest(TxnCompareDto[]? Compare, TxnOpDto[]? Success, TxnOpDto[]? Failure);
 
 /// <summary>One entry in a txn response — populated for get ops. Value is base64.</summary>
-public sealed record TxnOpResponseDto(string Op, string Key, bool Found, long CreateRevision, long ModRevision, string? Lease, string? Value);
+public sealed record TxnOpResponseDto(string Op, string Key, bool Found, long CreateRevision, long ModRevision, string? Lease, bool Immutable, string? Value);
 
 /// <summary>Response for POST /txn: which branch ran, the store revision, and any get responses.</summary>
 public sealed record TxnResponseDto(bool Succeeded, long Revision, TxnOpResponseDto[] Responses);
