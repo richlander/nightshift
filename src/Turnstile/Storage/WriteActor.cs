@@ -64,7 +64,21 @@ internal sealed class WriteActor : IDisposable
                 // connections and processes, so allocation is globally unique and gapless.
                 long committed = CommittedRevision.Read(_conn);
                 long allocated = committed;
-                long AllocateRevision() => ++allocated;
+
+                // Fail-closed at the ceiling: revisions must never wrap Int64. When the counter already sits
+                // at long.MaxValue, the next revision cannot be produced, so throwing here — before any row is
+                // staged — makes the whole transaction roll back with no row, no committed-revision move, and
+                // no pulse. long.MaxValue itself remains allocatable exactly once (committed == MaxValue - 1).
+                long AllocateRevision()
+                {
+                    if (allocated == long.MaxValue)
+                    {
+                        throw new TurnstileRevisionExhaustedException(
+                            "turnstile: revision space exhausted (committed_revision is at long.MaxValue); refusing to allocate a revision that would overflow Int64.");
+                    }
+
+                    return ++allocated;
+                }
 
                 object? result = job.Work(_conn, AllocateRevision);
 
