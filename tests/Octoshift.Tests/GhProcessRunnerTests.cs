@@ -14,7 +14,12 @@ using Xunit;
 /// containment is best-effort (a tree kill that cannot reach a process that outlived the root), and is not
 /// claimed here. The program name is a seam so these facts are provable against a purpose-built child rather
 /// than only the real binary.
+///
+/// Joins the non-parallel <c>ConsoleCapture</c> collection: the ambient-auth test mutates the process-wide
+/// <c>GH_TOKEN</c> environment variable, so it must not run alongside any other test that reads or redirects
+/// process-global state.
 /// </summary>
+[Collection("ConsoleCapture")]
 public class GhProcessRunnerTests
 {
     [Fact]
@@ -92,7 +97,7 @@ public class GhProcessRunnerTests
         Assert.SkipWhen(OperatingSystem.IsWindows(), "The gh runner path starts a POSIX child here; there is nothing to start on Windows.");
 
         // The launched process would otherwise run for a minute. The runner must not merely stop waiting on
-        // cancellation: it must confirm the token-bearing process it started has actually exited before
+        // cancellation: it must confirm the process it started has actually exited before
         // handing control back. `exec sleep` replaces the shell in place, so the pid the shell recorded is the
         // very process the runner is waiting on.
         string dir = Path.Combine(AppContext.BaseDirectory, $"gh-runner-direct-{Guid.NewGuid():N}");

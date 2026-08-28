@@ -294,9 +294,11 @@ internal static class GhProcessRunner
 internal readonly record struct GhResult(int ExitCode, string Stdout, string Stderr);
 
 /// <summary>
-/// Signals that the runner could not confirm the launched process was terminated during cancellation cleanup.
-/// It is deliberately NOT an <see cref="InvalidOperationException"/>, so the App auth wrapper — which
-/// normalises token-mint/config <see cref="InvalidOperationException"/>s to an unavailable read — cannot
-/// swallow it. A cleanup failure, like cancellation, must reach the caller untouched.
+/// Signals that the runner could not confirm the launched <c>gh</c> process exited during cancellation
+/// cleanup — after a kill was requested, a bounded wait never observed the direct process terminate. It is a
+/// dedicated exception type, distinct from <see cref="InvalidOperationException"/> and
+/// <see cref="OperationCanceledException"/>, so callers that map ordinary failures to an unavailable read
+/// cannot swallow it: a process that may still be alive is not an ordinary unavailable result. Like a
+/// cancellation, it must reach the caller untouched.
 /// </summary>
 internal sealed class GhProcessCleanupException(string message) : Exception(message);
