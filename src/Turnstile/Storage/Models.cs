@@ -105,6 +105,8 @@ public sealed record TxnResult(bool Succeeded, long Revision, IReadOnlyList<TxnO
 /// <summary>
 /// One row of the change log, as streamed to a watcher. A deleted row is a delete event carrying the
 /// previous value; every other row is a put. <see cref="Revision"/> is the row's mod_revision.
+/// <see cref="Immutable"/> is the new key state's immutability and is meaningful for puts only; a delete is a
+/// tombstone transition and always reports <c>false</c> (its previous immutable state is not reconstructed).
 /// </summary>
 public sealed record WatchEvent(
     long Revision,
@@ -112,6 +114,7 @@ public sealed record WatchEvent(
     bool Deleted,
     long CreateRevision,
     string? Lease,
+    bool Immutable,
     byte[]? Value,
     byte[]? PrevValue);
 
