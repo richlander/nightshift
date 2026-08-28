@@ -388,7 +388,10 @@ public sealed class KvStore : IDisposable
                 }
             }
 
-            long revision = maxRev > 0 ? maxRev : CurrentRev(conn);
+            // A write txn reports its own max allocated revision; a read-only/no-op txn reports the durable
+            // committed revision (which, after compaction, can legitimately exceed MAX(kv.id)) read on this
+            // same writer transaction snapshot — never MAX(kv.id), which would lag it.
+            long revision = maxRev > 0 ? maxRev : ReadCommittedRevision(conn);
             return new TxnResult(succeeded, revision, responses);
         });
     }
@@ -510,8 +513,6 @@ public sealed class KvStore : IDisposable
 
         return a.AsSpan().SequenceEqual(b);
     }
-
-    private static long CurrentRev(SqliteConnection conn) => ScalarLong(conn, "SELECT COALESCE(MAX(id), 0) FROM kv;");
 
     /// <summary>
     /// Reads the durable committed revision from the <c>meta</c> singleton. Fails visibly on a missing or
@@ -805,13 +806,6 @@ public sealed class KvStore : IDisposable
         using SqliteCommand cmd = conn.CreateCommand();
         cmd.CommandText = sql;
         cmd.ExecuteNonQuery();
-    }
-
-    private static long ScalarLong(SqliteConnection conn, string sql)
-    {
-        using SqliteCommand cmd = conn.CreateCommand();
-        cmd.CommandText = sql;
-        return Convert.ToInt64(cmd.ExecuteScalar());
     }
 }
 

@@ -95,6 +95,39 @@ public sealed class RevisionPersistenceTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task ReadOnlyTxn_OnAPreservedAboveMaxMeta_ReportsTheDurableRevisionNotMaxKvId()
+    {
+        // The final-round blocker: a no-write txn returned MAX(kv.id), which lags a preserved committed
+        // revision. With rows leaving MAX(kv.id)=1 but committed_revision=10, a read-only txn performed
+        // before the next write must report 10, and the next write then lands at 11.
+        using (KvStore store = KvStore.Open(_dbPath))
+        {
+            await store.CreateAsync("/a", Bytes("1"));
+        }
+
+        SetMeta("10");
+
+        SqliteConnection.ClearAllPools();
+        using (KvStore reopened = KvStore.Open(_dbPath))
+        {
+            TxnResult readOnly = await reopened.TxnAsync([], [new TxnOp(TxnOpKind.Get, "/a", null, null, false)], []);
+            Assert.True(readOnly.Succeeded);
+            Assert.Equal(10, readOnly.Revision);                       // durable revision, not MAX(kv.id)=1
+            Assert.Equal(11, (await reopened.CreateAsync("/b", Bytes("2"))).Revision);
+        }
+    }
+
+    [Fact]
+    public async Task ReadOnlyTxn_OnAFreshStore_ReportsRevisionZero()
+    {
+        using KvStore store = KvStore.Open(_dbPath);
+        TxnResult noop = await store.TxnAsync([], [], []);             // no compares, no ops
+        Assert.True(noop.Succeeded);
+        Assert.Equal(0, noop.Revision);
+        Assert.Equal(0, store.CurrentRevision);
+    }
+
     [Theory]
     [InlineData("garbage")]
     [InlineData("-5")]
