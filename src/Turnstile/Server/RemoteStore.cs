@@ -227,7 +227,10 @@ public sealed class RemoteStore : ITurnstile
                 WatchPutEventDto dto = JsonSerializer.Deserialize(data, TurnstileJson.Default.WatchPutEventDto)!;
                 return new WatchEventMessage(new WatchEvent(
                     dto.ModRevision, dto.Key, Deleted: false, dto.CreateRevision, dto.Lease,
-                    Immutable: dto.Immutable, dto.Value is null ? null : Convert.FromBase64String(dto.Value), PrevValue: null));
+                    dto.Value is null ? null : Convert.FromBase64String(dto.Value), PrevValue: null)
+                {
+                    Immutable = dto.Immutable,
+                });
             }
 
             case "delete":
@@ -235,7 +238,7 @@ public sealed class RemoteStore : ITurnstile
                 WatchDeleteEventDto dto = JsonSerializer.Deserialize(data, TurnstileJson.Default.WatchDeleteEventDto)!;
                 return new WatchEventMessage(new WatchEvent(
                     dto.ModRevision, dto.Key, Deleted: true, CreateRevision: 0, Lease: null,
-                    Immutable: false, Value: null, dto.PrevValue is null ? null : Convert.FromBase64String(dto.PrevValue)));
+                    Value: null, dto.PrevValue is null ? null : Convert.FromBase64String(dto.PrevValue)));
             }
 
             case "sync":

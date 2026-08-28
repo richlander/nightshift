@@ -116,6 +116,35 @@ public sealed class WatchImmutableTests : IDisposable
         Assert.Contains("\"immutable\":true", json);
     }
 
+    [Fact]
+    public void WatchEvent_PreservesSevenFieldConstructorAndDeconstruction()
+    {
+        // The original public positional record contract must survive: seven-argument construction and
+        // seven-value deconstruction still compile, and Immutable is an additive init member defaulting false.
+        var evt = new WatchEvent(5, "/k", false, 3, "lease-1", Bytes("v"), null);
+        Assert.False(evt.Immutable);
+
+        var (revision, key, deleted, createRevision, lease, value, prevValue) = evt;
+        Assert.Equal(5, revision);
+        Assert.Equal("/k", key);
+        Assert.False(deleted);
+        Assert.Equal(3, createRevision);
+        Assert.Equal("lease-1", lease);
+        Assert.Equal("v", Encoding.UTF8.GetString(value!));
+        Assert.Null(prevValue);
+    }
+
+    [Fact]
+    public void WatchEvent_ImmutableParticipatesInEqualityAndWith()
+    {
+        var mutable = new WatchEvent(5, "/k", false, 3, null, Bytes("v"), null);
+        WatchEvent immutable = mutable with { Immutable = true };
+
+        Assert.True(immutable.Immutable);
+        Assert.NotEqual(mutable, immutable);                       // Immutable is part of value equality
+        Assert.Equal(immutable, mutable with { Immutable = true }); // and reproducible via with
+    }
+
     private static async Task<List<WatchEvent>> DrainBacklogAsync(RemoteStore remote, string prefix, CancellationToken ct)
     {
         var events = new List<WatchEvent>();

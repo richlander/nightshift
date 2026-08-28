@@ -248,10 +248,12 @@ public sealed class KvStore : IDisposable
                 Deleted: deleted,
                 CreateRevision: reader.GetInt64(3),
                 Lease: reader.IsDBNull(4) ? null : reader.GetString(4),
-                // Immutable is the new key state's immutability; a delete is a tombstone and reports false.
-                Immutable: !deleted && reader.GetInt64(7) != 0,
                 Value: reader.IsDBNull(5) ? null : (byte[])reader[5],
-                PrevValue: reader.IsDBNull(6) ? null : (byte[])reader[6]));
+                PrevValue: reader.IsDBNull(6) ? null : (byte[])reader[6])
+            {
+                // Immutable is the new key state's immutability; a delete is a tombstone and reports false.
+                Immutable = !deleted && reader.GetInt64(7) != 0,
+            });
         }
 
         return events;

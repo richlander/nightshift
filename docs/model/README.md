@@ -204,8 +204,10 @@ on a logged write.
 ### Scope and known gaps
 
 The model earns its keep on the lease/log/watch core; it is not a certificate for the
-whole store. The watch is now modelled faithfully end to end, but three open defects still
-have no image here, and a passing run says nothing about them:
+whole store. The watch is now modelled faithfully end to end, but several store-level
+concerns still have no image here — some already fixed in the implementation and kept
+below for context (#195, #196, #197), others genuinely open (#198 overflow, and #199's
+cross-instance notification) — and a passing run says nothing about them:
 
 - **#197 — the watch sync boundary (fixed).** This used to be a gap: `WatchAsync` sampled
   its one-shot caught-up revision on a snapshot separate from the event drain, so it could

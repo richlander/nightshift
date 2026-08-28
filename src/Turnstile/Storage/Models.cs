@@ -107,6 +107,8 @@ public sealed record TxnResult(bool Succeeded, long Revision, IReadOnlyList<TxnO
 /// previous value; every other row is a put. <see cref="Revision"/> is the row's mod_revision.
 /// <see cref="Immutable"/> is the new key state's immutability and is meaningful for puts only; a delete is a
 /// tombstone transition and always reports <c>false</c> (its previous immutable state is not reconstructed).
+/// It is an additive init-only member (default <c>false</c>) so the original seven-field primary constructor
+/// and seven-value deconstruction are preserved; PUT mappings set it via an object initializer.
 /// </summary>
 public sealed record WatchEvent(
     long Revision,
@@ -114,9 +116,11 @@ public sealed record WatchEvent(
     bool Deleted,
     long CreateRevision,
     string? Lease,
-    bool Immutable,
     byte[]? Value,
-    byte[]? PrevValue);
+    byte[]? PrevValue)
+{
+    public bool Immutable { get; init; }
+}
 
 /// <summary>A message on a watch stream: either a change event or the one-shot "caught up" marker.</summary>
 public abstract record WatchMessage;
