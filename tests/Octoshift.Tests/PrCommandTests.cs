@@ -95,6 +95,168 @@ public class PrCommandTests
         public string FirstLine() => Report().Split('\n')[0];
     }
 
+    // Shared head-alignment fixture (#185): the initial detailed read sees head A with mergeability still
+    // computing; the mergeability re-read then observes a moved head B. Both `pr` and `waiting` must adopt B
+    // and clear check confidence, never report the stale head A.
+    private const string HeadA = "aaaaaaa1110000000000000000000000000000aa";
+    private const string HeadB = "bbbbbbb2220000000000000000000000000000bb";
+
+    private static PrFacts OnHeadA_MergeabilityComputing()
+        => new()
+        {
+            Number = 4448,
+            HeadSha = HeadA,
+            State = "open",
+            Title = "Wire the widget",
+            MergeableState = "unknown",
+            Checks = [new CheckRunFact("ci", "completed", "success")],
+        };
+
+    private static PrFacts RefreshedOnHeadB_Clean()
+        => new()
+        {
+            Number = 4448,
+            HeadSha = HeadB,
+            State = "open",
+            MergeableState = "clean",
+        };
+
+    private static async Task<PrCommand.PrLocation> LocateWithRefreshAsync(
+        int pr, WaitingCommand.Collection collected, PrFetch fetch, PrFacts? refreshed)
+        => await PrCommand.LocateAsync(
+            pr,
+            collected,
+            FreshHistory(),
+            (_, _) => Task.FromResult(fetch),
+            (_, _) => Task.FromResult(refreshed),
+            DateTimeOffset.UtcNow,
+            TestContext.Current.CancellationToken);
+
+    [Fact]
+    public async Task Locate_WhenMergeabilityRefreshObservesAMovedHead_AdoptsItAndClearsChecks()
+    {
+        // The root-cause regression: pr used to discard the refreshed facts and keep reporting the stale
+        // head A with unknown mergeability. It must now adopt the newer head B (reporting a known-stale head
+        // is false), take the mergeability freshly read for B, and clear check confidence since the checks in
+        // hand were gathered on A.
+        var result = new PrLocationResult(await LocateWithRefreshAsync(
+            4448,
+            Collection([Pane("fernie", "%1", "cp:1", agentState: $"pr=4448 head={HeadA} reviews=2/2 rec=merge", windowName: "pr4448")], ["fernie"]),
+            PrFetch.Found(OnHeadA_MergeabilityComputing()),
+            RefreshedOnHeadB_Clean()));
+
+        PrFacts facts = result.Located.Facts!;
+        Assert.Equal(HeadB, facts.HeadSha);
+        Assert.False(facts.ChecksKnown);
+        Assert.Equal("clean", facts.MergeableState);
+        Assert.Equal("Wire the widget", facts.Title);   // head-independent identity is carried across
+
+        // JSON surface: the head is the moved one, in full.
+        using var doc = JsonDocument.Parse(result.Json());
+        Assert.Equal(HeadB, doc.RootElement.GetProperty("head").GetString());
+
+        // Human surface: the GitHub facts summary shows the moved head, and the checks read on the old head
+        // are called unreadable. (The claim line separately names the agent's now-stale head A as a mismatch,
+        // which is correct — the authoritative facts head and JSON head are B.)
+        string report = result.Report();
+        Assert.Contains($"head {HeadB[..7]}", report, StringComparison.Ordinal);
+        Assert.Contains("checks unreadable", report, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Locate_WhenMergeabilityRefreshKeepsTheHead_GraftsTheFreshMergeability()
+    {
+        // The unchanged-head branch of the same policy: mergeability is grafted onto the complete facts and
+        // the checks stay trusted.
+        PrFacts sameHeadClean = RefreshedOnHeadB_Clean() with { HeadSha = HeadA };
+        var result = new PrLocationResult(await LocateWithRefreshAsync(
+            4448,
+            Collection([Pane("fernie", "%1", "cp:1", agentState: $"pr=4448 head={HeadA} reviews=2/2 rec=merge", windowName: "pr4448")], ["fernie"]),
+            PrFetch.Found(OnHeadA_MergeabilityComputing()),
+            sameHeadClean));
+
+        PrFacts facts = result.Located.Facts!;
+        Assert.Equal(HeadA, facts.HeadSha);
+        Assert.True(facts.ChecksKnown);
+        Assert.Equal("clean", facts.MergeableState);
+    }
+
+    [Fact]
+    public async Task Locate_WhenMovedHeadRefreshIsStillComputing_AdoptsBAndClearsStaleChecks()
+    {
+        // The blocking case both reviewers found: right after a push the re-read observes moved head B with
+        // mergeability still 'unknown'. That non-null re-read must still be adopted — head B, checks dropped
+        // and their confidence cleared — never discarded in favour of head A's trusted green checks (which
+        // would keep pr reporting a stale head that still looks CI-green).
+        PrFacts refreshedBComputing = new() { Number = 4448, HeadSha = HeadB, State = "open", MergeableState = "unknown" };
+        var result = new PrLocationResult(await LocateWithRefreshAsync(
+            4448,
+            Collection([Pane("fernie", "%1", "cp:1", agentState: $"pr=4448 head={HeadA} reviews=2/2 rec=merge", windowName: "pr4448")], ["fernie"]),
+            PrFetch.Found(OnHeadA_MergeabilityComputing()),
+            refreshedBComputing));
+
+        PrFacts facts = result.Located.Facts!;
+        Assert.Equal(HeadB, facts.HeadSha);
+        Assert.False(facts.ChecksKnown);
+        Assert.Empty(facts.Checks);                 // the old head's green check is gone, not carried forward
+        Assert.False(facts.MergeabilityKnown);      // B's mergeability is still computing
+
+        using var doc = JsonDocument.Parse(result.Json());
+        Assert.Equal(HeadB, doc.RootElement.GetProperty("head").GetString());
+        Assert.False(doc.RootElement.GetProperty("mergeable").GetBoolean());
+
+        string report = result.Report();
+        Assert.Contains($"head {HeadB[..7]}", report, StringComparison.Ordinal);
+        Assert.Contains("checks unreadable", report, StringComparison.Ordinal);
+        Assert.DoesNotContain("CI green", report, StringComparison.Ordinal);   // the old head's green CI is gone
+    }
+
+    [Fact]
+    public async Task Locate_WhenSameHeadRefreshShowsMerged_GraftsMergedStatusAndTime()
+    {
+        // Same head, but the PR merged between the two reads. The re-read's current-status fields — Merged,
+        // State, and the merge time — must be grafted, not just MergeableState, so merged-duration reporting
+        // survives.
+        DateTimeOffset mergedAt = DateTimeOffset.UtcNow.AddHours(-2);
+        PrFacts refreshedMerged = new()
+        {
+            Number = 4448, HeadSha = HeadA, State = "closed", Merged = true, MergedAt = mergedAt, MergeableState = "clean",
+        };
+        var result = new PrLocationResult(await LocateWithRefreshAsync(
+            4448,
+            Collection([Pane("fernie", "%1", "cp:1", agentState: $"pr=4448 head={HeadA} reviews=2/2 rec=merge", windowName: "pr4448")], ["fernie"]),
+            PrFetch.Found(OnHeadA_MergeabilityComputing()),
+            refreshedMerged));
+
+        PrFacts facts = result.Located.Facts!;
+        Assert.True(facts.Merged);
+        Assert.Equal(mergedAt, facts.MergedAt);
+
+        using var doc = JsonDocument.Parse(result.Json());
+        Assert.Equal("merged", doc.RootElement.GetProperty("state").GetString());
+        Assert.True(doc.RootElement.TryGetProperty("mergedAt", out _));
+
+        Assert.Contains("merged", result.Report(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Locate_WhenSameHeadRefreshShowsClosed_GraftsClosedStatus()
+    {
+        // Same head, closed without merging between the reads: the closed state must be grafted so the report
+        // does not keep calling an abandoned PR open.
+        PrFacts refreshedClosed = new() { Number = 4448, HeadSha = HeadA, State = "closed", Merged = false, MergeableState = "dirty" };
+        var result = new PrLocationResult(await LocateWithRefreshAsync(
+            4448,
+            Collection([Pane("fernie", "%1", "cp:1", agentState: $"pr=4448 head={HeadA} reviews=2/2 rec=merge", windowName: "pr4448")], ["fernie"]),
+            PrFetch.Found(OnHeadA_MergeabilityComputing()),
+            refreshedClosed));
+
+        PrFacts facts = result.Located.Facts!;
+        Assert.False(facts.Merged);
+        Assert.Equal("closed", facts.State);
+        Assert.Contains("closed without merging", result.Report(), StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task Locate_AFoundPrLeadsWithPrAndSucceeds()
     {

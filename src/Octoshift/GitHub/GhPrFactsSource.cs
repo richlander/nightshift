@@ -86,6 +86,7 @@ internal sealed class GhPrFactsSource
             HeadSha = headSha,
             State = pull.State ?? "open",
             Merged = pull.Merged ?? false,
+            MergedAt = DateTimeOffset.TryParse(pull.MergedAt, out DateTimeOffset mergedAt) ? mergedAt : null,
             MergeableState = pull.MergeableState,
         };
     }

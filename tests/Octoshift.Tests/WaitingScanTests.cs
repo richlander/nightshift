@@ -694,6 +694,69 @@ public class WaitingScanTests
     }
 
     [Fact]
+    public async Task BuildRows_WhenMergeabilityRefreshObservesAMovedHead_AdoptsItAndFailsClosed()
+    {
+        // The shared #185 head-alignment policy on the waiting side: the initial read sees head A with
+        // mergeability still computing, the re-read observes a moved head B. waiting adopts B (its existing
+        // behaviour), so the verdict is evaluated against B — the agent's record, made about A, is now stale
+        // and voids fail-closed, naming the GitHub head B rather than the agent's A.
+        const string headA = "aaaaaaa1110000000000000000000000000000aa";
+        const string headB = "bbbbbbb2220000000000000000000000000000bb";
+
+        PrFacts onA = new() { Number = 4595, HeadSha = headA, State = "open", MergeableState = "unknown", Checks = [new CheckRunFact("ci", "completed", "success")] };
+        PrFacts refreshedB = new() { Number = 4595, HeadSha = headB, State = "open", MergeableState = "clean" };
+
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [Pane("night:1", string.Empty, PaneActivity.Idle, agentState: $"pr=4595 head={headA} reviews=2/2 rec=merge")],
+            (_, _) => Task.FromResult<PrFacts?>(onA),
+            (_, _) => Task.FromResult<PrFacts?>(refreshedB),
+            DateTimeOffset.UtcNow,
+            all: false,
+            TestContext.Current.CancellationToken);
+
+        WaitingRow row = Assert.Single(rows);
+        Assert.Equal(WaitingState.Stale, row.Verdict.State);
+        Assert.True(row.Verdict.NeedsAttention);
+        // The verdict names the moved GitHub head B, never the stale head A — proof the refreshed head was
+        // adopted, matching what `pr` reports for the same head movement.
+        Assert.Contains("GitHub head is b", row.Verdict.Reason, StringComparison.Ordinal);
+        Assert.DoesNotContain("GitHub head is a", row.Verdict.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task BuildRows_WhenMovedHeadRefreshIsStillComputing_StaleChecksCannotStayActionable()
+    {
+        // The blocking case: an agent waiting on checks against head A, whose checks all concluded green on A.
+        // Between the two reads the head moved to B and the re-read's mergeability is still 'unknown'. Before
+        // the fix, waiting discarded that non-null unknown re-read, kept head A's green checks, and reported
+        // "checks concluded" — an actionable clearance built on a head GitHub no longer serves. Adopting B and
+        // clearing the checks voids the record fail-closed instead: the head no longer matches the agent's, so
+        // nothing here may act.
+        const string headA = "aaaaaaa1110000000000000000000000000000aa";
+        const string headB = "bbbbbbb2220000000000000000000000000000bb";
+
+        PrFacts onAChecksGreen = new()
+        {
+            Number = 4595, HeadSha = headA, State = "open", MergeableState = "unknown",
+            Checks = [new CheckRunFact("ci", "completed", "success")],
+        };
+        PrFacts refreshedBComputing = new() { Number = 4595, HeadSha = headB, State = "open", MergeableState = "unknown" };
+
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [Pane("night:1", string.Empty, PaneActivity.Idle, agentState: $"pr=4595 head={headA} waiting=checks")],
+            (_, _) => Task.FromResult<PrFacts?>(onAChecksGreen),
+            (_, _) => Task.FromResult<PrFacts?>(refreshedBComputing),
+            DateTimeOffset.UtcNow,
+            all: false,
+            TestContext.Current.CancellationToken);
+
+        WaitingRow row = Assert.Single(rows);
+        Assert.Equal(WaitingState.Stale, row.Verdict.State);
+        Assert.False(row.Verdict.MayAct);   // the old head's green checks cannot clear the wait
+        Assert.Contains("GitHub head is b", row.Verdict.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task BuildRows_AnUnreadablePaneIsReportedButNeverActionable()
     {
         // The record here is the strongest one the contract allows — head, a clean 2/2, rec=merge — and

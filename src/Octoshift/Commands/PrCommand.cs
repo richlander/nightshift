@@ -355,10 +355,15 @@ internal static class PrCommand
         PrFacts? prFacts = fetched.Facts;
         if (prFacts is not null && !prFacts.MergeabilityKnown && !prFacts.Merged)
         {
-            prFacts = await refreshMergeabilityAsync(prNumber, ct) is { MergeabilityKnown: true } refreshed
-                && string.Equals(refreshed.HeadSha, prFacts.HeadSha, StringComparison.OrdinalIgnoreCase)
-                    ? prFacts with { MergeableState = refreshed.MergeableState }
-                    : prFacts;
+            // Same fail-closed head-alignment policy as waiting: reconcile every non-null re-read. When it
+            // observes a moved head, adopt the newer head (reporting the older one would be a known-stale lie)
+            // and clear check confidence — even if the re-read's own mergeability is still unknown, which is
+            // normal right after a push — rather than discarding it and reporting the stale head with the old
+            // head's trusted checks.
+            if (await refreshMergeabilityAsync(prNumber, ct) is { } refreshed)
+            {
+                prFacts = PrFacts.AlignToRefreshedMergeability(prFacts, refreshed);
+            }
         }
 
         return new PrLocation(prNumber, mine, prFacts, fetched.Status, viewComplete, collected, silence)
