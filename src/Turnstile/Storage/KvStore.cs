@@ -210,6 +210,14 @@ public sealed class KvStore : IDisposable
     public Task<WriteResult> CreateAsync(string key, byte[] value, bool immutable = false, string? lease = null)
     {
         Validate(key, value);
+
+        // Reject the invalid combination up front — before the lease lookup or the writer enqueue — since both
+        // effective values are known here. (InsertRow keeps the same guard as a defensive backstop.)
+        if (immutable && lease is not null)
+        {
+            throw new TurnstileValidationException($"immutable key {key} cannot be attached to a lease");
+        }
+
         return _writer.ExecuteAsync((conn, next) =>
         {
             if (lease is not null && !LeaseIsLive(conn, lease))
@@ -326,6 +334,15 @@ public sealed class KvStore : IDisposable
             {
                 throw new TurnstileValidationException(ov);
             }
+
+            // An explicit immutable+lease put is invalid input, rejected up front alongside key/value the same
+            // way for both branches — before the writer is enqueued, so no transaction is even started. (A put
+            // that only becomes immutable+lease by inheriting a live key's lease can't be seen without reading
+            // state, so ApplyPut rejects that case before allocating a revision.)
+            if (op.Kind is TxnOpKind.Put && op.Immutable && op.Lease is not null)
+            {
+                throw new TurnstileValidationException($"immutable key {op.Key} cannot be attached to a lease");
+            }
         }
 
         return _writer.ExecuteAsync((conn, next) =>
@@ -408,7 +425,6 @@ public sealed class KvStore : IDisposable
         }
 
         LatestRow? latest = ReadLatest(conn, op.Key);
-        long id = next();
         if (latest is LatestRow live && !live.Deleted)
         {
             if (live.Immutable)
@@ -416,11 +432,29 @@ public sealed class KvStore : IDisposable
                 throw new TurnstileValidationException($"cannot modify immutable key {op.Key}");
             }
 
-            InsertRow(conn, id, op.Key, created: false, deleted: false, immutable: op.Immutable || live.Immutable,
-                live.CreateRev, prevRev: live.Id, op.Lease ?? live.Lease, op.Value ?? [], oldValue: live.Value);
-            return id;
+            // Compute the effective row (a put may inherit the live key's lease, or turn it immutable) and
+            // reject an immutable+leased result before allocating a revision or staging a row.
+            bool immutable = op.Immutable || live.Immutable;
+            string? lease = op.Lease ?? live.Lease;
+            if (immutable && lease is not null)
+            {
+                throw new TurnstileValidationException($"immutable key {op.Key} cannot be attached to a lease");
+            }
+
+            long updateId = next();
+            InsertRow(conn, updateId, op.Key, created: false, deleted: false, immutable,
+                live.CreateRev, prevRev: live.Id, lease, op.Value ?? [], oldValue: live.Value);
+            return updateId;
         }
 
+        // Create branch: the explicit immutable+lease combination was already rejected up front in TxnAsync,
+        // but keep the check here so ApplyPut is correct independent of its caller.
+        if (op.Immutable && op.Lease is not null)
+        {
+            throw new TurnstileValidationException($"immutable key {op.Key} cannot be attached to a lease");
+        }
+
+        long id = next();
         InsertRow(conn, id, op.Key, created: true, deleted: false, op.Immutable,
             createRev: id, prevRev: latest?.Id ?? 0, op.Lease, op.Value ?? [], oldValue: null);
         return id;
