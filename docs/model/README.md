@@ -188,7 +188,11 @@ calls `WatchAsync`, and reversing that loop to drain-then-capture would leave it
 capture-before-drain order is a source-order correspondence, established by reading
 `WatchAsync` and by the model's `DrainThenCapture` mutation, and an honest outcome-level
 test of it would need timing or a product seam this suite does not add. So the loop order
-is documented, not test-proven, and the table does not claim otherwise.
+is documented, not test-proven, and the table does not claim otherwise. The *other* half
+of the watch — that the one-shot sync boundary comes from the same snapshot as the events,
+the model's single atomic `rev` (nightshift #197) — is now outcome-tested in
+`SnapshotConsistencyTests`, including a seam-driven commit racing between the boundary
+snapshot and the sync that proves the boundary excludes it and a reconnect does not skip.
 
 `LogIsGapless_RejectedWriteConsumesNoRevision` is the correspondence for #192's
 transaction-local allocation: a rejected write (`Exists`, `NotFound`) returns without
@@ -199,18 +203,20 @@ on a logged write.
 
 ### Scope and known gaps
 
-The model earns its keep on the lease/log/wake-signal core; it is not a certificate for
-the whole store. Four open defects have no image in it, and a passing run says nothing
-about any of them:
+The model earns its keep on the lease/log/watch core; it is not a certificate for the
+whole store. The watch is now modelled faithfully end to end, but three open defects still
+have no image here, and a passing run says nothing about them:
 
-- **#197 — the watch sync boundary.** `NoLostWakeup` covers the wake *signal*, which the
-  shipped `WatchAsync` gets right (it captures `WaitForChangeAsync()` before draining).
-  But `WatchAsync` also emits its one-shot caught-up revision — `WatchSyncMessage(CurrentRevision)`
-  — sampled *after* the drain, on a snapshot separate from the one the events were read on.
-  A commit landing between the final `ReadEvents` and that sample makes the sync advertise a
-  revision whose events were never delivered, so a client resuming from it skips them. `rev`
-  is a single atomic value here that both the drain and the capture read, so the two-snapshot
-  gap is unrepresentable. This model does **not** claim the watch is free of lost events.
+- **#197 — the watch sync boundary (fixed).** This used to be a gap: `WatchAsync` sampled
+  its one-shot caught-up revision on a snapshot separate from the event drain, so it could
+  advertise a revision whose event was never delivered. Since #197 the boundary is the
+  committed revision read in the **same** snapshot as the events (`ReadEventBatch` returns
+  `{ Boundary, Events }`), so a batch shorter than a page has delivered every matching event
+  with `id <= Boundary` and the sync at `Boundary` cannot skip one. The model's single atomic
+  `rev` — read by both the drain and the capture — is now the faithful image of that one
+  snapshot, so `NoLostWakeup` plus the atomic drain correspond to the shipped watch. (The
+  `/kv` range read is made coherent by the same fix but is not modelled here — the model
+  speaks only to the watch, not range.)
 - **#198 — revision overflow.** `rev` is bounded by `MaxRevision` to keep the search finite;
   the Int64 wrap of the real counter is out of scope.
 - **#199 — multiple writers.** `rev` is global and singular; two `KvStore`/`LocalStore`
@@ -220,8 +226,6 @@ about any of them:
   `immutable` being dropped from txn `GET` results and watch events is invisible here.
 
 These are named so the model is read for what it proves and not for what it is silent on.
-Until #197 lands, the honest reading of the watch guarantees is exactly the wake-signal
-property above — nothing broader.
 
 ### Runs
 
