@@ -1,6 +1,7 @@
 namespace Turnstile.Storage;
 
 using System.Collections.Concurrent;
+using System.Globalization;
 using Microsoft.Data.Sqlite;
 
 /// <summary>
@@ -61,9 +62,19 @@ internal sealed class WriteActor : IDisposable
             {
                 long AllocateRevision() => ++allocated;
                 object? result = job.Work(_conn, AllocateRevision);
+
+                // Persist the committed revision in the SAME transaction as the rows it counts, so the durable
+                // meta counter and the kv rows commit and roll back together — a reader can never see one
+                // without the other. A no-op transaction (nothing allocated) leaves the counter untouched.
+                if (allocated > committed)
+                {
+                    PersistRevision(tx, allocated);
+                }
+
                 tx.Commit();
 
-                // Publish the advanced revision only after the commit succeeds, then notify watchers.
+                // The in-memory field is now only the writer-private allocation cursor (the external truth is
+                // the meta counter). Advance it and notify watchers only after the commit succeeds.
                 if (allocated > committed)
                 {
                     Interlocked.Exchange(ref _revision, allocated);
@@ -92,6 +103,16 @@ internal sealed class WriteActor : IDisposable
                 job.Tcs.SetException(ex);
             }
         }
+    }
+
+    private void PersistRevision(SqliteTransaction tx, long revision)
+    {
+        using SqliteCommand cmd = _conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "UPDATE meta SET v = $v WHERE k = $k;";
+        cmd.Parameters.AddWithValue("$v", revision.ToString(CultureInfo.InvariantCulture));
+        cmd.Parameters.AddWithValue("$k", Schema.CommittedRevisionKey);
+        cmd.ExecuteNonQuery();
     }
 
     public void Dispose()

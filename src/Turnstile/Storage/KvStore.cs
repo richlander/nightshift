@@ -20,8 +20,18 @@ public sealed class KvStore : IDisposable
         _changed = changed;
     }
 
-    /// <summary>The highest committed revision.</summary>
-    public long CurrentRevision => _writer.Revision;
+    /// <summary>The highest committed revision, read from the durable <c>meta</c> counter that is advanced in
+    /// the same transaction as the rows it counts — so it can never lag a committed row a reader can already
+    /// see (status, range, and the watch one-shot sync all read through this).</summary>
+    public long CurrentRevision
+    {
+        get
+        {
+            using var conn = new SqliteConnection(_readConnectionString);
+            conn.Open();
+            return ReadCommittedRevision(conn);
+        }
+    }
 
     /// <summary>Opens (creating if needed) the store at <paramref name="dbPath"/> in WAL mode.</summary>
     public static KvStore Open(string dbPath)
@@ -40,7 +50,9 @@ public sealed class KvStore : IDisposable
         Execute(writeConn, "PRAGMA busy_timeout=5000;");
         Schema.Ensure(writeConn);
 
-        long startRevision = ScalarLong(writeConn, "SELECT COALESCE(MAX(id), 0) FROM kv;");
+        // The durable committed revision is the allocation base for the writer and the external truth for
+        // readers. Read it once here to seed the writer's private counter; readers go to meta directly.
+        long startRevision = ReadCommittedRevision(writeConn);
         var changed = new ChangeSignal();
         var writer = new WriteActor(writeConn, startRevision, changed.Pulse);
 
@@ -500,6 +512,33 @@ public sealed class KvStore : IDisposable
     }
 
     private static long CurrentRev(SqliteConnection conn) => ScalarLong(conn, "SELECT COALESCE(MAX(id), 0) FROM kv;");
+
+    /// <summary>
+    /// Reads the durable committed revision from the <c>meta</c> singleton. Fails visibly on a missing or
+    /// unparseable value rather than silently resetting to zero — a corrupt counter is a bug to surface, not
+    /// to paper over by re-deriving a number that could rewind the log.
+    /// </summary>
+    private static long ReadCommittedRevision(SqliteConnection conn)
+    {
+        using SqliteCommand cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT v FROM meta WHERE k = $k;";
+        cmd.Parameters.AddWithValue("$k", Schema.CommittedRevisionKey);
+        object? raw = cmd.ExecuteScalar();
+        if (raw is null or DBNull)
+        {
+            throw new InvalidOperationException(
+                $"turnstile: the '{Schema.CommittedRevisionKey}' meta row is missing; refusing to guess the revision.");
+        }
+
+        string text = (string)raw;
+        if (!long.TryParse(text, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out long revision))
+        {
+            throw new InvalidOperationException(
+                $"turnstile: the committed-revision meta value '{text}' is not a valid non-negative integer.");
+        }
+
+        return revision;
+    }
 
     // ---- lease layer ---------------------------------------------------------------------------
     // A lease groups lifetime: on expiry or revoke, every attached key is deleted (a tombstone,
