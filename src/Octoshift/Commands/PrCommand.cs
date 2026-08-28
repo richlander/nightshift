@@ -50,8 +50,7 @@ internal static class PrCommand
             }
         }
 
-        using GhRunnerSession gh = GhRunnerFactory.Create();
-        var facts = new GhFleetPrFactsSource(repos, new FileConditionalCache(), gh.Run);
+        var facts = new GhFleetPrFactsSource(repos, new FileConditionalCache(), GhProcessRunner.RunGhAsync);
 
         try
         {
