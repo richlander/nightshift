@@ -116,8 +116,8 @@ stored, on the server clock. `RemoteStore` fabricates one from the *client* cloc
 long expiresAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds() + dto.Ttl;
 ```
 
-Its comment concedes the value is "informational only — keepalive returns authoritative
-remaining TTL", but nothing in the type says which of the two a caller is holding. The
+Its comment concedes the value is "informational only", but nothing in the type says which
+of the two a caller is holding. The
 `ClientComputedDeadline` mutation models that fabricated value: `HandedBack` becomes a
 number computed on the client clock (`Skew` is the client's offset from the server,
 positive meaning it leads), and `BeliefMatchesStoredDeadline` fails because that number is
@@ -138,8 +138,14 @@ later than the enforced one by the request/queue/write/response delay (the same 
 caller-visible lifetime note describes). This model does not represent it: `CreateLease`
 is one atomic step with no request/response delivery, so it neither certifies nor refutes
 that consequence. The takeaway stands regardless: `RemoteStore.ExpiresAt` is informational
-and must never be treated as the enforced server deadline — keepalive's authoritative
-remaining TTL is the only safe basis for a renewal decision.
+and must never be treated as the enforced server deadline. Nor is keepalive's returned TTL
+one: `KeepAlive` stores `floor(serverNow) + ttl` and returns the nominal `ttl`, and by the
+time the client receives it the same queue/write/response delay has run, so the number is
+already stale and may even have expired. What *is* authoritative is keepalive **success**
+itself, and only at the server's transaction instant — it means the lease was live and the
+renewal committed then; a **failure** means ownership is already lost. A renewal cadence
+must therefore act on success/failure, not on the returned number, and budget for second
+truncation plus every delay above.
 
 ### Checked properties
 

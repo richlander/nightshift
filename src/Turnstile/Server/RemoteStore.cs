@@ -132,8 +132,11 @@ public sealed class RemoteStore : ITurnstile
     {
         using var content = new StringContent($"{{\"ttl\":{ttlSecs}}}", System.Text.Encoding.UTF8, "application/json");
         LeaseCreatedResponse dto = await GetJsonAsync(await _http.PostAsync("/lease", content, ct), TurnstileJson.Default.LeaseCreatedResponse, ct);
-        // The wire response omits expires_at; approximate it from the local clock (informational only —
-        // keepalive returns authoritative remaining TTL).
+        // The wire response omits expires_at; approximate it from the local clock. This is a client-clock
+        // estimate, not the enforced deadline: the server stored floor(serverNow)+ttl and this adds ttl to the
+        // client's now after the round trip. Keepalive SUCCESS confirms the renewal committed while the lease
+        // was live, but only at the server's transaction instant; its returned TTL is nominal (already stale by
+        // the time it arrives), so it is not a safe wall-clock budget.
         long expiresAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds() + dto.Ttl;
         return new LeaseInfo(dto.Id, dto.Ttl, expiresAt);
     }
