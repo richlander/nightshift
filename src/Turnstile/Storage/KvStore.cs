@@ -617,7 +617,10 @@ public sealed class KvStore : IDisposable
     private static void TombstoneAttachedKey(SqliteConnection conn, Func<long> next, string key)
     {
         LatestRow? latest = ReadLatest(conn, key);
-        // Immutable keys are never deleted, preserving the immutability invariant even under a lease.
+        // An immutable key is never deleted. With immutable+lease rejected at write time (see InsertRow), no
+        // validly-created immutable key is ever attached to a lease, so this branch is unreachable for current
+        // data; it stays as a defensive guard so that even a legacy row written before that rule can never be
+        // silently deleted by lease expiry.
         if (latest is not LatestRow live || live.Deleted || live.Immutable)
         {
             return;
@@ -691,6 +694,18 @@ public sealed class KvStore : IDisposable
         SqliteConnection conn, long id, string key, bool created, bool deleted, bool immutable,
         long createRev, long prevRev, string? lease, byte[]? value, byte[]? oldValue)
     {
+        // Invariant: an immutable key can never carry a lease. A lease ending deletes every key attached to
+        // it (see TombstoneAttachedKey), but an immutable key is never deleted — so the combination would
+        // orphan the immutable key when its lease row is removed, contradicting the lease contract. This is
+        // the one point every write converges (direct create, txn put, and a txn that flips a leased mutable
+        // key to immutable), so rejecting it here closes every entry path at once. A rejected write throws
+        // before its INSERT and the enclosing transaction rolls back, so no state changes and no revision is
+        // consumed.
+        if (immutable && lease is not null)
+        {
+            throw new TurnstileValidationException($"immutable key {key} cannot be attached to a lease");
+        }
+
         using SqliteCommand cmd = conn.CreateCommand();
         cmd.CommandText = """
             INSERT INTO kv (id, key, created, deleted, immutable, create_rev, prev_rev, lease, value, old_value)
