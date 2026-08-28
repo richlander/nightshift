@@ -164,8 +164,16 @@ CREATE TABLE lease (
   expires_at   INTEGER NOT NULL                    -- unix seconds, SERVER clock
 );
 
-CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);    -- compact_revision
+CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);    -- committed_revision, compact_revision
 ```
+
+`meta` holds two durable singletons keyed by name: `committed_revision`, the highest committed revision,
+advanced **in the same transaction** as the `kv` rows it counts (so a reader — status, range, or the watch
+one-shot sync — can never report below a committed row it can already see, and a rolled-back write neither
+advances nor exposes it); and `compact_revision` (below). `committed_revision` is the external source of
+truth for the current revision — the single-writer actor keeps a private in-memory copy only as its
+allocation base — and it is backfilled from `MAX(kv.id)` when opening a database written before the key
+existed.
 
 **Three properties fall out, and they are the reason for this shape:**
 
