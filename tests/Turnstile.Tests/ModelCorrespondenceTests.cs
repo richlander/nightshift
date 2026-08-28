@@ -31,7 +31,9 @@ public class ModelCorrespondenceTests : IDisposable
     /// TLA+ <c>LogIsGapless</c>: every revision the store hands out is a row in the log. The model has no
     /// action for a rejected write that consumes a revision — <c>PutRejected</c> exists only under the
     /// <c>FailedWriteConsumesRevision</c> mutation, which violates the property. A gap matters because a
-    /// watcher resuming across it waits for an event that is never coming.
+    /// watcher resuming across it waits for an event that is never coming. This is the correspondence for
+    /// #192's transaction-local allocation: a rejected write returns without advancing the counter, and the
+    /// committed revision is persisted atomically with its rows so a rolled-back write leaves no phantom.
     /// </summary>
     [Fact]
     public async Task LogIsGapless_RejectedWriteConsumesNoRevision()
@@ -117,6 +119,12 @@ public class ModelCorrespondenceTests : IDisposable
     /// commit racing the drain still completes the captured task. The <c>DrainThenCapture</c> mutation
     /// reverses the two lines and the property fails.
     /// </summary>
+    /// <remarks>
+    /// This covers the wake <em>signal</em> ordering only, which the shipped code satisfies. It is not the
+    /// whole watch story: <c>WatchAsync</c> emits its one-shot caught-up <c>WatchSyncMessage(CurrentRevision)</c>
+    /// sampled on a snapshot separate from the event drain, so it can advertise a revision whose events were
+    /// not delivered — a real, current defect (nightshift #197) that neither this test nor the model covers.
+    /// </remarks>
     [Fact]
     public async Task NoLostWakeup_SignalCapturedBeforeTheDrainStillFires()
     {
