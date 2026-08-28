@@ -20,9 +20,20 @@ public sealed class WriteActorTests : IDisposable
         var conn = new SqliteConnection($"Data Source={_dbPath}");
         conn.Open();
         using SqliteCommand cmd = conn.CreateCommand();
-        cmd.CommandText = "CREATE TABLE IF NOT EXISTS log(id INTEGER PRIMARY KEY, v TEXT);";
+        cmd.CommandText = """
+            CREATE TABLE IF NOT EXISTS log(id INTEGER PRIMARY KEY, v TEXT);
+            CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+            INSERT OR IGNORE INTO meta (k, v) VALUES ('committed_revision', '0');
+            """;
         cmd.ExecuteNonQuery();
         return conn;
+    }
+
+    private static long MetaRevision(SqliteConnection c)
+    {
+        using SqliteCommand cmd = c.CreateCommand();
+        cmd.CommandText = "SELECT v FROM meta WHERE k = 'committed_revision';";
+        return long.Parse((string)cmd.ExecuteScalar()!, System.Globalization.CultureInfo.InvariantCulture);
     }
 
     private static void Insert(SqliteConnection c, long id, string v)
@@ -71,6 +82,7 @@ public sealed class WriteActorTests : IDisposable
         await Assert.ThrowsAsync<TurnstileValidationException>(() => jobA);
         Assert.Equal(0, writer.Revision);            // unadvanced after rollback
         Assert.Equal(0, committedNotifications);     // a rolled-back write notifies no watcher
+        Assert.Equal(0, MetaRevision(_conn));        // the durable counter rolled back with the row
 
         // The next committed write reuses the revision the rolled-back transaction had allocated. A resume
         // cursor left at 0 therefore sees this event at revision 1 rather than skipping it.
@@ -84,6 +96,7 @@ public sealed class WriteActorTests : IDisposable
         Assert.Equal(1, idB);
         Assert.Equal(1, writer.Revision);            // published only now, post-commit
         Assert.Equal(1, committedNotifications);
+        Assert.Equal(1, MetaRevision(_conn));        // durable counter advanced atomically with the row
 
         // Revision 1 is the committed 'B'; 'A' never persisted.
         using SqliteCommand check = _conn.CreateCommand();
