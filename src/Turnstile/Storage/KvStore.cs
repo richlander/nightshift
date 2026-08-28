@@ -13,6 +13,14 @@ public sealed class KvStore : IDisposable
     private readonly WriteActor _writer;
     private readonly ChangeSignal _changed;
 
+    /// <summary>
+    /// Test seam (issue #197): invoked once inside <see cref="WatchAsync"/> after a catch-up batch's boundary
+    /// snapshot has been taken but before the one-shot sync is yielded. A test sets it to commit a racing
+    /// change in exactly the window the old split-snapshot order left open, proving the sync boundary excludes
+    /// that change and a reconnect from it does not skip. Null (the default) in production.
+    /// </summary>
+    internal Func<Task>? OnCaughtUpBeforeSyncForTests { get; set; }
+
     private KvStore(string readConnectionString, WriteActor writer, ChangeSignal changed)
     {
         _readConnectionString = readConnectionString;
@@ -77,10 +85,29 @@ public sealed class KvStore : IDisposable
 
     /// <summary>Scans live keys under a prefix in lexicographic order.</summary>
     public IReadOnlyList<KeyState> Range(string prefix, int limit = 0, bool keysOnly = false)
+        => RangeSnapshot(prefix, limit, keysOnly).Items;
+
+    /// <summary>
+    /// Scans live keys under a prefix and returns them together with the durable committed revision that
+    /// describes <em>exactly that snapshot</em>, both read in one explicit SQLite read transaction. Any caller
+    /// that publishes a revision alongside range items must use this, so the two can never come from different
+    /// snapshots — the split that let a range advertise revision N without the state at N (issue #197). The
+    /// transaction spans only materialization: the rows are fully read before it ends, and nothing is held
+    /// across an await.
+    /// </summary>
+    internal RangeReadResult RangeSnapshot(string prefix, int limit = 0, bool keysOnly = false)
     {
         using var conn = new SqliteConnection(_readConnectionString);
         conn.Open();
+        using SqliteTransaction tx = conn.BeginTransaction(deferred: true);
+        long revision = ReadCommittedRevision(conn);
+        IReadOnlyList<KeyState> items = ReadRangeRows(conn, prefix, limit, keysOnly);
+        tx.Commit();
+        return new RangeReadResult(revision, items);
+    }
 
+    private static IReadOnlyList<KeyState> ReadRangeRows(SqliteConnection conn, string prefix, int limit, bool keysOnly)
+    {
         using SqliteCommand cmd = conn.CreateCommand();
         string? end = Keys.PrefixEnd(prefix);
         string bound = end is null ? string.Empty : " AND k.key < $end";
@@ -132,18 +159,47 @@ public sealed class KvStore : IDisposable
     {
         using var conn = new SqliteConnection(_readConnectionString);
         conn.Open();
+        return ReadEventRows(conn, prefix, fromExclusive, limit, boundary: null);
+    }
 
+    /// <summary>
+    /// Reads one batch of change-log events together with the committed boundary that batch was taken against,
+    /// both in one explicit read transaction. The events are bounded by that boundary, so a batch that returns
+    /// fewer than <paramref name="limit"/> rows has delivered <em>every</em> matching event with
+    /// <c>id &lt;= Boundary</c> — which is exactly the condition under which a watcher may advertise a sync at
+    /// <c>Boundary</c> without skipping an event. Reading the boundary and the events on separate snapshots is
+    /// what let a sync advertise a revision whose event was never delivered (issue #197).
+    /// </summary>
+    internal EventBatch ReadEventBatch(string prefix, long fromExclusive, int limit)
+    {
+        using var conn = new SqliteConnection(_readConnectionString);
+        conn.Open();
+        using SqliteTransaction tx = conn.BeginTransaction(deferred: true);
+        long boundary = ReadCommittedRevision(conn);
+        IReadOnlyList<WatchEvent> events = ReadEventRows(conn, prefix, fromExclusive, limit, boundary);
+        tx.Commit();
+        return new EventBatch(boundary, events);
+    }
+
+    private static IReadOnlyList<WatchEvent> ReadEventRows(
+        SqliteConnection conn, string prefix, long fromExclusive, int limit, long? boundary)
+    {
         string? end = Keys.PrefixEnd(prefix);
         using SqliteCommand cmd = conn.CreateCommand();
         cmd.CommandText = $"""
             SELECT id, key, deleted, create_rev, lease, value, old_value
             FROM kv
-            WHERE id > $from AND key >= $start{(end is null ? string.Empty : " AND key < $end")}
+            WHERE id > $from{(boundary is null ? string.Empty : " AND id <= $boundary")} AND key >= $start{(end is null ? string.Empty : " AND key < $end")}
             ORDER BY id
             {(limit > 0 ? "LIMIT $limit" : string.Empty)};
             """;
         cmd.Parameters.AddWithValue("$from", fromExclusive);
         cmd.Parameters.AddWithValue("$start", prefix);
+        if (boundary is not null)
+        {
+            cmd.Parameters.AddWithValue("$boundary", boundary.Value);
+        }
+
         if (end is not null)
         {
             cmd.Parameters.AddWithValue("$end", end);
@@ -181,9 +237,17 @@ public sealed class KvStore : IDisposable
     /// <summary>
     /// Streams the change log under <paramref name="prefix"/> starting after <paramref name="fromExclusive"/>:
     /// the backlog as <see cref="WatchEventMessage"/>s, then a one-shot <see cref="WatchSyncMessage"/> when
-    /// caught up, then live events as they commit. Runs until <paramref name="ct"/> is cancelled. The wake
-    /// signal is captured before each drain so a commit racing the drain is never missed.
+    /// caught up, then live events as they commit. Runs until <paramref name="ct"/> is cancelled.
     /// </summary>
+    /// <remarks>
+    /// Two orderings make this sound (issue #197). The wake signal is captured <em>before</em> each drain, so a
+    /// commit racing the drain still completes the captured task and wakes the next loop. And the sync boundary
+    /// is the committed revision read in the <em>same snapshot</em> as the batch that caught up: a batch shorter
+    /// than the page size has delivered every matching event with <c>id &lt;= Boundary</c>, so a sync at
+    /// <c>Boundary</c> never advertises a revision whose event was not yet emitted. A commit landing after that
+    /// final snapshot has <c>id &gt; Boundary</c>; the sync does not cover it and the pre-captured signal
+    /// delivers it on the next loop, so it is never skipped.
+    /// </remarks>
     public async IAsyncEnumerable<WatchMessage> WatchAsync(
         string prefix,
         long fromExclusive,
@@ -196,22 +260,32 @@ public sealed class KvStore : IDisposable
         {
             Task changed = WaitForChangeAsync();
 
-            IReadOnlyList<WatchEvent> batch;
-            do
+            while (true)
             {
-                batch = ReadEvents(prefix, cursor, 256);
-                foreach (WatchEvent e in batch)
+                EventBatch batch = ReadEventBatch(prefix, cursor, 256);
+                foreach (WatchEvent e in batch.Events)
                 {
                     yield return new WatchEventMessage(e);
                     cursor = e.Revision;
                 }
-            }
-            while (batch.Count == 256);
 
-            if (!synced)
-            {
-                yield return new WatchSyncMessage(CurrentRevision);
-                synced = true;
+                if (batch.Events.Count < 256)
+                {
+                    // Caught up to this snapshot's boundary: every matching event <= Boundary has been emitted,
+                    // so a one-shot sync at Boundary cannot skip one. Events past it wake the next loop.
+                    if (!synced)
+                    {
+                        if (OnCaughtUpBeforeSyncForTests is { } hook)
+                        {
+                            await hook().ConfigureAwait(false);
+                        }
+
+                        yield return new WatchSyncMessage(batch.Boundary);
+                        synced = true;
+                    }
+
+                    break;
+                }
             }
 
             await changed.WaitAsync(ct).ConfigureAwait(false);

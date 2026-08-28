@@ -88,16 +88,16 @@ public sealed class Daemon
 
         app.MapGet("/kv", (KvStore store, string? prefix, int? limit, bool? keys_only) =>
         {
-            IReadOnlyList<KeyState> rows = store.Range(prefix ?? "/", limit ?? 0, keys_only ?? false);
-            RangeItem[] items = new RangeItem[rows.Count];
-            for (int i = 0; i < rows.Count; i++)
+            RangeReadResult range = store.RangeSnapshot(prefix ?? "/", limit ?? 0, keys_only ?? false);
+            RangeItem[] items = new RangeItem[range.Items.Count];
+            for (int i = 0; i < range.Items.Count; i++)
             {
-                KeyState r = rows[i];
+                KeyState r = range.Items[i];
                 items[i] = new RangeItem(r.Key, r.CreateRevision, r.ModRevision, r.Lease, r.Immutable,
                     r.Value is null ? null : Convert.ToBase64String(r.Value));
             }
 
-            return Results.Json(new RangeResponse(store.CurrentRevision, items), TurnstileJson.Default.RangeResponse);
+            return Results.Json(new RangeResponse(range.Revision, items), TurnstileJson.Default.RangeResponse);
         });
 
         app.MapGet("/kv/{**key}", (string key, HttpContext ctx, KvStore store) =>

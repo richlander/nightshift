@@ -123,3 +123,16 @@ public sealed record WatchEventMessage(WatchEvent Event) : WatchMessage;
 
 /// <summary>Emitted once when the backlog drains: the watcher is caught up to <see cref="Revision"/>.</summary>
 public sealed record WatchSyncMessage(long Revision) : WatchMessage;
+
+/// <summary>
+/// A range read and the committed revision that describes exactly its snapshot, read in one transaction so a
+/// caller never publishes a revision from a snapshot other than the one the items came from (issue #197).
+/// </summary>
+internal readonly record struct RangeReadResult(long Revision, IReadOnlyList<KeyState> Items);
+
+/// <summary>
+/// One page of change-log events and the committed <see cref="Boundary"/> the page was read against, in one
+/// snapshot. A page shorter than the requested limit has delivered every matching event with
+/// <c>id &lt;= Boundary</c>, which is when a watcher may safely sync at <see cref="Boundary"/>.
+/// </summary>
+internal readonly record struct EventBatch(long Boundary, IReadOnlyList<WatchEvent> Events);
