@@ -182,4 +182,22 @@ internal sealed record PrFacts
     /// <summary>Finds a check run by name, case-insensitively.</summary>
     public CheckRunFact? FindCheck(string name)
         => Checks.FirstOrDefault(c => string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// The one fail-closed head-alignment policy shared by <c>waiting</c> and <c>pr</c> so both report the
+    /// same head and the same confidence after a mergeability re-read. <paramref name="current"/> is the
+    /// complete facts from the initial detailed read; <paramref name="refreshed"/> is the second, mergeability
+    /// re-read of the same PR (which may observe a moved head).
+    ///
+    /// When the head is unchanged, the freshly computed mergeability is grafted onto the complete facts. When
+    /// the head moved between the two reads, the newer head is adopted — continuing to report the older head
+    /// would be a known-stale lie — together with the mergeability freshly read for it; but the check runs in
+    /// hand were gathered on the <em>old</em> head, so their confidence is cleared
+    /// (<see cref="ChecksKnown"/> = false, no check runs) until facts for the new head are complete. The PR
+    /// title is head-independent identity, so it is carried across rather than blanked by a moved head.
+    /// </summary>
+    public static PrFacts AlignToRefreshedMergeability(PrFacts current, PrFacts refreshed)
+        => string.Equals(current.HeadSha, refreshed.HeadSha, StringComparison.OrdinalIgnoreCase)
+            ? current with { MergeableState = refreshed.MergeableState }
+            : refreshed with { ChecksKnown = false, Title = current.Title };
 }

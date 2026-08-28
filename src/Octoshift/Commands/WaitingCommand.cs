@@ -757,17 +757,15 @@ internal static class WaitingCommand
                 continue;
             }
 
-            // Only graft when the PR has not moved between the two reads. Otherwise the answer belongs to
-            // a different head, and pairing it with the old snapshot would report the agent's head as
-            // mergeable on the strength of a newer one. The resolution wrapper (searched/found repos) is
-            // preserved either way, so the row still names where the PR was located.
+            // Reconcile the re-read under the one shared fail-closed head-alignment policy: graft the fresh
+            // mergeability when the head held, or adopt the newer head and clear check confidence when it
+            // moved. The resolution wrapper (searched/found repos) is preserved either way, so the row still
+            // names where the PR was located.
             PrFetch located = seen[prNumber];
             PrFacts current = located.Facts!;
             seen[prNumber] = located with
             {
-                Facts = string.Equals(current.HeadSha, refreshed.HeadSha, StringComparison.OrdinalIgnoreCase)
-                    ? current with { MergeableState = refreshed.MergeableState }
-                    : refreshed with { ChecksKnown = false },
+                Facts = PrFacts.AlignToRefreshedMergeability(current, refreshed),
             };
         }
 
