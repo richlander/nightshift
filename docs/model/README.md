@@ -118,11 +118,19 @@ long expiresAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds() + dto.Ttl;
 
 Its comment concedes the value is "informational only — keepalive returns authoritative
 remaining TTL", but nothing in the type says which of the two a caller is holding. The
-`ClientComputedDeadline` mutation asks what a caller that trusts it concludes when its
-clock trails the server's, and the answer is that it believes it holds a lock past the
-point the server has already reaped: `BeliefMatchesStoredDeadline` fails, and with that
-invariant removed so it cannot mask the consequence, `NeverReapBelievedLease` fails too.
-This is a hazard in the type's shape rather than a bug in either store.
+`ClientComputedDeadline` mutation models that fabricated value: `HandedBack` becomes a
+number computed on the client clock (`Skew` is the client's offset from the server,
+positive meaning it leads), and `BeliefMatchesStoredDeadline` fails because that number is
+not the stored deadline the store will enforce.
+
+That is the whole finding — a hazard in the type's shape, not a reaping harm. An earlier
+draft claimed the holder believes it holds the lock past the point the server reaps, and
+that does not hold up: a constant client/server offset **cancels** when the same client
+both computes `clientNow + ttl` and later checks its own clock against that deadline, so
+at the server's physical expiry the client's clock has reached its computed deadline too.
+Asserting otherwise compares a client-clock timestamp to a server-clock instant across
+domains, which is not a real contract, so the model makes no such claim (the
+`NeverReapBelievedLease` property and its config were removed for exactly this reason).
 
 ### Checked properties
 
@@ -133,8 +141,7 @@ This is a hazard in the type's shape rather than a bug in either store.
 | A sweep never reaps a lease that is live | `NeverReapLiveLease` |
 | Writes naming an expired lease are refused | `NoWriteUnderExpiredLease` |
 | A parked watcher that is behind always has a reason to wake | `NoLostWakeup` |
-| The deadline a holder is handed is the one that will be enforced | `BeliefMatchesStoredDeadline` |
-| Keys are never reaped inside the window their holder was promised | `NeverReapBelievedLease` |
+| The deadline a holder is handed is the same number the store will enforce | `BeliefMatchesStoredDeadline` |
 | A lease granted for Ttl seconds stays live for Ttl seconds | `LeaseHonoursItsTtl` |
 | A key stops being live only by way of a log row | `RemovalIsLoggedStep` |
 | The log only grows | `RevisionNeverDecreasesStep` |
@@ -157,8 +164,16 @@ store, so the model is not describing a system nobody built:
 | `NoWriteUnderExpiredLease` | `NoWriteUnderExpiredLease_PutUnderAnExpiredLeaseIsRefused` |
 | `RemovalIsLoggedStep` | `RemovalIsLoggedStep_ExpiryTombstonesThroughTheLog` |
 | `LiveKeysHaveALeaseRow` | `LiveKeysHaveALeaseRow_RevokeTakesTheKeysWithIt` |
-| `NoLostWakeup` | `NoLostWakeup_SignalCapturedBeforeTheDrainStillFires` |
 | `BeliefMatchesStoredDeadline` | `BeliefMatchesStoredDeadline_LocalLeaseReportsTheDeadlineItEnforces` |
+
+`NoLostWakeup` is deliberately absent from this table. The one test near it —
+`ChangeSignal_PulseCapturedBeforeACommitIsNotLost` — exercises the `ChangeSignal` primitive
+(a pulse captured before a commit is not lost), not `WatchAsync`'s loop order: it never
+calls `WatchAsync`, and reversing that loop to drain-then-capture would leave it green. The
+capture-before-drain order is a source-order correspondence, established by reading
+`WatchAsync` and by the model's `DrainThenCapture` mutation, and an honest outcome-level
+test of it would need timing or a product seam this suite does not add. So the loop order
+is documented, not test-proven, and the table does not claim otherwise.
 
 `LogIsGapless_RejectedWriteConsumesNoRevision` is the correspondence for #192's
 transaction-local allocation: a rejected write (`Exists`, `NotFound`) returns without
@@ -231,7 +246,6 @@ clean exit means the gate has gone vacuous.
 | `TurnstileExpiryBoundaryOff.cfg` | Write guard admits a lease on the tick the sweeper deletes it | `NoWriteUnderExpiredLease` |
 | `TurnstileFailedWriteConsumesRevision.cfg` | A rejected write consumes a revision | `LogIsGapless` |
 | `TurnstileClientComputedDeadline.cfg` | Holder's deadline computed on a client clock | `BeliefMatchesStoredDeadline` |
-| `TurnstileClientComputedDeadlineReap.cfg` | The same, with the cause invariant removed | `NeverReapBelievedLease` |
 
 `TurnstileSubSecond.cfg` is listed separately because it is not a mutation: it runs
 `Mutation = "None"` and fails, which makes it a finding rather than a gate.

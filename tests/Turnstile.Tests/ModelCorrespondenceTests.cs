@@ -5,17 +5,24 @@ using Turnstile.Storage;
 using Xunit;
 
 /// <summary>
-/// Each test here corresponds to one property in <c>docs/model/Turnstile.tla</c>, checked against the
-/// real store rather than the model.
+/// Each test here corresponds to a property in <c>docs/model/Turnstile.tla</c>, checked against the real
+/// store rather than the model.
 /// </summary>
 /// <remarks>
 /// A model that has been checked exhaustively proves things about the model. It says nothing about the
 /// code unless the correspondence is demonstrated, and an unchecked correspondence is how a specification
-/// ends up describing a system nobody built. These are named for the TLA+ definitions they mirror so a
-/// change to either side has an obvious counterpart to update.
+/// ends up describing a system nobody built. Most tests here exercise the state-level property directly
+/// (a rejected write consumes no revision; an expiry tombstones through the log).
+///
+/// One correspondence is not state-level and is not claimed to be: <c>WatchAsync</c>'s capture-before-drain
+/// loop order is a source-order fact, exercised at the level of the <c>ChangeSignal</c> primitive it relies
+/// on (<see cref="ChangeSignal_PulseCapturedBeforeACommitIsNotLost"/>) and by the model's
+/// <c>DrainThenCapture</c> mutation — not by an outcome-level test of the loop itself, which would need
+/// timing or a product seam this does not add. So not every named test demonstrates the full production
+/// property; where it does not, the summary says so.
 ///
 /// The model is the authority on what a lease holder may conclude; these tests are the evidence that the
-/// C# agrees.
+/// C# agrees where a test can carry that weight.
 /// </remarks>
 public class ModelCorrespondenceTests : IDisposable
 {
@@ -114,23 +121,26 @@ public class ModelCorrespondenceTests : IDisposable
     }
 
     /// <summary>
-    /// TLA+ <c>NoLostWakeup</c>: a parked watcher that is behind the log always has a pending reason to
-    /// wake. <c>WatchAsync</c> gets that by capturing the change signal <em>before</em> draining, so a
-    /// commit racing the drain still completes the captured task. The <c>DrainThenCapture</c> mutation
-    /// reverses the two lines and the property fails.
+    /// The <c>ChangeSignal</c> primitive that TLA+ <c>NoLostWakeup</c> abstracts: a pulse captured before a
+    /// commit is not lost — the task the watcher will park on has already completed by the time it awaits.
+    /// This is the primitive <c>WatchAsync</c> relies on by capturing <c>WaitForChangeAsync()</c> before it
+    /// drains.
     /// </summary>
     /// <remarks>
-    /// This covers the wake <em>signal</em> ordering only, which the shipped code satisfies. It is not the
-    /// whole watch story: <c>WatchAsync</c> emits its one-shot caught-up <c>WatchSyncMessage(CurrentRevision)</c>
-    /// sampled on a snapshot separate from the event drain, so it can advertise a revision whose events were
-    /// not delivered — a real, current defect (nightshift #197) that neither this test nor the model covers.
+    /// It tests the primitive, NOT <c>WatchAsync</c>'s loop order: this test never calls <c>WatchAsync</c>,
+    /// and reversing that loop to drain-then-capture would leave it green. The capture-before-drain ordering
+    /// itself is a source-order correspondence, verified by reading <c>WatchAsync</c> and by the model's
+    /// <c>DrainThenCapture</c> mutation — not proven here. Nor does anything here touch the separate
+    /// sync-boundary defect (nightshift #197), where <c>WatchSyncMessage(CurrentRevision)</c> is sampled on a
+    /// snapshot apart from the event drain and can advertise undelivered events.
     /// </remarks>
     [Fact]
-    public async Task NoLostWakeup_SignalCapturedBeforeTheDrainStillFires()
+    public async Task ChangeSignal_PulseCapturedBeforeACommitIsNotLost()
     {
         using KvStore store = Open();
 
-        // Capture first, exactly as the watch loop does, then commit. The pulse must not be missed.
+        // Capture first, exactly as the watch loop does before draining, then commit. The pulse must not be
+        // missed: the captured task is already complete when the watcher would await it.
         Task changed = store.WaitForChangeAsync();
         await store.CreateAsync("/k", Bytes("v"));
 
