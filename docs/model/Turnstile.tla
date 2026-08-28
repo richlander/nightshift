@@ -60,9 +60,13 @@
    Also out of scope, so the model must not be read as covering them:
      - revision overflow (#198): `rev` is bounded by MaxRevision for a finite state
        space; the Int64 wrap of the real counter is not represented.
-     - a single writer/counter is assumed. Two KvStore/LocalStore instances over one
-       file, each caching its own revision base, is a distinct hazard (#199) with no
-       image here -- `rev` is global and singular.
+     - cross-instance watch *notification*. Revision *allocation* across independently
+       opened instances is now globally serialized -- each writer reads the durable
+       committed revision under BEGIN IMMEDIATE as its base, never a cached value -- so
+       the model's single global `rev` faithfully abstracts it (#199). What the model
+       still does not cover is notification: each instance's change signal is in-memory,
+       so a watcher on one instance is not woken by another instance's commit. That is a
+       distinct gap, not addressed by #199.
      - the wire: fields dropped in serialization (txn GET and watch events omitting
        `immutable`, #195/#196) are a protocol concern the abstract state vector does
        not carry.
