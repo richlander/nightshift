@@ -37,15 +37,16 @@
    without any liveness machinery. This is the wake-*signal* ordering only, and the
    shipped code gets it right: `WaitForChangeAsync()` is captured before the drain.
 
-   It is NOT the whole watch story. `WatchAsync` also emits a one-shot "caught up"
-   revision -- `WatchSyncMessage(CurrentRevision)` -- sampled *after* the drain, on a
-   read connection separate from the one the drain read events on. A commit landing
-   between the final `ReadEvents` and that sample makes the sync advertise a revision N
-   whose events were never delivered, so a client that resumes from N skips them. That
-   is a real, current defect (nightshift #197), and this model does not represent it:
-   `rev` here is a single atomic value that both the drain and the capture read, so the
-   two-snapshot gap has no image in the state vector. `NoLostWakeup` must therefore be
-   read as covering the wake signal, not as certifying the watch free of lost events.
+   The watch also emits a one-shot "caught up" revision -- `WatchSyncMessage`. Since
+   nightshift #197 that boundary is the committed revision read in the *same* snapshot as
+   the events the drain returned, so a batch shorter than a page has delivered every
+   matching event with `id <= Boundary` and the sync at `Boundary` cannot advertise a
+   revision whose event was not delivered. The model's single atomic `rev` -- read by
+   both the drain (which advances `cursor`) and the capture -- is the faithful image of
+   that one snapshot: there is no two-snapshot gap to represent because the code no longer
+   has one. `NoLostWakeup` and the atomic drain together correspond to the shipped watch.
+   (The `/kv` range read -- items plus their revision, made coherent by the same #197 fix
+   -- is not modelled here at all; the model speaks only to the watch.)
 
    Scope: keys, leases and revisions are abstract. Deliberately NOT modeled -- SQLite
    semantics, WAL behaviour, the txn compare/branch language, prefix ranges, key and
@@ -57,9 +58,6 @@
    the tests that exercise it.
 
    Also out of scope, so the model must not be read as covering them:
-     - the watch sync boundary (#197): the caught-up revision is sampled on a snapshot
-       separate from the event drain, so it can advertise events it did not deliver.
-       `rev` is one atomic value here, which has no image of that two-snapshot gap.
      - revision overflow (#198): `rev` is bounded by MaxRevision for a finite state
        space; the Int64 wrap of the real counter is not represented.
      - a single writer/counter is assumed. Two KvStore/LocalStore instances over one

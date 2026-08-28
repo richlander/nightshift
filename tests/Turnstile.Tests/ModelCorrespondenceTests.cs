@@ -130,9 +130,10 @@ public class ModelCorrespondenceTests : IDisposable
     /// It tests the primitive, NOT <c>WatchAsync</c>'s loop order: this test never calls <c>WatchAsync</c>,
     /// and reversing that loop to drain-then-capture would leave it green. The capture-before-drain ordering
     /// itself is a source-order correspondence, verified by reading <c>WatchAsync</c> and by the model's
-    /// <c>DrainThenCapture</c> mutation — not proven here. Nor does anything here touch the separate
-    /// sync-boundary defect (nightshift #197), where <c>WatchSyncMessage(CurrentRevision)</c> is sampled on a
-    /// snapshot apart from the event drain and can advertise undelivered events.
+    /// <c>DrainThenCapture</c> mutation — not proven here. The separate sync-boundary property (nightshift
+    /// #197) — that the one-shot sync is the committed revision read in the same snapshot as the events, so it
+    /// cannot advertise an undelivered one — is now fixed and is exercised at outcome level in
+    /// <c>SnapshotConsistencyTests</c>.
     /// </remarks>
     [Fact]
     public async Task ChangeSignal_PulseCapturedBeforeACommitIsNotLost()
