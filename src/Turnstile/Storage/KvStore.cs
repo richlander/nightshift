@@ -37,7 +37,7 @@ public sealed class KvStore : IDisposable
         {
             using var conn = new SqliteConnection(_readConnectionString);
             conn.Open();
-            return ReadCommittedRevision(conn);
+            return CommittedRevision.Read(conn);
         }
     }
 
@@ -58,11 +58,8 @@ public sealed class KvStore : IDisposable
         Execute(writeConn, "PRAGMA busy_timeout=5000;");
         Schema.Ensure(writeConn);
 
-        // The durable committed revision is the allocation base for the writer and the external truth for
-        // readers. Read it once here to seed the writer's private counter; readers go to meta directly.
-        long startRevision = ReadCommittedRevision(writeConn);
         var changed = new ChangeSignal();
-        var writer = new WriteActor(writeConn, startRevision, changed.Pulse);
+        var writer = new WriteActor(writeConn, changed.Pulse);
 
         string readConnectionString = new SqliteConnectionStringBuilder
         {
@@ -111,7 +108,7 @@ public sealed class KvStore : IDisposable
         using var conn = new SqliteConnection(_readConnectionString);
         conn.Open();
         using SqliteTransaction tx = conn.BeginTransaction(deferred: true);
-        long revision = ReadCommittedRevision(conn);
+        long revision = CommittedRevision.Read(conn);
         RunAfterBoundarySeam(afterBoundaryRead);
         IReadOnlyList<KeyState> items = ReadRangeRows(conn, prefix, limit, keysOnly);
         tx.Commit();
@@ -204,7 +201,7 @@ public sealed class KvStore : IDisposable
         using var conn = new SqliteConnection(_readConnectionString);
         conn.Open();
         using SqliteTransaction tx = conn.BeginTransaction(deferred: true);
-        long boundary = ReadCommittedRevision(conn);
+        long boundary = CommittedRevision.Read(conn);
         RunAfterBoundarySeam(afterBoundaryRead);
         IReadOnlyList<WatchEvent> events = ReadEventRows(conn, prefix, fromExclusive, limit, boundary);
         tx.Commit();
@@ -495,7 +492,7 @@ public sealed class KvStore : IDisposable
             // A write txn reports its own max allocated revision; a read-only/no-op txn reports the durable
             // committed revision (which, after compaction, can legitimately exceed MAX(kv.id)) read on this
             // same writer transaction snapshot — never MAX(kv.id), which would lag it.
-            long revision = maxRev > 0 ? maxRev : ReadCommittedRevision(conn);
+            long revision = maxRev > 0 ? maxRev : CommittedRevision.Read(conn);
             return new TxnResult(succeeded, revision, responses);
         });
     }
@@ -616,33 +613,6 @@ public sealed class KvStore : IDisposable
         }
 
         return a.AsSpan().SequenceEqual(b);
-    }
-
-    /// <summary>
-    /// Reads the durable committed revision from the <c>meta</c> singleton. Fails visibly on a missing or
-    /// unparseable value rather than silently resetting to zero — a corrupt counter is a bug to surface, not
-    /// to paper over by re-deriving a number that could rewind the log.
-    /// </summary>
-    private static long ReadCommittedRevision(SqliteConnection conn)
-    {
-        using SqliteCommand cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT v FROM meta WHERE k = $k;";
-        cmd.Parameters.AddWithValue("$k", Schema.CommittedRevisionKey);
-        object? raw = cmd.ExecuteScalar();
-        if (raw is null or DBNull)
-        {
-            throw new InvalidOperationException(
-                $"turnstile: the '{Schema.CommittedRevisionKey}' meta row is missing; refusing to guess the revision.");
-        }
-
-        string text = (string)raw;
-        if (!long.TryParse(text, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out long revision))
-        {
-            throw new InvalidOperationException(
-                $"turnstile: the committed-revision meta value '{text}' is not a valid non-negative integer.");
-        }
-
-        return revision;
     }
 
     // ---- lease layer ---------------------------------------------------------------------------
