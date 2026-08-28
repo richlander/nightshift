@@ -206,8 +206,8 @@ on a logged write.
 The model earns its keep on the lease/log/watch core; it is not a certificate for the
 whole store. The watch is now modelled faithfully end to end, but several store-level
 concerns still have no image here — some already fixed in the implementation and kept
-below for context (#195, #196, #197), others genuinely open (#198 overflow, and #199's
-cross-instance notification) — and a passing run says nothing about them:
+below for context (#195, #196, #197, #198), and #199's cross-instance notification, which
+remains genuinely open — and a passing run says nothing about their wire/value specifics:
 
 - **#197 — the watch sync boundary (fixed).** This used to be a gap: `WatchAsync` sampled
   its one-shot caught-up revision on a snapshot separate from the event drain, so it could
@@ -219,8 +219,15 @@ cross-instance notification) — and a passing run says nothing about them:
   snapshot, so `NoLostWakeup` plus the atomic drain correspond to the shipped watch. (The
   `/kv` range read is made coherent by the same fix but is not modelled here — the model
   speaks only to the watch, not range.)
-- **#198 — revision overflow.** `rev` is bounded by `MaxRevision` to keep the search finite;
-  the Int64 wrap of the real counter is out of scope.
+- **#198 — revision overflow (fixed).** The Int64 *value* of the ceiling is not modelled —
+  `rev` is bounded by `MaxRevision` only to keep the search finite. But the *shape* the
+  bound enforces is now the faithful image of the implementation: once the ceiling is
+  reached no revision-allocating action fires, and a multi-row action that would cross it
+  (`rev + n <= MaxRevision`) does not fire at all rather than partially applying. The real
+  allocator is fail-closed to match — at `long.MaxValue` it throws and rolls the whole
+  transaction back with no row, no committed-revision move, and no pulse, while reads and
+  no-op transactions stay valid and `long.MaxValue` is allocatable exactly once (enforced
+  by `RevisionOverflowTests`). What the model does not certify is the specific 2^63 limit.
 - **#199 — multiple writers (allocation fixed; notification is the remaining gap).**
   Revision *allocation* across independently opened `KvStore`/`LocalStore` instances over one
   file is now globally serialized — each writer reads the durable committed revision under
