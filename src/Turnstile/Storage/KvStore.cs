@@ -96,14 +96,34 @@ public sealed class KvStore : IDisposable
     /// across an await.
     /// </summary>
     internal RangeReadResult RangeSnapshot(string prefix, int limit = 0, bool keysOnly = false)
+        => RangeSnapshot(prefix, limit, keysOnly, afterBoundaryRead: null);
+
+    /// <summary>
+    /// Test-seam overload (issue #197): <paramref name="afterBoundaryRead"/> runs once inside the read
+    /// transaction, after the boundary SELECT has established the snapshot but before the range rows are read.
+    /// A test commits through the writer there to prove the committed change never enters this snapshot — the
+    /// returned revision and items both predate it — which fails if the explicit transaction is removed or the
+    /// two reads stop sharing it. Null (the default) in production; the WAL read snapshot lets the writer
+    /// commit without deadlock.
+    /// </summary>
+    internal RangeReadResult RangeSnapshot(string prefix, int limit, bool keysOnly, Func<Task>? afterBoundaryRead)
     {
         using var conn = new SqliteConnection(_readConnectionString);
         conn.Open();
         using SqliteTransaction tx = conn.BeginTransaction(deferred: true);
         long revision = ReadCommittedRevision(conn);
+        RunAfterBoundarySeam(afterBoundaryRead);
         IReadOnlyList<KeyState> items = ReadRangeRows(conn, prefix, limit, keysOnly);
         tx.Commit();
         return new RangeReadResult(revision, items);
+    }
+
+    private static void RunAfterBoundarySeam(Func<Task>? seam)
+    {
+        if (seam is { } run)
+        {
+            run().GetAwaiter().GetResult();
+        }
     }
 
     private static IReadOnlyList<KeyState> ReadRangeRows(SqliteConnection conn, string prefix, int limit, bool keysOnly)
@@ -171,11 +191,21 @@ public sealed class KvStore : IDisposable
     /// what let a sync advertise a revision whose event was never delivered (issue #197).
     /// </summary>
     internal EventBatch ReadEventBatch(string prefix, long fromExclusive, int limit)
+        => ReadEventBatch(prefix, fromExclusive, limit, afterBoundaryRead: null);
+
+    /// <summary>
+    /// Test-seam overload (issue #197): <paramref name="afterBoundaryRead"/> runs once inside the read
+    /// transaction, after the boundary SELECT has established the snapshot but before the events are read, so a
+    /// test can prove a commit there never enters this snapshot — the boundary and events both predate it.
+    /// Null in production.
+    /// </summary>
+    internal EventBatch ReadEventBatch(string prefix, long fromExclusive, int limit, Func<Task>? afterBoundaryRead)
     {
         using var conn = new SqliteConnection(_readConnectionString);
         conn.Open();
         using SqliteTransaction tx = conn.BeginTransaction(deferred: true);
         long boundary = ReadCommittedRevision(conn);
+        RunAfterBoundarySeam(afterBoundaryRead);
         IReadOnlyList<WatchEvent> events = ReadEventRows(conn, prefix, fromExclusive, limit, boundary);
         tx.Commit();
         return new EventBatch(boundary, events);

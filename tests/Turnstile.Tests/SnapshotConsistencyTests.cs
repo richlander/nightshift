@@ -138,6 +138,58 @@ public sealed class SnapshotConsistencyTests : IDisposable
         Assert.Empty(store.ReadEventBatch("/watched/", batch.Boundary, 256).Events);
     }
 
+    [Fact]
+    public async Task Range_CommitBetweenBoundaryAndRows_EntersNeitherRevisionNorItems()
+    {
+        // The mutation-killing gate: force a commit in the exact window between the boundary SELECT (which
+        // establishes the read snapshot) and the range row query. With the shared read transaction, that
+        // commit is outside the snapshot, so the returned revision AND items both predate it. If the explicit
+        // transaction is removed — or the two reads stop sharing it — the row query runs on a newer snapshot
+        // and reintroduces a key newer than the returned revision, which the assertions below reject.
+        using KvStore store = Open();
+        await store.CreateAsync("/a", Bytes("1"));   // rev 1
+
+        long racedRevision = 0;
+        RangeReadResult range = store.RangeSnapshot("/", 0, false, afterBoundaryRead: async () =>
+        {
+            WriteResult w = await store.CreateAsync("/b", Bytes("2"));   // rev 2, committed through the writer
+            racedRevision = w.Revision;
+        });
+
+        Assert.Equal(2, racedRevision);                                  // the racing commit did land
+        Assert.Equal(1, range.Revision);                                 // ... but not in this snapshot
+        KeyState item = Assert.Single(range.Items);
+        Assert.Equal("/a", item.Key);
+        Assert.All(range.Items, i => Assert.True(i.ModRevision <= range.Revision));
+
+        // Afterwards the store sees the committed new state — the writer was never blocked.
+        Assert.Equal(2, store.CurrentRevision);
+        Assert.NotNull(store.Get("/b"));
+    }
+
+    [Fact]
+    public async Task Watch_CommitBetweenBoundaryAndEvents_EntersNeitherBoundaryNorEvents()
+    {
+        // The same gate for the event batch: a commit between the boundary SELECT and the events query must
+        // not enter the batch's snapshot, so boundary and events both predate it.
+        using KvStore store = Open();
+        await store.CreateAsync("/a", Bytes("1"));   // rev 1
+
+        EventBatch batch = store.ReadEventBatch("/", 0, 256, afterBoundaryRead: async () =>
+        {
+            await store.CreateAsync("/b", Bytes("2"));   // rev 2 races inside the snapshot window
+        });
+
+        Assert.Equal(1, batch.Boundary);
+        WatchEvent only = Assert.Single(batch.Events);
+        Assert.Equal(1, only.Revision);
+        Assert.All(batch.Events, e => Assert.True(e.Revision <= batch.Boundary));
+
+        // The racing event is delivered on reconnect from the boundary, never skipped.
+        EventBatch reconnect = store.ReadEventBatch("/", batch.Boundary, 256);
+        Assert.Contains(reconnect.Events, ev => ev.Key == "/b" && ev.Revision == 2);
+    }
+
     public void Dispose()
     {
         SqliteConnection.ClearAllPools();
