@@ -724,6 +724,39 @@ public class WaitingScanTests
     }
 
     [Fact]
+    public async Task BuildRows_WhenMovedHeadRefreshIsStillComputing_StaleChecksCannotStayActionable()
+    {
+        // The blocking case: an agent waiting on checks against head A, whose checks all concluded green on A.
+        // Between the two reads the head moved to B and the re-read's mergeability is still 'unknown'. Before
+        // the fix, waiting discarded that non-null unknown re-read, kept head A's green checks, and reported
+        // "checks concluded" — an actionable clearance built on a head GitHub no longer serves. Adopting B and
+        // clearing the checks voids the record fail-closed instead: the head no longer matches the agent's, so
+        // nothing here may act.
+        const string headA = "aaaaaaa1110000000000000000000000000000aa";
+        const string headB = "bbbbbbb2220000000000000000000000000000bb";
+
+        PrFacts onAChecksGreen = new()
+        {
+            Number = 4595, HeadSha = headA, State = "open", MergeableState = "unknown",
+            Checks = [new CheckRunFact("ci", "completed", "success")],
+        };
+        PrFacts refreshedBComputing = new() { Number = 4595, HeadSha = headB, State = "open", MergeableState = "unknown" };
+
+        IReadOnlyList<WaitingRow> rows = await WaitingCommand.BuildRowsAsync(
+            [Pane("night:1", string.Empty, PaneActivity.Idle, agentState: $"pr=4595 head={headA} waiting=checks")],
+            (_, _) => Task.FromResult<PrFacts?>(onAChecksGreen),
+            (_, _) => Task.FromResult<PrFacts?>(refreshedBComputing),
+            DateTimeOffset.UtcNow,
+            all: false,
+            TestContext.Current.CancellationToken);
+
+        WaitingRow row = Assert.Single(rows);
+        Assert.Equal(WaitingState.Stale, row.Verdict.State);
+        Assert.False(row.Verdict.MayAct);   // the old head's green checks cannot clear the wait
+        Assert.Contains("GitHub head is b", row.Verdict.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task BuildRows_AnUnreadablePaneIsReportedButNeverActionable()
     {
         // The record here is the strongest one the contract allows — head, a clean 2/2, rec=merge — and
