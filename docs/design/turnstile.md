@@ -127,7 +127,9 @@ Not a kernel feature — a **design vocabulary** — but it determines what the 
 > **Immutable and ephemeral are mutually exclusive.** An immutable key cannot be attached to a lease.
 > Immutability means the key is *never* deleted; a lease exists precisely to *delete* what it holds when the
 > holder dies. The two contracts contradict — an immutable leased key would outlive its lease as an orphan —
-> so the combination is rejected at write time (`400`), on every path that could create it (see §6).
+> so the combination is rejected at write time (`400`), on every path that could create it (see §6). This
+> constrains *new* writes; it is not a migration. A row written before the rule that is both immutable and
+> leased keeps its immutability and so may outlive lease removal — see the lease-deletion note in §6.
 
 A controller reconciling its own derived state is the *sole* authority. There is no one to race. CAS there is pure ceremony. **Where there's no race, CAS is noise. Where there is one, it's mandatory. Where there shouldn't be a writer at all, the key is immutable.**
 
@@ -328,7 +330,7 @@ loop:
 
 **This is the most important idea in Turnstile.**
 
-A lease has a TTL. Keys may be **attached** to it. On expiry or revoke, **all attached keys are deleted** — every one of them, since an immutable key can never be attached to a lease (§3), so nothing attached is exempt from deletion — which writes tombstones, which **emit `delete` events on the watch.**
+A lease has a TTL. Keys may be **attached** to it. On expiry or revoke, **all attached keys are deleted** — which writes tombstones, which **emit `delete` events on the watch.** No *validly written* key is exempt: immutable+lease is rejected at write time (§3), so a current database has no immutable leased key to strand. One caveat for a legacy database: a row written before that rule that is both immutable and leased is intentionally **skipped** by deletion (an immutable key is never deleted) and so survives its lease. That is a pre-existing row, not something a new write can produce, and it is left as-is rather than migrated.
 
 Therefore:
 
@@ -423,13 +425,13 @@ The things the tests exist to prove.
 2. **Conditional writes are linearizable.** N concurrent claimants of one key ⇒ exactly one succeeds.
 3. **No lost events.** A watcher from revision `R` sees *every* matching mutation with `id > R`, exactly once, in revision order.
 4. **No phantom events.** A watcher never sees a rolled-back mutation.
-5. **Lease expiry emits exactly one delete event per attached key.** Every attached key is deletable, because immutable+lease is rejected at write time (invariant 11), so none is left orphaned.
+5. **Lease expiry emits exactly one delete event per attached key.** Every *validly attached* key is deletable, because immutable+lease is rejected at write time (invariant 11); a legacy immutable+leased row is the one exception and is intentionally skipped rather than deleted (§6).
 6. **Compaction never destroys the latest live row for any key.**
 7. **A watch from a compacted revision fails loudly (`410`)** rather than silently skipping history.
 8. **Crash recovery is clean.** `kill -9` mid-write leaves no torn state; the revision counter resumes correctly.
 9. **Immutable keys cannot be mutated by anyone, ever.**
 10. **Turnstile opens no outbound sockets.**
-11. **Immutable and lease are mutually exclusive.** Creating or attaching a key that is both immutable and leased — via create, txn put, or making a leased key immutable — is rejected (`400`) before any state change, so no immutable key can outlive its lease.
+11. **Immutable and lease are mutually exclusive for new writes.** Creating or attaching a key that is both immutable and leased — via create, txn put, or making a leased key immutable — is rejected (`400`) before any state change, so no *newly written* immutable key can outlive its lease. This is not retroactive: a row written before the rule that is both immutable and leased keeps its immutability and may survive lease removal (§6), and is not migrated.
 
 ---
 
