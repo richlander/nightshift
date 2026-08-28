@@ -62,7 +62,24 @@ from `HardeningTests`:
 > a successful keepalive means the key was never reaped out from under it; a failed one
 > means it is gone and must not be re-acquired.
 
-Three things came out of checking it.
+Four things came out of checking it, and the first is a defect in shipped code.
+
+**A lease does not last as long as it says.** `KvStore.Now()` truncates to whole
+seconds, but the instant a lease is granted at does not, so `Now() + ttlSecs` is short
+by however much of the current second has already elapsed. A one-second lease granted
+partway through a second is live for less than a second — in the limit, for
+microseconds. `Grain` is the number of clock sub-ticks per stored second; at `Grain = 1`
+the two collapse and `LeaseHonoursItsTtl` holds trivially, which is why the base
+configuration does not catch it. `TurnstileSubSecond.cfg` sets `Grain = 2` and the
+invariant fails against `Mutation = "None"` — the real design — in three steps: tick to
+mid-second, grant, and the lease is half the length it was asked for.
+
+This is not hypothetical. It is the root cause of the flaky suite fixed in #177, where
+five tests created one-second leases and did setup work under them. Those were repaired
+on the test side; the store behaviour is unchanged, and the consequence for a *client*
+is the part that has not been addressed — a renewal cadence derived from the TTL must
+assume `Ttl - 1` seconds, not `Ttl`, or the holder can lose its lease early. Tracked in
+#189.
 
 **The clock is not monotonic, and the design survives that anyway.** Expiry is evaluated
 against `DateTimeOffset.UtcNow`, which is wall time: NTP or an operator can move it
@@ -108,6 +125,7 @@ This is a hazard in the type's shape rather than a bug in either store.
 | A parked watcher that is behind always has a reason to wake | `NoLostWakeup` |
 | The deadline a holder is handed is the one that will be enforced | `BeliefMatchesStoredDeadline` |
 | Keys are never reaped inside the window their holder was promised | `NeverReapBelievedLease` |
+| A lease granted for Ttl seconds stays live for Ttl seconds | `LeaseHonoursItsTtl` |
 | A key stops being live only by way of a log row | `RemovalIsLoggedStep` |
 | The log only grows | `RevisionNeverDecreasesStep` |
 | A cursor advances, and never past what is committed | `CursorAdvancesSoundlyStep` |
@@ -132,8 +150,12 @@ violations, in a few seconds.
 
 | Configuration | Clock may step back | Result |
 | --- | --- | --- |
-| `Turnstile.cfg` | yes | No error — 390,517 states, 72,163 distinct, depth 18 |
+| `Turnstile.cfg` | yes | No error — 558,208 states, 106,978 distinct, depth 18 |
 | `TurnstileSplitSweepMonotonic.cfg` | no | No error — 315,718 states, 88,849 distinct, depth 18 |
+
+The base configuration runs at `Grain = 1`, which assumes every TTL is full length. That
+assumption is false on the real clock, and removing it is what
+`TurnstileSubSecond.cfg` does.
 
 The second is a contrast, not a gate: it is the same defect as `TurnstileSplitSweep.cfg`
 with the clock forced to behave, and it passes. It is recorded to show that the mutation
@@ -153,6 +175,13 @@ clean exit means the gate has gone vacuous.
 | `TurnstileFailedWriteConsumesRevision.cfg` | A rejected write consumes a revision | `LogIsGapless` |
 | `TurnstileClientComputedDeadline.cfg` | Holder's deadline computed on a client clock | `BeliefMatchesStoredDeadline` |
 | `TurnstileClientComputedDeadlineReap.cfg` | The same, with the cause invariant removed | `NeverReapBelievedLease` |
+
+`TurnstileSubSecond.cfg` is listed separately because it is not a mutation: it runs
+`Mutation = "None"` and fails, which makes it a finding rather than a gate.
+
+| Configuration | What it removes | Violation |
+| --- | --- | --- |
+| `TurnstileSubSecond.cfg` | The assumption that a TTL is full length | `LeaseHonoursItsTtl` |
 
 All were run with `-workers 1` and produced their named violation. State counts for
 mutations are not recorded: the first violating state is not deterministic across runs.

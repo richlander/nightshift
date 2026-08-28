@@ -45,13 +45,21 @@
    re-acquisition -- is a rule about client code, not about the store, and stays with
    the tests that exercise it.
 
-   The clock is the server clock, in whole ticks, matching the whole-second truncation
-   in KvStore.Now(). Ttl >= 1 is assumed so that a live lease's deadline is always
+   The fourth question is the clock's resolution. KvStore.Now() truncates to whole
+   seconds, but the instant a lease is granted at does not, so a deadline of
+   `Now() + ttlSecs` is short by however much of the current second has already elapsed.
+   Grain is the number of clock sub-ticks per stored second: at Grain = 1 the two
+   collapse and every TTL is full length, which is the assumption `LeaseHonoursItsTtl`
+   fails without. Ttl >= 1 is assumed so that a live lease's deadline is always
    distinguishable from the absent-lease sentinel.
 
    Status: parsed cleanly with SANY and model-checked with TLC 2.19 against
-   Turnstile.cfg -- no errors, 390,517 states generated, 72,163 distinct, depth 18,
-   zero violations (a few seconds). The base configuration deliberately enables
+   Turnstile.cfg -- no errors, 558,208 states generated, 106,978 distinct, depth 18,
+   zero violations (a few seconds). One configuration is a finding rather than a gate:
+   TurnstileSubSecond.cfg raises Grain to 2 and violates LeaseHonoursItsTtl against
+   Mutation = "None", because a lease granted partway through a second is short by the
+   part already elapsed -- the root cause of the flaky suite fixed in #177, tracked
+   for the store side in #189. The base configuration deliberately enables
    AllowClockStepBack: the server clock is DateTimeOffset.UtcNow, which is wall time and
    can move backwards, and the design is meant to tolerate that. It does, because the
    sweep's selection and its deletion are one transaction on the write actor.
@@ -76,7 +84,8 @@ EXTENDS Integers, FiniteSets
 CONSTANTS
     Keys,               \* abstract keys; a lock is one of these attached to a lease
     Leases,             \* abstract lease ids
-    Ttl,                \* lease lifetime in whole ticks
+    Ttl,                \* lease lifetime, in whole seconds -- the unit the lease table stores
+    Grain,              \* clock sub-ticks per whole second; 1 assumes every TTL is full length
     Skew,               \* how far a remote client's clock trails the server's
     AllowClockStepBack, \* whether the server clock may run backwards
     MaxTime,            \* bound the clock so the state space is finite
@@ -90,6 +99,7 @@ Mutations == {"None", "SplitSweep", "LazyExpiry", "DrainThenCapture",
 ASSUME /\ Keys \subseteq (Nat \ {0})
        /\ Leases \subseteq (Nat \ {0})
        /\ Ttl \in (Nat \ {0})
+       /\ Grain \in (Nat \ {0})
        /\ Skew \in Nat
        /\ AllowClockStepBack \in BOOLEAN
        /\ MaxTime \in Nat
@@ -101,8 +111,9 @@ ASSUME /\ Keys \subseteq (Nat \ {0})
 Nothing == 0
 
 VARIABLES
-    now,                \* server clock, in ticks
-    expiry,             \* lease id -> deadline on the SERVER clock, Nothing when absent
+    now,                \* server clock, in sub-ticks (see Second below)
+    expiry,             \* lease id -> deadline in whole seconds on the SERVER clock, Nothing when absent
+    grantedAt,          \* lease id -> the sub-tick at which that deadline was handed out
     belief,             \* lease id -> the deadline its holder was handed, 0 when it holds none
     live,               \* the set of keys currently live
     owner,              \* key -> the lease it is attached to, or Nothing
@@ -115,11 +126,17 @@ VARIABLES
     scanned,            \* leases a split sweep has scanned but not yet applied
     reapedLive,         \* set once a sweep has reaped a lease that was live at the time
     wroteUnderExpired,  \* set once a write was accepted naming an already-expired lease
-
     reapedBelieved      \* set once a sweep reaped keys whose holder's deadline had not arrived
 
-vars == << now, expiry, belief, live, owner, rev, logRows, lastDel, cursor, captured,
-           wstate, scanned, reapedLive, wroteUnderExpired, reapedBelieved >>
+vars == << now, expiry, grantedAt, belief, live, owner, rev, logRows, lastDel, cursor,
+           captured, wstate, scanned, reapedLive, wroteUnderExpired, reapedBelieved >>
+
+\* The clock advances in sub-ticks; the lease table stores whole seconds. KvStore.Now()
+\* is `DateTimeOffset.UtcNow.ToUnixTimeSeconds()`, so every deadline it writes is
+\* truncated to a second boundary while the instant it was computed at was not. Grain = 1
+\* collapses the two and assumes every TTL is full length, which is the assumption
+\* TurnstileSubSecond.cfg removes.
+Second(t) == t \div Grain
 
 \* The deadline handed back to the holder. KvStore returns the value it stored, on the
 \* server clock. RemoteStore does not: it fabricates one from the *client* clock as
@@ -127,7 +144,9 @@ vars == << now, expiry, belief, live, owner, rev, logRows, lastDel, cursor, capt
 \* the value is "informational only". Nothing in the LeaseInfo type says which of the
 \* two a caller is holding, so ClientComputedDeadline asks what a caller that trusts it
 \* would conclude when its clock trails the server's.
-HandedBack == IF Mutation = "ClientComputedDeadline" THEN now + Ttl + Skew ELSE now + Ttl
+HandedBack == IF Mutation = "ClientComputedDeadline"
+              THEN Second(now) + Ttl + Skew
+              ELSE Second(now) + Ttl
 
 ----------------------------------------------------------------------------------
 \* Lease predicates. These two must agree: KvStore guards writes with `exp > Now()`
@@ -138,9 +157,11 @@ Exists(l) == expiry[l] # Nothing
 
 LeaseLive(l) ==
     /\ Exists(l)
-    /\ IF Mutation = "ExpiryBoundaryOff" THEN expiry[l] >= now ELSE expiry[l] > now
+    /\ IF Mutation = "ExpiryBoundaryOff"
+       THEN expiry[l] >= Second(now)
+       ELSE expiry[l] > Second(now)
 
-Expired(l) == Exists(l) /\ expiry[l] <= now
+Expired(l) == Exists(l) /\ expiry[l] <= Second(now)
 
 KeysOf(l) == {k \in live : owner[k] = l}
 
@@ -155,8 +176,9 @@ NextOfDrain   == IF Mutation = "DrainThenCapture" THEN "capture" ELSE "park"
 ----------------------------------------------------------------------------------
 
 TypeOK ==
-    /\ now \in 0..MaxTime
+    /\ now \in 0..(MaxTime * Grain)
     /\ expiry \in [Leases -> 0..(MaxTime + Ttl)]
+    /\ grantedAt \in [Leases -> 0..(MaxTime * Grain)]
     /\ belief \in [Leases -> 0..(MaxTime + Ttl + Skew)]
     /\ live \subseteq Keys
     /\ owner \in [Keys -> Leases \cup {Nothing}]
@@ -174,6 +196,7 @@ TypeOK ==
 Init ==
     /\ now = 0
     /\ expiry = [l \in Leases |-> Nothing]
+    /\ grantedAt = [l \in Leases |-> 0]
     /\ belief = [l \in Leases |-> 0]
     /\ live = {}
     /\ owner = [k \in Keys |-> Nothing]
@@ -192,10 +215,10 @@ Init ==
 \* Actions.
 
 Tick ==
-    /\ now < MaxTime
+    /\ now < MaxTime * Grain
     /\ now' = now + 1
     /\ lastDel' = {}
-    /\ UNCHANGED << expiry, belief, live, owner, rev, logRows, cursor, captured,
+    /\ UNCHANGED << expiry, grantedAt, belief, live, owner, rev, logRows, cursor, captured,
                     wstate, scanned, reapedLive, wroteUnderExpired, reapedBelieved >>
 
 \* The server clock is DateTimeOffset.UtcNow, which is wall time and not monotonic: NTP
@@ -207,12 +230,13 @@ ClockStepBack ==
     /\ now > 0
     /\ now' = now - 1
     /\ lastDel' = {}
-    /\ UNCHANGED << expiry, belief, live, owner, rev, logRows, cursor, captured,
+    /\ UNCHANGED << expiry, grantedAt, belief, live, owner, rev, logRows, cursor, captured,
                     wstate, scanned, reapedLive, wroteUnderExpired, reapedBelieved >>
 
 CreateLease(l) ==
     /\ ~Exists(l)
-    /\ expiry' = [expiry EXCEPT ![l] = now + Ttl]
+    /\ expiry' = [expiry EXCEPT ![l] = Second(now) + Ttl]
+    /\ grantedAt' = [grantedAt EXCEPT ![l] = now]
     /\ belief' = [belief EXCEPT ![l] = HandedBack]
     /\ lastDel' = {}
     /\ UNCHANGED << now, live, owner, rev, logRows, cursor, captured, wstate,
@@ -229,7 +253,7 @@ Put(k, l) ==
     /\ owner' = [owner EXCEPT ![k] = l]
     /\ wroteUnderExpired' = (wroteUnderExpired \/ Expired(l))
     /\ lastDel' = {}
-    /\ UNCHANGED << now, expiry, belief, cursor, captured, wstate, scanned,
+    /\ UNCHANGED << now, expiry, grantedAt, belief, cursor, captured, wstate, scanned,
                     reapedLive, reapedBelieved >>
 
 \* A rejected write. In the real store this consumes no revision -- Exists never
@@ -240,12 +264,13 @@ PutRejected(k, l) ==
     /\ ~LeaseLive(l)
     /\ rev' = rev + 1
     /\ lastDel' = {}
-    /\ UNCHANGED << now, expiry, belief, live, owner, logRows, cursor, captured,
+    /\ UNCHANGED << now, expiry, grantedAt, belief, live, owner, logRows, cursor, captured,
                     wstate, scanned, reapedLive, wroteUnderExpired, reapedBelieved >>
 
 KeepAlive(l) ==
     /\ LeaseLive(l)
-    /\ expiry' = [expiry EXCEPT ![l] = now + Ttl]
+    /\ expiry' = [expiry EXCEPT ![l] = Second(now) + Ttl]
+    /\ grantedAt' = [grantedAt EXCEPT ![l] = now]
     /\ belief' = [belief EXCEPT ![l] = HandedBack]
     /\ lastDel' = {}
     /\ UNCHANGED << now, live, owner, rev, logRows, cursor, captured, wstate,
@@ -266,10 +291,10 @@ SweepAtomic(l) ==
           /\ live' = live \ K
           /\ owner' = [k \in Keys |-> IF k \in K THEN Nothing ELSE owner[k]]
           /\ reapedLive' = (reapedLive \/ LeaseLive(l))
-          /\ reapedBelieved' = (reapedBelieved \/ (K # {} /\ now < belief[l]))
+          /\ reapedBelieved' = (reapedBelieved \/ (K # {} /\ Second(now) < belief[l]))
     /\ expiry' = [expiry EXCEPT ![l] = Nothing]
     /\ belief' = [belief EXCEPT ![l] = 0]
-    /\ UNCHANGED << now, cursor, captured, wstate, scanned, wroteUnderExpired >>
+    /\ UNCHANGED << now, grantedAt, cursor, captured, wstate, scanned, wroteUnderExpired >>
 
 \* SplitSweep: the selection and the deletion become two steps, so a keepalive can land
 \* between them and the deletion proceeds on a stale decision.
@@ -279,7 +304,7 @@ SweepScan(l) ==
     /\ l \notin scanned
     /\ scanned' = scanned \cup {l}
     /\ lastDel' = {}
-    /\ UNCHANGED << now, expiry, belief, live, owner, rev, logRows, cursor, captured,
+    /\ UNCHANGED << now, expiry, grantedAt, belief, live, owner, rev, logRows, cursor, captured,
                     wstate, reapedLive, wroteUnderExpired, reapedBelieved >>
 
 SweepApply(l) ==
@@ -294,11 +319,11 @@ SweepApply(l) ==
           /\ live' = live \ K
           /\ owner' = [k \in Keys |-> IF k \in K THEN Nothing ELSE owner[k]]
           /\ reapedLive' = (reapedLive \/ LeaseLive(l))
-          /\ reapedBelieved' = (reapedBelieved \/ (K # {} /\ now < belief[l]))
+          /\ reapedBelieved' = (reapedBelieved \/ (K # {} /\ Second(now) < belief[l]))
     /\ expiry' = [expiry EXCEPT ![l] = Nothing]
     /\ belief' = [belief EXCEPT ![l] = 0]
     /\ scanned' = scanned \ {l}
-    /\ UNCHANGED << now, cursor, captured, wstate, wroteUnderExpired >>
+    /\ UNCHANGED << now, grantedAt, cursor, captured, wstate, wroteUnderExpired >>
 
 \* The watcher. Capture records the revision it will wake above; drain advances the
 \* cursor to whatever is committed; park blocks until the log passes the threshold.
@@ -307,7 +332,7 @@ WatchCapture ==
     /\ captured' = rev
     /\ wstate' = NextOfCapture
     /\ lastDel' = {}
-    /\ UNCHANGED << now, expiry, belief, live, owner, rev, logRows, cursor, scanned,
+    /\ UNCHANGED << now, expiry, grantedAt, belief, live, owner, rev, logRows, cursor, scanned,
                     reapedLive, wroteUnderExpired, reapedBelieved >>
 
 WatchDrain ==
@@ -315,7 +340,7 @@ WatchDrain ==
     /\ cursor' = rev
     /\ wstate' = NextOfDrain
     /\ lastDel' = {}
-    /\ UNCHANGED << now, expiry, belief, live, owner, rev, logRows, captured, scanned,
+    /\ UNCHANGED << now, expiry, grantedAt, belief, live, owner, rev, logRows, captured, scanned,
                     reapedLive, wroteUnderExpired, reapedBelieved >>
 
 WatchPark ==
@@ -323,7 +348,7 @@ WatchPark ==
     /\ rev > captured
     /\ wstate' = WatchStart
     /\ lastDel' = {}
-    /\ UNCHANGED << now, expiry, belief, live, owner, rev, logRows, cursor, captured,
+    /\ UNCHANGED << now, expiry, grantedAt, belief, live, owner, rev, logRows, cursor, captured,
                     scanned, reapedLive, wroteUnderExpired, reapedBelieved >>
 
 Next ==
@@ -377,6 +402,17 @@ BeliefMatchesStoredDeadline ==
 \* The harm that follows when it does not: keys reaped while their holder is still
 \* inside the window it was promised, and therefore still believes it holds the lock.
 NeverReapBelievedLease == ~reapedBelieved
+
+\* A lease granted for Ttl seconds stays live for Ttl seconds. This is what a caller
+\* asking for a TTL believes it is buying, and it is the assumption behind any renewal
+\* cadence derived from the TTL.
+\*
+\* It holds trivially at Grain = 1. It does not hold on the real clock: KvStore stores
+\* `Now() + ttlSecs` with Now() truncated to whole seconds, so a lease granted partway
+\* through a second is short by exactly the part already elapsed. See
+\* TurnstileSubSecond.cfg -- this one fails against the real design, not a mutation.
+LeaseHonoursItsTtl ==
+    \A l \in Leases : Exists(l) => (expiry[l] * Grain) - grantedAt[l] >= Ttl * Grain
 
 ----------------------------------------------------------------------------------
 \* Step properties. These are about transitions, not states, because the defects they
