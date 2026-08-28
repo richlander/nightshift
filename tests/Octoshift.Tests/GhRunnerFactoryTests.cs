@@ -144,6 +144,37 @@ public class GhRunnerFactoryTests
     }
 
     [Fact]
+    public async Task ConfiguredRunnerCleanupFailure_PropagatesNotSwallowedAsAuthFailure()
+    {
+        // The runner surfaces a GhProcessCleanupException when it cannot confirm the gh process died on
+        // cancellation. That must reach the caller untouched — never be normalised to a failed GhResult, which
+        // would report a live-process cleanup failure as an ordinary unavailable read.
+        var provider = new FakeTokenProvider();
+        Task<GhResult> Runner(IReadOnlyList<string> args, IReadOnlyDictionary<string, string?>? env, CancellationToken ct)
+            => throw new GhProcessCleanupException("octoshift: could not terminate the gh process on cancellation.");
+
+        using GhRunnerSession session = GhRunnerFactory.Create(_ => ConfiguredPath, () => provider, Runner);
+
+        await Assert.ThrowsAsync<GhProcessCleanupException>(
+            () => session.Run(["api", "x"], CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ConfiguredRunnerCancellation_Propagates()
+    {
+        // A cancellation raised inside the runner (after the token was minted) must also propagate, not be
+        // caught by the auth normalisation and turned into a failed read that hides the cancellation.
+        var provider = new FakeTokenProvider();
+        Task<GhResult> Runner(IReadOnlyList<string> args, IReadOnlyDictionary<string, string?>? env, CancellationToken ct)
+            => throw new OperationCanceledException();
+
+        using GhRunnerSession session = GhRunnerFactory.Create(_ => ConfiguredPath, () => provider, Runner);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => session.Run(["api", "x"], CancellationToken.None));
+    }
+
+    [Fact]
     public void Configured_DisposesTokenProviderWithTheSession()
     {
         var gh = new RecordingGh();

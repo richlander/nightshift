@@ -29,7 +29,13 @@ internal sealed class GitHubAppInstallationTokenProvider : IGitHubInstallationTo
     private readonly IGitHubTokenAuditSink _auditSink;
     private readonly SemaphoreSlim _refreshLock = new(1, 1);
 
-    private GitHubInstallationToken? _cached;
+    // Disposal and the cached token are the mutable shared state; a plain lock guards both. It is only ever
+    // held for a few synchronous field reads/writes (never across an await or the mint), so there is no torn
+    // publication and no memory-model reasoning to get wrong. The refresh SemaphoreSlim, separately, still
+    // serialises the token exchange itself.
+    private readonly object _stateLock = new();
+    private bool _disposed;
+    private CachedToken? _cached;
 
     public GitHubAppInstallationTokenProvider(GitHubAppCredentials credentials)
         : this(
@@ -66,23 +72,36 @@ internal sealed class GitHubAppInstallationTokenProvider : IGitHubInstallationTo
     public async Task<GitHubInstallationToken> GetTokenAsync(CancellationToken ct)
     {
         DateTimeOffset now = _clock();
-        if (_cached is { } cached && !NeedsRefresh(cached, now))
+        if (TryGetCached(now, out GitHubInstallationToken fastPath))
         {
-            return cached;
+            return fastPath;
         }
 
         await _refreshLock.WaitAsync(ct);
         try
         {
             now = _clock();
-            if (_cached is { } current && !NeedsRefresh(current, now))
+            if (TryGetCached(now, out GitHubInstallationToken current))
             {
                 return current;
             }
 
-            bool refreshed = _cached is not null;
+            bool refreshed = HasCached();
+
+            // Mint outside the state lock (it must not be held across the await), while the refresh semaphore
+            // keeps this the only exchange in flight.
             GitHubInstallationToken minted = await MintTokenAsync(refreshed, ct);
-            _cached = minted;
+
+            lock (_stateLock)
+            {
+                // Cache only if disposal did not land during the mint. Either way this caller returns the
+                // token it fetched; the cache simply is not repopulated past a Dispose.
+                if (!_disposed)
+                {
+                    _cached = new CachedToken(minted);
+                }
+            }
+
             return minted;
         }
         finally
@@ -91,9 +110,45 @@ internal sealed class GitHubAppInstallationTokenProvider : IGitHubInstallationTo
         }
     }
 
+    /// <summary>
+    /// Returns a still-valid cached token under the state lock, throwing if the provider has been disposed.
+    /// The disposed check lives here so it guards both the fast path and the post-semaphore recheck.
+    /// </summary>
+    private bool TryGetCached(DateTimeOffset now, out GitHubInstallationToken token)
+    {
+        lock (_stateLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_cached is { } cached && !NeedsRefresh(cached.Token, now))
+            {
+                token = cached.Token;
+                return true;
+            }
+        }
+
+        token = default;
+        return false;
+    }
+
+    private bool HasCached()
+    {
+        lock (_stateLock)
+        {
+            return _cached is not null;
+        }
+    }
+
     public void Dispose()
     {
-        _refreshLock.Dispose();
+        // Logical disposal under the state lock: mark disposed and drop the cached token so a live credential
+        // is not retained in memory. The SemaphoreSlim is intentionally not disposed — it needs disposal only
+        // to release the ManualResetEvent behind AvailableWaitHandle, which this type never touches — so an
+        // in-flight refresh's finally-Release can never race a disposed handle.
+        lock (_stateLock)
+        {
+            _disposed = true;
+            _cached = null;
+        }
     }
 
     private bool NeedsRefresh(GitHubInstallationToken token, DateTimeOffset now)
@@ -160,6 +215,12 @@ internal sealed class GitHubAppInstallationTokenProvider : IGitHubInstallationTo
         return minted;
     }
 }
+
+/// <summary>
+/// Immutable holder that lets the cached token be published as one atomic reference store. Its single field
+/// is set before the holder is assigned to a volatile field, so a reader either sees the whole token or none.
+/// </summary>
+internal sealed record CachedToken(GitHubInstallationToken Token);
 
 internal sealed record GitHubInstallationTokenResponseDto
 {

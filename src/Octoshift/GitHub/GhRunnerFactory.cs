@@ -68,8 +68,11 @@ internal sealed class GhRunnerSession : IDisposable
             {
                 // MintTokenAsync normalises every expected token-exchange failure (a nonzero gh exit, a
                 // malformed response, a missing token/expiry) to InvalidOperationException. Surface it as an
-                // unavailable GitHub read, not a crash. OperationCanceledException is not an
-                // InvalidOperationException, so caller cancellation still propagates untouched.
+                // unavailable GitHub read, not a crash. This catch is scoped to that token-mint/config family
+                // only: OperationCanceledException is not an InvalidOperationException, and the runner's
+                // cancellation-cleanup failure is a GhProcessCleanupException (deliberately not an
+                // InvalidOperationException), so both a caller cancellation and a cleanup failure propagate
+                // untouched rather than being masked as an auth failure.
                 return new GhResult(AuthFailureExitCode, string.Empty, ex.Message);
             }
         }
