@@ -285,7 +285,7 @@ public sealed class Daemon
             return WriteSseAsync(ctx, "delete", JsonSerializer.Serialize(dto, TurnstileJson.Default.WatchDeleteEventDto), ct);
         }
 
-        var put = new WatchPutEventDto(e.Key, e.CreateRevision, e.Revision, e.Lease, e.Value is null ? null : Convert.ToBase64String(e.Value));
+        var put = new WatchPutEventDto(e.Key, e.CreateRevision, e.Revision, e.Lease, e.Immutable, e.Value is null ? null : Convert.ToBase64String(e.Value));
         return WriteSseAsync(ctx, "put", JsonSerializer.Serialize(put, TurnstileJson.Default.WatchPutEventDto), ct);
     }
 

@@ -51,7 +51,7 @@ public sealed record TxnOpResponseDto(string Op, string Key, bool Found, long Cr
 public sealed record TxnResponseDto(bool Succeeded, long Revision, TxnOpResponseDto[] Responses);
 
 /// <summary>A watch put event. Value is base64 (opaque bytes).</summary>
-public sealed record WatchPutEventDto(string Key, long CreateRevision, long ModRevision, string? Lease, string? Value);
+public sealed record WatchPutEventDto(string Key, long CreateRevision, long ModRevision, string? Lease, bool Immutable, string? Value);
 
 /// <summary>A watch delete event, carrying the previous value (base64) for reverse-index maintenance.</summary>
 public sealed record WatchDeleteEventDto(string Key, long ModRevision, string? PrevValue);

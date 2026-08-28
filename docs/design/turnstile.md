@@ -299,7 +299,7 @@ All `compare` clauses ANDed. The chosen branch executes atomically in one SQLite
 GET /watch?prefix=/ready/&from=4200
 
 event: put
-data: {"key":"/ready/1234/0005/a","value":{},"create_revision":4201,"mod_revision":4201}
+data: {"key":"/ready/1234/0005/a","value":{},"create_revision":4201,"mod_revision":4201,"immutable":false}
 
 event: delete
 data: {"key":"/order/1234/op/0005/slice/a/claim","prev_value":{...},"mod_revision":4202}

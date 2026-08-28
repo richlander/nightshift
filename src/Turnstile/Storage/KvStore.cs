@@ -214,7 +214,7 @@ public sealed class KvStore : IDisposable
         string? end = Keys.PrefixEnd(prefix);
         using SqliteCommand cmd = conn.CreateCommand();
         cmd.CommandText = $"""
-            SELECT id, key, deleted, create_rev, lease, value, old_value
+            SELECT id, key, deleted, create_rev, lease, value, old_value, immutable
             FROM kv
             WHERE id > $from{(boundary is null ? string.Empty : " AND id <= $boundary")} AND key >= $start{(end is null ? string.Empty : " AND key < $end")}
             ORDER BY id
@@ -249,7 +249,11 @@ public sealed class KvStore : IDisposable
                 CreateRevision: reader.GetInt64(3),
                 Lease: reader.IsDBNull(4) ? null : reader.GetString(4),
                 Value: reader.IsDBNull(5) ? null : (byte[])reader[5],
-                PrevValue: reader.IsDBNull(6) ? null : (byte[])reader[6]));
+                PrevValue: reader.IsDBNull(6) ? null : (byte[])reader[6])
+            {
+                // Immutable is the new key state's immutability; a delete is a tombstone and reports false.
+                Immutable = !deleted && reader.GetInt64(7) != 0,
+            });
         }
 
         return events;
