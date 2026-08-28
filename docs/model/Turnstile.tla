@@ -99,8 +99,11 @@
    threshold violates NoLostWakeup; admitting a lease on the boundary tick the sweeper
    deletes it violates NoWriteUnderExpiredLease; letting a rejected write consume a
    revision violates LogIsGapless; and computing the holder's deadline on a client clock
-   -- what RemoteStore does -- violates BeliefMatchesStoredDeadline, and
-   NeverReapBelievedLease once the first is removed so it cannot mask the consequence.
+   -- what RemoteStore does -- makes the handed-back deadline a different number from the
+   stored one, violating BeliefMatchesStoredDeadline. That is a value-shape mismatch, not
+   a reaping harm: a constant client/server offset cancels when the same client both
+   computes and later checks its deadline, so the model makes no claim that the holder is
+   reaped while still believing the lease live.
 
    Re-run TLC after any change here to regenerate the counts and confirm zero
    violations. *)
@@ -112,7 +115,7 @@ CONSTANTS
     Leases,             \* abstract lease ids
     Ttl,                \* lease lifetime, in whole seconds -- the unit the lease table stores
     Grain,              \* clock sub-ticks per whole second; 1 assumes every TTL is full length
-    Skew,               \* how far a remote client's clock trails the server's
+    Skew,               \* the client clock's offset from the server (positive = client leads)
     AllowClockStepBack, \* whether the server clock may run backwards
     MaxTime,            \* bound the clock so the state space is finite
     MaxRevision,        \* bound the log so the state space is finite
@@ -151,11 +154,10 @@ VARIABLES
     wstate,             \* where the watcher is in capture/drain/park
     scanned,            \* leases a split sweep has scanned but not yet applied
     reapedLive,         \* set once a sweep has reaped a lease that was live at the time
-    wroteUnderExpired,  \* set once a write was accepted naming an already-expired lease
-    reapedBelieved      \* set once a sweep reaped keys whose holder's deadline had not arrived
+    wroteUnderExpired   \* set once a write was accepted naming an already-expired lease
 
 vars == << now, expiry, grantedAt, belief, live, owner, rev, logRows, lastDel, cursor,
-           captured, wstate, scanned, reapedLive, wroteUnderExpired, reapedBelieved >>
+           captured, wstate, scanned, reapedLive, wroteUnderExpired >>
 
 \* The clock advances in sub-ticks; the lease table stores whole seconds. KvStore.Now()
 \* is `DateTimeOffset.UtcNow.ToUnixTimeSeconds()`, so every deadline it writes is
@@ -168,8 +170,10 @@ Second(t) == t \div Grain
 \* server clock. RemoteStore does not: it fabricates one from the *client* clock as
 \* `DateTimeOffset.UtcNow.ToUnixTimeSeconds() + dto.Ttl`, and its own comment concedes
 \* the value is "informational only". Nothing in the LeaseInfo type says which of the
-\* two a caller is holding, so ClientComputedDeadline asks what a caller that trusts it
-\* would conclude when its clock trails the server's.
+\* two a caller is holding, so ClientComputedDeadline hands back a number computed on the
+\* client clock. Skew is that clock's offset from the server (positive = the client leads),
+\* so the fabricated deadline differs from the stored one by exactly Skew. This is a
+\* value-shape mismatch, not a claim that the holder outlives the server's reap.
 HandedBack == IF Mutation = "ClientComputedDeadline"
               THEN Second(now) + Ttl + Skew
               ELSE Second(now) + Ttl
@@ -217,7 +221,6 @@ TypeOK ==
     /\ scanned \subseteq Leases
     /\ reapedLive \in BOOLEAN
     /\ wroteUnderExpired \in BOOLEAN
-    /\ reapedBelieved \in BOOLEAN
 
 Init ==
     /\ now = 0
@@ -235,7 +238,6 @@ Init ==
     /\ scanned = {}
     /\ reapedLive = FALSE
     /\ wroteUnderExpired = FALSE
-    /\ reapedBelieved = FALSE
 
 ----------------------------------------------------------------------------------
 \* Actions.
@@ -245,7 +247,7 @@ Tick ==
     /\ now' = now + 1
     /\ lastDel' = {}
     /\ UNCHANGED << expiry, grantedAt, belief, live, owner, rev, logRows, cursor, captured,
-                    wstate, scanned, reapedLive, wroteUnderExpired, reapedBelieved >>
+                    wstate, scanned, reapedLive, wroteUnderExpired >>
 
 \* The server clock is DateTimeOffset.UtcNow, which is wall time and not monotonic: NTP
 \* correction or an operator can move it backwards. This is environmental rather than a
@@ -257,7 +259,7 @@ ClockStepBack ==
     /\ now' = now - 1
     /\ lastDel' = {}
     /\ UNCHANGED << expiry, grantedAt, belief, live, owner, rev, logRows, cursor, captured,
-                    wstate, scanned, reapedLive, wroteUnderExpired, reapedBelieved >>
+                    wstate, scanned, reapedLive, wroteUnderExpired >>
 
 CreateLease(l) ==
     /\ ~Exists(l)
@@ -266,7 +268,7 @@ CreateLease(l) ==
     /\ belief' = [belief EXCEPT ![l] = HandedBack]
     /\ lastDel' = {}
     /\ UNCHANGED << now, live, owner, rev, logRows, cursor, captured, wstate,
-                    scanned, reapedLive, wroteUnderExpired, reapedBelieved >>
+                    scanned, reapedLive, wroteUnderExpired >>
 
 \* A put under a lease. The guard is the only thing standing between a client and a
 \* key attached to a lease the sweeper is about to delete.
@@ -280,7 +282,7 @@ Put(k, l) ==
     /\ wroteUnderExpired' = (wroteUnderExpired \/ Expired(l))
     /\ lastDel' = {}
     /\ UNCHANGED << now, expiry, grantedAt, belief, cursor, captured, wstate, scanned,
-                    reapedLive, reapedBelieved >>
+                    reapedLive >>
 
 \* A rejected write. In the real store this consumes no revision -- Exists never
 \* touches the log, which is what makes the revision sequence gapless.
@@ -291,7 +293,7 @@ PutRejected(k, l) ==
     /\ rev' = rev + 1
     /\ lastDel' = {}
     /\ UNCHANGED << now, expiry, grantedAt, belief, live, owner, logRows, cursor, captured,
-                    wstate, scanned, reapedLive, wroteUnderExpired, reapedBelieved >>
+                    wstate, scanned, reapedLive, wroteUnderExpired >>
 
 KeepAlive(l) ==
     /\ LeaseLive(l)
@@ -300,7 +302,7 @@ KeepAlive(l) ==
     /\ belief' = [belief EXCEPT ![l] = HandedBack]
     /\ lastDel' = {}
     /\ UNCHANGED << now, live, owner, rev, logRows, cursor, captured, wstate,
-                    scanned, reapedLive, wroteUnderExpired, reapedBelieved >>
+                    scanned, reapedLive, wroteUnderExpired >>
 
 \* The sweep as written: selecting the expired leases and tombstoning their keys is one
 \* transaction on the write actor, so nothing can renew the lease in between.
@@ -317,7 +319,6 @@ SweepAtomic(l) ==
           /\ live' = live \ K
           /\ owner' = [k \in Keys |-> IF k \in K THEN Nothing ELSE owner[k]]
           /\ reapedLive' = (reapedLive \/ LeaseLive(l))
-          /\ reapedBelieved' = (reapedBelieved \/ (K # {} /\ Second(now) < belief[l]))
     /\ expiry' = [expiry EXCEPT ![l] = Nothing]
     /\ belief' = [belief EXCEPT ![l] = 0]
     /\ UNCHANGED << now, grantedAt, cursor, captured, wstate, scanned, wroteUnderExpired >>
@@ -331,7 +332,7 @@ SweepScan(l) ==
     /\ scanned' = scanned \cup {l}
     /\ lastDel' = {}
     /\ UNCHANGED << now, expiry, grantedAt, belief, live, owner, rev, logRows, cursor, captured,
-                    wstate, reapedLive, wroteUnderExpired, reapedBelieved >>
+                    wstate, reapedLive, wroteUnderExpired >>
 
 SweepApply(l) ==
     /\ Mutation = "SplitSweep"
@@ -345,7 +346,6 @@ SweepApply(l) ==
           /\ live' = live \ K
           /\ owner' = [k \in Keys |-> IF k \in K THEN Nothing ELSE owner[k]]
           /\ reapedLive' = (reapedLive \/ LeaseLive(l))
-          /\ reapedBelieved' = (reapedBelieved \/ (K # {} /\ Second(now) < belief[l]))
     /\ expiry' = [expiry EXCEPT ![l] = Nothing]
     /\ belief' = [belief EXCEPT ![l] = 0]
     /\ scanned' = scanned \ {l}
@@ -359,7 +359,7 @@ WatchCapture ==
     /\ wstate' = NextOfCapture
     /\ lastDel' = {}
     /\ UNCHANGED << now, expiry, grantedAt, belief, live, owner, rev, logRows, cursor, scanned,
-                    reapedLive, wroteUnderExpired, reapedBelieved >>
+                    reapedLive, wroteUnderExpired >>
 
 WatchDrain ==
     /\ wstate = "drain"
@@ -367,7 +367,7 @@ WatchDrain ==
     /\ wstate' = NextOfDrain
     /\ lastDel' = {}
     /\ UNCHANGED << now, expiry, grantedAt, belief, live, owner, rev, logRows, captured, scanned,
-                    reapedLive, wroteUnderExpired, reapedBelieved >>
+                    reapedLive, wroteUnderExpired >>
 
 WatchPark ==
     /\ wstate = "park"
@@ -375,7 +375,7 @@ WatchPark ==
     /\ wstate' = WatchStart
     /\ lastDel' = {}
     /\ UNCHANGED << now, expiry, grantedAt, belief, live, owner, rev, logRows, cursor, captured,
-                    scanned, reapedLive, wroteUnderExpired, reapedBelieved >>
+                    scanned, reapedLive, wroteUnderExpired >>
 
 Next ==
     \/ Tick
@@ -422,12 +422,19 @@ NoLostWakeup == (wstate = "park" /\ rev > cursor) => rev > captured
 \* The deadline a holder is handed is the deadline the store will actually enforce.
 \* KvStore returns the value it stored; RemoteStore fabricates one from the client
 \* clock, and this is the invariant that separates the two.
+\*
+\* This is a numeric/type-shape distinction, not a harm claim. RemoteStore computes
+\* ExpiresAt as `client-Now + ttl` rather than echoing the server's stored `expires_at`,
+\* so the two are different numbers derived from different bases (Skew models the client
+\* clock's offset from the server; positive = client leads). A caller cannot tell from
+\* LeaseInfo.ExpiresAt alone which of the two it is holding. We deliberately do NOT model
+\* a "holder reaped while still believing live" consequence: a constant client/server
+\* offset cancels when the same client both computes `client-Now + ttl` and later checks
+\* its own clock against it, so at the server's physical expiry the client's clock has
+\* reached its own computed deadline too. Asserting otherwise would compare a client-clock
+\* timestamp to a server-clock instant across domains, which is not a real contract.
 BeliefMatchesStoredDeadline ==
     \A l \in Leases : Exists(l) => belief[l] = expiry[l]
-
-\* The harm that follows when it does not: keys reaped while their holder is still
-\* inside the window it was promised, and therefore still believes it holds the lock.
-NeverReapBelievedLease == ~reapedBelieved
 
 \* A lease granted for Ttl seconds stays live for Ttl seconds. This is what a caller
 \* asking for a TTL believes it is buying, and it is the assumption behind any renewal
