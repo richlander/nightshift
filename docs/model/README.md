@@ -1,14 +1,17 @@
 # Models
 
-Two TLA+ specifications, kept apart because they answer different questions.
+Three TLA+ specifications, kept apart because they answer different questions.
 
 | Spec | Question |
 | --- | --- |
 | `Waiting.tla` | Over time, who owns a PR and what may be acted on? |
 | `TmuxWindows.tla` | At one instant, which window is this even, given that agents write to each other's? |
+| `Turnstile.tla` | What may a lease holder conclude, when a sweeper is deleting on a clock nobody controls? |
 
 Mixing them would blur both: "who owns this PR" and "which window is this" have
-different state, different actions and different failure modes.
+different state, different actions and different failure modes. `Turnstile.tla` is
+further apart still — it models the coordination store under `src/Turnstile`, not the
+GitHub gate.
 
 ## TmuxWindows
 
@@ -47,6 +50,117 @@ One refinement came from the fleet rather than the checker. Requiring the pane t
 was simply empty — normal here, since a report that has scrolled past the top leaves only
 chrome. Silence is not disagreement, so the rule fires only when the pane talks about PRs
 and never about this one.
+
+## Turnstile
+
+Clients build mutual exclusion out of leases whose expiry they do not control. A lock is
+a key attached to a lease; the holder stays alive by renewing, and a sweeper deletes the
+keys of any lease whose deadline has passed. Two processes therefore reason about the
+same lease at the same instant, and the client's entire safety argument is one sentence
+from `HardeningTests`:
+
+> a successful keepalive means the key was never reaped out from under it; a failed one
+> means it is gone and must not be re-acquired.
+
+Three things came out of checking it.
+
+**The clock is not monotonic, and the design survives that anyway.** Expiry is evaluated
+against `DateTimeOffset.UtcNow`, which is wall time: NTP or an operator can move it
+backwards. That is environmental rather than a defect, so it is a constant
+(`AllowClockStepBack`) rather than a mutation, and the base configuration turns it *on*.
+TLC finds no violation. The reason is worth naming, because it is not the lease logic —
+`SweepExpiredAsync` selects the expired leases and deletes their keys inside one write
+transaction, so "is it expired" and "delete it" are evaluated against the same instant.
+No clock movement can get between them.
+
+**Which makes the atomicity, not the lease logic, the load-bearing part.** The
+`SplitSweep` mutation separates the selection from the deletion and changes nothing
+else. Under a monotone clock it is still correct — `TurnstileSplitSweepMonotonic.cfg`
+runs clean, because a lease that is expired can never become live again, so a stale
+selection stays true. Allow the clock to step back and the same mutation violates
+`NeverReapLiveLease` in six steps: scan while expired, clock steps back, the lease is
+live once more, delete anyway. A refactor that moved the sweep's clock read outside the
+write actor would be invisible in tests and on a well-behaved machine.
+
+**`LeaseInfo.ExpiresAt` means two different things.** `KvStore` returns the deadline it
+stored, on the server clock. `RemoteStore` fabricates one from the *client* clock:
+
+```csharp
+long expiresAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds() + dto.Ttl;
+```
+
+Its comment concedes the value is "informational only — keepalive returns authoritative
+remaining TTL", but nothing in the type says which of the two a caller is holding. The
+`ClientComputedDeadline` mutation asks what a caller that trusts it concludes when its
+clock trails the server's, and the answer is that it believes it holds a lock past the
+point the server has already reaped: `BeliefMatchesStoredDeadline` fails, and with that
+invariant removed so it cannot mask the consequence, `NeverReapBelievedLease` fails too.
+This is a hazard in the type's shape rather than a bug in either store.
+
+### Checked properties
+
+| Design property | Model property |
+| --- | --- |
+| Every revision handed out is a row in the log | `LogIsGapless` |
+| A key never outlives the lease holding it | `LiveKeysHaveALeaseRow` |
+| A sweep never reaps a lease that is live | `NeverReapLiveLease` |
+| Writes naming an expired lease are refused | `NoWriteUnderExpiredLease` |
+| A parked watcher that is behind always has a reason to wake | `NoLostWakeup` |
+| The deadline a holder is handed is the one that will be enforced | `BeliefMatchesStoredDeadline` |
+| Keys are never reaped inside the window their holder was promised | `NeverReapBelievedLease` |
+| A key stops being live only by way of a log row | `RemovalIsLoggedStep` |
+| The log only grows | `RevisionNeverDecreasesStep` |
+| A cursor advances, and never past what is committed | `CursorAdvancesSoundlyStep` |
+
+`RemovalIsLoggedStep` is a step property rather than an invariant on purpose. Lazy
+expiry would give every *reader* the same answer as eager expiry, so no predicate over a
+single state can separate them — the difference exists only as an event that did not
+happen. `KvStore` makes the same point in prose: "expiry produces delete events — lazy
+expiry would be correct but silent."
+
+### Runs
+
+```sh
+cd docs/model
+java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers 1 -cleanup \
+  -config Turnstile.cfg Turnstile.tla
+```
+
+Two keys, two leases, `Ttl = 1`, `Skew = 1`, clock bound 3, revision bound 4. With TLC
+2.19 the base configuration generates 390,517 states, 72,163 distinct, depth 18, zero
+violations, in a few seconds.
+
+| Configuration | Clock may step back | Result |
+| --- | --- | --- |
+| `Turnstile.cfg` | yes | No error — 390,517 states, 72,163 distinct, depth 18 |
+| `TurnstileSplitSweepMonotonic.cfg` | no | No error — 315,718 states, 88,849 distinct, depth 18 |
+
+The second is a contrast, not a gate: it is the same defect as `TurnstileSplitSweep.cfg`
+with the clock forced to behave, and it passes. It is recorded to show that the mutation
+needs the clock to bite, which is the whole point of that section above.
+
+### Counterexample mutations
+
+Each opt-in configuration enables one defect and must fail with the named property. A
+clean exit means the gate has gone vacuous.
+
+| Configuration | Deliberate defect | Expected violation |
+| --- | --- | --- |
+| `TurnstileSplitSweep.cfg` | Sweep selects and deletes in two steps | `NeverReapLiveLease` |
+| `TurnstileLazyExpiry.cfg` | Expiry removes keys without writing rows | `RemovalIsLoggedStep` |
+| `TurnstileDrainThenCapture.cfg` | Watcher drains before capturing its wake threshold | `NoLostWakeup` |
+| `TurnstileExpiryBoundaryOff.cfg` | Write guard admits a lease on the tick the sweeper deletes it | `NoWriteUnderExpiredLease` |
+| `TurnstileFailedWriteConsumesRevision.cfg` | A rejected write consumes a revision | `LogIsGapless` |
+| `TurnstileClientComputedDeadline.cfg` | Holder's deadline computed on a client clock | `BeliefMatchesStoredDeadline` |
+| `TurnstileClientComputedDeadlineReap.cfg` | The same, with the cause invariant removed | `NeverReapBelievedLease` |
+
+All were run with `-workers 1` and produced their named violation. State counts for
+mutations are not recorded: the first violating state is not deterministic across runs.
+
+One mutation was written, failed to fire, and was kept — the investigation into *why*
+`SplitSweep` passed is what produced the clock finding above. A mutation that does not
+fire is either a vacuous property or a fact about the design that was not understood
+yet, and it is worth finding out which.
 
 ## Waiting
 
