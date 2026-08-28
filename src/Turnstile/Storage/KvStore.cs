@@ -20,8 +20,18 @@ public sealed class KvStore : IDisposable
         _changed = changed;
     }
 
-    /// <summary>The highest committed revision.</summary>
-    public long CurrentRevision => _writer.Revision;
+    /// <summary>The highest committed revision, read from the durable <c>meta</c> counter that is advanced in
+    /// the same transaction as the rows it counts — so it can never lag a committed row a reader can already
+    /// see (status, range, and the watch one-shot sync all read through this).</summary>
+    public long CurrentRevision
+    {
+        get
+        {
+            using var conn = new SqliteConnection(_readConnectionString);
+            conn.Open();
+            return ReadCommittedRevision(conn);
+        }
+    }
 
     /// <summary>Opens (creating if needed) the store at <paramref name="dbPath"/> in WAL mode.</summary>
     public static KvStore Open(string dbPath)
@@ -40,7 +50,9 @@ public sealed class KvStore : IDisposable
         Execute(writeConn, "PRAGMA busy_timeout=5000;");
         Schema.Ensure(writeConn);
 
-        long startRevision = ScalarLong(writeConn, "SELECT COALESCE(MAX(id), 0) FROM kv;");
+        // The durable committed revision is the allocation base for the writer and the external truth for
+        // readers. Read it once here to seed the writer's private counter; readers go to meta directly.
+        long startRevision = ReadCommittedRevision(writeConn);
         var changed = new ChangeSignal();
         var writer = new WriteActor(writeConn, startRevision, changed.Pulse);
 
@@ -210,6 +222,14 @@ public sealed class KvStore : IDisposable
     public Task<WriteResult> CreateAsync(string key, byte[] value, bool immutable = false, string? lease = null)
     {
         Validate(key, value);
+
+        // Reject the invalid combination up front — before the lease lookup or the writer enqueue — since both
+        // effective values are known here. (InsertRow keeps the same guard as a defensive backstop.)
+        if (immutable && lease is not null)
+        {
+            throw new TurnstileValidationException($"immutable key {key} cannot be attached to a lease");
+        }
+
         return _writer.ExecuteAsync((conn, next) =>
         {
             if (lease is not null && !LeaseIsLive(conn, lease))
@@ -326,6 +346,15 @@ public sealed class KvStore : IDisposable
             {
                 throw new TurnstileValidationException(ov);
             }
+
+            // An explicit immutable+lease put is invalid input, rejected up front alongside key/value the same
+            // way for both branches — before the writer is enqueued, so no transaction is even started. (A put
+            // that only becomes immutable+lease by inheriting a live key's lease can't be seen without reading
+            // state, so ApplyPut rejects that case before allocating a revision.)
+            if (op.Kind is TxnOpKind.Put && op.Immutable && op.Lease is not null)
+            {
+                throw new TurnstileValidationException($"immutable key {op.Key} cannot be attached to a lease");
+            }
         }
 
         return _writer.ExecuteAsync((conn, next) =>
@@ -359,7 +388,10 @@ public sealed class KvStore : IDisposable
                 }
             }
 
-            long revision = maxRev > 0 ? maxRev : CurrentRev(conn);
+            // A write txn reports its own max allocated revision; a read-only/no-op txn reports the durable
+            // committed revision (which, after compaction, can legitimately exceed MAX(kv.id)) read on this
+            // same writer transaction snapshot — never MAX(kv.id), which would lag it.
+            long revision = maxRev > 0 ? maxRev : ReadCommittedRevision(conn);
             return new TxnResult(succeeded, revision, responses);
         });
     }
@@ -408,7 +440,6 @@ public sealed class KvStore : IDisposable
         }
 
         LatestRow? latest = ReadLatest(conn, op.Key);
-        long id = next();
         if (latest is LatestRow live && !live.Deleted)
         {
             if (live.Immutable)
@@ -416,11 +447,29 @@ public sealed class KvStore : IDisposable
                 throw new TurnstileValidationException($"cannot modify immutable key {op.Key}");
             }
 
-            InsertRow(conn, id, op.Key, created: false, deleted: false, immutable: op.Immutable || live.Immutable,
-                live.CreateRev, prevRev: live.Id, op.Lease ?? live.Lease, op.Value ?? [], oldValue: live.Value);
-            return id;
+            // Compute the effective row (a put may inherit the live key's lease, or turn it immutable) and
+            // reject an immutable+leased result before allocating a revision or staging a row.
+            bool immutable = op.Immutable || live.Immutable;
+            string? lease = op.Lease ?? live.Lease;
+            if (immutable && lease is not null)
+            {
+                throw new TurnstileValidationException($"immutable key {op.Key} cannot be attached to a lease");
+            }
+
+            long updateId = next();
+            InsertRow(conn, updateId, op.Key, created: false, deleted: false, immutable,
+                live.CreateRev, prevRev: live.Id, lease, op.Value ?? [], oldValue: live.Value);
+            return updateId;
         }
 
+        // Create branch: the explicit immutable+lease combination was already rejected up front in TxnAsync,
+        // but keep the check here so ApplyPut is correct independent of its caller.
+        if (op.Immutable && op.Lease is not null)
+        {
+            throw new TurnstileValidationException($"immutable key {op.Key} cannot be attached to a lease");
+        }
+
+        long id = next();
         InsertRow(conn, id, op.Key, created: true, deleted: false, op.Immutable,
             createRev: id, prevRev: latest?.Id ?? 0, op.Lease, op.Value ?? [], oldValue: null);
         return id;
@@ -465,7 +514,32 @@ public sealed class KvStore : IDisposable
         return a.AsSpan().SequenceEqual(b);
     }
 
-    private static long CurrentRev(SqliteConnection conn) => ScalarLong(conn, "SELECT COALESCE(MAX(id), 0) FROM kv;");
+    /// <summary>
+    /// Reads the durable committed revision from the <c>meta</c> singleton. Fails visibly on a missing or
+    /// unparseable value rather than silently resetting to zero — a corrupt counter is a bug to surface, not
+    /// to paper over by re-deriving a number that could rewind the log.
+    /// </summary>
+    private static long ReadCommittedRevision(SqliteConnection conn)
+    {
+        using SqliteCommand cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT v FROM meta WHERE k = $k;";
+        cmd.Parameters.AddWithValue("$k", Schema.CommittedRevisionKey);
+        object? raw = cmd.ExecuteScalar();
+        if (raw is null or DBNull)
+        {
+            throw new InvalidOperationException(
+                $"turnstile: the '{Schema.CommittedRevisionKey}' meta row is missing; refusing to guess the revision.");
+        }
+
+        string text = (string)raw;
+        if (!long.TryParse(text, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out long revision))
+        {
+            throw new InvalidOperationException(
+                $"turnstile: the committed-revision meta value '{text}' is not a valid non-negative integer.");
+        }
+
+        return revision;
+    }
 
     // ---- lease layer ---------------------------------------------------------------------------
     // A lease groups lifetime: on expiry or revoke, every attached key is deleted (a tombstone,
@@ -617,7 +691,10 @@ public sealed class KvStore : IDisposable
     private static void TombstoneAttachedKey(SqliteConnection conn, Func<long> next, string key)
     {
         LatestRow? latest = ReadLatest(conn, key);
-        // Immutable keys are never deleted, preserving the immutability invariant even under a lease.
+        // An immutable key is never deleted. With immutable+lease rejected at write time (see InsertRow), no
+        // validly-created immutable key is ever attached to a lease, so this branch is unreachable for current
+        // data; it stays as a defensive guard so that even a legacy row written before that rule can never be
+        // silently deleted by lease expiry.
         if (latest is not LatestRow live || live.Deleted || live.Immutable)
         {
             return;
@@ -691,6 +768,18 @@ public sealed class KvStore : IDisposable
         SqliteConnection conn, long id, string key, bool created, bool deleted, bool immutable,
         long createRev, long prevRev, string? lease, byte[]? value, byte[]? oldValue)
     {
+        // Invariant: an immutable key can never carry a lease. A lease ending deletes every key attached to
+        // it (see TombstoneAttachedKey), but an immutable key is never deleted — so the combination would
+        // orphan the immutable key when its lease row is removed, contradicting the lease contract. This is
+        // the one point every write converges (direct create, txn put, and a txn that flips a leased mutable
+        // key to immutable), so rejecting it here closes every entry path at once. A rejected write throws
+        // before its INSERT and the enclosing transaction rolls back, so no state changes and no revision is
+        // consumed.
+        if (immutable && lease is not null)
+        {
+            throw new TurnstileValidationException($"immutable key {key} cannot be attached to a lease");
+        }
+
         using SqliteCommand cmd = conn.CreateCommand();
         cmd.CommandText = """
             INSERT INTO kv (id, key, created, deleted, immutable, create_rev, prev_rev, lease, value, old_value)
@@ -717,13 +806,6 @@ public sealed class KvStore : IDisposable
         using SqliteCommand cmd = conn.CreateCommand();
         cmd.CommandText = sql;
         cmd.ExecuteNonQuery();
-    }
-
-    private static long ScalarLong(SqliteConnection conn, string sql)
-    {
-        using SqliteCommand cmd = conn.CreateCommand();
-        cmd.CommandText = sql;
-        return Convert.ToInt64(cmd.ExecuteScalar());
     }
 }
 

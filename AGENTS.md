@@ -17,8 +17,10 @@ other:
 - **Turnstile** (`turnstile`) — a credential-free coordination store: kv, leases, and an
   ETag watch over a local Unix socket. No GitHub, no network, no auth. This is the
   long-running state substrate the gate caches into.
-- **Octoshift** (`octoshift`) — the GitHub-facing membrane. It holds the GitHub App credentials
-  agents never touch and observes PR/CI state over cheap REST + `If-None-Match` (leaving the
+- **Octoshift** (`octoshift`) — the GitHub-facing membrane. It runs an already-authenticated `gh`
+  (the host's ambient `gh` credential storage, or an externally provisioned `GH_TOKEN`) and owns no
+  credential material of its own — following Git's credential boundary. It observes PR/CI state over
+  cheap REST + `If-None-Match` (leaving the
   exhausted GraphQL half alone). `octoshift waiting` joins agent-published tmux window state across
   hosts with what GitHub says about each PR to report which windows need a person; `octoshift pr`
   locates a single PR across the fleet; `octoshift fleet` manages the set of collection targets.
@@ -57,8 +59,11 @@ Keep this file to repository-wide engineering rules. Subsystem design lives in
   Never change a token's spelling, meaning, or exit code without updating every consumer.
   Adding a new token is fine; silently repurposing one is not.
 - **Keep the credential boundary.** Turnstile is GitHub-unaware: it coordinates over a local
-  socket with no network and no credentials. Octoshift is the *only* component that holds
-  GitHub authority and speaks to `gh`. Don't move network or credentials onto the Turnstile path.
+  socket with no network and no credentials. Octoshift is the *only* component that speaks to
+  GitHub, and it does so through an already-authenticated `gh` it never owns credentials for —
+  authority lives in the host-provided `gh`, not in octoshift. Don't move network or credentials
+  onto the Turnstile path, and don't reintroduce octoshift-owned credential material or token
+  minting.
 - Reuse the existing command, state, and PR/repo-scope types before adding parallel
   abstractions.
 - Keep failure visible. An unreachable socket, an ineligible action, or a GitHub error must

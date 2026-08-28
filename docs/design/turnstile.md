@@ -124,6 +124,13 @@ Not a kernel feature — a **design vocabulary** — but it determines what the 
 
 **Only one class needs mandatory CAS.**
 
+> **Immutable and ephemeral are mutually exclusive.** An immutable key cannot be attached to a lease.
+> Immutability means the key is *never* deleted; a lease exists precisely to *delete* what it holds when the
+> holder dies. The two contracts contradict — an immutable leased key would outlive its lease as an orphan —
+> so the combination is rejected at write time (`400`), on every path that could create it (see §6). This
+> constrains *new* writes; it is not a migration. A row written before the rule that is both immutable and
+> leased keeps its immutability and so may outlive lease removal — see the lease-deletion note in §6.
+
 A controller reconciling its own derived state is the *sole* authority. There is no one to race. CAS there is pure ceremony. **Where there's no race, CAS is noise. Where there is one, it's mandatory. Where there shouldn't be a writer at all, the key is immutable.**
 
 So the question is never "is this key transactional." It's **who is allowed to write this, and is there anyone to race with.**
@@ -157,8 +164,19 @@ CREATE TABLE lease (
   expires_at   INTEGER NOT NULL                    -- unix seconds, SERVER clock
 );
 
-CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);    -- compact_revision
+CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);    -- committed_revision, compact_revision
 ```
+
+`meta` holds two durable singletons keyed by name: `committed_revision`, the highest committed revision,
+advanced **in the same transaction** as the `kv` rows it counts (so a reader — status, range, or the watch
+one-shot sync — can never report below a committed row it can already see, and a rolled-back write neither
+advances nor exposes it); and `compact_revision` (below). `committed_revision` is the external source of
+truth for the current revision — the single-writer actor keeps a private in-memory copy only as its
+allocation base. On open it is reconciled with the log in the schema transaction: backfilled from
+`MAX(kv.id)` when absent (a database written before the key existed), repaired **upward** to `MAX(kv.id)` if a
+stored value has fallen below it (so it never sits under a visible row), and left untouched when at or above
+it — a value above the surviving max is legitimate after compaction. A malformed or negative value fails
+loudly rather than resetting a corrupt counter.
 
 **Three properties fall out, and they are the reason for this shape:**
 
@@ -221,12 +239,12 @@ A lint that fires loudly at development time, against a class of bug your author
 ```
 GET    /kv/{key}                          → value, create_revision, mod_revision, lease
 GET    /kv?prefix=P[&limit=N][&keys_only] → range scan, lexicographic order
-POST   /kv/{key}         [?lease=L] [?immutable]     create
+POST   /kv/{key}         [?lease=L] [?immutable]     create (lease and immutable are mutually exclusive → 400)
 PUT    /kv/{key}         If-Match | ?unconditional   update
 DELETE /kv/{key}         If-Match
 POST   /txn                               general CAS — multi-key
 POST   /lease            {"ttl": 2700}    → {"id": "<128-bit random>"}
-PUT    /lease/{id}                        keepalive → {"ttl_remaining": 2640}
+PUT    /lease/{id}                        keepalive → {"ttl_remaining": 2700}
 DELETE /lease/{id}                        revoke (deletes all attached keys)
 GET    /lease/{id}                        ttl_remaining, attached keys
 GET    /watch?prefix=P&from=R             SSE stream
@@ -323,7 +341,7 @@ loop:
 
 **This is the most important idea in Turnstile.**
 
-A lease has a TTL. Keys may be **attached** to it. On expiry or revoke, **all attached keys are deleted** — which writes tombstones, which **emit `delete` events on the watch.**
+A lease has a TTL. Keys may be **attached** to it. On expiry or revoke, **all attached keys are deleted** — which writes tombstones, which **emit `delete` events on the watch.** No *validly written* key is exempt: immutable+lease is rejected at write time (§3), so a current database has no immutable leased key to strand. One caveat for a legacy database: a row written before that rule that is both immutable and leased is intentionally **skipped** by deletion (an immutable key is never deleted) and so survives its lease. That is a pre-existing row, not something a new write can produce, and it is left as-is rather than migrated.
 
 Therefore:
 
@@ -349,6 +367,8 @@ And a smell worth naming: **if a, b, c must always be mutated together by the sa
 ### Implementation notes
 
 - **Expiry is evaluated at the server**, on the server's clock, always. Clock skew between laptop and desktop must never decide who owns an operation.
+- **Deadlines are stored in whole server seconds, truncated — and fixed before the write lands.** `expires_at` is computed as `floor(now) + ttl` at the moment the request is prepared, where `floor(now)` drops the fraction of the current second already elapsed. Truncation alone puts the deadline in **`(ttl − 1, ttl]`** ahead of *that* instant. But the deadline is frozen *before* the insert is handed to the single serialized writer, so the writer-queue wait, the write itself, and the response transit all elapse against a clock that is already counting down: under contention the lifetime a caller can actually use once its response returns is shorter than `(ttl − 1, ttl]`, and a sufficiently delayed grant can return already expired. This is the current storage contract; a round-up or higher-resolution deadline would be a future change, if a sub-second-sensitive caller ever needs one. Neither number a client sees is a promise of that much wall-clock life left: the requested `ttl` (wire `ttl`, `LeaseInfo.TtlSecs`) is the value asked for, and `ttl_remaining` is `max(0, expires_at − floor(now))`, a whole-second difference that over-reports by up to the elapsed sub-second remainder. A successful keepalive resets the deadline to `floor(now) + ttl` and returns the requested `ttl`.
+- **Renew against `ttl − 1`, not `ttl`.** A holder that sets its keepalive cadence from the nominal TTL — renew every `ttl/2`, the obvious choice — is timing against up to a full second more lease than it holds. At `ttl = 2` the deadline starts at most 2s out (less once the queue and response delay from the previous bullet are counted), so after waiting the nominal `ttl/2 = 1s` the remaining margin is at most about a second: absent other delay it lies in `(0, 1]` and can be nearly zero, and under writer contention it has no positive lower bound — the renewal can arrive after the lease has already expired. Short TTLs give no dependable renewal window: keep TTLs comfortably above your renewal interval (tens of seconds or more), and treat very short TTLs as unreliable.
 - **The sweeper runs eagerly** (~1s tick), not lazily on read. Lazy expiry is *correct* but produces no event — and the event is the entire point.
 - **Keepalive racing expiry must be deterministic.** The server decides. A keepalive arriving after the sweeper has run **fails** with `410 Gone`. The client must treat this as *"I have lost my claim"* and **stop** — never silently re-acquire.
 
@@ -416,12 +436,13 @@ The things the tests exist to prove.
 2. **Conditional writes are linearizable.** N concurrent claimants of one key ⇒ exactly one succeeds.
 3. **No lost events.** A watcher from revision `R` sees *every* matching mutation with `id > R`, exactly once, in revision order.
 4. **No phantom events.** A watcher never sees a rolled-back mutation.
-5. **Lease expiry emits exactly one delete event per attached key.**
+5. **Lease expiry emits exactly one delete event per attached key.** Every *validly attached* key is deletable, because immutable+lease is rejected at write time (invariant 11); a legacy immutable+leased row is the one exception and is intentionally skipped rather than deleted (§6).
 6. **Compaction never destroys the latest live row for any key.**
 7. **A watch from a compacted revision fails loudly (`410`)** rather than silently skipping history.
 8. **Crash recovery is clean.** `kill -9` mid-write leaves no torn state; the revision counter resumes correctly.
 9. **Immutable keys cannot be mutated by anyone, ever.**
 10. **Turnstile opens no outbound sockets.**
+11. **Immutable and lease are mutually exclusive for new writes.** Creating or attaching a key that is both immutable and leased — via create, txn put, or making a leased key immutable — is rejected (`400`) before any state change, so no *newly written* immutable key can outlive its lease. This is not retroactive: a row written before the rule that is both immutable and leased keeps its immutability and may survive lease removal (§6), and is not migrated.
 
 ---
 
@@ -456,6 +477,7 @@ Priority order. **The first four are where the bugs will actually be.**
 - Oversized values rejected.
 - `PUT` without `If-Match` → **428**. With a stale one → **412**.
 - Immutable key mutation → **409**, always.
+- Immutable + lease (create, txn put, or making a leased key immutable) → **400**, on every path, before any state change.
 - SSE survives a slow consumer without unbounded server-side buffering.
 
 ### If you have the appetite

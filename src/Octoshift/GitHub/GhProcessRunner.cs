@@ -4,58 +4,36 @@ using System.ComponentModel;
 using System.Diagnostics;
 
 /// <summary>
-/// Builds <c>gh</c> runner delegates that inject an installation token as <c>GH_TOKEN</c>.
+/// Runs an ambient <c>gh</c> subprocess: the caller's own <c>gh</c> authentication, inherited from the
+/// process environment (ambient <c>gh</c> credential storage, or an externally provisioned <c>GH_TOKEN</c>),
+/// reaches gh untouched. octoshift owns no credential material and injects none — following Git's credential
+/// boundary, authority lives in the already-authenticated <c>gh</c> the host provides.
+///
+/// What this runner keeps is the hardened process lifecycle. Both output streams are drained concurrently
+/// with the wait so a burst larger than a pipe buffer is neither truncated nor able to deadlock the child; on
+/// ordinary completion the full stdout/stderr and exit code are returned; on cancellation the launched
+/// process's exit is confirmed by a bounded wait (a kill only <em>requests</em> termination) and both reads
+/// are unblocked and observed before the cancellation propagates, or the runner fails deterministically with
+/// <see cref="GhProcessCleanupException"/> rather than returning while the process may still be alive.
+/// Descendant containment is best-effort (a tree kill cannot reach a process that outlived the root) and is
+/// tracked separately. The program name is a parameter so these facts can be exercised against a purpose-built
+/// child rather than only the real <c>gh</c> binary.
 /// </summary>
-internal static class GhAuthenticatedRunner
+internal static class GhProcessRunner
 {
-    public static Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> Create(
-        IGitHubInstallationTokenProvider tokenProvider)
-        => Create(tokenProvider, RunGhAsync);
-
-    internal static Func<IReadOnlyList<string>, CancellationToken, Task<GhResult>> Create(
-        IGitHubInstallationTokenProvider tokenProvider,
-        Func<IReadOnlyList<string>, IReadOnlyDictionary<string, string?>?, CancellationToken, Task<GhResult>> runGhAsync)
-    {
-        ArgumentNullException.ThrowIfNull(tokenProvider);
-        ArgumentNullException.ThrowIfNull(runGhAsync);
-
-        return async (args, ct) =>
-        {
-            GitHubInstallationToken token = await tokenProvider.GetTokenAsync(ct);
-            var environment = new Dictionary<string, string?>(StringComparer.Ordinal)
-            {
-                ["GH_TOKEN"] = token.Token,
-            };
-
-            return await runGhAsync(args, environment, ct);
-        };
-    }
-
-    internal static Task<GhResult> RunGhAsync(
-        IReadOnlyList<string> args,
-        IReadOnlyDictionary<string, string?>? environmentOverrides,
-        CancellationToken ct)
-        => RunProcessAsync("gh", args, environmentOverrides, ct);
-
     /// <summary>
-    /// Starts <paramref name="file"/> with <paramref name="args"/> and returns its exit code and captured
-    /// stdout/stderr. On ordinary completion the full output and exit code are returned. On cancellation the
-    /// contract is scoped to the process we launch: the tree is asked to die (best-effort
-    /// <see cref="Process.Kill(bool)"/>, so a descendant that outlived the root may not be reached — durable
-    /// descendant containment is tracked separately), and the direct token-bearing process's exit is confirmed
-    /// by a bounded wait (a kill only requests termination, so exit is never assumed); if it cannot be
-    /// confirmed in time the runner fails deterministically with <see cref="GhProcessCleanupException"/> rather
-    /// than hanging. Either way both output reads are unblocked and observed before the runner returns, so it
-    /// never returns while the launched process is confirmed alive nor leaves a drain task running. The program
-    /// name is a parameter so this can be exercised against a purpose-built child rather than only the real
-    /// <c>gh</c> binary.
+    /// Runs ambient <c>gh</c> with <paramref name="args"/>, inheriting the caller's environment and auth. This
+    /// is the runner delegate the read-only membrane commands (<c>waiting</c>, <c>pr</c>) hand to
+    /// <see cref="GhPrFactsSource"/>.
     /// </summary>
+    public static Task<GhResult> RunGhAsync(IReadOnlyList<string> args, CancellationToken ct)
+        => RunProcessAsync("gh", args, ct);
+
     internal static Task<GhResult> RunProcessAsync(
         string file,
         IReadOnlyList<string> args,
-        IReadOnlyDictionary<string, string?>? environmentOverrides,
         CancellationToken ct)
-        => RunProcessAsync(file, args, environmentOverrides, TryKill, DefaultTerminationConfirmation, ct);
+        => RunProcessAsync(file, args, TryKill, DefaultTerminationConfirmation, ct);
 
     /// <summary>
     /// Per-attempt ceiling on confirming the launched process actually exited after a kill was requested.
@@ -76,7 +54,6 @@ internal static class GhAuthenticatedRunner
     internal static async Task<GhResult> RunProcessAsync(
         string file,
         IReadOnlyList<string> args,
-        IReadOnlyDictionary<string, string?>? environmentOverrides,
         Func<Process, bool, bool> requestKill,
         TimeSpan terminationConfirmation,
         CancellationToken ct)
@@ -93,20 +70,9 @@ internal static class GhAuthenticatedRunner
             psi.ArgumentList.Add(arg);
         }
 
-        if (environmentOverrides is not null)
-        {
-            foreach ((string key, string? value) in environmentOverrides)
-            {
-                if (value is null)
-                {
-                    psi.Environment.Remove(key);
-                }
-                else
-                {
-                    psi.Environment[key] = value;
-                }
-            }
-        }
+        // No environment overrides: the child inherits octoshift's environment, so ambient `gh` credential
+        // storage or an externally provisioned GH_TOKEN reaches gh unchanged. octoshift neither injects nor
+        // unsets authentication.
 
         using var proc = new Process { StartInfo = psi };
 
@@ -328,9 +294,11 @@ internal static class GhAuthenticatedRunner
 internal readonly record struct GhResult(int ExitCode, string Stdout, string Stderr);
 
 /// <summary>
-/// Signals that the runner could not confirm the launched process was terminated during cancellation cleanup.
-/// It is deliberately NOT an <see cref="InvalidOperationException"/>, so the App auth wrapper — which
-/// normalises token-mint/config <see cref="InvalidOperationException"/>s to an unavailable read — cannot
-/// swallow it. A cleanup failure, like cancellation, must reach the caller untouched.
+/// Signals that the runner could not confirm the launched <c>gh</c> process exited during cancellation
+/// cleanup — after a kill was requested, a bounded wait never observed the direct process terminate. It is a
+/// dedicated exception type, distinct from <see cref="InvalidOperationException"/> and
+/// <see cref="OperationCanceledException"/>, so callers that map ordinary failures to an unavailable read
+/// cannot swallow it: a process that may still be alive is not an ordinary unavailable result. Like a
+/// cancellation, it must reach the caller untouched.
 /// </summary>
 internal sealed class GhProcessCleanupException(string message) : Exception(message);

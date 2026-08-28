@@ -1,13 +1,16 @@
 namespace Turnstile.Storage;
 
 using System.Collections.Concurrent;
+using System.Globalization;
 using Microsoft.Data.Sqlite;
 
 /// <summary>
 /// The single-writer actor. All mutations funnel through one connection on one dedicated thread,
 /// so writes are serialized without scattering BEGIN IMMEDIATE discipline across the codebase.
-/// Revisions are allocated here — strictly monotonic, gapless, never reused — and rolled back
-/// in memory if the transaction fails, so a rolled-back write never consumes a revision.
+/// Revisions are allocated transaction-locally — strictly monotonic, gapless across commits, never
+/// reused by a committed row — and the public counter is advanced only after the transaction commits.
+/// A rolled-back write therefore never publishes a revision (nor a phantom one mid-flight), and its
+/// allocated numbers are reused by the next transaction.
 /// </summary>
 internal sealed class WriteActor : IDisposable
 {
@@ -47,19 +50,40 @@ internal sealed class WriteActor : IDisposable
     {
         foreach (Job job in _queue.GetConsumingEnumerable())
         {
-            long snapshot = Interlocked.Read(ref _revision);
+            // The revision counter is allocated transaction-locally and published only on commit. The public
+            // _revision field (read cross-thread via Revision, /status, and watch sync) therefore never shows
+            // a number belonging to an in-flight transaction, and a rolled-back write neither advances it nor
+            // needs to restore it — so a reused revision cannot be skipped by a resume cursor that observed a
+            // phantom. The single writer thread means `allocated` needs no synchronization.
+            long committed = Interlocked.Read(ref _revision);
+            long allocated = committed;
             using SqliteTransaction tx = _conn.BeginTransaction(deferred: false);
             try
             {
-                long AllocateRevision() => Interlocked.Increment(ref _revision);
+                long AllocateRevision() => ++allocated;
                 object? result = job.Work(_conn, AllocateRevision);
-                tx.Commit();
-                job.Tcs.SetResult(result);
 
-                // Notify watchers only when the write actually advanced the log (post-commit).
-                if (Interlocked.Read(ref _revision) > snapshot)
+                // Persist the committed revision in the SAME transaction as the rows it counts, so the durable
+                // meta counter and the kv rows commit and roll back together — a reader can never see one
+                // without the other. A no-op transaction (nothing allocated) leaves the counter untouched.
+                if (allocated > committed)
                 {
+                    PersistRevision(tx, allocated);
+                }
+
+                tx.Commit();
+
+                // The in-memory field is now only the writer-private allocation cursor (the external truth is
+                // the meta counter). Advance it and notify watchers only after the commit succeeds.
+                if (allocated > committed)
+                {
+                    Interlocked.Exchange(ref _revision, allocated);
+                    job.Tcs.SetResult(result);
                     _onCommitted?.Invoke();
+                }
+                else
+                {
+                    job.Tcs.SetResult(result);
                 }
             }
             catch (Exception ex)
@@ -74,10 +98,21 @@ internal sealed class WriteActor : IDisposable
                     // writer; surfacing the original error to the caller is the useful signal.
                 }
 
-                Interlocked.Exchange(ref _revision, snapshot);
+                // Nothing was published, so _revision is already correct; the allocated numbers are discarded
+                // and reused by the next transaction.
                 job.Tcs.SetException(ex);
             }
         }
+    }
+
+    private void PersistRevision(SqliteTransaction tx, long revision)
+    {
+        using SqliteCommand cmd = _conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "UPDATE meta SET v = $v WHERE k = $k;";
+        cmd.Parameters.AddWithValue("$v", revision.ToString(CultureInfo.InvariantCulture));
+        cmd.Parameters.AddWithValue("$k", Schema.CommittedRevisionKey);
+        cmd.ExecuteNonQuery();
     }
 
     public void Dispose()

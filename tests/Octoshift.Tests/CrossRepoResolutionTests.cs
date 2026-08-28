@@ -368,6 +368,26 @@ public class CrossRepoResolutionTests
         Assert.DoesNotContain(gh.Requests, args => args.Contains("repos/owner/second/pulls/4623"));
     }
 
+    [Fact]
+    public async Task Refresh_ParsesMergedAtWithTheSameSemanticsAsTheDetailedRead()
+    {
+        // #185 round 1: a PR that merged between the two reads must carry its merge time through the refresh,
+        // so merged-duration reporting is not lost. RefreshMergeabilityAsync parses merged_at exactly as
+        // FetchDetailedAsync does.
+        var gh = new FakeGh
+        {
+            ["repos/owner/first/pulls/4623"] = Response(200,
+                "{\"number\":4623,\"state\":\"closed\",\"merged\":true,\"merged_at\":\"2026-08-27T12:00:00Z\",\"mergeable_state\":\"clean\",\"head\":{\"sha\":\"" + HeadB + "\"}}"),
+        };
+
+        GhFleetPrFactsSource fleet = Fleet(gh, "owner/first");
+        PrFacts? refreshed = await fleet.RefreshMergeabilityAsync(4623, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(refreshed);
+        Assert.True(refreshed!.Merged);
+        Assert.Equal(DateTimeOffset.Parse("2026-08-27T12:00:00Z", System.Globalization.CultureInfo.InvariantCulture), refreshed.MergedAt);
+    }
+
     // ---- scope resolution --------------------------------------------------
 
     [Fact]
