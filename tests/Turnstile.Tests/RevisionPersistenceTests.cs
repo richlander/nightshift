@@ -51,6 +51,79 @@ public sealed class RevisionPersistenceTests : IDisposable
     }
 
     [Fact]
+    public async Task Open_OnAStaleButValidMetaBelowMaxKvId_RepairsUpward()
+    {
+        // The round-3 blocker: a syntactically valid committed_revision that has fallen below MAX(kv.id) must
+        // be repaired upward on open, or CurrentRevision reports below a visible row and the next write reuses
+        // an existing id and fails. Rows 1..3 with a stale meta of 1 must reopen at 3, and the next write gets 4.
+        using (KvStore store = KvStore.Open(_dbPath))
+        {
+            await store.CreateAsync("/a", Bytes("1"));
+            await store.CreateAsync("/b", Bytes("2"));
+            await store.CreateAsync("/c", Bytes("3"));
+        }
+
+        SetMeta("1");
+
+        SqliteConnection.ClearAllPools();
+        using (KvStore reopened = KvStore.Open(_dbPath))
+        {
+            Assert.Equal(3, reopened.CurrentRevision);                 // repaired up to MAX(kv.id)
+            WriteResult next = await reopened.CreateAsync("/d", Bytes("4"));
+            Assert.Equal(4, next.Revision);                            // no reused id, no collision
+            Assert.Equal(4, reopened.CurrentRevision);
+        }
+    }
+
+    [Fact]
+    public async Task Open_OnAMetaAboveMaxKvId_PreservesIt()
+    {
+        // A committed revision above the surviving MAX(kv.id) is legitimate after compaction/history retention
+        // removes rows, so it is preserved rather than dragged down.
+        using (KvStore store = KvStore.Open(_dbPath))
+        {
+            await store.CreateAsync("/a", Bytes("1"));
+        }
+
+        SetMeta("10");
+
+        SqliteConnection.ClearAllPools();
+        using (KvStore reopened = KvStore.Open(_dbPath))
+        {
+            Assert.Equal(10, reopened.CurrentRevision);                // preserved (> MAX(kv.id))
+            Assert.Equal(11, (await reopened.CreateAsync("/b", Bytes("2"))).Revision);
+        }
+    }
+
+    [Theory]
+    [InlineData("garbage")]
+    [InlineData("-5")]
+    [InlineData("3.5")]
+    public async Task Open_OnAMalformedMeta_FailsVisibly(string corrupt)
+    {
+        using (KvStore store = KvStore.Open(_dbPath))
+        {
+            await store.CreateAsync("/a", Bytes("1"));   // one row so the database is otherwise valid
+        }
+
+        SetMeta(corrupt);
+
+        SqliteConnection.ClearAllPools();
+        Assert.Throws<InvalidOperationException>(() => KvStore.Open(_dbPath));
+    }
+
+    private void SetMeta(string value)
+    {
+        SqliteConnection.ClearAllPools();
+        using var raw = new SqliteConnection($"Data Source={_dbPath}");
+        raw.Open();
+        using SqliteCommand cmd = raw.CreateCommand();
+        cmd.CommandText = "UPDATE meta SET v = $v WHERE k = 'committed_revision';";
+        cmd.Parameters.AddWithValue("$v", value);
+        cmd.ExecuteNonQuery();
+    }
+
+    [Fact]
     public async Task Reopen_PreservesCommittedRevision_AndStaysMonotonic()
     {
         using (KvStore store = KvStore.Open(_dbPath))

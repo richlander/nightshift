@@ -1,5 +1,6 @@
 namespace Turnstile.Storage;
 
+using System.Globalization;
 using Microsoft.Data.Sqlite;
 
 /// <summary>The log-structured schema (spec §4). kine's model: a single append-only revision table.</summary>
@@ -47,21 +48,72 @@ internal static class Schema
             ddl.ExecuteNonQuery();
         }
 
-        // Initialize the durable committed-revision singleton idempotently and atomically with the DDL: an
-        // existing database adopts its MAX(kv.id); a fresh one starts at 0; a database that already carries
-        // the key is left exactly as it is (OR IGNORE keeps the existing value — never a reset). This is the
-        // migration for databases that predate the key — a one-time backfill, not a rewrite.
-        using (SqliteCommand init = conn.CreateCommand())
-        {
-            init.Transaction = tx;
-            init.CommandText = """
-                INSERT OR IGNORE INTO meta (k, v)
-                SELECT $k, CAST(COALESCE(MAX(id), 0) AS TEXT) FROM kv;
-                """;
-            init.Parameters.AddWithValue("$k", CommittedRevisionKey);
-            init.ExecuteNonQuery();
-        }
+        ReconcileCommittedRevision(conn, tx);
 
         tx.Commit();
+    }
+
+    /// <summary>
+    /// Reconciles the durable <c>committed_revision</c> singleton with the log, atomically with the DDL:
+    /// <list type="bullet">
+    /// <item>Absent (a database written before the key existed): backfill it from <c>MAX(kv.id)</c>.</item>
+    /// <item>Present but below <c>MAX(kv.id)</c> (a stale counter): repair it upward to <c>MAX(kv.id)</c>, or
+    /// the next write would reuse a visible id and the reported revision would sit below a visible row.</item>
+    /// <item>Present at or above <c>MAX(kv.id)</c>: leave it. A value above the surviving max is legitimate
+    /// after compaction or history retention removes rows.</item>
+    /// <item>Malformed / negative / out-of-range: fail visibly rather than silently reset a corrupt counter.</item>
+    /// </list>
+    /// </summary>
+    private static void ReconcileCommittedRevision(SqliteConnection conn, SqliteTransaction tx)
+    {
+        long maxId = MaxKvId(conn, tx);
+        string? existing = ReadCommittedRevisionText(conn, tx);
+
+        if (existing is null)
+        {
+            SetCommittedRevision(conn, tx, maxId, insert: true);
+            return;
+        }
+
+        if (!long.TryParse(existing, NumberStyles.None, CultureInfo.InvariantCulture, out long committed))
+        {
+            throw new InvalidOperationException(
+                $"turnstile: the committed-revision meta value '{existing}' is not a valid non-negative integer.");
+        }
+
+        if (committed < maxId)
+        {
+            SetCommittedRevision(conn, tx, maxId, insert: false);
+        }
+    }
+
+    private static long MaxKvId(SqliteConnection conn, SqliteTransaction tx)
+    {
+        using SqliteCommand cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "SELECT COALESCE(MAX(id), 0) FROM kv;";
+        return (long)cmd.ExecuteScalar()!;
+    }
+
+    private static string? ReadCommittedRevisionText(SqliteConnection conn, SqliteTransaction tx)
+    {
+        using SqliteCommand cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "SELECT v FROM meta WHERE k = $k;";
+        cmd.Parameters.AddWithValue("$k", CommittedRevisionKey);
+        object? raw = cmd.ExecuteScalar();
+        return raw is null or DBNull ? null : (string)raw;
+    }
+
+    private static void SetCommittedRevision(SqliteConnection conn, SqliteTransaction tx, long value, bool insert)
+    {
+        using SqliteCommand cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = insert
+            ? "INSERT INTO meta (k, v) VALUES ($k, $v);"
+            : "UPDATE meta SET v = $v WHERE k = $k;";
+        cmd.Parameters.AddWithValue("$k", CommittedRevisionKey);
+        cmd.Parameters.AddWithValue("$v", value.ToString(CultureInfo.InvariantCulture));
+        cmd.ExecuteNonQuery();
     }
 }

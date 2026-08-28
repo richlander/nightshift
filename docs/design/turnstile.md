@@ -172,8 +172,11 @@ advanced **in the same transaction** as the `kv` rows it counts (so a reader —
 one-shot sync — can never report below a committed row it can already see, and a rolled-back write neither
 advances nor exposes it); and `compact_revision` (below). `committed_revision` is the external source of
 truth for the current revision — the single-writer actor keeps a private in-memory copy only as its
-allocation base — and it is backfilled from `MAX(kv.id)` when opening a database written before the key
-existed.
+allocation base. On open it is reconciled with the log in the schema transaction: backfilled from
+`MAX(kv.id)` when absent (a database written before the key existed), repaired **upward** to `MAX(kv.id)` if a
+stored value has fallen below it (so it never sits under a visible row), and left untouched when at or above
+it — a value above the surviving max is legitimate after compaction. A malformed or negative value fails
+loudly rather than resetting a corrupt counter.
 
 **Three properties fall out, and they are the reason for this shape:**
 
