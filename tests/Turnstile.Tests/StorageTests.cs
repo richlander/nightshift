@@ -94,6 +94,45 @@ public class StorageTests : IDisposable
     }
 
     [Fact]
+    public async Task Create_ImmutableWithLease_RejectedBeforeAnyStateChange()
+    {
+        // The lease contract deletes every attached key when the lease ends, but an immutable key is never
+        // deleted — so an immutable leased key would orphan itself. Creating one is rejected outright, and
+        // nothing is written: no key row, no revision consumed.
+        using KvStore store = Open();
+        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 3600);
+        long revBefore = store.CurrentRevision;
+
+        await Assert.ThrowsAsync<TurnstileValidationException>(
+            () => store.CreateAsync("/spec", Bytes("frozen"), immutable: true, lease: lease.Id));
+
+        Assert.Null(store.Get("/spec"));                 // no state change
+        Assert.Equal(revBefore, store.CurrentRevision);  // no revision consumed
+    }
+
+    [Fact]
+    public async Task Create_ImmutableWithoutLease_StillSucceeds()
+    {
+        // No regression: immutable-only creation is unaffected.
+        using KvStore store = Open();
+        Assert.Equal(WriteStatus.Created, (await store.CreateAsync("/spec", Bytes("frozen"), immutable: true)).Status);
+        Assert.True(store.Get("/spec")!.Immutable);
+        Assert.Null(store.Get("/spec")!.Lease);
+    }
+
+    [Fact]
+    public async Task Create_LeasedMutable_StillSucceeds()
+    {
+        // No regression: a leased mutable key (the ephemeral class) is unaffected.
+        using KvStore store = Open();
+        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 3600);
+        Assert.Equal(WriteStatus.Created, (await store.CreateAsync("/agent/dev-b", Bytes("host"), lease: lease.Id)).Status);
+        KeyState s = store.Get("/agent/dev-b")!;
+        Assert.False(s.Immutable);
+        Assert.Equal(lease.Id, s.Lease);
+    }
+
+    [Fact]
     public async Task Range_ReturnsLiveKeysInLexicographicOrder()
     {
         using KvStore store = Open();

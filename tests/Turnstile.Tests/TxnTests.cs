@@ -148,6 +148,54 @@ public class TxnTests : IDisposable
     }
 
     [Fact]
+    public async Task Txn_PutImmutableWithLease_RejectedBeforeAnyStateChange()
+    {
+        // A txn put is another entry path onto the shared write point, so it enforces the same invariant: an
+        // immutable key cannot be attached to a lease. The whole transaction rolls back — no key, no revision.
+        using KvStore store = Open();
+        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 3600);
+        long revBefore = store.CurrentRevision;
+
+        var immutableLeased = new TxnOp(TxnOpKind.Put, "/spec", Bytes("frozen"), lease.Id, true);
+        await Assert.ThrowsAsync<TurnstileValidationException>(
+            () => store.TxnAsync([NotExist("/spec")], [immutableLeased], []));
+
+        Assert.Null(store.Get("/spec"));
+        Assert.Equal(revBefore, store.CurrentRevision);
+    }
+
+    [Fact]
+    public async Task Txn_MakingALeasedKeyImmutable_Rejected()
+    {
+        // The subtler path the shared enforcement catches: a txn put that flips an existing leased mutable key
+        // to immutable would produce an immutable+leased row. It is rejected, and the key stays as it was.
+        using KvStore store = Open();
+        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 3600);
+        await store.TxnAsync([NotExist("/claim")], [Put("/claim", "dev-b", lease.Id)], []);
+
+        var flipToImmutable = new TxnOp(TxnOpKind.Put, "/claim", Bytes("dev-b"), null, true);
+        await Assert.ThrowsAsync<TurnstileValidationException>(
+            () => store.TxnAsync([], [flipToImmutable], []));
+
+        KeyState s = store.Get("/claim")!;
+        Assert.False(s.Immutable);          // unchanged: still the ephemeral leased key it was
+        Assert.Equal(lease.Id, s.Lease);
+    }
+
+    [Fact]
+    public async Task Txn_PutImmutableWithoutLease_StillSucceeds()
+    {
+        // No regression: creating an immutable key with no lease via a txn put is unaffected.
+        using KvStore store = Open();
+        TxnResult r = await store.TxnAsync([NotExist("/spec")], [new TxnOp(TxnOpKind.Put, "/spec", Bytes("frozen"), null, true)], []);
+
+        Assert.True(r.Succeeded);
+        KeyState s = store.Get("/spec")!;
+        Assert.True(s.Immutable);
+        Assert.Null(s.Lease);
+    }
+
+    [Fact]
     public async Task Claim_UnderLease_AttachesAndExpires()
     {
         using KvStore store = Open();
