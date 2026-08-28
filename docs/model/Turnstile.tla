@@ -67,9 +67,10 @@
        still does not cover is notification: each instance's change signal is in-memory,
        so a watcher on one instance is not woken by another instance's commit. That is a
        distinct gap, not addressed by #199.
-     - the wire: fields dropped in serialization (txn GET and watch events omitting
-       `immutable`, #195/#196) are a protocol concern the abstract state vector does
-       not carry.
+     - the wire: watch events still omit `immutable` in serialization (#196), a protocol
+       concern the abstract state vector does not carry. (The matching txn GET omission,
+       #195, has since been fixed in the implementation; the model never modelled the
+       wire either way.)
    These are honest gaps, not claims -- a passing run of this model says nothing about
    any of them.
 
