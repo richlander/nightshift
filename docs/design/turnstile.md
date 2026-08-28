@@ -226,7 +226,7 @@ PUT    /kv/{key}         If-Match | ?unconditional   update
 DELETE /kv/{key}         If-Match
 POST   /txn                               general CAS — multi-key
 POST   /lease            {"ttl": 2700}    → {"id": "<128-bit random>"}
-PUT    /lease/{id}                        keepalive → {"ttl_remaining": 2640}
+PUT    /lease/{id}                        keepalive → {"ttl_remaining": 2700}
 DELETE /lease/{id}                        revoke (deletes all attached keys)
 GET    /lease/{id}                        ttl_remaining, attached keys
 GET    /watch?prefix=P&from=R             SSE stream
@@ -349,6 +349,8 @@ And a smell worth naming: **if a, b, c must always be mutated together by the sa
 ### Implementation notes
 
 - **Expiry is evaluated at the server**, on the server's clock, always. Clock skew between laptop and desktop must never decide who owns an operation.
+- **Deadlines are stored in whole server seconds, truncated — and fixed before the write lands.** `expires_at` is computed as `floor(now) + ttl` at the moment the request is prepared, where `floor(now)` drops the fraction of the current second already elapsed. Truncation alone puts the deadline in **`(ttl − 1, ttl]`** ahead of *that* instant. But the deadline is frozen *before* the insert is handed to the single serialized writer, so the writer-queue wait, the write itself, and the response transit all elapse against a clock that is already counting down: under contention the lifetime a caller can actually use once its response returns is shorter than `(ttl − 1, ttl]`, and a sufficiently delayed grant can return already expired. This is the current storage contract; a round-up or higher-resolution deadline would be a future change, if a sub-second-sensitive caller ever needs one. Neither number a client sees is a promise of that much wall-clock life left: the requested `ttl` (wire `ttl`, `LeaseInfo.TtlSecs`) is the value asked for, and `ttl_remaining` is `max(0, expires_at − floor(now))`, a whole-second difference that over-reports by up to the elapsed sub-second remainder. A successful keepalive resets the deadline to `floor(now) + ttl` and returns the requested `ttl`.
+- **Renew against `ttl − 1`, not `ttl`.** A holder that sets its keepalive cadence from the nominal TTL — renew every `ttl/2`, the obvious choice — is timing against up to a full second more lease than it holds. At `ttl = 2` the deadline starts at most 2s out (less once the queue and response delay from the previous bullet are counted), so after waiting the nominal `ttl/2 = 1s` the remaining margin is at most about a second: absent other delay it lies in `(0, 1]` and can be nearly zero, and under writer contention it has no positive lower bound — the renewal can arrive after the lease has already expired. Short TTLs give no dependable renewal window: keep TTLs comfortably above your renewal interval (tens of seconds or more), and treat very short TTLs as unreliable.
 - **The sweeper runs eagerly** (~1s tick), not lazily on read. Lazy expiry is *correct* but produces no event — and the event is the entire point.
 - **Keepalive racing expiry must be deterministic.** The server decides. A keepalive arriving after the sweeper has run **fails** with `410 Gone`. The client must treat this as *"I have lost my claim"* and **stop** — never silently re-acquire.
 
