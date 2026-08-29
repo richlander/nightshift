@@ -71,13 +71,21 @@
        opened instances is now globally serialized -- each writer reads the durable
        committed revision under BEGIN IMMEDIATE as its base, never a cached value -- so
        the model's single global `rev` faithfully abstracts it (#199). Notification is
-       handled by *narrowing the contract*, not by adding cross-process signalling: watch
-       liveness is daemon-only (#202). The single change signal modelled here is the
-       daemon-owned one that watchers park on; the direct LocalStore transport exposes no
+       closed not by adding cross-process signalling but by making the single-signal
+       abstraction *true* (#202), in two parts. The direct LocalStore transport exposes no
        watcher at all -- it rejects the call up front (TurnstileWatchUnavailableException)
-       rather than park on a process-local signal no other writer pulses. So the model's
-       one watcher is the only watcher there is to model, and direct mode's absence from it
-       is faithful rather than a gap.
+       rather than park on a process-local signal no other writer pulses. And a
+       database-ownership lock (ModeLock, a cross-process flock) forbids a direct writer
+       and a daemon from holding one file at once: the daemon holds it *exclusively* for
+       its lifetime, so while its watch is live no other process can open the file to
+       commit behind its back -- every advance of `rev` is one its own signal pulses.
+       Rejection alone would not suffice: it stops a caller parking on a dead signal but
+       leaves a direct *write* free to advance the global revision under a parked daemon
+       watcher, the very lost wakeup NoLostWakeup forbids; the exclusive lock is what
+       removes that writer. So the single change signal modelled here is the daemon-owned
+       one, the single global `rev` advances only within that daemon-owned mode, and the
+       model's one watcher is the only watcher there is to model -- direct mode has no
+       watcher, and while a daemon watches, no competing writer exists either.
      - the wire: watch events now carry `immutable` in serialization (#196), and the
        matching txn GET omission (#195) is likewise fixed in the implementation. Both are
        protocol concerns the abstract state vector never carried, so the model modelled the

@@ -32,6 +32,10 @@ internal sealed class TestDaemon : IAsyncDisposable
     /// <summary>The Unix socket the daemon is listening on.</summary>
     public string Socket { get; }
 
+    /// <summary>The database file this daemon exclusively owns — handed to a child process (via
+    /// <c>TURNSTILE_DB</c>) that must reach the same file the daemon holds.</summary>
+    public string DbPath => _dbPath;
+
     /// <summary>Starts a daemon on a fresh, owned database (generated here and cleaned up on dispose).</summary>
     public static Task<TestDaemon> StartAsync(CancellationToken ct, DaemonOptions? options = null)
         => StartAsync(NewDbPath(), ownsDb: true, options, ct);
@@ -112,7 +116,7 @@ internal sealed class TestDaemon : IAsyncDisposable
         List<string> paths = [Socket];
         if (_ownsDb)
         {
-            paths.AddRange([_dbPath, _dbPath + "-wal", _dbPath + "-shm"]);
+            paths.AddRange([_dbPath, _dbPath + "-wal", _dbPath + "-shm", _dbPath + "-modelock"]);
         }
 
         foreach (string path in paths)

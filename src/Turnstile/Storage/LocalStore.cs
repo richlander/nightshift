@@ -6,30 +6,64 @@ namespace Turnstile.Storage;
 /// is therefore <em>eventual</em>: <see cref="OpenAsync"/> sweeps once on open so a leaked lock from a
 /// dead process is reclaimed the next time any process touches the store.
 ///
-/// WAL plus globally serialized revision allocation (each writer reads the durable committed revision under
-/// BEGIN IMMEDIATE, never a cached value) makes this safe alongside a running daemon or another instance
-/// against the same file <em>for storage integrity</em>: revisions stay globally unique, monotonic and
-/// gapless, and every committed row persists (#199). It does <em>not</em> make watch notification
-/// cross-process: each instance's change signal is in-memory, so a watcher here could never be woken by a
-/// commit another instance made. Rather than expose a watch that can silently park on a process-local signal,
-/// <see cref="WatchAsync"/> rejects up front with a <see cref="TurnstileWatchUnavailableException"/> —
-/// watch liveness is daemon-only (#202). Finite reads/writes/txns/leases and storage integrity remain fully
-/// useful here; only the live watch requires the daemon.
+/// <para>Direct mode is for when <em>no daemon owns the database</em>. <see cref="OpenAsync"/> takes a shared
+/// <see cref="ModeLock"/> first, so any number of direct stores can share one file — WAL plus globally
+/// serialized revision allocation (each writer reads the durable committed revision under BEGIN IMMEDIATE,
+/// never a cached value) keeps revisions globally unique, monotonic and gapless, and every committed row
+/// persists (#199) — but a database a daemon holds exclusively refuses the open with a
+/// <see cref="TurnstileDatabaseInUseException"/>. That boundary is what keeps a daemon's watch honest: because
+/// no direct store can open the file while the daemon owns it, no commit ever bypasses the daemon's change
+/// signal.</para>
+///
+/// <para>Watch liveness never survives the direct path regardless: each instance's change signal is
+/// in-memory, so a watcher here could never be woken by another instance's commit. Rather than expose a watch
+/// that can silently park on a process-local signal, <see cref="WatchAsync"/> rejects up front with a
+/// <see cref="TurnstileWatchUnavailableException"/> — watch liveness is daemon-only (#202). Finite
+/// reads/writes/txns/leases remain fully useful here; only the live watch requires the daemon.</para>
 /// </summary>
 public sealed class LocalStore : ITurnstile
 {
     private readonly KvStore _kv;
+    private readonly ModeLock _modeLock;
 
-    private LocalStore(KvStore kv) => _kv = kv;
+    private LocalStore(KvStore kv, ModeLock modeLock)
+    {
+        _kv = kv;
+        _modeLock = modeLock;
+    }
 
     /// <summary>Opens the store at <paramref name="dbPath"/> and sweeps expired leases once (sweep-on-open).</summary>
+    /// <exception cref="TurnstileDatabaseInUseException">
+    /// If a daemon exclusively owns the database (#202). Direct library-mode access is refused while a daemon
+    /// is running, so callers reach it through the daemon's socket instead of opening the file behind its back.
+    /// </exception>
     public static async Task<LocalStore> OpenAsync(string dbPath)
     {
-        KvStore kv = KvStore.Open(dbPath);
-        // Sweep-on-open: library mode has no always-on sweeper, so reclaim any leases that expired while
-        // no process was attached. This emits the delete events a lazy read would silently swallow.
-        await kv.SweepExpiredAsync().ConfigureAwait(false);
-        return new LocalStore(kv);
+        string? dir = Path.GetDirectoryName(Path.GetFullPath(dbPath));
+        if (dir is { Length: > 0 })
+        {
+            Directory.CreateDirectory(dir);
+        }
+
+        // Take the shared mode lock before touching SQLite: if a daemon owns this database it fails here,
+        // before any connection is opened, so a direct write can never slip in behind a daemon's live watch.
+        // Multiple direct stores share the lock, so daemonless multi-writer use is unaffected (#199).
+        ModeLock modeLock = ModeLock.AcquireShared(dbPath);
+        try
+        {
+            KvStore kv = KvStore.Open(dbPath);
+            // Sweep-on-open: library mode has no always-on sweeper, so reclaim any leases that expired while
+            // no process was attached. This emits the delete events a lazy read would silently swallow.
+            await kv.SweepExpiredAsync().ConfigureAwait(false);
+            return new LocalStore(kv, modeLock);
+        }
+        catch
+        {
+            // A failed open must not leak the lock, or the database would stay marked in-use with no store
+            // behind it — releasing it here lets a daemon (or a retry) acquire immediately.
+            modeLock.Dispose();
+            throw;
+        }
     }
 
     public Task<long> GetRevisionAsync(CancellationToken ct = default)
@@ -79,5 +113,9 @@ public sealed class LocalStore : ITurnstile
             "watch liveness requires a running Turnstile daemon; the direct SQLite store (library mode) "
             + "cannot observe another process's commits (start 'turnstile serve')");
 
-    public void Dispose() => _kv.Dispose();
+    public void Dispose()
+    {
+        _kv.Dispose();
+        _modeLock.Dispose();
+    }
 }

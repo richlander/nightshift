@@ -26,16 +26,23 @@ public sealed class Daemon
     /// </summary>
     internal static async Task<int> RunAsync(string socketPath, string dbPath, DaemonOptions? options, CancellationToken ct = default)
     {
-        // A Unix socket bind fails if a stale file is present; clear it first.
-        if (File.Exists(socketPath))
-        {
-            File.Delete(socketPath);
-        }
-
         string? dir = Path.GetDirectoryName(Path.GetFullPath(dbPath));
         if (dir is not null)
         {
             Directory.CreateDirectory(dir);
+        }
+
+        // Take exclusive database ownership before touching anything else — the socket file included. A second
+        // daemon (or any open direct store) fails here, before we would otherwise delete a live daemon's socket
+        // or open a second writer behind an existing watch. Exclusive ownership is the invariant the daemon's
+        // live watch rests on: with no direct store able to open the file, every commit flows through this
+        // store's change signal (#202). Held for the daemon's whole lifetime; the OS drops it if we crash.
+        using ModeLock modeLock = ModeLock.AcquireExclusive(dbPath);
+
+        // A Unix socket bind fails if a stale file is present; clear it first.
+        if (File.Exists(socketPath))
+        {
+            File.Delete(socketPath);
         }
 
         using KvStore store = KvStore.Open(dbPath);

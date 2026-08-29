@@ -14,15 +14,18 @@ using Xunit;
 /// rejects <see cref="ITurnstile.WatchAsync"/> eagerly with a <see cref="TurnstileWatchUnavailableException"/>
 /// rather than hand back a stream that could park forever.
 ///
-/// <para>These are outcome tests of that contract, at the boundaries that make it real:</para>
+/// <para>These are outcome tests of that rejection contract, at the boundaries that make it real:</para>
 /// <list type="bullet">
 ///   <item>the eager, deterministic throw (the mutation guard against restoring the direct delegation);</item>
-///   <item>a genuinely separate OS process committing to the shared file in library mode, then a real daemon
-///   on that same file resuming from the saved cursor and delivering that commit without loss — the
-///   cross-process claim the process-local signal could not satisfy;</item>
+///   <item>backlog replay across a reconnect: a genuinely separate OS process commits to the shared file in
+///   library mode <em>while no daemon owns it</em>, then a real daemon on that same file resumes from the
+///   saved cursor and replays that commit without loss. This is durability/replay evidence, not the live
+///   guarantee — a direct commit and a running daemon never coexist (the ownership lock forbids it), so this
+///   proves a daemon picks up what direct predecessors durably wrote, which the daemon-only live watch is
+///   proven separately in <see cref="DatabaseOwnershipTests"/>;</item>
 ///   <item>the CLI mapping of the narrowed contract to its load-bearing signal: exit 1 and a first-line
 ///   <c>turnstile:</c> error, on both watch-dependent helper paths (queue <c>pop --wait</c> and a contended
-///   <c>lock</c>, which catch the condition in different methods).</item>
+///   <c>lock</c>, which catch the condition in different methods), when no daemon is available to serve them.</item>
 /// </list>
 /// The separate writer is a real <c>turnstile</c> child process, not a second in-process store: process exit
 /// is what synchronises its commit, which is the only thing that proves the boundary the daemon-only decision
@@ -67,6 +70,12 @@ public sealed class DirectWatchContractTests : IDisposable
     [Fact]
     public async Task SeparateOsProcess_CommitsInLibraryMode_AndADaemonReplaysItFromTheSavedCursorWithoutLoss()
     {
+        // Backlog-replay evidence, not the live guarantee: every direct commit below happens while NO daemon
+        // owns the file, and the daemon starts only afterward — the ownership lock forbids a direct store and a
+        // daemon coexisting, so this deliberately stays on the direct-only side of that boundary and proves a
+        // daemon resumes what direct predecessors durably wrote. Live delivery under a running daemon is proven
+        // in DatabaseOwnershipTests.
+        //
         // The parent opens the file directly (library mode), seeds a baseline, and records the revision a
         // reconnect must resume from — the cursor. At this point a direct-store watch is refused eagerly, so
         // the parent is never left parked on events it could not see.
@@ -78,11 +87,12 @@ public sealed class DirectWatchContractTests : IDisposable
             Assert.Throws<TurnstileWatchUnavailableException>(() => { _ = parent.WatchAsync("/events/", resumeFrom, Ct); });
         }
 
-        // A genuinely separate OS process commits to the same DB in library mode (no daemon), then exits.
+        // A genuinely separate OS process commits to the same DB in library mode (still no daemon), then exits.
         // Process exit is what synchronises the commit across the boundary — the exact scenario a process-local
         // signal cannot bridge. `queue push` is a library-mode-capable product path, so this exercises the real
         // binary, not a test-only writer. TURNSTILE_SOCKET points at an absent path, forcing the LocalStore
-        // fallback; TURNSTILE_DB is the shared file.
+        // fallback; TURNSTILE_DB is the shared file. The parent store above is already disposed, so its shared
+        // mode lock is released and the child's own shared open succeeds.
         var childEnv = new Dictionary<string, string>
         {
             ["TURNSTILE_DB"] = _dbPath,
@@ -213,7 +223,7 @@ public sealed class DirectWatchContractTests : IDisposable
     public void Dispose()
     {
         Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-        foreach (string path in new[] { _dbPath, _dbPath + "-wal", _dbPath + "-shm", _dbPath + ".nosock" })
+        foreach (string path in new[] { _dbPath, _dbPath + "-wal", _dbPath + "-shm", _dbPath + "-modelock", _dbPath + ".nosock" })
         {
             if (File.Exists(path))
             {

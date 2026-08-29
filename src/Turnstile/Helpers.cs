@@ -16,6 +16,11 @@ using Turnstile.Storage;
 /// push) need live cross-process notification, which only the daemon delivers. In library mode those raise
 /// <see cref="TurnstileWatchUnavailableException"/>, which each helper maps to the non-success CLI convention
 /// (a first-line <c>turnstile:</c> error, exit 1) rather than parking forever (#202).
+///
+/// <para>The library-mode fallback itself can also be refused: if a daemon exclusively owns the database, the
+/// direct open fails with a <see cref="TurnstileDatabaseInUseException"/> — the connect calls (which sit
+/// outside the per-operation try) catch that and map it to the same non-success convention, so a helper never
+/// crashes with a stack trace when it should have reached the daemon over its socket (#202).</para>
 /// </summary>
 internal static class Helpers
 {
@@ -52,7 +57,23 @@ internal static class Helpers
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
         CancellationToken ct = cts.Token;
 
-        ITurnstile store = await TurnstileConnection.ConnectAsync(Cli.OptionValue(head, "--socket"), ct: ct);
+        ITurnstile store;
+        try
+        {
+            store = await TurnstileConnection.ConnectAsync(Cli.OptionValue(head, "--socket"), ct: ct);
+        }
+        catch (TurnstileUnavailableException ex)
+        {
+            // A daemon exclusively owns the database, so the direct fallback is refused (#202). Report the
+            // narrowed contract rather than crash with a stack trace: reach the daemon over its socket.
+            Console.Error.WriteLine($"turnstile: {ex.Message}");
+            return ExitUnavailable;
+        }
+        catch (OperationCanceledException)
+        {
+            return 130;
+        }
+
         string leaseId;
         try
         {
@@ -80,7 +101,7 @@ internal static class Helpers
 
             return await HoldAndRunAsync(store, leaseId, ttl, cmd, ct);
         }
-        catch (TurnstileWatchUnavailableException ex)
+        catch (TurnstileUnavailableException ex)
         {
             // Contention here needs a live watch to wait for release, and only the daemon delivers one. Fail
             // visibly rather than fall back to a park that can never wake (#202). Uncontended claims never
@@ -309,23 +330,41 @@ internal static class Helpers
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
         CancellationToken ct = cts.Token;
 
-        using ITurnstile store = await TurnstileConnection.ConnectAsync(Cli.OptionValue(args, "--socket"), ct: ct);
+        ITurnstile store;
         try
         {
-            return sub == "push"
-                ? await QueuePushAsync(store, queue, args, ct)
-                : await QueuePopAsync(store, queue, Cli.HasFlag(args, "--wait"), ct);
+            store = await TurnstileConnection.ConnectAsync(Cli.OptionValue(args, "--socket"), ct: ct);
         }
-        catch (TurnstileWatchUnavailableException ex)
+        catch (TurnstileUnavailableException ex)
         {
-            // Only `queue pop --wait` blocks on a watch; push and a non-wait pop stay finite and daemonless.
-            // A blocking wait needs the daemon's live notification, so surface the narrowed contract (#202).
+            // A daemon owns the database, so the direct fallback is refused (#202); report, don't crash.
             Console.Error.WriteLine($"turnstile: {ex.Message}");
             return ExitUnavailable;
         }
         catch (OperationCanceledException)
         {
             return 130;
+        }
+
+        using (store)
+        {
+            try
+            {
+                return sub == "push"
+                    ? await QueuePushAsync(store, queue, args, ct)
+                    : await QueuePopAsync(store, queue, Cli.HasFlag(args, "--wait"), ct);
+            }
+            catch (TurnstileUnavailableException ex)
+            {
+                // Only `queue pop --wait` blocks on a watch; push and a non-wait pop stay finite and daemonless.
+                // A blocking wait needs the daemon's live notification, so surface the narrowed contract (#202).
+                Console.Error.WriteLine($"turnstile: {ex.Message}");
+                return ExitUnavailable;
+            }
+            catch (OperationCanceledException)
+            {
+                return 130;
+            }
         }
     }
 

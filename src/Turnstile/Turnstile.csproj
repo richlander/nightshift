@@ -7,6 +7,10 @@
     <ToolCommandName>turnstile</ToolCommandName>
     <PublishAot>true</PublishAot>
     <EnableRequestDelegateGenerator>true</EnableRequestDelegateGenerator>
+    <!-- Source-generated P/Invoke (LibraryImport, used by Storage/ModeLock.cs for flock) emits `unsafe`
+         marshalling stubs, so the generator requires this flag. It permits the generated stubs only; no
+         hand-written unsafe code is introduced. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>

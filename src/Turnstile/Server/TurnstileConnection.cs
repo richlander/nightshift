@@ -9,10 +9,13 @@ using Turnstile.Storage;
 /// controllers call this and never care which they got — the daemon is an opt-in for liveness, not a
 /// prerequisite for the single-user helpers.
 ///
-/// <para>One capability does not survive the fallback: a <em>live watch</em>. A <see cref="LocalStore"/>
-/// rejects <see cref="ITurnstile.WatchAsync"/> with a <see cref="TurnstileWatchUnavailableException"/>
-/// because its change signal is process-local (#202). Finite operations — get, range, create, put, delete,
-/// txn, and leases — work daemonless unchanged; only a blocking watch requires a running daemon.</para>
+/// <para>Two failures do not survive the fallback. A <em>live watch</em>: a <see cref="LocalStore"/> rejects
+/// <see cref="ITurnstile.WatchAsync"/> with a <see cref="TurnstileWatchUnavailableException"/> because its
+/// change signal is process-local (#202). And the fallback <em>itself</em>: if a daemon exclusively owns the
+/// database, opening it directly fails with a <see cref="TurnstileDatabaseInUseException"/> — a caller that
+/// could not reach the socket must not open the file behind the daemon's live watch. Finite operations — get,
+/// range, create, put, delete, txn, and leases — work daemonless unchanged whenever no daemon owns the file;
+/// only a blocking watch (or a daemon-owned database) requires the daemon.</para>
 /// </summary>
 public static class TurnstileConnection
 {
