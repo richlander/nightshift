@@ -7,17 +7,23 @@ using Xunit;
 /// <summary>
 /// How an ambient <c>gh</c> subprocess is run. The runner injects no credentials of its own — the child
 /// inherits octoshift's environment, so the caller's own <c>gh</c> auth (ambient credential storage or an
-/// externally supplied <c>GH_TOKEN</c>) reaches gh untouched. Beyond that it drains both output streams
-/// concurrently with the wait so a burst larger than a pipe buffer is neither truncated nor able to deadlock
-/// the child, returns the full output and exit code on ordinary completion, and on cancellation confirms the
-/// launched process itself has exited and unblocks both reads before the cancellation propagates. Descendant
-/// containment is best-effort (a tree kill that cannot reach a process that outlived the root), and is not
-/// claimed here. The program name is a seam so these facts are provable against a purpose-built child rather
-/// than only the real binary.
+/// externally supplied <c>GH_TOKEN</c>) reaches gh as the host provides it; octoshift does not inspect, parse,
+/// log, mint, unset, or modify authentication. It does override gh's <em>non-auth</em> execution controls
+/// (<c>GH_TELEMETRY=false</c>, <c>GH_PAGER=cat</c>, and removing <c>GH_FORCE_TTY</c>) so <c>gh api</c> is a
+/// plain noninteractive machine transport and the known persistent/detached and pager paths that spawn a
+/// token-bearing process outliving the root — v2.97.0's detached telemetry child, a configured pager — are
+/// prevented at the source. Beyond that it drains both output streams concurrently with the wait so a burst
+/// larger than a pipe buffer is neither truncated nor able to deadlock the child, returns the full output and
+/// exit code on ordinary completion, and on cancellation confirms the launched process itself has exited and
+/// unblocks both reads before the cancellation propagates. Descendant containment is prevention, not a
+/// sandbox: preventing those paths does not make the root gh's only process (a synchronous helper such as
+/// macOS keyring's <c>/usr/bin/security</c> or Windows <c>tzutil</c> may still run), and such helpers remain
+/// covered only by the best-effort tree kill — no hostile-descendant sandbox is claimed here. The program name
+/// is a seam so these facts are provable against a purpose-built child rather than only the real binary.
 ///
-/// Joins the non-parallel <c>ConsoleCapture</c> collection: the ambient-auth test mutates the process-wide
-/// <c>GH_TOKEN</c> environment variable, so it must not run alongside any other test that reads or redirects
-/// process-global state.
+/// Joins the non-parallel <c>ConsoleCapture</c> collection: the environment tests mutate process-wide
+/// variables (<c>GH_TOKEN</c>, <c>GH_TELEMETRY</c>, <c>GH_PAGER</c>, <c>GH_FORCE_TTY</c>), so they must not run
+/// alongside any other test that reads or redirects process-global state.
 /// </summary>
 [Collection("ConsoleCapture")]
 public class GhProcessRunnerTests
@@ -88,6 +94,66 @@ public class GhProcessRunnerTests
         finally
         {
             Environment.SetEnvironmentVariable("GH_TOKEN", previous);
+        }
+    }
+
+    [Fact]
+    public async Task RunProcessAsync_OverridesGhSideEffectControls_WhilePreservingAuthAndUnrelatedEnvironment()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "The gh runner path starts a POSIX child here; there is nothing to start on Windows.");
+
+        // The runner turns `gh api` into a plain machine transport by overriding gh's non-auth side-effect
+        // controls, without touching the credential boundary. Seed octoshift's own environment with an
+        // ambient token *and* hostile inherited values for the controls the runner is responsible for, plus an
+        // unrelated variable, then prove at the process boundary that:
+        //   * GH_TOKEN reaches the child unchanged (auth is inherited, never owned);
+        //   * GH_TELEMETRY is exactly false (no sampled detached `gh send-telemetry` child);
+        //   * GH_PAGER is exactly cat (no external pager inheriting the token and redirected pipes);
+        //   * GH_FORCE_TTY is absent (the forced-TTY interactive path cannot reach this transport);
+        //   * an unrelated inherited variable is preserved (the runner overrides only what it must).
+        const string ambientToken = "externally-provisioned-token";
+        const string unrelatedName = "OCTOSHIFT_TEST_UNRELATED_ENV";
+        const string unrelatedValue = "unrelated-inherited-value";
+
+        string? prevToken = Environment.GetEnvironmentVariable("GH_TOKEN");
+        string? prevTelemetry = Environment.GetEnvironmentVariable("GH_TELEMETRY");
+        string? prevPager = Environment.GetEnvironmentVariable("GH_PAGER");
+        string? prevForceTty = Environment.GetEnvironmentVariable("GH_FORCE_TTY");
+        string? prevUnrelated = Environment.GetEnvironmentVariable(unrelatedName);
+        try
+        {
+            Environment.SetEnvironmentVariable("GH_TOKEN", ambientToken);
+            Environment.SetEnvironmentVariable("GH_TELEMETRY", "true");
+            Environment.SetEnvironmentVariable("GH_PAGER", "less");
+            Environment.SetEnvironmentVariable("GH_FORCE_TTY", "80");
+            Environment.SetEnvironmentVariable(unrelatedName, unrelatedValue);
+
+            GhResult result = await GhProcessRunner.RunProcessAsync(
+                "/bin/sh",
+                [
+                    "-c",
+                    "printf 'token=[%s]\\n' \"$GH_TOKEN\"; " +
+                    "printf 'telemetry=[%s]\\n' \"$GH_TELEMETRY\"; " +
+                    "printf 'pager=[%s]\\n' \"$GH_PAGER\"; " +
+                    "printf 'forcetty=[%s]\\n' \"$GH_FORCE_TTY\"; " +
+                    "printf 'unrelated=[%s]\\n' \"$OCTOSHIFT_TEST_UNRELATED_ENV\"",
+                ],
+                TestContext.Current.CancellationToken);
+
+            Assert.Equal(0, result.ExitCode);
+            Assert.Contains($"token=[{ambientToken}]", result.Stdout, StringComparison.Ordinal);
+            Assert.Contains("telemetry=[false]", result.Stdout, StringComparison.Ordinal);
+            Assert.Contains("pager=[cat]", result.Stdout, StringComparison.Ordinal);
+            Assert.Contains("forcetty=[]", result.Stdout, StringComparison.Ordinal);
+            Assert.Contains($"unrelated=[{unrelatedValue}]", result.Stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("GH_TOKEN", prevToken);
+            Environment.SetEnvironmentVariable("GH_TELEMETRY", prevTelemetry);
+            Environment.SetEnvironmentVariable("GH_PAGER", prevPager);
+            Environment.SetEnvironmentVariable("GH_FORCE_TTY", prevForceTty);
+            Environment.SetEnvironmentVariable(unrelatedName, prevUnrelated);
         }
     }
 
