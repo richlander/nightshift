@@ -7,7 +7,9 @@ using System.Diagnostics;
 /// Runs an ambient <c>gh</c> subprocess: the caller's own <c>gh</c> authentication, inherited from the
 /// process environment (ambient <c>gh</c> credential storage, or an externally provisioned <c>GH_TOKEN</c>),
 /// reaches gh untouched. octoshift owns no credential material and injects none — following Git's credential
-/// boundary, authority lives in the already-authenticated <c>gh</c> the host provides.
+/// boundary, authority lives in the already-authenticated <c>gh</c> the host provides. The only environment
+/// the runner overrides is gh's <em>non-auth</em> execution controls (<c>GH_TELEMETRY</c>, <c>GH_PAGER</c>,
+/// <c>GH_FORCE_TTY</c>): those govern gh's side effects and output, never credentials.
 ///
 /// What this runner keeps is the hardened process lifecycle. Both output streams are drained concurrently
 /// with the wait so a burst larger than a pipe buffer is neither truncated nor able to deadlock the child; on
@@ -15,9 +17,16 @@ using System.Diagnostics;
 /// process's exit is confirmed by a bounded wait (a kill only <em>requests</em> termination) and both reads
 /// are unblocked and observed before the cancellation propagates, or the runner fails deterministically with
 /// <see cref="GhProcessCleanupException"/> rather than returning while the process may still be alive.
-/// Descendant containment is best-effort (a tree kill cannot reach a process that outlived the root) and is
-/// tracked separately. The program name is a parameter so these facts can be exercised against a purpose-built
-/// child rather than only the real <c>gh</c> binary.
+///
+/// Descendant containment here is <em>prevention</em>, not a sandbox. The environment overrides disable the
+/// known gh side effects that spawn a token-bearing process which outlives the API root — v2.97.0's sampled,
+/// detached <c>gh send-telemetry</c> child and a configured pager — so in ordinary operation the direct root
+/// is the only process octoshift starts. What remains is best-effort: a tree kill cannot reach a process that
+/// deliberately left the root's process group (which is exactly what the telemetry child does), and octoshift
+/// does <em>not</em> claim a general hostile-descendant sandbox or containment of arbitrary future gh
+/// behavior. Native process-group / Job Object containment is deliberately not added, because it cannot catch
+/// that one child (gh forks it into a new group by design); see #184. The program name is a parameter so
+/// these facts can be exercised against a purpose-built child rather than only the real <c>gh</c> binary.
 /// </summary>
 internal static class GhProcessRunner
 {
@@ -70,9 +79,27 @@ internal static class GhProcessRunner
             psi.ArgumentList.Add(arg);
         }
 
-        // No environment overrides: the child inherits octoshift's environment, so ambient `gh` credential
-        // storage or an externally provisioned GH_TOKEN reaches gh unchanged. octoshift neither injects nor
-        // unsets authentication.
+        // The credential boundary: inherit octoshift's full environment untouched, so ambient `gh` credential
+        // storage or an externally provisioned GH_TOKEN/GITHUB_TOKEN reaches gh exactly as supplied. octoshift
+        // never reads, copies, unsets, or logs authentication. The only overrides are gh's *non-auth*
+        // execution controls, which turn `gh api` into a plain noninteractive machine transport and prevent
+        // the gh side effects that spawn a token-bearing process outliving the root:
+        //
+        //   * GH_TELEMETRY=false — gh v2.97.0 samples command completions and, when one is drawn, re-execs
+        //     itself as a *detached* `gh send-telemetry` (Setpgid=true on POSIX, CREATE_NEW_PROCESS_GROUP on
+        //     Windows) that inherits the parent env — including GH_TOKEN — and intentionally outlives the API
+        //     root. Because gh deliberately leaves the root's process group, a process group around the root
+        //     could not contain it; disabling telemetry prevents the child at the source.
+        //   * GH_PAGER=cat — a configured pager under a forced TTY would otherwise be spawned as a child that
+        //     inherits the token and octoshift's redirected pipes.
+        //   * GH_FORCE_TTY removed — a user-forced TTY must not reach this machine-transport path; it is what
+        //     re-enables the pager and other interactive side effects.
+        //
+        // These are documented gh controls (`gh help environment`) governing side effects and output only,
+        // never authentication.
+        psi.Environment["GH_TELEMETRY"] = "false";
+        psi.Environment["GH_PAGER"] = "cat";
+        psi.Environment.Remove("GH_FORCE_TTY");
 
         using var proc = new Process { StartInfo = psi };
 

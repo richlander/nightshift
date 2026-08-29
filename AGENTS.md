@@ -63,7 +63,10 @@ Keep this file to repository-wide engineering rules. Subsystem design lives in
   GitHub, and it does so through an already-authenticated `gh` it never owns credentials for —
   authority lives in the host-provided `gh`, not in octoshift. Don't move network or credentials
   onto the Turnstile path, and don't reintroduce octoshift-owned credential material or token
-  minting.
+  minting. octoshift inherits the ambient environment untouched and never reads, copies, or unsets
+  `GH_TOKEN`/`GITHUB_TOKEN`; the only environment it overrides on the `gh` path is gh's *non-auth*
+  execution controls (`GH_TELEMETRY`, `GH_PAGER`, `GH_FORCE_TTY`), which govern gh's side effects
+  and output, not credentials (see `GhProcessRunner`, #184).
 - Reuse the existing command, state, and PR/repo-scope types before adding parallel
   abstractions.
 - Keep failure visible. An unreachable socket, an ineligible action, or a GitHub error must
