@@ -1,6 +1,7 @@
 namespace Turnstile;
 
 using Turnstile.Server;
+using Turnstile.Storage;
 
 /// <summary>Entry dispatch: <c>turnstile serve</c> runs the daemon; everything else is a thin client.</summary>
 public static class Cli
@@ -43,6 +44,13 @@ public static class Cli
         try
         {
             return await Daemon.RunAsync(socket, db, cts.Token);
+        }
+        catch (TurnstileUnavailableException ex)
+        {
+            // Expected ownership conflict (a direct store already holds this database, #202). Surface the
+            // established non-success signal — first-line `turnstile:` and exit 1 — not a stack trace.
+            Console.Error.WriteLine($"turnstile: {ex.Message}");
+            return 1;
         }
         catch (OperationCanceledException)
         {

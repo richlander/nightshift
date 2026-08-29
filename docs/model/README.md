@@ -207,8 +207,9 @@ on a logged write.
 The model earns its keep on the lease/log/watch core; it is not a certificate for the
 whole store. The watch is now modelled faithfully end to end, but several store-level
 concerns still have no image here — some already fixed in the implementation and kept
-below for context (#195, #196, #197, #198), and #199's cross-instance notification, which
-remains genuinely open — and a passing run says nothing about their wire/value specifics:
+below for context (#195, #196, #197, #198), and #199/#202's cross-instance notification,
+now closed by making watch liveness a property the daemon owns exclusively — and a passing
+run says nothing about their wire/value specifics:
 
 - **#197 — the watch sync boundary (fixed).** This used to be a gap: `WatchAsync` sampled
   its one-shot caught-up revision on a snapshot separate from the event drain, so it could
@@ -229,13 +230,27 @@ remains genuinely open — and a passing run says nothing about their wire/value
   transaction back with no row, no committed-revision move, and no pulse, while reads and
   no-op transactions stay valid and `long.MaxValue` is allocatable exactly once (enforced
   by `RevisionOverflowTests`). What the model does not certify is the specific 2^63 limit.
-- **#199 — multiple writers (allocation fixed; notification is the remaining gap).**
+- **#199 / #202 — multiple writers (allocation fixed; watch liveness closed by ownership).**
   Revision *allocation* across independently opened `KvStore`/`LocalStore` instances over one
   file is now globally serialized — each writer reads the durable committed revision under
   `BEGIN IMMEDIATE` as its base, never a cached value — so the model's single global `rev`
-  faithfully abstracts it. What the model still does not cover is *notification*: each
-  instance's change signal is in-memory, so a watcher on one instance is not woken by another
-  instance's commit. That is a distinct gap #199 does not address.
+  faithfully abstracts it. *Notification* is where the two split: each instance's change
+  signal is in-memory, so a watcher on one instance could never be woken by another instance's
+  commit. #202 closes this not by adding cross-process notification but by making the model's
+  single-signal abstraction *true* — in two parts. First, the direct `LocalStore` transport
+  rejects a watch outright (`TurnstileWatchUnavailableException`) rather than expose one that
+  can park on a signal no other process pulses. Second — and this is the part rejection alone
+  cannot cover — a database-ownership lock (`ModeLock`, a cross-process `flock`) forbids a
+  direct writer and a daemon from holding the same file at once: the daemon takes it
+  *exclusively* for its lifetime, so while its watch is live no other process can open the file
+  to commit behind its back, and every revision advance is one its own signal pulses. Without
+  that lock, rejecting the direct watch would still leave a direct *write* free to advance the
+  global revision under a parked daemon watcher — exactly the lost wakeup the model forbids.
+  So the model's single change signal is the daemon-owned one, its single global `rev` advances
+  only within that daemon-owned mode, and it models no direct-mode watch — direct mode has no
+  watcher to model, and while a daemon watches, the lock guarantees no competing writer exists
+  to model either. (Daemonless, many direct stores still share the file under a *shared* lock,
+  #199 — but with no daemon there is no watcher, so no liveness claim is at stake.)
 - **#196 — watch event wire serialization.** The abstract state vector carries no
   serialization, so whether `immutable` rides the wire on watch events is invisible here.
   Both that omission (#196) and the matching txn `GET` omission (#195) have since been fixed

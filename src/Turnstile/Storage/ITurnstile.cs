@@ -44,5 +44,44 @@ public interface ITurnstile : IDisposable
     /// Streams the change log under <paramref name="prefix"/> after <paramref name="fromExclusive"/>:
     /// backlog events, a one-shot <see cref="WatchSyncMessage"/> when caught up, then live events.
     /// </summary>
+    /// <remarks>
+    /// Watch <em>liveness</em> is daemon-only. A <see cref="LocalStore"/> (library mode) has only a
+    /// process-local change signal and cannot be woken by another process's commit to the same file, so it
+    /// rejects this call up front with a <see cref="TurnstileWatchUnavailableException"/> rather than
+    /// yielding a stream that could park forever on events it will never see (#202). Only the daemon
+    /// transport delivers a live watch.
+    /// </remarks>
     IAsyncEnumerable<WatchMessage> WatchAsync(string prefix, long fromExclusive, CancellationToken ct = default);
 }
+
+/// <summary>
+/// The requested capability cannot be served by the transport the caller reached, and retrying it there
+/// cannot succeed — it is a narrowed contract, not a transient error. Two conditions raise it, both rooted in
+/// the daemon-only watch contract (#202): a database-ownership conflict (a running daemon exclusively owns the
+/// file, or a direct library-mode store already holds it when a daemon tries to start — see
+/// <see cref="TurnstileDatabaseInUseException"/>), and the eager watch rejection on a direct store (see
+/// <see cref="TurnstileWatchUnavailableException"/>). Product surfaces map this to the established non-success
+/// convention — a first-line <c>turnstile:</c> message and exit 1 — never a stack trace, because the condition
+/// is expected.
+/// </summary>
+public class TurnstileUnavailableException(string message) : Exception(message);
+
+/// <summary>
+/// Thrown when a watch is requested on a transport that cannot deliver live cross-process notification —
+/// the direct-SQLite <see cref="LocalStore"/> (library mode). Each store instance owns an in-memory,
+/// per-process change signal, so a watcher there is never woken by another process's commit to the same
+/// file (#202). Watch liveness is therefore daemon-only: a caller that needs a live watch must connect
+/// through a running Turnstile daemon (<c>turnstile serve</c>). This is a narrowed contract, not a
+/// transient failure — retrying against the same direct store cannot succeed.
+/// </summary>
+public sealed class TurnstileWatchUnavailableException(string message) : TurnstileUnavailableException(message);
+
+/// <summary>
+/// Thrown when the cross-process mode lock refuses a store open because the database's ownership contract
+/// (#202) would be violated. Two directions raise it: a <see cref="LocalStore"/> tried to open a database a
+/// running daemon exclusively owns (callers must use the daemon's socket instead), or a daemon tried to start
+/// on a database a direct library-mode store already holds (the daemon needs exclusive ownership so its watch
+/// stays the only writer a watcher can miss). Multiple direct stores against one database — with no daemon —
+/// stay allowed (#199); this only fires across the direct/daemon boundary.
+/// </summary>
+public sealed class TurnstileDatabaseInUseException(string message) : TurnstileUnavailableException(message);

@@ -9,14 +9,29 @@ using Turnstile.Storage;
 /// Stage-0 coordination recipes built on <see cref="ITurnstile"/>: a mutex (<c>lock</c>), leader
 /// election with standby failover (<c>elect</c>), and a FIFO work queue (<c>queue</c>). Each is a thin
 /// composition of lease + txn + watch — the proof that "coordination is a store plus recipes." They
-/// auto-connect via <see cref="TurnstileConnection"/>, so they work daemonless (library mode) or against
-/// a running daemon, unchanged.
+/// auto-connect via <see cref="TurnstileConnection"/>. The finite parts survive the library-mode fallback:
+/// an uncontended <c>lock</c>/<c>elect</c> claim, <c>queue push</c>, and a non-waiting <c>queue pop</c> are
+/// lease+txn only and run daemonless. The parts that block on a watch do not: a <em>contended</em>
+/// <c>lock</c>/<c>elect</c> (waiting for the holder to release) and <c>queue pop --wait</c> (waiting for a
+/// push) need live cross-process notification, which only the daemon delivers. In library mode those raise
+/// <see cref="TurnstileWatchUnavailableException"/>, which each helper maps to the non-success CLI convention
+/// (a first-line <c>turnstile:</c> error, exit 1) rather than parking forever (#202).
+///
+/// <para>The library-mode fallback itself can also be refused: if a daemon exclusively owns the database, the
+/// direct open fails with a <see cref="TurnstileDatabaseInUseException"/> — the connect calls (which sit
+/// outside the per-operation try) catch that and map it to the same non-success convention, so a helper never
+/// crashes with a stack trace when it should have reached the daemon over its socket (#202).</para>
 /// </summary>
 internal static class Helpers
 {
     private const int ExitHeld = 4;
     private const int ExitLostLock = 5;
     private const int ExitEmpty = 4;
+
+    // Non-success for "the store cannot serve this" — matches the thin client's exit 1 when the daemon is
+    // unreachable. A blocking helper (contended lock/elect, `queue pop --wait`) needs a live watch, which
+    // only the daemon delivers; library mode reports unavailable rather than parking forever (#202).
+    private const int ExitUnavailable = 1;
 
     /// <summary>A mutex: acquire <c>key</c>, run the wrapped command while holding it, release on exit.</summary>
     public static Task<int> LockAsync(string[] args) => ExclusiveAsync(args, alwaysWait: false);
@@ -42,7 +57,23 @@ internal static class Helpers
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
         CancellationToken ct = cts.Token;
 
-        ITurnstile store = await TurnstileConnection.ConnectAsync(Cli.OptionValue(head, "--socket"), ct: ct);
+        ITurnstile store;
+        try
+        {
+            store = await TurnstileConnection.ConnectAsync(Cli.OptionValue(head, "--socket"), ct: ct);
+        }
+        catch (TurnstileUnavailableException ex)
+        {
+            // A daemon exclusively owns the database, so the direct fallback is refused (#202). Report the
+            // narrowed contract rather than crash with a stack trace: reach the daemon over its socket.
+            Console.Error.WriteLine($"turnstile: {ex.Message}");
+            return ExitUnavailable;
+        }
+        catch (OperationCanceledException)
+        {
+            return 130;
+        }
+
         string leaseId;
         try
         {
@@ -69,6 +100,14 @@ internal static class Helpers
             }
 
             return await HoldAndRunAsync(store, leaseId, ttl, cmd, ct);
+        }
+        catch (TurnstileUnavailableException ex)
+        {
+            // Contention here needs a live watch to wait for release, and only the daemon delivers one. Fail
+            // visibly rather than fall back to a park that can never wake (#202). Uncontended claims never
+            // reach the watch, so daemonless single-holder locking is unaffected.
+            Console.Error.WriteLine($"turnstile: {ex.Message}");
+            return ExitUnavailable;
         }
         catch (OperationCanceledException)
         {
@@ -291,16 +330,41 @@ internal static class Helpers
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
         CancellationToken ct = cts.Token;
 
-        using ITurnstile store = await TurnstileConnection.ConnectAsync(Cli.OptionValue(args, "--socket"), ct: ct);
+        ITurnstile store;
         try
         {
-            return sub == "push"
-                ? await QueuePushAsync(store, queue, args, ct)
-                : await QueuePopAsync(store, queue, Cli.HasFlag(args, "--wait"), ct);
+            store = await TurnstileConnection.ConnectAsync(Cli.OptionValue(args, "--socket"), ct: ct);
+        }
+        catch (TurnstileUnavailableException ex)
+        {
+            // A daemon owns the database, so the direct fallback is refused (#202); report, don't crash.
+            Console.Error.WriteLine($"turnstile: {ex.Message}");
+            return ExitUnavailable;
         }
         catch (OperationCanceledException)
         {
             return 130;
+        }
+
+        using (store)
+        {
+            try
+            {
+                return sub == "push"
+                    ? await QueuePushAsync(store, queue, args, ct)
+                    : await QueuePopAsync(store, queue, Cli.HasFlag(args, "--wait"), ct);
+            }
+            catch (TurnstileUnavailableException ex)
+            {
+                // Only `queue pop --wait` blocks on a watch; push and a non-wait pop stay finite and daemonless.
+                // A blocking wait needs the daemon's live notification, so surface the narrowed contract (#202).
+                Console.Error.WriteLine($"turnstile: {ex.Message}");
+                return ExitUnavailable;
+            }
+            catch (OperationCanceledException)
+            {
+                return 130;
+            }
         }
     }
 

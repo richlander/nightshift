@@ -8,6 +8,14 @@ using Turnstile.Storage;
 /// is listening, otherwise the file directly (<see cref="LocalStore"/>, library mode). Helpers and
 /// controllers call this and never care which they got — the daemon is an opt-in for liveness, not a
 /// prerequisite for the single-user helpers.
+///
+/// <para>Two failures do not survive the fallback. A <em>live watch</em>: a <see cref="LocalStore"/> rejects
+/// <see cref="ITurnstile.WatchAsync"/> with a <see cref="TurnstileWatchUnavailableException"/> because its
+/// change signal is process-local (#202). And the fallback <em>itself</em>: if a daemon exclusively owns the
+/// database, opening it directly fails with a <see cref="TurnstileDatabaseInUseException"/> — a caller that
+/// could not reach the socket must not open the file behind the daemon's live watch. Finite operations — get,
+/// range, create, put, delete, txn, and leases — work daemonless unchanged whenever no daemon owns the file;
+/// only a blocking watch (or a daemon-owned database) requires the daemon.</para>
 /// </summary>
 public static class TurnstileConnection
 {
