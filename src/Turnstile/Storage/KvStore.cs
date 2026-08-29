@@ -6,8 +6,15 @@ using Microsoft.Data.Sqlite;
 /// <summary>
 /// The kv layer: a flat, revision-ordered key/value store with conditional single-key writes.
 /// Reads run on short-lived pooled connections; every write funnels through the single-writer actor.
+///
+/// <para><b>Not a supported public surface.</b> This type is an implementation detail shared by the two
+/// entry points that <em>do</em> take a <see cref="ModeLock"/> — <see cref="LocalStore"/> (shared) and the
+/// daemon (exclusive). It is deliberately <c>internal</c>: <see cref="Open"/> performs no ownership locking,
+/// so a caller reaching it directly would bypass the database-ownership contract (#202). External code uses
+/// <see cref="LocalStore"/>/<c>ITurnstile</c> or the daemon socket; trusted product internals and tests reach
+/// this through <c>InternalsVisibleTo</c>.</para>
 /// </summary>
-public sealed class KvStore : IDisposable
+internal sealed class KvStore : IDisposable
 {
     private readonly string _readConnectionString;
     private readonly WriteActor _writer;
@@ -41,8 +48,11 @@ public sealed class KvStore : IDisposable
         }
     }
 
-    /// <summary>Opens (creating if needed) the store at <paramref name="dbPath"/> in WAL mode.</summary>
-    public static KvStore Open(string dbPath)
+    /// <summary>Opens (creating if needed) the store at <paramref name="dbPath"/> in WAL mode. Internal: it
+    /// performs no ownership locking, so every caller must first hold a <see cref="ModeLock"/> — a shared one
+    /// for direct <see cref="LocalStore"/> use, an exclusive one for the daemon. Bypassing that (a raw open
+    /// against a daemon-owned file) is exactly the contract violation #202 closes.</summary>
+    internal static KvStore Open(string dbPath)
     {
         string writeConnectionString = new SqliteConnectionStringBuilder
         {

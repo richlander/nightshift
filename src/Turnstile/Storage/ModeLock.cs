@@ -15,9 +15,14 @@ using System.Runtime.InteropServices;
 /// (<c>&lt;db&gt;-modelock</c>): a <em>shared</em> lock for a <see cref="LocalStore"/> (many compatible, so
 /// multiple direct writers coexist — #199) and an <em>exclusive</em> lock for a daemon (incompatible with any
 /// shared holder, so it excludes every direct store). The lock lives on an open file description, so the OS
-/// releases it automatically when the process exits or crashes — a dead owner never wedges the database. Both
-/// acquisitions are non-blocking: a conflict fails immediately with <see cref="TurnstileDatabaseInUseException"/>
-/// rather than parking, which is how the contract surfaces as a visible error instead of a silent hang.</para>
+/// releases it automatically when the process exits or crashes — a dead owner never wedges the database. That
+/// property only holds if no <em>other</em> process keeps the description open, so the lock fd is opened
+/// <c>O_CLOEXEC</c>: a child this process spawns never inherits it and so can never keep a dead owner's flock
+/// alive. Both acquisitions are non-blocking: a conflict fails immediately with
+/// <see cref="TurnstileDatabaseInUseException"/> rather than parking, which is how the contract surfaces as a
+/// visible error instead of a silent hang. Only a real ownership conflict (<c>EWOULDBLOCK</c>) maps to that
+/// exception; any other <c>flock</c>/<c>open</c> failure surfaces as an <see cref="IOException"/> with its
+/// errno, never dressed up as a conflict.</para>
 ///
 /// <para>Turnstile already requires Unix-domain sockets, so a Unix-only <c>flock</c> is in-scope. The P/Invoke
 /// is source-generated (<see cref="LibraryImport"/>), so it stays NativeAOT- and trim-safe with no added
@@ -37,6 +42,21 @@ internal sealed partial class ModeLock : IDisposable
     // only when it is genuinely absent (see EnsureOpen), so no variadic call is ever made.
     private const int ORdwr = 2;
 
+    // open(2) O_CLOEXEC: set close-on-exec atomically at open time so the retained lock fd is never inherited
+    // by a child this process spawns. Without it a child would keep the flock's open file description alive
+    // after the owner exits/crashes, contradicting the OS-release property and potentially wedging a later
+    // daemon start. Set at open() rather than with a follow-up fcntl(F_SETFD, FD_CLOEXEC) because FD_CLOEXEC is
+    // a *variadic* fcntl argument, and a fixed-arity P/Invoke mispasses it on arm64 macOS (where variadic args
+    // travel on the stack) — the same ABI trap that keeps O_CREAT off the open() path. The flag value differs
+    // by platform: 0x0008_0000 on Linux, 0x0100_0000 on macOS.
+    private static readonly int OCloexec = OperatingSystem.IsMacOS() ? 0x0100_0000 : 0x0008_0000;
+
+    // fcntl(2) F_GETFD command and the FD_CLOEXEC bit it returns. Both are 1 on Linux and macOS. F_GETFD takes
+    // no meaningful variadic argument, so — unlike F_SETFD — it is safe to read back through a fixed-arity
+    // P/Invoke on every ABI; it is used only to verify O_CLOEXEC actually took.
+    private const int FGetfd = 1;
+    private const int FdCloexec = 1;
+
     // Sidecar creation mode: 0644. creat(2) is fixed-arity, so this passes correctly on every ABI (unlike a
     // variadic open + O_CREAT); the owner keeps read+write so a later O_RDWR open never trips on permissions.
     private const int CreateMode = 0x1A4;
@@ -44,6 +64,14 @@ internal sealed partial class ModeLock : IDisposable
     // errno. EINTR is 4 on both Linux and macOS; a non-blocking flock can still be interrupted by a signal,
     // so that one case is retried rather than mistaken for a conflict.
     private const int Eintr = 4;
+
+    // errno. ENOENT is 2 on both Linux and macOS: the *only* open(2) failure that may be answered by creating
+    // the sidecar. Any other open error is a real fault and must surface, not be masked by a creat() attempt.
+    private const int Enoent = 2;
+
+    // errno. EWOULDBLOCK (== EAGAIN) is the only flock(LOCK_NB) failure that means "a conflicting holder owns
+    // the database". It is 11 on Linux and 35 on macOS. Every other errno is a genuine system failure.
+    private static readonly int EWouldBlock = OperatingSystem.IsMacOS() ? 35 : 11;
 
     private int _fd;
 
@@ -79,11 +107,11 @@ internal sealed partial class ModeLock : IDisposable
     {
         string path = SidecarPath(dbPath);
 
-        int fd = EnsureOpen(path);
+        int fd = EnsureOpen(path, out int openErrno);
         if (fd < 0)
         {
             throw new IOException(
-                $"turnstile: cannot open mode-lock sidecar '{path}' (errno {Marshal.GetLastPInvokeError()})");
+                $"turnstile: cannot open mode-lock sidecar '{path}' (errno {openErrno})");
         }
 
         int op = mode | LockNb;
@@ -100,11 +128,20 @@ internal sealed partial class ModeLock : IDisposable
                 continue;
             }
 
-            // With LOCK_NB the only expected non-EINTR failure is EWOULDBLOCK/EAGAIN — a conflicting holder.
-            // The fd was just opened, so a genuine EBADF/EINVAL here is not reachable in practice; treat any
-            // remaining failure as the ownership conflict rather than leak an open descriptor.
+            // The fd is closed before either throw so no descriptor leaks on the failure path. Only
+            // EWOULDBLOCK/EAGAIN — the sole errno flock(LOCK_NB) raises for an incompatible holder — is the
+            // ownership conflict the contract exists to report. Every other errno (EBADF, EINVAL, ENOLCK,
+            // EOPNOTSUPP/ENOTSUP, EIO, ...) is a genuine system failure; reporting it as a conflict would tell
+            // a caller "someone else owns the database" when the lock is simply broken, so it surfaces as an
+            // IOException carrying the errno instead.
             close(fd);
-            throw new TurnstileDatabaseInUseException(conflictMessage);
+            if (err == EWouldBlock)
+            {
+                throw new TurnstileDatabaseInUseException(conflictMessage);
+            }
+
+            throw new IOException(
+                $"turnstile: cannot acquire mode-lock on sidecar '{path}' via flock (errno {err})");
         }
     }
 
@@ -115,7 +152,13 @@ internal sealed partial class ModeLock : IDisposable
     // open(2): try the existing file first — open never checks the advisory lock, so this succeeds even while
     // an owner holds it — and only creat(2) a genuinely missing file. Racing creators just re-truncate a fresh
     // zero-byte inode; the flock above, not the open, is what actually arbitrates ownership.
-    private static int EnsureOpen(string path)
+    //
+    // On failure it returns -1 and reports the errno through <paramref name="errno"/>, captured immediately
+    // after the failing syscall so no interposed managed work can clobber it. Only ENOENT is answered by
+    // creat(2); every other open error (EACCES on a read-only directory, EISDIR, EROFS, ENAMETOOLONG, ...) is
+    // returned as-is rather than being masked by a creat() attempt that would fail confusingly or, worse,
+    // succeed and hide the original fault.
+    private static int EnsureOpen(string path, out int errno)
     {
         string? dir = Path.GetDirectoryName(path);
         if (dir is { Length: > 0 })
@@ -123,10 +166,17 @@ internal sealed partial class ModeLock : IDisposable
             Directory.CreateDirectory(dir);
         }
 
-        int fd = open(path, ORdwr);
+        int fd = OpenLockFd(path);
         if (fd >= 0)
         {
+            errno = 0;
             return fd;
+        }
+
+        errno = Marshal.GetLastPInvokeError();
+        if (errno != Enoent)
+        {
+            return -1;
         }
 
         int created = creat(path, CreateMode);
@@ -135,7 +185,40 @@ internal sealed partial class ModeLock : IDisposable
             close(created);
         }
 
-        return open(path, ORdwr);
+        fd = OpenLockFd(path);
+        if (fd >= 0)
+        {
+            errno = 0;
+            return fd;
+        }
+
+        errno = Marshal.GetLastPInvokeError();
+        return -1;
+    }
+
+    // Opens the sidecar O_CLOEXEC and returns the retained lock fd, or -1 (with the marshaller's last error set
+    // for the caller) if open(2) fails. On success it verifies the kernel actually set close-on-exec: the
+    // retained lock fd must never be inheritable, or a spawned child that outlives this process would keep the
+    // flock alive and break the OS-release property. O_CLOEXEC does this atomically at open time; the F_GETFD
+    // read is defence-in-depth against a wrong platform constant, and because it is the retained-fd invariant
+    // being violated (not a caller-recoverable open error) a failure throws rather than returning -1.
+    private static int OpenLockFd(string path)
+    {
+        int fd = open(path, ORdwr | OCloexec);
+        if (fd < 0)
+        {
+            return -1;
+        }
+
+        int flags = fcntl(fd, FGetfd, 0);
+        if (flags < 0 || (flags & FdCloexec) == 0)
+        {
+            close(fd);
+            throw new IOException(
+                $"turnstile: mode-lock sidecar '{path}' opened without close-on-exec; refusing an inheritable lock fd");
+        }
+
+        return fd;
     }
 
     /// <summary>Releases the lock by closing the descriptor (the OS drops the flock with it). Idempotent.</summary>
@@ -156,6 +239,9 @@ internal sealed partial class ModeLock : IDisposable
 
     [LibraryImport("libc", SetLastError = true)]
     private static partial int flock(int fd, int operation);
+
+    [LibraryImport("libc", SetLastError = true)]
+    private static partial int fcntl(int fd, int command, int arg);
 
     [LibraryImport("libc", SetLastError = true)]
     private static partial int close(int fd);

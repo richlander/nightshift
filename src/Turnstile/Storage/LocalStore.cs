@@ -115,7 +115,16 @@ public sealed class LocalStore : ITurnstile
 
     public void Dispose()
     {
-        _kv.Dispose();
-        _modeLock.Dispose();
+        // Release the mode lock even if the store's own cleanup throws: an exceptional KvStore.Dispose must
+        // not leave the database marked in-use with no store behind it, or the ownership would wedge and a
+        // daemon (or a retry) could never acquire it. The finally makes ownership release unconditional.
+        try
+        {
+            _kv.Dispose();
+        }
+        finally
+        {
+            _modeLock.Dispose();
+        }
     }
 }
