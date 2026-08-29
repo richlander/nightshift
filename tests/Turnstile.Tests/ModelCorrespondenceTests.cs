@@ -85,7 +85,15 @@ public class ModelCorrespondenceTests : IDisposable
     {
         using KvStore store = Open();
         await LeaseClock.EnsureHeadroomAsync(Ct);
-        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 1);
+
+        // A one-second lease leaves a sub-second window between create and the /ephemeral attach below, so a
+        // scheduling stall under parallel load can cross the whole-second boundary and expire the lease before
+        // the key is attached ("lease not found or expired"). A multi-second TTL keeps the lease live at attach
+        // even if an entire second is lost to scheduling, while the deadline-anchored WaitPastExpiryAsync still
+        // drives real expiry — so the test deterministically proves expiry tombstones through the log without
+        // depending on machine speed. Whole-second lease semantics (#189) are unchanged; only the attach window
+        // widens (#208).
+        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 3);
         WriteResult created = await store.CreateAsync("/ephemeral", Bytes("v"), lease: lease.Id);
 
         await LeaseClock.WaitPastExpiryAsync(lease, Ct);
