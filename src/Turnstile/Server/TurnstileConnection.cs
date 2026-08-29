@@ -8,6 +8,11 @@ using Turnstile.Storage;
 /// is listening, otherwise the file directly (<see cref="LocalStore"/>, library mode). Helpers and
 /// controllers call this and never care which they got — the daemon is an opt-in for liveness, not a
 /// prerequisite for the single-user helpers.
+///
+/// <para>One capability does not survive the fallback: a <em>live watch</em>. A <see cref="LocalStore"/>
+/// rejects <see cref="ITurnstile.WatchAsync"/> with a <see cref="TurnstileWatchUnavailableException"/>
+/// because its change signal is process-local (#202). Finite operations — get, range, create, put, delete,
+/// txn, and leases — work daemonless unchanged; only a blocking watch requires a running daemon.</para>
 /// </summary>
 public static class TurnstileConnection
 {

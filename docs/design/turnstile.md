@@ -317,6 +317,8 @@ data: {"revision":4202}
 
 **Watching from a compacted revision returns `410 Gone`** with the current `compact_revision`. The client MUST re-`Range` and resume. This is etcd's behavior and it is **load-bearing** — it *forces* controllers to be level-triggered instead of silently drifting. It is not an error case; it is the mechanism.
 
+**Watch liveness is daemon-only (#202).** The daemon owns the change signal every watcher parks on, so a watch is a capability of the daemon transport, not of the file. The direct-SQLite path (`LocalStore`, library mode) has only a process-local signal — it can never be woken by another process's commit to the same file — so it does **not** return a watch that could park forever; it fails the call up front with a typed `TurnstileWatchUnavailableException`. This narrows the contract rather than adding shared notification: finite reads, writes, txns and leases stay fully available daemonless (and safe alongside other writers, #199), but a live watch — a contended `lock`/`elect`, a `queue pop --wait`, or `turnstile watch` — requires a running `turnstile serve`, which surfaces as the unavailable exit code and a first-line error rather than a silent hang.
+
 **The canonical controller loop** — put this in the tool-author docs:
 
 ```

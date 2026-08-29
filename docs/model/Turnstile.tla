@@ -70,10 +70,14 @@
      - cross-instance watch *notification*. Revision *allocation* across independently
        opened instances is now globally serialized -- each writer reads the durable
        committed revision under BEGIN IMMEDIATE as its base, never a cached value -- so
-       the model's single global `rev` faithfully abstracts it (#199). What the model
-       still does not cover is notification: each instance's change signal is in-memory,
-       so a watcher on one instance is not woken by another instance's commit. That is a
-       distinct gap, not addressed by #199.
+       the model's single global `rev` faithfully abstracts it (#199). Notification is
+       handled by *narrowing the contract*, not by adding cross-process signalling: watch
+       liveness is daemon-only (#202). The single change signal modelled here is the
+       daemon-owned one that watchers park on; the direct LocalStore transport exposes no
+       watcher at all -- it rejects the call up front (TurnstileWatchUnavailableException)
+       rather than park on a process-local signal no other writer pulses. So the model's
+       one watcher is the only watcher there is to model, and direct mode's absence from it
+       is faithful rather than a gap.
      - the wire: watch events now carry `immutable` in serialization (#196), and the
        matching txn GET omission (#195) is likewise fixed in the implementation. Both are
        protocol concerns the abstract state vector never carried, so the model modelled the

@@ -44,5 +44,22 @@ public interface ITurnstile : IDisposable
     /// Streams the change log under <paramref name="prefix"/> after <paramref name="fromExclusive"/>:
     /// backlog events, a one-shot <see cref="WatchSyncMessage"/> when caught up, then live events.
     /// </summary>
+    /// <remarks>
+    /// Watch <em>liveness</em> is daemon-only. A <see cref="LocalStore"/> (library mode) has only a
+    /// process-local change signal and cannot be woken by another process's commit to the same file, so it
+    /// rejects this call up front with a <see cref="TurnstileWatchUnavailableException"/> rather than
+    /// yielding a stream that could park forever on events it will never see (#202). Only the daemon
+    /// transport delivers a live watch.
+    /// </remarks>
     IAsyncEnumerable<WatchMessage> WatchAsync(string prefix, long fromExclusive, CancellationToken ct = default);
 }
+
+/// <summary>
+/// Thrown when a watch is requested on a transport that cannot deliver live cross-process notification —
+/// the direct-SQLite <see cref="LocalStore"/> (library mode). Each store instance owns an in-memory,
+/// per-process change signal, so a watcher there is never woken by another process's commit to the same
+/// file (#202). Watch liveness is therefore daemon-only: a caller that needs a live watch must connect
+/// through a running Turnstile daemon (<c>turnstile serve</c>). This is a narrowed contract, not a
+/// transient failure — retrying against the same direct store cannot succeed.
+/// </summary>
+public sealed class TurnstileWatchUnavailableException(string message) : Exception(message);

@@ -18,6 +18,11 @@ internal static class Helpers
     private const int ExitLostLock = 5;
     private const int ExitEmpty = 4;
 
+    // Non-success for "the store cannot serve this" — matches the thin client's exit 1 when the daemon is
+    // unreachable. A blocking helper (contended lock/elect, `queue pop --wait`) needs a live watch, which
+    // only the daemon delivers; library mode reports unavailable rather than parking forever (#202).
+    private const int ExitUnavailable = 1;
+
     /// <summary>A mutex: acquire <c>key</c>, run the wrapped command while holding it, release on exit.</summary>
     public static Task<int> LockAsync(string[] args) => ExclusiveAsync(args, alwaysWait: false);
 
@@ -69,6 +74,14 @@ internal static class Helpers
             }
 
             return await HoldAndRunAsync(store, leaseId, ttl, cmd, ct);
+        }
+        catch (TurnstileWatchUnavailableException ex)
+        {
+            // Contention here needs a live watch to wait for release, and only the daemon delivers one. Fail
+            // visibly rather than fall back to a park that can never wake (#202). Uncontended claims never
+            // reach the watch, so daemonless single-holder locking is unaffected.
+            Console.Error.WriteLine($"turnstile: {ex.Message}");
+            return ExitUnavailable;
         }
         catch (OperationCanceledException)
         {
@@ -297,6 +310,13 @@ internal static class Helpers
             return sub == "push"
                 ? await QueuePushAsync(store, queue, args, ct)
                 : await QueuePopAsync(store, queue, Cli.HasFlag(args, "--wait"), ct);
+        }
+        catch (TurnstileWatchUnavailableException ex)
+        {
+            // Only `queue pop --wait` blocks on a watch; push and a non-wait pop stay finite and daemonless.
+            // A blocking wait needs the daemon's live notification, so surface the narrowed contract (#202).
+            Console.Error.WriteLine($"turnstile: {ex.Message}");
+            return ExitUnavailable;
         }
         catch (OperationCanceledException)
         {

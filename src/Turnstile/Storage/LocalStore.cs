@@ -10,9 +10,11 @@ namespace Turnstile.Storage;
 /// BEGIN IMMEDIATE, never a cached value) makes this safe alongside a running daemon or another instance
 /// against the same file <em>for storage integrity</em>: revisions stay globally unique, monotonic and
 /// gapless, and every committed row persists (#199). It does <em>not</em> make watch notification
-/// cross-process: each instance's change signal is in-memory, so a watcher here is not woken by a commit
-/// another instance made. A watcher needing another writer's events must poll or run against the daemon —
-/// tracked separately; #199 is revision allocation only, not notification.
+/// cross-process: each instance's change signal is in-memory, so a watcher here could never be woken by a
+/// commit another instance made. Rather than expose a watch that can silently park on a process-local signal,
+/// <see cref="WatchAsync"/> rejects up front with a <see cref="TurnstileWatchUnavailableException"/> —
+/// watch liveness is daemon-only (#202). Finite reads/writes/txns/leases and storage integrity remain fully
+/// useful here; only the live watch requires the daemon.
 /// </summary>
 public sealed class LocalStore : ITurnstile
 {
@@ -63,8 +65,19 @@ public sealed class LocalStore : ITurnstile
     public Task<LeaseView?> GetLeaseAsync(string id, CancellationToken ct = default)
         => Task.FromResult(_kv.GetLease(id));
 
+    /// <summary>
+    /// Rejects the watch: a <see cref="LocalStore"/> can only ever be woken by its own process's commits, so a
+    /// live watch here would silently park on events another writer made. The failure is raised <em>eagerly</em>
+    /// — synchronously, when this method is invoked, before any element is yielded or any wait is entered — so a
+    /// caller cannot end up parked on a deferred async iterator. The unsupported transport always wins: the
+    /// exception is thrown regardless of <paramref name="ct"/>, so the contract is deterministic rather than
+    /// racing the token's state. Watch liveness is daemon-only (#202).
+    /// </summary>
+    /// <exception cref="TurnstileWatchUnavailableException">Always, because library mode has no cross-process signal.</exception>
     public IAsyncEnumerable<WatchMessage> WatchAsync(string prefix, long fromExclusive, CancellationToken ct = default)
-        => _kv.WatchAsync(prefix, fromExclusive, ct);
+        => throw new TurnstileWatchUnavailableException(
+            "watch liveness requires a running Turnstile daemon; the direct SQLite store (library mode) "
+            + "cannot observe another process's commits (start 'turnstile serve')");
 
     public void Dispose() => _kv.Dispose();
 }
