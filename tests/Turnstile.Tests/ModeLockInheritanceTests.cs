@@ -20,6 +20,11 @@ using Xunit;
 /// open flags and both tests fail — they are the mutation guard for the close-on-exec property (on Unix
 /// <see cref="Process"/>.<see cref="Process.Start()"/> <c>fork</c>+<c>exec</c>s and inherits exactly those
 /// descriptors that are not close-on-exec, so the boundary is real, not simulated).</para>
+///
+/// <para>The <c>O_CLOEXEC</c> open, and thus this guard, live on the shared <see cref="FileLock"/> primitive
+/// (#212) that both <see cref="ModeLock"/> and <see cref="SocketLock"/> build on. The socket lock therefore
+/// inherits exactly this once-tested behaviour; a duplicate socket-flavoured spawn-a-child test would only
+/// re-exercise the same primitive.</para>
 /// </summary>
 public sealed class ModeLockInheritanceTests : IDisposable
 {

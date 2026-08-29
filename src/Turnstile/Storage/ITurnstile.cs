@@ -85,3 +85,17 @@ public sealed class TurnstileWatchUnavailableException(string message) : Turnsti
 /// stay allowed (#199); this only fires across the direct/daemon boundary.
 /// </summary>
 public sealed class TurnstileDatabaseInUseException(string message) : TurnstileUnavailableException(message);
+
+/// <summary>
+/// Thrown when a daemon cannot take ownership of its socket <em>endpoint</em> (#212). Database ownership
+/// (<see cref="TurnstileDatabaseInUseException"/>) does not cover this: a second daemon on the same socket but
+/// a <em>different</em> database takes a different mode lock and would otherwise unlink the first daemon's live
+/// socket and bind its own, leaving existing connections on the first daemon while new clients reach the
+/// second — a split coordination state. Two conditions raise it, both before any socket is deleted or bound: a
+/// socket-ownership conflict (another daemon already holds the <see cref="SocketLock"/> for the same canonical
+/// socket identity), and a live-endpoint refusal (a listener — Turnstile or not — answers a connect on the
+/// socket path, so it is not stale and must never be unlinked). A genuinely stale pathname is not this: it is
+/// deleted and startup proceeds. Product surfaces map this to the established non-success convention — a
+/// first-line <c>turnstile:</c> message and exit 1 — never a stack trace, because the condition is expected.
+/// </summary>
+public sealed class TurnstileSocketInUseException(string message) : TurnstileUnavailableException(message);

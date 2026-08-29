@@ -47,7 +47,8 @@ public static class Cli
         }
         catch (TurnstileUnavailableException ex)
         {
-            // Expected ownership conflict (a direct store already holds this database, #202). Surface the
+            // Expected ownership conflict: a direct store already holds this database (#202), another daemon
+            // owns this socket endpoint, or a live listener already answers there (#212). Surface the
             // established non-success signal — first-line `turnstile:` and exit 1 — not a stack trace.
             Console.Error.WriteLine($"turnstile: {ex.Message}");
             return 1;

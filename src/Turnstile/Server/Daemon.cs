@@ -26,24 +26,27 @@ public sealed class Daemon
     /// </summary>
     internal static async Task<int> RunAsync(string socketPath, string dbPath, DaemonOptions? options, CancellationToken ct = default)
     {
-        // Resolve the database's canonical filesystem identity once and use it for the ownership lock, SQLite,
-        // and status reporting alike: a daemon started via a symlink alias (a symlinked file, or a file under a
-        // symlinked directory) must take the very lock a direct store on the real path would, so the
-        // exclusive/shared contract holds across aliases (#202). This also creates the parent directory.
+        // Two independent ownerships gate a daemon start, taken in one documented non-blocking order: the
+        // socket endpoint first, then the database. Both are non-blocking flocks, so neither can deadlock, and
+        // both are held as `using` declarations for the daemon's whole lifetime — released on any startup
+        // failure below and after shutdown, or by the OS if we crash.
+
+        // Socket-endpoint ownership first, *before* the socket path is probed, deleted, or bound. Keyed on the
+        // socket's canonical identity so two daemons that would bind the same endpoint through different path
+        // spellings still contend on one lock (#212). Acquiring it also makes the path bindable: a live
+        // listener there is refused (never unlinked — that is the #212 split), and only a proven-stale pathname
+        // (a crash leftover) is deleted so a restart can bind. This replaces the old unconditional delete,
+        // which let a second daemon on a *different* database unlink a live daemon's socket.
+        string canonicalSocket = CanonicalPath.Resolve(socketPath, "socket");
+        using SocketLock socketLock = SocketLock.Acquire(socketPath, canonicalSocket);
+
+        // Then exclusive database ownership. Resolve the database's canonical identity once and use it for the
+        // ownership lock, SQLite, and status reporting alike: a daemon started via a symlink alias must take the
+        // very lock a direct store on the real path would, so the exclusive/shared contract holds across
+        // aliases (#202). A second daemon (or any open direct store) fails here. This also creates the parent
+        // directory.
         string canonicalDb = DatabasePath.Canonicalize(dbPath);
-
-        // Take exclusive database ownership before touching anything else — the socket file included. A second
-        // daemon (or any open direct store) fails here, before we would otherwise delete a live daemon's socket
-        // or open a second writer behind an existing watch. Exclusive ownership is the invariant the daemon's
-        // live watch rests on: with no direct store able to open the file, every commit flows through this
-        // store's change signal (#202). Held for the daemon's whole lifetime; the OS drops it if we crash.
         using ModeLock modeLock = ModeLock.AcquireExclusive(canonicalDb);
-
-        // A Unix socket bind fails if a stale file is present; clear it first.
-        if (File.Exists(socketPath))
-        {
-            File.Delete(socketPath);
-        }
 
         using KvStore store = KvStore.Open(canonicalDb);
 

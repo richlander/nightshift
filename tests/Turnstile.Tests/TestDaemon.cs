@@ -43,15 +43,27 @@ internal sealed class TestDaemon : IAsyncDisposable
     /// <summary>Starts a daemon on a caller-supplied database (not deleted on dispose — the caller owns it),
     /// so a reconnect can resume from state another process already committed to that file.</summary>
     public static Task<TestDaemon> StartOnDbAsync(string dbPath, CancellationToken ct, DaemonOptions? options = null)
-        => StartAsync(dbPath, ownsDb: false, options, ct);
+        => StartAsync(NewSocketPath(), dbPath, ownsDb: false, options, ct);
+
+    /// <summary>Starts a daemon on a caller-supplied socket path and database (neither deleted on dispose — the
+    /// caller owns both). Lets a test pre-place something at the socket path — a stale pathname to be cleared,
+    /// or a live listener to be refused — and observe how startup treats it (#212).</summary>
+    public static Task<TestDaemon> StartOnSocketAndDbAsync(string socket, string dbPath, CancellationToken ct, DaemonOptions? options = null)
+        => StartAsync(socket, dbPath, ownsDb: false, options, ct);
 
     /// <summary>A unique temp database path, matching the convention the other suites use.</summary>
     public static string NewDbPath()
         => Path.Combine(Path.GetTempPath(), $"turnstile-test-{Guid.NewGuid():N}.db");
 
-    private static async Task<TestDaemon> StartAsync(string dbPath, bool ownsDb, DaemonOptions? options, CancellationToken ct)
+    /// <summary>A unique temp socket path, matching the convention the other suites use.</summary>
+    public static string NewSocketPath()
+        => Path.Combine(Path.GetTempPath(), $"ts-{Guid.NewGuid():N}.sock");
+
+    private static Task<TestDaemon> StartAsync(string dbPath, bool ownsDb, DaemonOptions? options, CancellationToken ct)
+        => StartAsync(NewSocketPath(), dbPath, ownsDb, options, ct);
+
+    private static async Task<TestDaemon> StartAsync(string socket, string dbPath, bool ownsDb, DaemonOptions? options, CancellationToken ct)
     {
-        string socket = Path.Combine(Path.GetTempPath(), $"ts-{Guid.NewGuid():N}.sock");
         var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         Task run = Daemon.RunAsync(socket, dbPath, options, cts.Token);
 
@@ -113,7 +125,9 @@ internal sealed class TestDaemon : IAsyncDisposable
         _cts.Dispose();
         SqliteConnection.ClearAllPools();
 
-        List<string> paths = [Socket];
+        // The socket file and its endpoint-ownership sidecar (<socket>-socklock, #212) are always ours to
+        // clean: the daemon binds one and locks the other under this unique, per-run socket path.
+        List<string> paths = [Socket, Socket + "-socklock"];
         if (_ownsDb)
         {
             paths.AddRange([_dbPath, _dbPath + "-wal", _dbPath + "-shm", _dbPath + "-modelock"]);
