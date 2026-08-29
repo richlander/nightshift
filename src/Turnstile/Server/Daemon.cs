@@ -40,7 +40,26 @@ public sealed class Daemon
         // socket. A graceful shutdown removes this daemon's own socket (Kestrel unlinks it on unbind), so an
         // ordinary restart binds; an unclean crash leaves the file behind as an explicit operator-cleanup
         // condition rather than something the daemon silently deletes.
-        string canonicalSocket = CanonicalPath.Resolve(socketPath, "socket");
+        string canonicalSocket;
+        try
+        {
+            canonicalSocket = CanonicalPath.Resolve(socketPath, "socket");
+        }
+        catch (DanglingSymlinkException)
+        {
+            // The socket path's final component is a dangling symlink. Its identity cannot be canonicalized
+            // honestly, so it belongs to the same fail-closed family as an occupied endpoint: refuse visibly and
+            // never unlink it. Translate the precise canonicalization subtype into the socket path's typed
+            // refusal so `turnstile serve` emits the load-bearing contract (first-line `turnstile:`, exit 1)
+            // instead of dying on an unhandled exception (#212). Only this one exact type is caught; unrelated
+            // canonicalization/I/O failures stay visible as real failures.
+            throw new TurnstileSocketInUseException(
+                $"cannot start the daemon: the socket path '{socketPath}' is a dangling symlink — its target "
+                + "does not exist. Turnstile refuses to bind through it and does not unlink it, because it "
+                + "cannot derive a canonical identity that names the same path it would open. Verify the link, "
+                + "then remove it or repoint it to the real socket path, or serve on a different --socket (#212).");
+        }
+
         using SocketLock socketLock = SocketLock.Acquire(socketPath, canonicalSocket);
 
         // Then exclusive database ownership. Resolve the database's canonical identity once and use it for the

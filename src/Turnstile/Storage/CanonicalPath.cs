@@ -45,9 +45,14 @@ internal static partial class CanonicalPath
     /// below and the caller — SQLite opening a database, Kestrel binding a socket — need it present).
     /// <paramref name="label"/> names the resource kind for error messages only ("database", "socket").
     /// </summary>
+    /// <exception cref="DanglingSymlinkException">
+    /// If the final component is a dangling symlink (its target absent) — a precise subtype callers on the
+    /// socket-startup path translate to their typed refusal, while database callers still see it as the
+    /// <see cref="IOException"/> it derives from.
+    /// </exception>
     /// <exception cref="IOException">
-    /// If the final component is a dangling symlink (its target absent), or the parent directory cannot be
-    /// canonicalized — either case would otherwise derive a lock identity that differs from the opened resource.
+    /// If the parent directory cannot be canonicalized — this would otherwise derive a lock identity that
+    /// differs from the opened resource.
     /// </exception>
     public static string Resolve(string path, string label)
     {
@@ -77,7 +82,7 @@ internal static partial class CanonicalPath
         // Refuse visibly instead of deriving a lock that disagrees with the resource that would be opened.
         if (LeafIsSymlink(full))
         {
-            throw new IOException(
+            throw new DanglingSymlinkException(
                 $"turnstile: {label} path '{path}' is a dangling symlink — its target does not exist, so a "
                 + "canonical identity cannot be derived without risking an ownership lock that names a different "
                 + "path than would actually be opened. Create the target first, or pass the real path.");
@@ -145,3 +150,14 @@ internal static partial class CanonicalPath
     [LibraryImport("libc")]
     private static partial void free(nint ptr);
 }
+
+/// <summary>
+/// The final component of a path is a <em>dangling</em> symlink — it is itself a symlink, but its target does
+/// not exist — so <see cref="CanonicalPath.Resolve"/> cannot derive a canonical identity that names the same
+/// path the OS would actually open. A precise subtype of <see cref="IOException"/>: the socket-startup path
+/// catches exactly this to translate it into its typed, operator-visible refusal
+/// (<see cref="TurnstileSocketInUseException"/>) instead of crashing on an unhandled exception, while database
+/// and other callers that do not distinguish it still see the <see cref="IOException"/> it derives from — so no
+/// behaviour changes for them and no broad <see cref="IOException"/> catch is needed to identify this one case.
+/// </summary>
+internal sealed class DanglingSymlinkException(string message) : IOException(message);

@@ -37,6 +37,9 @@ using Xunit;
 ///   the daemon's own socket (only an unclean crash leftover is refused);</item>
 ///   <item>a final-component symlink to an existing endpoint is refused, leaving both the link and its target
 ///   untouched — no unlink, no rebind through the alias;</item>
+///   <item>a final-component <em>dangling</em> symlink (its target absent) is refused with the same CLI
+///   contract — exit 1, first-line <c>turnstile:</c> — rather than crashing on an unhandled canonicalization
+///   exception, and the dangling link is left untouched with no database created;</item>
 ///   <item>ordinary socket-path aliases (a final-component symlink, a parent-directory symlink) converge on one
 ///   canonical endpoint identity, so aliasing cannot bypass the lock.</item>
 /// </list>
@@ -274,6 +277,36 @@ public sealed class SocketOwnershipTests : IDisposable
         // Both the link and its target survive, untouched: no unlink, no rebind through the alias.
         Assert.True(File.Exists(real), "the symlink target must not be unlinked");
         Assert.Equal("real.sock", new FileInfo(alias).LinkTarget);
+        Assert.False(File.Exists(db), "the refused daemon must not have created its database");
+    }
+
+    [Fact]
+    public async Task Start_FinalComponentDanglingSymlink_IsRefused_WithTheCliContract_AndLeavesTheLinkUntouched()
+    {
+        // The socket path's final component is a symlink whose target does not exist (a *dangling* leaf). Its
+        // identity cannot be canonicalized honestly — appending its name to the resolved parent would lock the
+        // link's own path while the OS followed it elsewhere — so CanonicalPath.Resolve refuses it with a
+        // precise DanglingSymlinkException *before* any lock or bind. The daemon must translate that into the
+        // same typed refusal every other fail-closed socket condition emits: exit 1, first-line `turnstile:`,
+        // never a raw unhandled-exception crash (the round-2 finding, where the native binary exited 134). It
+        // must not create the database, and must leave the dangling link exactly as it found it — no unlink.
+        string dir = NewDir();
+        string alias = Path.Combine(dir, "dangling.sock");
+        File.CreateSymbolicLink(alias, "no-such-target.sock");
+        Assert.False(File.Exists(Path.Combine(dir, "no-such-target.sock")), "the symlink target must be absent — this is the dangling case");
+        Assert.Equal("no-such-target.sock", new FileInfo(alias).LinkTarget);
+
+        string db = NewDb();
+        using var guard = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        guard.CancelAfter(TimeSpan.FromSeconds(30));
+        CliResult serve = await CliProcess.RunAsync(null, guard.Token, "serve", "--socket", alias, "--db", db);
+
+        Assert.Equal(1, serve.ExitCode);
+        Assert.StartsWith("turnstile:", serve.FirstStdErrLine);
+        Assert.Contains("socket", serve.FirstStdErrLine, StringComparison.OrdinalIgnoreCase);
+
+        // The dangling link itself is untouched (still points at the absent target), and no database was created.
+        Assert.Equal("no-such-target.sock", new FileInfo(alias).LinkTarget);
         Assert.False(File.Exists(db), "the refused daemon must not have created its database");
     }
 
