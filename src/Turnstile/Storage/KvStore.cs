@@ -28,10 +28,6 @@ internal sealed class KvStore : IDisposable
     /// </summary>
     internal Func<Task>? OnCaughtUpBeforeSyncForTests { get; set; }
 
-    /// <summary>Test-only: whether this store's writer (thread + connection) has been disposed. Lets a failed
-    /// open be proven to have torn its writer down rather than leaking it (#202).</summary>
-    internal bool IsWriterDisposedForTests => _writer.IsDisposed;
-
     private KvStore(string readConnectionString, WriteActor writer, ChangeSignal changed)
     {
         _readConnectionString = readConnectionString;

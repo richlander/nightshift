@@ -26,16 +26,6 @@ public sealed class LocalStore : ITurnstile
     private readonly KvStore _kv;
     private readonly ModeLock _modeLock;
 
-    /// <summary>
-    /// Test-only observation seam (issue #202 follow-up), keyed by canonical DB path. When
-    /// <see cref="OpenAsync"/> has just created a <see cref="KvStore"/> for a registered path, it hands that
-    /// instance to the observer so a test can later assert the writer was disposed on the failure path. Keying
-    /// by path — rather than a single global hook — keeps a parallel test's open from clobbering the capture,
-    /// and each test uses a unique path. It only reads; it never changes open behavior and is empty in
-    /// production.
-    /// </summary>
-    internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Action<KvStore>> KvStoreOpenObserversForTests = new();
-
     private LocalStore(KvStore kv, ModeLock modeLock)
     {
         _kv = kv;
@@ -68,11 +58,6 @@ public sealed class LocalStore : ITurnstile
         try
         {
             kv = KvStore.Open(canonicalDb);
-            if (KvStoreOpenObserversForTests.TryGetValue(canonicalDb, out Action<KvStore>? observe))
-            {
-                observe(kv);
-            }
-
             // Sweep-on-open: library mode has no always-on sweeper, so reclaim any leases that expired while
             // no process was attached. This emits the delete events a lazy read would silently swallow.
             await kv.SweepExpiredAsync().ConfigureAwait(false);

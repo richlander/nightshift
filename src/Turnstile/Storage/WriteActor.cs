@@ -24,12 +24,6 @@ internal sealed class WriteActor : IDisposable
     private readonly BlockingCollection<Job> _queue = new(new ConcurrentQueue<Job>());
     private readonly Thread _thread;
     private readonly Action? _onCommitted;
-    private bool _disposed;
-
-    /// <summary>Test-only: true once <see cref="Dispose"/> has drained the writer thread and closed its
-    /// connection. Direct, deterministic evidence (no thread-count or timing check) that a failed
-    /// <see cref="LocalStore.OpenAsync"/> disposed the writer it created rather than leaking it (#202).</summary>
-    internal bool IsDisposed => _disposed;
 
     public WriteActor(SqliteConnection conn, Action? onCommitted = null)
     {
@@ -145,7 +139,6 @@ internal sealed class WriteActor : IDisposable
         }
 
         _conn.Dispose();
-        _disposed = true;
     }
 
     private readonly record struct Job(
