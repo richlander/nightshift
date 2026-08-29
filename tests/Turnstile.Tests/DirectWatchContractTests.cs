@@ -93,13 +93,15 @@ public sealed class DirectWatchContractTests : IDisposable
         string committedKey = push.StdOut.Trim();
         Assert.StartsWith("/events/item/", committedKey);
 
-        // The child wrote through a pooled WAL connection and exited; its committed frames can linger in the
-        // -wal file. A daemon that then opens the file fresh reads reliably on one connection (a unary get
-        // below sees the row) but a *separate* pooled read connection — the one the watch backlog uses — can
-        // momentarily observe a staler WAL snapshot. That cross-process pooled-WAL visibility is orthogonal to
-        // the watch contract under test, so materialise the log into the database first, making every fresh
-        // reader deterministic. (See findings: the daemon's cold cross-process read may merit a follow-up.)
-        MaterializeWal(_dbPath);
+        // The child process has exited, so its write is committed and durable on the shared file — that exit is
+        // the write/commit synchronisation, and it is all this needs. The daemon starts next *in this same test
+        // process*, which still holds Microsoft.Data.Sqlite's process-local connection pool from the parent
+        // LocalStore opened above — a pool populated before the child committed. A real daemon is a separate OS
+        // process whose connection pool starts empty and cold, so it can only open fresh connections that see
+        // the child's commit. Clear the pool here to emulate exactly that: without it, the in-process daemon
+        // could reuse a pre-child pooled connection an out-of-process daemon never could. No checkpoint, no
+        // sleep, no database mutation — just the fresh pool a real daemon process would have.
+        SqliteConnection.ClearAllPools();
 
         // Reconnect through a real daemon on the same database and resume from the saved cursor. The commit the
         // separate process made while only library-mode stores were open is past the cursor, so it replays from
@@ -189,24 +191,8 @@ public sealed class DirectWatchContractTests : IDisposable
         Assert.Contains("daemon", r.FirstStdErrLine, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static void MaterializeWal(string dbPath)
+    private static string NewScratchDir()
     {
-        // Checkpoint (and truncate) the write-ahead log so every committed frame is folded into the main
-        // database file. After this, a freshly opened reader in any process reads the committed state without
-        // depending on a per-connection WAL snapshot. Pooling is off so this connection does its work and goes
-        // away rather than being parked for reuse.
-        using var conn = new SqliteConnection(new SqliteConnectionStringBuilder
-        {
-            DataSource = dbPath,
-            Pooling = false,
-        }.ConnectionString);
-        conn.Open();
-        using SqliteCommand cmd = conn.CreateCommand();
-        cmd.CommandText = "PRAGMA wal_checkpoint(TRUNCATE);";
-        cmd.ExecuteNonQuery();
-    }
-
-    private static string NewScratchDir()    {
         string home = Path.Combine(Path.GetTempPath(), $"turnstile-directwatch-home-{Guid.NewGuid():N}");
         Directory.CreateDirectory(home);
         return home;

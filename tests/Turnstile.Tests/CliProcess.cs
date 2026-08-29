@@ -54,12 +54,33 @@ internal static class CliProcess
         using var process = new Process { StartInfo = psi };
         process.Start();
 
-        // Read both streams before waiting for exit so a full pipe can never deadlock the child.
-        Task<string> stdout = process.StandardOutput.ReadToEndAsync(ct);
-        Task<string> stderr = process.StandardError.ReadToEndAsync(ct);
-        await process.WaitForExitAsync(ct);
+        try
+        {
+            // Read both streams before waiting for exit so a full pipe can never deadlock the child.
+            Task<string> stdout = process.StandardOutput.ReadToEndAsync(ct);
+            Task<string> stderr = process.StandardError.ReadToEndAsync(ct);
+            await process.WaitForExitAsync(ct);
 
-        return new CliResult(process.ExitCode, await stdout, await stderr);
+            return new CliResult(process.ExitCode, await stdout, await stderr);
+        }
+        catch (OperationCanceledException)
+        {
+            // The test was cancelled while the child was still running: kill it rather than leave an orphaned
+            // process behind.
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+            catch
+            {
+                // The process may have exited between the check and the kill; nothing to clean up then.
+            }
+
+            throw;
+        }
     }
 }
 

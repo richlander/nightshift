@@ -51,12 +51,34 @@ internal sealed class TestDaemon : IAsyncDisposable
         var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         Task run = Daemon.RunAsync(socket, dbPath, options, cts.Token);
 
-        for (int i = 0; i < 400 && !File.Exists(socket); i++)
+        try
         {
-            await Task.Delay(25, ct);
+            for (int i = 0; i < 400 && !File.Exists(socket); i++)
+            {
+                await Task.Delay(25, ct);
+            }
+
+            Assert.True(File.Exists(socket), "daemon socket never appeared");
+        }
+        catch
+        {
+            // Startup was cancelled, or the socket never appeared: the daemon task is already running on the
+            // linked token, so cancel and drain it here rather than leaking a live daemon (and its pooled
+            // connections) past this failed start.
+            cts.Cancel();
+            try
+            {
+                await run;
+            }
+            catch
+            {
+                // Shutdown cancellation is expected.
+            }
+
+            cts.Dispose();
+            throw;
         }
 
-        Assert.True(File.Exists(socket), "daemon socket never appeared");
         return new TestDaemon(socket, dbPath, ownsDb, cts, run);
     }
 
