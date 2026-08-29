@@ -9,8 +9,13 @@ using Turnstile.Storage;
 /// Stage-0 coordination recipes built on <see cref="ITurnstile"/>: a mutex (<c>lock</c>), leader
 /// election with standby failover (<c>elect</c>), and a FIFO work queue (<c>queue</c>). Each is a thin
 /// composition of lease + txn + watch — the proof that "coordination is a store plus recipes." They
-/// auto-connect via <see cref="TurnstileConnection"/>, so they work daemonless (library mode) or against
-/// a running daemon, unchanged.
+/// auto-connect via <see cref="TurnstileConnection"/>. The finite parts survive the library-mode fallback:
+/// an uncontended <c>lock</c>/<c>elect</c> claim, <c>queue push</c>, and a non-waiting <c>queue pop</c> are
+/// lease+txn only and run daemonless. The parts that block on a watch do not: a <em>contended</em>
+/// <c>lock</c>/<c>elect</c> (waiting for the holder to release) and <c>queue pop --wait</c> (waiting for a
+/// push) need live cross-process notification, which only the daemon delivers. In library mode those raise
+/// <see cref="TurnstileWatchUnavailableException"/>, which each helper maps to the non-success CLI convention
+/// (a first-line <c>turnstile:</c> error, exit 1) rather than parking forever (#202).
 /// </summary>
 internal static class Helpers
 {

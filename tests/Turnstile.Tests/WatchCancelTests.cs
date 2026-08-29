@@ -163,75 +163,27 @@ public sealed class WatchCancelTests
             "watch teardown logged request-handler error(s):\n" + string.Join("\n", errors.Select(e => $"[{e.Level}] {e.Category}: {e.Message} :: {e.Exception}")));
     }
 
-    /// <summary>Owns one daemon instance: its socket, db, capturing logger, and run task. Stopping awaits the
-    /// run task so all request logging is flushed before assertions.</summary>
-    private sealed class DaemonHarness : IAsyncDisposable
+    /// <summary>Adds this suite's per-instance log capture on top of the shared <see cref="TestDaemon"/>
+    /// lifecycle (start, wait-for-socket, drain-on-stop, cleanup), so the request-handler logging can be
+    /// asserted without duplicating the daemon boilerplate the other watch suite also needs.</summary>
+    private sealed class DaemonHarness(TestDaemon daemon, CapturingLoggerProvider logs) : IAsyncDisposable
     {
-        private readonly string _dbPath;
-        private readonly CancellationTokenSource _cts = new();
-        private readonly Task _run;
-        private readonly CapturingLoggerProvider _logs;
-        private bool _stopped;
+        public string SocketPath => daemon.Socket;
 
-        private DaemonHarness(string socketPath, string dbPath, CapturingLoggerProvider logs, WatchHooks hooks)
-        {
-            SocketPath = socketPath;
-            _dbPath = dbPath;
-            _logs = logs;
-            _run = Daemon.RunAsync(socketPath, dbPath, new DaemonOptions { LoggerProvider = logs, WatchHooks = hooks }, _cts.Token);
-        }
-
-        public string SocketPath { get; }
-
-        public IReadOnlyList<CapturedLog> Logs => _logs.Entries;
+        public IReadOnlyList<CapturedLog> Logs => logs.Entries;
 
         public static async Task<DaemonHarness> StartAsync(WatchHooks? hooks, CancellationToken ct)
         {
-            string socketPath = Path.Combine(Path.GetTempPath(), $"ts-{Guid.NewGuid():N}.sock");
-            string dbPath = Path.Combine(Path.GetTempPath(), $"turnstile-watchcancel-{Guid.NewGuid():N}.db");
-            var harness = new DaemonHarness(socketPath, dbPath, new CapturingLoggerProvider(), hooks ?? WatchHooks.None);
-
-            for (int i = 0; i < 400 && !File.Exists(socketPath); i++)
-            {
-                await Task.Delay(25, ct);
-            }
-
-            Assert.True(File.Exists(socketPath), "daemon socket never appeared");
-            return harness;
+            var logs = new CapturingLoggerProvider();
+            TestDaemon daemon = await TestDaemon.StartAsync(
+                ct,
+                new DaemonOptions { LoggerProvider = logs, WatchHooks = hooks ?? WatchHooks.None });
+            return new DaemonHarness(daemon, logs);
         }
 
-        public async Task StopAsync()
-        {
-            if (_stopped)
-            {
-                return;
-            }
+        public Task StopAsync() => daemon.StopAsync();
 
-            _stopped = true;
-            _cts.Cancel();
-            try
-            {
-                await _run;
-            }
-            catch
-            {
-                // Shutdown cancellation is expected.
-            }
-        }
-
-        public async ValueTask DisposeAsync()
-        {
-            await StopAsync();
-            _cts.Dispose();
-            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-            foreach (string path in new[] { _dbPath, _dbPath + "-wal", _dbPath + "-shm", SocketPath })
-            {
-                if (File.Exists(path))
-                {
-                    File.Delete(path);
-                }
-            }
-        }
+        public ValueTask DisposeAsync() => daemon.DisposeAsync();
     }
 
     private sealed record CapturedLog(string Category, LogLevel Level, string Message, Exception? Exception);
