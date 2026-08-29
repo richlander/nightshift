@@ -58,8 +58,15 @@
    the tests that exercise it.
 
    Also out of scope, so the model must not be read as covering them:
-     - revision overflow (#198): `rev` is bounded by MaxRevision for a finite state
-       space; the Int64 wrap of the real counter is not represented.
+     - revision overflow (#198): the Int64 *value* of the ceiling is not modelled --
+       `rev` is bounded by MaxRevision only to keep the state space finite. But the
+       *shape* the bound enforces now corresponds to the implementation: once the ceiling
+       is reached no revision-allocating action is enabled, and a multi-row action that
+       would cross it (`rev + n <= MaxRevision`) does not fire at all rather than partially
+       applying. That is fail-closed exhaustion -- the real allocator throws and rolls the
+       whole transaction back with no row, no counter move, and no pulse (enforced by
+       `RevisionOverflowTests`), never an integer wrap. The model images the fail-closed
+       boundary, not the specific 2^63 limit.
      - cross-instance watch *notification*. Revision *allocation* across independently
        opened instances is now globally serialized -- each writer reads the durable
        committed revision under BEGIN IMMEDIATE as its base, never a cached value -- so

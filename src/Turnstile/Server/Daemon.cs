@@ -78,6 +78,12 @@ public sealed class Daemon
                 ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
                 await ctx.Response.WriteAsJsonAsync(new ErrorResponse(ex.Message), TurnstileJson.Default.ErrorResponse);
             }
+            catch (TurnstileRevisionExhaustedException ex)
+            {
+                // Server-side resource exhaustion, not client input: a stable 500 with the uniform envelope.
+                ctx.Response.StatusCode = StatusCodes.Status500InternalServerError;
+                await ctx.Response.WriteAsJsonAsync(new ErrorResponse(ex.Message), TurnstileJson.Default.ErrorResponse);
+            }
         });
 
         app.MapGet("/status", (KvStore store, DaemonInfo info) =>

@@ -73,3 +73,11 @@ public static class Keys
 
 /// <summary>Thrown when a key or value fails validation; the server maps this to HTTP 400.</summary>
 public sealed class TurnstileValidationException(string message) : Exception(message);
+
+/// <summary>
+/// Thrown when the durable revision counter cannot advance without overflowing <see cref="long"/> — the
+/// store has exhausted its 2^63 revision space. This is a server-side resource-exhaustion invariant, not
+/// malformed client input, so it is deliberately NOT a <see cref="TurnstileValidationException"/>; the
+/// server maps it to HTTP 500. The failing transaction rolls back whole: no row, no revision, no pulse.
+/// </summary>
+public sealed class TurnstileRevisionExhaustedException(string message) : Exception(message);
