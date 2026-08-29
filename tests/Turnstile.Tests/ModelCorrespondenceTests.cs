@@ -84,19 +84,19 @@ public class ModelCorrespondenceTests : IDisposable
     public async Task RemovalIsLoggedStep_ExpiryTombstonesThroughTheLog()
     {
         using KvStore store = Open();
-        await LeaseClock.EnsureHeadroomAsync(Ct);
 
-        // A one-second lease leaves a sub-second window between create and the /ephemeral attach below, so a
-        // scheduling stall under parallel load can cross the whole-second boundary and expire the lease before
-        // the key is attached ("lease not found or expired"). A multi-second TTL keeps the lease live at attach
-        // even if an entire second is lost to scheduling, while the deadline-anchored WaitPastExpiryAsync still
-        // drives real expiry — so the test deterministically proves expiry tombstones through the log without
-        // depending on machine speed. Whole-second lease semantics (#189) are unchanged; only the attach window
-        // widens (#208).
-        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 3);
+        // A comfortably-live lease: the attach below cannot race the clock, so setup is deterministic. (No
+        // finite TTL makes this race-free on its own — CreateLeaseAsync fixes expiry before the writer enqueue,
+        // and an unbounded stall before the attach could still cross any deadline — so the expiry itself is not
+        // driven by the wall clock at all.)
+        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 60);
         WriteResult created = await store.CreateAsync("/ephemeral", Bytes("v"), lease: lease.Id);
 
-        await LeaseClock.WaitPastExpiryAsync(lease, Ct);
+        // Deterministically establish the expired state SweepExpiredAsync acts on by moving the lease's stored
+        // deadline into the past — the same durable state that elapsed time would produce, with no wall-clock
+        // wait. This changes controllable test state only; production lease semantics (#189) are untouched.
+        ExpireLeaseInThePast(lease.Id);
+
         long before = store.CurrentRevision;
         Assert.Equal(1, await store.SweepExpiredAsync());
 
@@ -107,6 +107,21 @@ public class ModelCorrespondenceTests : IDisposable
         WatchEvent removal = Assert.Single(store.ReadEvents("/", fromExclusive: created.Revision, limit: 0));
         Assert.Equal("/ephemeral", removal.Key);
         Assert.True(removal.Deleted);
+    }
+
+    /// <summary>
+    /// Forces a lease's stored deadline into the distant past so a subsequent sweep must see it expired. This
+    /// establishes the expired state deterministically — the durable equivalent of elapsed time — instead of
+    /// waiting on the wall clock, and touches only the lease row's <c>expires_at</c>, not any production logic.
+    /// </summary>
+    private void ExpireLeaseInThePast(string leaseId)
+    {
+        using var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={_dbPath}");
+        conn.Open();
+        using Microsoft.Data.Sqlite.SqliteCommand cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE lease SET expires_at = 0 WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$id", leaseId);
+        Assert.Equal(1, cmd.ExecuteNonQuery());
     }
 
     /// <summary>
