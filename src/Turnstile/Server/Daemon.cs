@@ -31,12 +31,15 @@ public sealed class Daemon
         // both are held as `using` declarations for the daemon's whole lifetime — released on any startup
         // failure below and after shutdown, or by the OS if we crash.
 
-        // Socket-endpoint ownership first, *before* the socket path is probed, deleted, or bound. Keyed on the
-        // socket's canonical identity so two daemons that would bind the same endpoint through different path
-        // spellings still contend on one lock (#212). Acquiring it also makes the path bindable: a live
-        // listener there is refused (never unlinked — that is the #212 split), and only a proven-stale pathname
-        // (a crash leftover) is deleted so a restart can bind. This replaces the old unconditional delete,
-        // which let a second daemon on a *different* database unlink a live daemon's socket.
+        // Socket-endpoint ownership first, *before* the socket path is bound. Keyed on the socket's canonical
+        // identity so two daemons that would bind the same endpoint through different path spellings still
+        // contend on one lock (#212). Acquiring it also fails the start closed if anything already occupies the
+        // path: a live listener, a stale socket, or any other entry is refused and *never* unlinked, because
+        // staleness cannot be proven without cooperation from whatever bound it. This replaces the old
+        // unconditional delete, which let a second daemon on a *different* database unlink a live daemon's
+        // socket. A graceful shutdown removes this daemon's own socket (Kestrel unlinks it on unbind), so an
+        // ordinary restart binds; an unclean crash leaves the file behind as an explicit operator-cleanup
+        // condition rather than something the daemon silently deletes.
         string canonicalSocket = CanonicalPath.Resolve(socketPath, "socket");
         using SocketLock socketLock = SocketLock.Acquire(socketPath, canonicalSocket);
 

@@ -1,8 +1,5 @@
 namespace Turnstile.Storage;
 
-using System.Runtime.InteropServices;
-using System.Text;
-
 /// <summary>
 /// Socket-<em>endpoint</em> ownership for a daemon (#212). <see cref="ModeLock"/> protects the database a daemon
 /// owns, but not the Unix socket path it binds. Those are independent: a second daemon started on the same
@@ -11,53 +8,45 @@ using System.Text;
 /// listening socket be unlinked without disturbing existing connections, so the two daemons would then split
 /// coordination state: old connections stay on the first daemon and its database, new clients reach the second.
 ///
-/// <para>This closes that with two independent guards, both applied <em>before</em> any socket is deleted or
-/// bound:</para>
+/// <para>This closes that with two mechanisms, both applied <em>before</em> any socket is bound and neither of
+/// which ever deletes a socket path:</para>
 /// <list type="number">
 ///   <item><b>An exclusive <see cref="FileLock"/> on the socket's canonical identity</b> (sidecar
-///   <c>&lt;socket&gt;-socklock</c>). Two daemons that would bind the same endpoint — even through different
-///   path spellings, because the identity is canonicalized (<see cref="CanonicalPath"/>) — contend on this one
-///   lock, so the second fails fast with <see cref="TurnstileSocketInUseException"/> and never reaches the
-///   delete. It reuses the very same close-on-exec, OS-release, non-blocking flock machinery the database lock
-///   uses; only the sidecar name and the typed exception differ.</item>
-///   <item><b>A liveness probe before any delete.</b> The lock alone cannot protect an <em>older</em> daemon
-///   (built before this lock existed) or any foreign listener that holds no socklock — it would acquire the
-///   free lock and then delete a live endpoint. So once the lock is held, if the socket path still exists, a
-///   single connect probes it: a successful connect means a listener is live (Turnstile or not) and startup
-///   <em>refuses</em> rather than unlink it; only a probe that proves the pathname stale
-///   (<c>ENOENT</c>/<c>ECONNREFUSED</c>-class — nothing is listening) is deleted. Any other probe outcome
-///   (<c>EACCES</c>, a non-socket at the path, ...) surfaces as an <see cref="IOException"/>, never silently
-///   treated as stale. No polling: one connect attempt, then a decision.</item>
+///   <c>&lt;socket&gt;-socklock</c>). Two compliant daemons that would bind the same endpoint — even through
+///   different path spellings, because the identity is canonicalized (<see cref="CanonicalPath"/>) — contend on
+///   this one lock, so the second fails fast with <see cref="TurnstileSocketInUseException"/>. This both
+///   serializes daemon startup and closes the absent-path race (two daemons starting on a fresh socket that
+///   both see no file). It reuses the very same close-on-exec, OS-release, non-blocking flock machinery the
+///   database lock uses; only the sidecar name and the typed exception differ.</item>
+///   <item><b>A fail-closed existence check.</b> The lock alone cannot protect an <em>older</em> daemon (built
+///   before this lock existed) or any foreign listener that holds no socklock — it would acquire the free lock
+///   over a live endpoint. A daemon <em>cannot</em> prove a socket path is stale without cooperation from
+///   whatever bound it: on macOS a saturated but live listener can refuse a connect, so no connect-only probe
+///   can tell a crash leftover apart from a busy live server. So once the lock is held, if <em>any</em>
+///   filesystem entry exists at the requested or canonical endpoint — a live listener, a stale socket, a
+///   regular file, or a symlink — startup <em>refuses</em> with <see cref="TurnstileSocketInUseException"/> and
+///   never unlinks it. Safety wins over crash-restart convenience: Turnstile will not silently delete a path
+///   that might be live.</item>
 /// </list>
+///
+/// <para><b>What still restarts cleanly, and what does not.</b> A graceful shutdown removes the daemon's own
+/// socket (Kestrel unlinks it on unbind), so an ordinary restart finds nothing at the path and binds. An
+/// <em>unclean</em> crash leaves the socket file behind; because staleness cannot be proven, that becomes an
+/// explicit operator-cleanup condition — verify no process is listening, remove the path, and retry. There is
+/// deliberately no <c>--force</c>, no automatic retry, and no polling. If an external process races to bind
+/// after the existence check, that surfaces as a visible Kestrel bind failure and still deletes nothing;
+/// compliant daemons cannot race because the lock serializes them.</para>
 ///
 /// <para>The daemon acquires this <em>before</em> the database <see cref="ModeLock"/>, in one documented
 /// non-blocking order; both locks are non-blocking, so no acquisition can deadlock, and both are released on
-/// any startup failure and after shutdown. Malicious host-local tampering (a hostile hardlink, a path swapped
-/// after resolution) is out of scope, exactly as for <see cref="FileLock"/>/<see cref="CanonicalPath"/>: this
-/// follows #202's supported-symlink contract, not a security boundary.</para>
+/// any startup failure and after shutdown. This is a thin, socket-specific face over <see cref="FileLock"/>,
+/// exactly analogous to <see cref="ModeLock"/>: it adds only the sidecar name, the typed exception, and the
+/// existence refusal. Malicious host-local tampering (a hostile hardlink, a path swapped after resolution) is
+/// out of scope, exactly as for <see cref="FileLock"/>/<see cref="CanonicalPath"/>: this follows #202's
+/// supported-symlink contract, not a security boundary.</para>
 /// </summary>
-internal sealed partial class SocketLock : IDisposable
+internal sealed class SocketLock : IDisposable
 {
-    // socket(2)/connect(2) constants for the liveness probe. AF_UNIX and SOCK_STREAM are both 1 on Linux and
-    // macOS. The probe speaks the same transport a client would, so "a listener answers" is exactly what a
-    // client would find — the honest test of liveness.
-    private const int AfUnix = 1;
-    private const int SockStream = 1;
-
-    // errno for the probe. EINTR (4) and ENOENT (2) are identical on Linux and macOS; ECONNREFUSED differs
-    // (111 on Linux, 61 on macOS). ENOENT ("nothing at the path") and ECONNREFUSED ("a socket file with no
-    // listener") are the two stale outcomes that authorize deleting the pathname; every other errno is a real
-    // fault that must surface rather than be mistaken for stale.
-    private const int Eintr = 4;
-    private const int Enoent = 2;
-    private static readonly int EConnRefused = OperatingSystem.IsMacOS() ? 61 : 111;
-
-    // sockaddr_un layout differs by platform: macOS has a leading 1-byte sun_len then a 1-byte sun_family;
-    // Linux has a 2-byte sun_family and no sun_len. On both, AF_UNIX is 1 and the pathname follows at offset 2,
-    // NUL-terminated. macOS caps sun_path at 104 bytes, Linux at 108.
-    private const int SunPathOffset = 2;
-    private static readonly int SunPathMax = OperatingSystem.IsMacOS() ? 104 : 108;
-
     private readonly FileLock _lock;
 
     private SocketLock(FileLock fileLock) => _lock = fileLock;
@@ -70,10 +59,10 @@ internal sealed partial class SocketLock : IDisposable
 
     /// <summary>
     /// Takes exclusive ownership of the socket endpoint named by <paramref name="canonicalSocketPath"/>, then
-    /// makes <paramref name="socketPath"/> safe to bind: a live endpoint there is refused (never unlinked) and
-    /// only a proven-stale pathname is deleted. Fails with <see cref="TurnstileSocketInUseException"/> if
-    /// another daemon already owns the endpoint or a live listener answers; other probe faults surface as
-    /// <see cref="IOException"/>. On any failure no lock is retained and no live socket is deleted.
+    /// verifies <paramref name="socketPath"/> is free to bind. Fails with <see cref="TurnstileSocketInUseException"/>
+    /// if another daemon already owns the endpoint, or if <em>any</em> filesystem entry already exists at the
+    /// requested or canonical path — Turnstile never unlinks an existing socket path, because it cannot prove
+    /// the path is not a live listener. On any failure no lock is retained and no socket path is deleted.
     /// </summary>
     public static SocketLock Acquire(string socketPath, string canonicalSocketPath)
     {
@@ -90,139 +79,64 @@ internal sealed partial class SocketLock : IDisposable
 
         try
         {
-            ClearStalePathOrRefuse(socketPath);
+            RefuseIfEndpointExists(socketPath, canonicalSocketPath);
             return new SocketLock(held);
         }
         catch
         {
-            // Release the just-acquired lock on any failure (a live-endpoint refusal, or a probe fault) so a
-            // failed start leaves nothing held.
+            // Release the just-acquired lock on the existence refusal so a failed start leaves nothing held.
             held.Dispose();
             throw;
         }
     }
 
-    // Makes socketPath bindable now that the endpoint lock is held. If nothing is at the path there is nothing
-    // to clear. Otherwise probe once: a live listener is refused (unlinking it would strand its connections —
-    // the #212 bug), a stale pathname is deleted so the daemon can bind, and any other outcome surfaces.
-    private static void ClearStalePathOrRefuse(string socketPath)
+    // With the endpoint lock held, refuse to bind if anything at all already occupies the path. Turnstile
+    // cannot prove such an entry is a crash leftover rather than a live listener — a connect-only probe cannot
+    // distinguish a stale pathname from a saturated, uncooperative live server — so it never unlinks it. A
+    // graceful shutdown removes the daemon's own socket, so a leftover here means an unclean exit or a foreign
+    // process, and clearing it is the operator's explicit decision, not the daemon's.
+    private static void RefuseIfEndpointExists(string socketPath, string canonicalSocketPath)
     {
-        if (!File.Exists(socketPath))
+        if (!PathExists(socketPath) && !PathExists(canonicalSocketPath))
         {
             return;
         }
 
-        switch (Probe(socketPath))
-        {
-            case ProbeResult.Live:
-                throw new TurnstileSocketInUseException(
-                    $"cannot start the daemon: a live listener already answers on the socket '{socketPath}'. "
-                    + "Refusing to replace it — an existing daemon (or another process) is serving there. Stop "
-                    + "it or serve on a different --socket (#212).");
-
-            case ProbeResult.Stale:
-                // The pathname is a leftover with no listener (a crash left the file, or the path vanished).
-                // Deleting it is what lets a daemon restart on the same socket after an unclean exit.
-                File.Delete(socketPath);
-                break;
-        }
+        throw new TurnstileSocketInUseException(
+            $"cannot start the daemon: a filesystem entry already exists at the socket path '{socketPath}'. "
+            + "Turnstile refuses to unlink it because it cannot prove the path is not a live listener — a "
+            + "graceful daemon shutdown removes its own socket, so a leftover means an unclean exit or another "
+            + "process. Verify no daemon or other process is listening there, then remove the stale path "
+            + "explicitly and retry, or serve on a different --socket (#212).");
     }
 
-    private enum ProbeResult
+    // Reports whether any filesystem entry occupies <paramref name="path"/> — a regular file, a directory, a
+    // Unix socket, or a symlink, *including a dangling one whose target is absent*. Path.Exists catches the
+    // first three (and a symlink whose target exists); the LinkTarget read adds a dangling symlink honestly,
+    // whose broken target Path.Exists would otherwise follow and report as nothing. A daemon must refuse every
+    // one of these rather than risk unlinking a live endpoint.
+    private static bool PathExists(string path)
     {
-        Live,
-        Stale,
-    }
-
-    // Connects once to socketPath over AF_UNIX/SOCK_STREAM and classifies the outcome. A successful connect is
-    // Live (a listener queued us — no accept() by the peer is needed, so this cannot hang on a live-but-busy
-    // server). ENOENT/ECONNREFUSED is Stale (nothing is listening). Any other errno — EACCES, ENOTSOCK (a
-    // non-socket file sits at the path), ... — is a real fault the caller must see, so it throws rather than
-    // guess "stale" and unlink something it does not understand. EINTR is retried, matching FileLock.
-    private static ProbeResult Probe(string socketPath)
-    {
-        byte[] addr = BuildSockaddrUn(socketPath, out uint addrLen);
-
-        int fd = socket(AfUnix, SockStream, 0);
-        if (fd < 0)
+        if (Path.Exists(path))
         {
-            throw new IOException(
-                $"turnstile: cannot create a probe socket for '{socketPath}' (errno {Marshal.GetLastPInvokeError()})");
+            return true;
         }
 
         try
         {
-            while (true)
-            {
-                if (connect(fd, addr, addrLen) == 0)
-                {
-                    return ProbeResult.Live;
-                }
-
-                int err = Marshal.GetLastPInvokeError();
-                if (err == Eintr)
-                {
-                    continue;
-                }
-
-                if (err == Enoent || err == EConnRefused)
-                {
-                    return ProbeResult.Stale;
-                }
-
-                throw new IOException(
-                    $"turnstile: cannot probe the socket '{socketPath}' before binding (errno {err}); refusing to "
-                    + "treat an unclassified endpoint as stale");
-            }
+            return new FileInfo(path).LinkTarget is not null;
         }
-        finally
+        catch (IOException)
         {
-            close(fd);
+            return false;
         }
-    }
-
-    // Packs a pathname AF_UNIX sockaddr_un for connect(2), honouring the per-platform header layout (macOS:
-    // sun_len + 1-byte family; Linux: 2-byte family). The address length passed to connect covers the header,
-    // the path bytes, and the terminating NUL. A path too long for the platform's sun_path is a real error —
-    // it could never be bound either — so it surfaces rather than being silently truncated into a different
-    // endpoint.
-    private static byte[] BuildSockaddrUn(string socketPath, out uint addrLen)
-    {
-        byte[] pathBytes = Encoding.UTF8.GetBytes(socketPath);
-        if (pathBytes.Length + 1 > SunPathMax)
+        catch (UnauthorizedAccessException)
         {
-            throw new IOException(
-                $"turnstile: socket path '{socketPath}' is too long for a Unix socket address "
-                + $"({pathBytes.Length} bytes; max {SunPathMax - 1})");
+            return false;
         }
-
-        addrLen = (uint)(SunPathOffset + pathBytes.Length + 1);
-        byte[] addr = new byte[addrLen];
-        if (OperatingSystem.IsMacOS())
-        {
-            addr[0] = (byte)addrLen;
-            addr[1] = AfUnix;
-        }
-        else
-        {
-            addr[0] = AfUnix;
-            addr[1] = 0;
-        }
-
-        Array.Copy(pathBytes, 0, addr, SunPathOffset, pathBytes.Length);
-        return addr;
     }
 
     /// <summary>Releases socket-endpoint ownership (the OS drops the flock when the descriptor closes).
     /// Idempotent. Does not unlink the bound socket file — Kestrel owns that.</summary>
     public void Dispose() => _lock.Dispose();
-
-    [LibraryImport("libc", SetLastError = true)]
-    private static partial int socket(int domain, int type, int protocol);
-
-    [LibraryImport("libc", SetLastError = true)]
-    private static partial int connect(int fd, byte[] addr, uint addrLen);
-
-    [LibraryImport("libc", SetLastError = true)]
-    private static partial int close(int fd);
 }

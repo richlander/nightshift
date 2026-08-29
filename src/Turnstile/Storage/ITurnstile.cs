@@ -91,11 +91,13 @@ public sealed class TurnstileDatabaseInUseException(string message) : TurnstileU
 /// (<see cref="TurnstileDatabaseInUseException"/>) does not cover this: a second daemon on the same socket but
 /// a <em>different</em> database takes a different mode lock and would otherwise unlink the first daemon's live
 /// socket and bind its own, leaving existing connections on the first daemon while new clients reach the
-/// second — a split coordination state. Two conditions raise it, both before any socket is deleted or bound: a
-/// socket-ownership conflict (another daemon already holds the <see cref="SocketLock"/> for the same canonical
-/// socket identity), and a live-endpoint refusal (a listener — Turnstile or not — answers a connect on the
-/// socket path, so it is not stale and must never be unlinked). A genuinely stale pathname is not this: it is
-/// deleted and startup proceeds. Product surfaces map this to the established non-success convention — a
-/// first-line <c>turnstile:</c> message and exit 1 — never a stack trace, because the condition is expected.
+/// second — a split coordination state. Two conditions raise it, both before any socket is bound and neither of
+/// which deletes anything: a socket-ownership conflict (another daemon already holds the
+/// <see cref="SocketLock"/> for the same canonical socket identity), and a fail-closed existence refusal (any
+/// filesystem entry — a live listener, a stale socket, a regular file, or a symlink — already occupies the
+/// path, and Turnstile will not unlink it because it cannot prove the path is not live). A graceful shutdown
+/// removes the daemon's own socket, so a leftover is an explicit operator-cleanup condition, not something the
+/// daemon silently clears. Product surfaces map this to the established non-success convention — a first-line
+/// <c>turnstile:</c> message and exit 1 — never a stack trace, because the condition is expected.
 /// </summary>
 public sealed class TurnstileSocketInUseException(string message) : TurnstileUnavailableException(message);

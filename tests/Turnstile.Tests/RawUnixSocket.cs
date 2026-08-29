@@ -6,12 +6,12 @@ using System.Text;
 /// <summary>
 /// Fabricates a persistent, listenerless Unix socket file for #212 tests: <c>bind(2)</c> then <c>close(2)</c>
 /// with no <c>unlink</c>, leaving the pathname on disk with nothing listening — the "crash leftover" a daemon
-/// must recognise as stale (an <c>ECONNREFUSED</c>-class probe) and clear before binding. .NET's
-/// <see cref="System.Net.Sockets.Socket"/> cannot stand in here: it unlinks the socket file on
-/// <c>Dispose</c>, so a bound-then-closed managed socket leaves <em>no</em> file for the daemon to find — the
-/// opposite of the case under test. A raw <c>bind</c>+<c>close</c> is the honest reproduction. macOS and Linux
-/// differ only in the <c>sockaddr_un</c> header (macOS: a leading <c>sun_len</c> byte then a 1-byte family;
-/// Linux: a 2-byte family), handled below.
+/// must now <em>refuse</em> (fail closed) rather than silently clear, because it cannot prove the path is not a
+/// live listener. .NET's <see cref="System.Net.Sockets.Socket"/> cannot stand in here: it unlinks the socket
+/// file on <c>Dispose</c>, so a bound-then-closed managed socket leaves <em>no</em> file for the daemon to find
+/// — the opposite of the case under test. A raw <c>bind</c>+<c>close</c> is the honest reproduction. macOS and
+/// Linux differ only in the <c>sockaddr_un</c> header (macOS: a leading <c>sun_len</c> byte then a 1-byte
+/// family; Linux: a 2-byte family), handled below.
 ///
 /// <para>This uses classic <see cref="DllImportAttribute"/> rather than the product's source-generated
 /// <see cref="LibraryImportAttribute"/> so the (non-AOT) test project needs no <c>AllowUnsafeBlocks</c>; the
