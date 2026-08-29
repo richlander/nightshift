@@ -7,17 +7,19 @@ using Xunit;
 /// <summary>
 /// How an ambient <c>gh</c> subprocess is run. The runner injects no credentials of its own — the child
 /// inherits octoshift's environment, so the caller's own <c>gh</c> auth (ambient credential storage or an
-/// externally supplied <c>GH_TOKEN</c>) reaches gh untouched. It does override gh's <em>non-auth</em>
-/// execution controls (<c>GH_TELEMETRY=false</c>, <c>GH_PAGER=cat</c>, and removing <c>GH_FORCE_TTY</c>) so
-/// <c>gh api</c> is a plain noninteractive machine transport and the side effects that spawn a token-bearing
-/// process outliving the root — v2.97.0's detached telemetry child, a configured pager — are prevented at the
-/// source. Beyond that it drains both output streams concurrently with the wait so a burst larger than a pipe
-/// buffer is neither truncated nor able to deadlock the child, returns the full output and exit code on
-/// ordinary completion, and on cancellation confirms the launched process itself has exited and unblocks both
-/// reads before the cancellation propagates. Descendant containment is prevention, not a sandbox: what remains
-/// is best-effort (a tree kill cannot reach a process that left the root's process group), and no
-/// hostile-descendant sandbox is claimed here. The program name is a seam so these facts are provable against
-/// a purpose-built child rather than only the real binary.
+/// externally supplied <c>GH_TOKEN</c>) reaches gh as the host provides it; octoshift does not inspect, parse,
+/// log, mint, unset, or modify authentication. It does override gh's <em>non-auth</em> execution controls
+/// (<c>GH_TELEMETRY=false</c>, <c>GH_PAGER=cat</c>, and removing <c>GH_FORCE_TTY</c>) so <c>gh api</c> is a
+/// plain noninteractive machine transport and the known persistent/detached and pager paths that spawn a
+/// token-bearing process outliving the root — v2.97.0's detached telemetry child, a configured pager — are
+/// prevented at the source. Beyond that it drains both output streams concurrently with the wait so a burst
+/// larger than a pipe buffer is neither truncated nor able to deadlock the child, returns the full output and
+/// exit code on ordinary completion, and on cancellation confirms the launched process itself has exited and
+/// unblocks both reads before the cancellation propagates. Descendant containment is prevention, not a
+/// sandbox: preventing those paths does not make the root gh's only process (a synchronous helper such as
+/// macOS keyring's <c>/usr/bin/security</c> or Windows <c>tzutil</c> may still run), and such helpers remain
+/// covered only by the best-effort tree kill — no hostile-descendant sandbox is claimed here. The program name
+/// is a seam so these facts are provable against a purpose-built child rather than only the real binary.
 ///
 /// Joins the non-parallel <c>ConsoleCapture</c> collection: the environment tests mutate process-wide
 /// variables (<c>GH_TOKEN</c>, <c>GH_TELEMETRY</c>, <c>GH_PAGER</c>, <c>GH_FORCE_TTY</c>), so they must not run

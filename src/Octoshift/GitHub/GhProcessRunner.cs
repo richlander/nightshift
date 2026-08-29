@@ -4,12 +4,14 @@ using System.ComponentModel;
 using System.Diagnostics;
 
 /// <summary>
-/// Runs an ambient <c>gh</c> subprocess: the caller's own <c>gh</c> authentication, inherited from the
-/// process environment (ambient <c>gh</c> credential storage, or an externally provisioned <c>GH_TOKEN</c>),
-/// reaches gh untouched. octoshift owns no credential material and injects none — following Git's credential
-/// boundary, authority lives in the already-authenticated <c>gh</c> the host provides. The only environment
-/// the runner overrides is gh's <em>non-auth</em> execution controls (<c>GH_TELEMETRY</c>, <c>GH_PAGER</c>,
-/// <c>GH_FORCE_TTY</c>): those govern gh's side effects and output, never credentials.
+/// Runs an ambient <c>gh</c> subprocess: the caller's own <c>gh</c> authentication (ambient <c>gh</c>
+/// credential storage, or an externally provisioned <c>GH_TOKEN</c>/<c>GITHUB_TOKEN</c>) reaches gh as the
+/// host provides it. octoshift owns no credential material and injects none — following Git's credential
+/// boundary, authority lives in the already-authenticated <c>gh</c> the host provides. octoshift does not
+/// inspect, parse, log, mint, unset, or modify authentication variables or ambient credential storage. The
+/// inherited environment is preserved except for three <em>non-auth</em> gh execution controls the runner
+/// overrides (<c>GH_TELEMETRY</c>, <c>GH_PAGER</c>, <c>GH_FORCE_TTY</c>): those govern gh's side effects and
+/// output, never credentials.
 ///
 /// What this runner keeps is the hardened process lifecycle. Both output streams are drained concurrently
 /// with the wait so a burst larger than a pipe buffer is neither truncated nor able to deadlock the child; on
@@ -20,13 +22,17 @@ using System.Diagnostics;
 ///
 /// Descendant containment here is <em>prevention</em>, not a sandbox. The environment overrides disable the
 /// known gh side effects that spawn a token-bearing process which outlives the API root — v2.97.0's sampled,
-/// detached <c>gh send-telemetry</c> child and a configured pager — so in ordinary operation the direct root
-/// is the only process octoshift starts. What remains is best-effort: a tree kill cannot reach a process that
-/// deliberately left the root's process group (which is exactly what the telemetry child does), and octoshift
-/// does <em>not</em> claim a general hostile-descendant sandbox or containment of arbitrary future gh
-/// behavior. Native process-group / Job Object containment is deliberately not added, because it cannot catch
-/// that one child (gh forks it into a new group by design); see #184. The program name is a parameter so
-/// these facts can be exercised against a purpose-built child rather than only the real <c>gh</c> binary.
+/// detached <c>gh send-telemetry</c> child and a configured pager — so the known persistent/detached and pager
+/// paths are prevented at the source. That does not make the root gh's only process: a synchronous
+/// implementation helper (for example ambient keyring retrieval spawning <c>/usr/bin/security</c> on macOS, or
+/// <c>tzutil</c> on Windows) may still run. Such short-lived helpers remain covered only by the existing
+/// best-effort tree kill, and octoshift claims no general hostile-descendant sandbox. A POSIX process group
+/// alone cannot catch the detached telemetry child, because gh sets <c>Setpgid=true</c> and leaves the root's
+/// group; a Windows Job Object could contain it, but once the documented gh controls prevent the known
+/// persistent-child and pager paths, cross-platform native containment is not justified by current evidence
+/// and would add disproportionate platform-specific machinery — so it is deliberately not added (see #184).
+/// The program name is a parameter so these facts can be exercised against a purpose-built child rather than
+/// only the real <c>gh</c> binary.
 /// </summary>
 internal static class GhProcessRunner
 {
@@ -79,17 +85,18 @@ internal static class GhProcessRunner
             psi.ArgumentList.Add(arg);
         }
 
-        // The credential boundary: inherit octoshift's full environment untouched, so ambient `gh` credential
-        // storage or an externally provisioned GH_TOKEN/GITHUB_TOKEN reaches gh exactly as supplied. octoshift
-        // never reads, copies, unsets, or logs authentication. The only overrides are gh's *non-auth*
-        // execution controls, which turn `gh api` into a plain noninteractive machine transport and prevent
-        // the gh side effects that spawn a token-bearing process outliving the root:
+        // The credential boundary: ProcessStartInfo.Environment inherits octoshift's environment, which
+        // reaches gh preserved except for the three non-auth controls set below. octoshift does not inspect,
+        // parse, log, mint, unset, or modify authentication — ambient `gh` credential storage or an externally
+        // provisioned GH_TOKEN/GITHUB_TOKEN reaches gh as the host provides it. The only overrides are gh's
+        // *non-auth* execution controls, which turn `gh api` into a plain noninteractive machine transport and
+        // prevent the gh side effects that spawn a token-bearing process outliving the root:
         //
         //   * GH_TELEMETRY=false — gh v2.97.0 samples command completions and, when one is drawn, re-execs
         //     itself as a *detached* `gh send-telemetry` (Setpgid=true on POSIX, CREATE_NEW_PROCESS_GROUP on
         //     Windows) that inherits the parent env — including GH_TOKEN — and intentionally outlives the API
-        //     root. Because gh deliberately leaves the root's process group, a process group around the root
-        //     could not contain it; disabling telemetry prevents the child at the source.
+        //     root. Because gh sets Setpgid=true, a POSIX process group around the root could not contain it;
+        //     disabling telemetry prevents the child at the source.
         //   * GH_PAGER=cat — a configured pager under a forced TTY would otherwise be spawned as a child that
         //     inherits the token and octoshift's redirected pipes.
         //   * GH_FORCE_TTY removed — a user-forced TTY must not reach this machine-transport path; it is what
