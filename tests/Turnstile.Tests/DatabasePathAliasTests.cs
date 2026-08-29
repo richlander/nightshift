@@ -204,7 +204,11 @@ public sealed class DatabasePathAliasTests : IDisposable
         string dangling = Path.Combine(root, "dangling.db");
         File.CreateSymbolicLink(dangling, "does-not-exist.db");
 
-        IOException ex = Assert.Throws<IOException>(() => DatabasePath.Canonicalize(dangling));
+        // The database path still fails visibly with an IOException — canonicalization refuses a dangling final
+        // symlink for a database exactly as before. The refusal is now a precise IOException subtype
+        // (DanglingSymlinkException) so the socket-startup path can translate only this one case to its typed
+        // refusal; database callers keep the unchanged IOException contract, verified with the base type here.
+        IOException ex = Assert.ThrowsAny<IOException>(() => DatabasePath.Canonicalize(dangling));
         Assert.Contains("dangling", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
