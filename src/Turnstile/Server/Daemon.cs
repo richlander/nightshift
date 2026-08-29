@@ -26,18 +26,18 @@ public sealed class Daemon
     /// </summary>
     internal static async Task<int> RunAsync(string socketPath, string dbPath, DaemonOptions? options, CancellationToken ct = default)
     {
-        string? dir = Path.GetDirectoryName(Path.GetFullPath(dbPath));
-        if (dir is not null)
-        {
-            Directory.CreateDirectory(dir);
-        }
+        // Resolve the database's canonical filesystem identity once and use it for the ownership lock, SQLite,
+        // and status reporting alike: a daemon started via a symlink alias (a symlinked file, or a file under a
+        // symlinked directory) must take the very lock a direct store on the real path would, so the
+        // exclusive/shared contract holds across aliases (#202). This also creates the parent directory.
+        string canonicalDb = DatabasePath.Canonicalize(dbPath);
 
         // Take exclusive database ownership before touching anything else — the socket file included. A second
         // daemon (or any open direct store) fails here, before we would otherwise delete a live daemon's socket
         // or open a second writer behind an existing watch. Exclusive ownership is the invariant the daemon's
         // live watch rests on: with no direct store able to open the file, every commit flows through this
         // store's change signal (#202). Held for the daemon's whole lifetime; the OS drops it if we crash.
-        using ModeLock modeLock = ModeLock.AcquireExclusive(dbPath);
+        using ModeLock modeLock = ModeLock.AcquireExclusive(canonicalDb);
 
         // A Unix socket bind fails if a stale file is present; clear it first.
         if (File.Exists(socketPath))
@@ -45,7 +45,7 @@ public sealed class Daemon
             File.Delete(socketPath);
         }
 
-        using KvStore store = KvStore.Open(dbPath);
+        using KvStore store = KvStore.Open(canonicalDb);
 
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
@@ -57,7 +57,7 @@ public sealed class Daemon
         builder.Services.Configure<KestrelServerOptions>(o => o.ListenUnixSocket(socketPath));
         builder.Services.ConfigureHttpJsonOptions(o => o.SerializerOptions.TypeInfoResolverChain.Insert(0, TurnstileJson.Default));
         builder.Services.AddSingleton(store);
-        builder.Services.AddSingleton(new DaemonInfo(socketPath, dbPath));
+        builder.Services.AddSingleton(new DaemonInfo(socketPath, canonicalDb));
         builder.Services.AddSingleton(options?.WatchHooks ?? WatchHooks.None);
 
         WebApplication app = builder.Build();
@@ -66,7 +66,7 @@ public sealed class Daemon
         using var sweeper = new LeaseSweeper(store);
         sweeper.Start(ct);
 
-        Console.WriteLine($"turnstile: listening on {socketPath} (db: {dbPath})");
+        Console.WriteLine($"turnstile: listening on {socketPath} (db: {canonicalDb})");
         await app.RunAsync(ct);
         return 0;
     }

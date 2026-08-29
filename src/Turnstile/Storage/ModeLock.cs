@@ -28,6 +28,13 @@ using System.Runtime.InteropServices;
 /// is source-generated (<see cref="LibraryImport"/>), so it stays NativeAOT- and trim-safe with no added
 /// dependency. Host-local tampering with the sidecar file is out of scope: this is coordination correctness,
 /// not security containment.</para>
+///
+/// <para>The sidecar name is derived from the database's <em>canonical</em> path, which the caller resolves once
+/// through <see cref="DatabasePath.Canonicalize"/> and hands to both this lock and <see cref="KvStore.Open"/>.
+/// That is what makes the lock name the same file SQLite opens even when the database is reached through an
+/// ordinary symlink alias (a symlinked file, or a file under a symlinked directory): without canonicalization
+/// two aliases of one inode would take two different sidecars and a direct writer could commit behind a daemon's
+/// live watch. This lock does <em>not</em> recanonicalize; passing it a non-canonical path is a caller error.</para>
 /// </summary>
 internal sealed partial class ModeLock : IDisposable
 {
@@ -77,9 +84,13 @@ internal sealed partial class ModeLock : IDisposable
 
     private ModeLock(int fd) => _fd = fd;
 
-    /// <summary>The sidecar path whose lock guards <paramref name="dbPath"/>. Absolute, so the lock is stable
-    /// regardless of the caller's working directory.</summary>
-    public static string SidecarPath(string dbPath) => Path.GetFullPath(dbPath) + "-modelock";
+    /// <summary>The sidecar path whose lock guards <paramref name="canonicalDbPath"/>. The argument must already
+    /// be the database's canonical filesystem identity from <see cref="DatabasePath.Canonicalize"/> — the sidecar
+    /// name is derived from it verbatim rather than recanonicalized lexically here, so a symlink alias of a file
+    /// takes the very sidecar its canonical path names (not a second lock beside a different name for the same
+    /// inode). Resolving once in the caller and passing the same string to both this lock and
+    /// <see cref="KvStore.Open"/> also keeps a single open from resolving the path twice and racing a swap.</summary>
+    public static string SidecarPath(string canonicalDbPath) => canonicalDbPath + "-modelock";
 
     /// <summary>
     /// Takes the shared lock for a direct <see cref="LocalStore"/>. Succeeds alongside other direct stores;

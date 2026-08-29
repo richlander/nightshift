@@ -39,19 +39,19 @@ public sealed class LocalStore : ITurnstile
     /// </exception>
     public static async Task<LocalStore> OpenAsync(string dbPath)
     {
-        string? dir = Path.GetDirectoryName(Path.GetFullPath(dbPath));
-        if (dir is { Length: > 0 })
-        {
-            Directory.CreateDirectory(dir);
-        }
+        // Resolve the database's canonical filesystem identity once and hand the same string to both the
+        // ownership lock and SQLite: a symlink alias of a daemon-owned file must take the daemon's own sidecar
+        // lock (and so be refused), not a second lock beside a different name for the same inode (#202). This
+        // also creates the parent directory as needed.
+        string canonicalDb = DatabasePath.Canonicalize(dbPath);
 
         // Take the shared mode lock before touching SQLite: if a daemon owns this database it fails here,
         // before any connection is opened, so a direct write can never slip in behind a daemon's live watch.
         // Multiple direct stores share the lock, so daemonless multi-writer use is unaffected (#199).
-        ModeLock modeLock = ModeLock.AcquireShared(dbPath);
+        ModeLock modeLock = ModeLock.AcquireShared(canonicalDb);
         try
         {
-            KvStore kv = KvStore.Open(dbPath);
+            KvStore kv = KvStore.Open(canonicalDb);
             // Sweep-on-open: library mode has no always-on sweeper, so reclaim any leases that expired while
             // no process was attached. This emits the delete events a lazy read would silently swallow.
             await kv.SweepExpiredAsync().ConfigureAwait(false);
