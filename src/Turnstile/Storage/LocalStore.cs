@@ -26,6 +26,16 @@ public sealed class LocalStore : ITurnstile
     private readonly KvStore _kv;
     private readonly ModeLock _modeLock;
 
+    /// <summary>
+    /// Test-only observation seam (issue #202 follow-up), keyed by canonical DB path. When
+    /// <see cref="OpenAsync"/> has just created a <see cref="KvStore"/> for a registered path, it hands that
+    /// instance to the observer so a test can later assert the writer was disposed on the failure path. Keying
+    /// by path — rather than a single global hook — keeps a parallel test's open from clobbering the capture,
+    /// and each test uses a unique path. It only reads; it never changes open behavior and is empty in
+    /// production.
+    /// </summary>
+    internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Action<KvStore>> KvStoreOpenObserversForTests = new();
+
     private LocalStore(KvStore kv, ModeLock modeLock)
     {
         _kv = kv;
@@ -49,19 +59,43 @@ public sealed class LocalStore : ITurnstile
         // before any connection is opened, so a direct write can never slip in behind a daemon's live watch.
         // Multiple direct stores share the lock, so daemonless multi-writer use is unaffected (#199).
         ModeLock modeLock = ModeLock.AcquireShared(canonicalDb);
+        // Held in an outer variable so failure cleanup owns it too: once KvStore.Open succeeds it has spun up a
+        // WriteActor (a background thread plus a write connection), so a later failure — a throwing
+        // SweepExpiredAsync — must dispose the KvStore, not just the lock, or that thread and connection leak
+        // with no store behind them. Nulled the instant ownership transfers to the returned LocalStore so the
+        // catch never disposes what the caller now owns (each is disposed exactly once).
+        KvStore? kv = null;
         try
         {
-            KvStore kv = KvStore.Open(canonicalDb);
+            kv = KvStore.Open(canonicalDb);
+            if (KvStoreOpenObserversForTests.TryGetValue(canonicalDb, out Action<KvStore>? observe))
+            {
+                observe(kv);
+            }
+
             // Sweep-on-open: library mode has no always-on sweeper, so reclaim any leases that expired while
             // no process was attached. This emits the delete events a lazy read would silently swallow.
             await kv.SweepExpiredAsync().ConfigureAwait(false);
-            return new LocalStore(kv, modeLock);
+            LocalStore store = new(kv, modeLock);
+            kv = null;
+            return store;
         }
         catch
         {
-            // A failed open must not leak the lock, or the database would stay marked in-use with no store
-            // behind it — releasing it here lets a daemon (or a retry) acquire immediately.
-            modeLock.Dispose();
+            // A failed open must leave nothing behind: dispose the KvStore (draining its writer thread and
+            // closing its connection) when one was created, then release the lock — or the database would stay
+            // marked in-use, or its writer would linger, with no store behind either. The nested try/finally
+            // makes the lock release unconditional even if KvStore.Dispose itself throws, so ownership is always
+            // freed and a daemon (or a retry) can acquire immediately.
+            try
+            {
+                kv?.Dispose();
+            }
+            finally
+            {
+                modeLock.Dispose();
+            }
+
             throw;
         }
     }
