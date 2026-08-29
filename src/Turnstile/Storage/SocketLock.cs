@@ -111,10 +111,23 @@ internal sealed class SocketLock : IDisposable
     }
 
     // Reports whether any filesystem entry occupies <paramref name="path"/> — a regular file, a directory, a
-    // Unix socket, or a symlink, *including a dangling one whose target is absent*. Path.Exists catches the
-    // first three (and a symlink whose target exists); the LinkTarget read adds a dangling symlink honestly,
-    // whose broken target Path.Exists would otherwise follow and report as nothing. A daemon must refuse every
-    // one of these rather than risk unlinking a live endpoint.
+    // Unix socket, or a symlink, *including a dangling one whose target is absent*. Path.Exists reports each of
+    // those as present (it does not follow the final link, so a dangling symlink still reads as present); the
+    // LinkTarget probe is a belt-and-braces confirmation of a dangling symlink on any platform whose Path.Exists
+    // might miss it — a genuinely absent path yields a null LinkTarget with no error.
+    //
+    // The dangling-symlink *leaf* case is in fact already refused upstream: the daemon canonicalizes the socket
+    // path through CanonicalPath.Resolve before ever calling Acquire, and that resolution rejects a dangling
+    // final symlink (and any leaf whose parent will not realpath) with a visible IOException. That same
+    // resolution also guarantees the parent directory exists and resolves here, which confines Path.Exists's
+    // "false on many errors" behaviour to the leaf — absent versus present — so a dedicated lstat probe would be
+    // a disproportionate seam for no additional safety.
+    //
+    // What is *not* acceptable is reading an inability to inspect the pathname as "absent". A false return from
+    // this helper means "bind is free"; an IOException or UnauthorizedAccessException while probing the link is
+    // neither absent nor free-to-bind, and swallowing it to false would turn "cannot tell" into "go ahead and
+    // bind" — the exact fail-open the socket lock exists to prevent. So an inspection failure refuses closed,
+    // surfaced as the same typed, operator-visible signal as an occupied path, preserving the underlying cause.
     private static bool PathExists(string path)
     {
         if (Path.Exists(path))
@@ -126,13 +139,12 @@ internal sealed class SocketLock : IDisposable
         {
             return new FileInfo(path).LinkTarget is not null;
         }
-        catch (IOException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return false;
-        }
-        catch (UnauthorizedAccessException)
-        {
-            return false;
+            throw new TurnstileSocketInUseException(
+                $"cannot start the daemon: the socket path '{path}' could not be inspected ({ex.Message}), so "
+                + "Turnstile cannot prove it is free to bind. It refuses to continue rather than risk binding "
+                + "over a live endpoint. Resolve the access error, or serve on a different --socket (#212).");
         }
     }
 
