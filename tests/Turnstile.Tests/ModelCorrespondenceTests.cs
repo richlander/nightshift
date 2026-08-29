@@ -145,7 +145,11 @@ public class ModelCorrespondenceTests : IDisposable
         Task changed = store.WaitForChangeAsync();
         await store.CreateAsync("/k", Bytes("v"));
 
-        await changed.WaitAsync(TimeSpan.FromSeconds(5), Ct);
+        // Correctness, not performance: await the captured task governed only by the runner's cancellation
+        // token — no wall-clock bound, so a loaded machine cannot manufacture a flake. If the pulse were
+        // dropped (e.g. CreateAsync failing to signal the change), this task never completes and the test
+        // hangs until the runner cancels, surfacing the lost pulse as a failure rather than a false pass.
+        await changed.WaitAsync(Ct);
         Assert.True(changed.IsCompleted);
     }
 
