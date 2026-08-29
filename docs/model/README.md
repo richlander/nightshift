@@ -182,8 +182,9 @@ store, so the model is not describing a system nobody built:
 | `BeliefMatchesStoredDeadline` | `BeliefMatchesStoredDeadline_LocalLeaseReportsTheDeadlineItEnforces` |
 
 `NoLostWakeup` is deliberately absent from this table. The one test near it —
-`ChangeSignal_PulseCapturedBeforeACommitIsNotLost` — exercises the `ChangeSignal` primitive
-(a pulse captured before a commit is not lost), not `WatchAsync`'s loop order: it never
+`ChangeSignal_PulseCompletesAnAlreadyCapturedWaiter` — exercises the `ChangeSignal` primitive
+(a pulse completes a waiter captured before it, so the wakeup is not lost), not `WatchAsync`'s
+loop order: it never
 calls `WatchAsync`, and reversing that loop to drain-then-capture would leave it green. The
 capture-before-drain order is a source-order correspondence, established by reading
 `WatchAsync` and by the model's `DrainThenCapture` mutation, and an honest outcome-level

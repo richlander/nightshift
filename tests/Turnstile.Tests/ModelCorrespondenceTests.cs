@@ -16,7 +16,7 @@ using Xunit;
 ///
 /// One correspondence is not state-level and is not claimed to be: <c>WatchAsync</c>'s capture-before-drain
 /// loop order is a source-order fact, exercised at the level of the <c>ChangeSignal</c> primitive it relies
-/// on (<see cref="ChangeSignal_PulseCapturedBeforeACommitIsNotLost"/>) and by the model's
+/// on (<see cref="ChangeSignal_PulseCompletesAnAlreadyCapturedWaiter"/>) and by the model's
 /// <c>DrainThenCapture</c> mutation — not by an outcome-level test of the loop itself, which would need
 /// timing or a product seam this does not add. So not every named test demonstrates the full production
 /// property; where it does not, the summary says so.
@@ -121,32 +121,36 @@ public class ModelCorrespondenceTests : IDisposable
     }
 
     /// <summary>
-    /// The <c>ChangeSignal</c> primitive that TLA+ <c>NoLostWakeup</c> abstracts: a pulse captured before a
-    /// commit is not lost — the task the watcher will park on has already completed by the time it awaits.
-    /// This is the primitive <c>WatchAsync</c> relies on by capturing <c>WaitForChangeAsync()</c> before it
-    /// drains.
+    /// The <c>ChangeSignal</c> primitive that TLA+ <c>NoLostWakeup</c> abstracts: a pulse completes a waiter
+    /// that was captured before the pulse — the task the watcher parks on is already complete by the time it
+    /// awaits, so a pulse racing an already-captured waiter is never lost. This is the primitive
+    /// <c>WatchAsync</c> relies on by capturing <c>WaitForChangeAsync()</c> before it drains.
     /// </summary>
     /// <remarks>
-    /// It tests the primitive, NOT <c>WatchAsync</c>'s loop order: this test never calls <c>WatchAsync</c>,
-    /// and reversing that loop to drain-then-capture would leave it green. The capture-before-drain ordering
-    /// itself is a source-order correspondence, verified by reading <c>WatchAsync</c> and by the model's
-    /// <c>DrainThenCapture</c> mutation — not proven here. The separate sync-boundary property (nightshift
-    /// #197) — that the one-shot sync is the committed revision read in the same snapshot as the events, so it
-    /// cannot advertise an undelivered one — is now fixed and is exercised at outcome level in
-    /// <c>SnapshotConsistencyTests</c>.
+    /// It tests the primitive directly and synchronously — it constructs a <c>ChangeSignal</c>, not a store,
+    /// and never calls <c>WatchAsync</c> or commits anything. It therefore proves neither store commit wiring
+    /// nor <c>WatchAsync</c>'s loop order: reversing that loop to drain-then-capture would leave it green. The
+    /// capture-before-drain ordering is a source-order correspondence, verified by reading <c>WatchAsync</c>
+    /// and by the model's <c>DrainThenCapture</c> mutation — not proven here. The separate sync-boundary
+    /// property (nightshift #197) — that the one-shot sync is the committed revision read in the same snapshot
+    /// as the events, so it cannot advertise an undelivered one — is now fixed and is exercised at outcome
+    /// level in <c>SnapshotConsistencyTests</c>.
     /// </remarks>
     [Fact]
-    public async Task ChangeSignal_PulseCapturedBeforeACommitIsNotLost()
+    public void ChangeSignal_PulseCompletesAnAlreadyCapturedWaiter()
     {
-        using KvStore store = Open();
+        var signal = new ChangeSignal();
 
-        // Capture first, exactly as the watch loop does before draining, then commit. The pulse must not be
-        // missed: the captured task is already complete when the watcher would await it.
-        Task changed = store.WaitForChangeAsync();
-        await store.CreateAsync("/k", Bytes("v"));
+        // Capture the waiter first, exactly as the watch loop does before draining, then pulse.
+        Task changed = signal.WaitAsync();
+        Assert.False(changed.IsCompleted);   // nothing has pulsed yet
 
-        await changed.WaitAsync(TimeSpan.FromSeconds(5), Ct);
-        Assert.True(changed.IsCompleted);
+        signal.Pulse();
+
+        // The pulse completes the already-captured waiter synchronously: the wakeup cannot be lost. A
+        // regression that drops the Pulse leaves this task uncompleted, so the assertion fails here
+        // immediately — deterministic, with no wall-clock bound, and it can never hang.
+        Assert.True(changed.IsCompletedSuccessfully);
     }
 
     /// <summary>
