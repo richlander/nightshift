@@ -83,12 +83,19 @@ public class ModelCorrespondenceTests : IDisposable
     [Fact]
     public async Task RemovalIsLoggedStep_ExpiryTombstonesThroughTheLog()
     {
-        using KvStore store = Open();
-        await LeaseClock.EnsureHeadroomAsync(Ct);
-        LeaseInfo lease = await store.CreateLeaseAsync(ttlSecs: 1);
-        WriteResult created = await store.CreateAsync("/ephemeral", Bytes("v"), lease: lease.Id);
+        // Construct — with no live clock anywhere — the exact durable state that "create a key attached to a
+        // lease, then let the lease expire" leaves behind: a created, live /ephemeral row whose lease row is
+        // already past its deadline. Building it directly means no step depends on the lease being live at any
+        // wall-clock instant (there is no CreateLeaseAsync + leased CreateAsync sequence to outrun). The only
+        // "now" left is inside SweepExpiredAsync, comparing a long-past expires_at against the real clock —
+        // which is the behaviour under test, not a setup precondition.
+        const long baseline = 1;
+        SeedExpiredLeasedKey(key: "/ephemeral", revision: baseline);
 
-        await LeaseClock.WaitPastExpiryAsync(lease, Ct);
+        using KvStore store = Open();
+        Assert.Equal(baseline, store.CurrentRevision);
+        Assert.NotNull(store.Get("/ephemeral"));   // the constructed key is live until an eager sweep removes it
+
         long before = store.CurrentRevision;
         Assert.Equal(1, await store.SweepExpiredAsync());
 
@@ -96,9 +103,71 @@ public class ModelCorrespondenceTests : IDisposable
         Assert.Null(store.Get("/ephemeral"));
         Assert.Equal(before + 1, store.CurrentRevision);
 
-        WatchEvent removal = Assert.Single(store.ReadEvents("/", fromExclusive: created.Revision, limit: 0));
+        WatchEvent removal = Assert.Single(store.ReadEvents("/", fromExclusive: baseline, limit: 0));
         Assert.Equal("/ephemeral", removal.Key);
         Assert.True(removal.Deleted);
+    }
+
+    /// <summary>
+    /// Establishes, entirely through direct SQLite state, the durable snapshot that ordinary elapsed time
+    /// would leave: a key created and attached to a lease whose <c>expires_at</c> is already in the past. The
+    /// key's sole log row has exactly the shape <c>InsertRow</c> writes for a leased create (created, live,
+    /// <c>lease</c> set, <c>create_rev = id</c>), and the durable <c>committed_revision</c> is advanced in the
+    /// same transaction as its row, so the store opens onto a consistent, product-reachable state. No lease is
+    /// ever live at any wall-clock instant, so there is no timing precondition to lose. Production lease
+    /// semantics (#189) are untouched.
+    /// </summary>
+    private void SeedExpiredLeasedKey(string key, long revision)
+    {
+        using (KvStore _ = Open())
+        {
+            // Create the real schema (committed_revision = 0, empty log).
+        }
+
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+
+        // A fixed 128-bit hex id, the shape CreateLeaseAsync mints; the value only has to match the kv row.
+        const string leaseId = "00000000000000000000000000000001";
+
+        using (var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={_dbPath}"))
+        {
+            conn.Open();
+            using Microsoft.Data.Sqlite.SqliteTransaction tx = conn.BeginTransaction();
+
+            using (Microsoft.Data.Sqlite.SqliteCommand lease = conn.CreateCommand())
+            {
+                lease.Transaction = tx;
+                lease.CommandText = "INSERT INTO lease (id, ttl_secs, expires_at) VALUES ($id, 1, 0);";
+                lease.Parameters.AddWithValue("$id", leaseId);
+                lease.ExecuteNonQuery();
+            }
+
+            using (Microsoft.Data.Sqlite.SqliteCommand row = conn.CreateCommand())
+            {
+                row.Transaction = tx;
+                row.CommandText = """
+                    INSERT INTO kv (id, key, created, deleted, immutable, create_rev, prev_rev, lease, value, old_value)
+                    VALUES ($id, $key, 1, 0, 0, $id, 0, $lease, $value, NULL);
+                    """;
+                row.Parameters.AddWithValue("$id", revision);
+                row.Parameters.AddWithValue("$key", key);
+                row.Parameters.AddWithValue("$lease", leaseId);
+                row.Parameters.AddWithValue("$value", Bytes("v"));
+                row.ExecuteNonQuery();
+            }
+
+            using (Microsoft.Data.Sqlite.SqliteCommand meta = conn.CreateCommand())
+            {
+                meta.Transaction = tx;
+                meta.CommandText = "UPDATE meta SET v = $v WHERE k = 'committed_revision';";
+                meta.Parameters.AddWithValue("$v", revision.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                meta.ExecuteNonQuery();
+            }
+
+            tx.Commit();
+        }
+
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     }
 
     /// <summary>
