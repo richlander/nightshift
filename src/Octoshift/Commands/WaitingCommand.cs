@@ -131,7 +131,8 @@ internal static class WaitingCommand
             FleetResult result = await CollectAndResolveAsync(
                 hosts, scanAsync ?? ((host, token) => new TmuxScanner(host).ScanAsync(token)),
                 facts.FetchDetailedAsync, facts.RefreshMergeabilityAsync, now: null, ct, historyPath: historyPath,
-                fetchBlockerAsync: blockerFacts.FetchAsync);
+                fetchBlockerAsync: blockerFacts.FetchAsync,
+                fetchTrackedIssueAsync: (number, token) => blockerFacts.FetchAcrossReposAsync(repos, number, token));
 
             // An explicitly empty fleet is its own disposition, not a quiet sweep and not a failure: the
             // operator retired every target, so there is nothing to sweep. Lead with a distinct EMPTY token
@@ -253,9 +254,11 @@ internal static class WaitingCommand
         CancellationToken ct,
         string? historyPath = null,
         TimeSpan? perTargetTimeout = null,
-        Func<string, int, CancellationToken, Task<BlockerFetch>>? fetchBlockerAsync = null)
+        Func<string, int, CancellationToken, Task<BlockerFetch>>? fetchBlockerAsync = null,
+        Func<int, CancellationToken, Task<TrackedIssueFetch>>? fetchTrackedIssueAsync = null)
         => CollectAndResolveAsync(
-            hosts, scanAsync, Wrap(fetchAsync), refreshMergeabilityAsync, now, ct, historyPath, perTargetTimeout, fetchBlockerAsync);
+            hosts, scanAsync, Wrap(fetchAsync), refreshMergeabilityAsync, now, ct, historyPath, perTargetTimeout,
+            fetchBlockerAsync, fetchTrackedIssueAsync);
 
     internal static async Task<FleetResult> CollectAndResolveAsync(
         IReadOnlyList<string> hosts,
@@ -266,7 +269,8 @@ internal static class WaitingCommand
         CancellationToken ct,
         string? historyPath = null,
         TimeSpan? perTargetTimeout = null,
-        Func<string, int, CancellationToken, Task<BlockerFetch>>? fetchBlockerAsync = null)
+        Func<string, int, CancellationToken, Task<BlockerFetch>>? fetchBlockerAsync = null,
+        Func<int, CancellationToken, Task<TrackedIssueFetch>>? fetchTrackedIssueAsync = null)
     {
         PaneHistory? history = null;
         try
@@ -326,7 +330,8 @@ internal static class WaitingCommand
             IReadOnlyList<WaitingRow> resolved = await ResolveAllAsync(
                 collected.Panes, fetchAsync, refreshMergeabilityAsync, stamped, ct,
                 collected.CollectedHosts, allHostsAnswered: collected.Unreachable.Count == 0, history: history,
-                attemptedHosts: collected.AttemptedHosts, fetchBlockerAsync: fetchBlockerAsync);
+                attemptedHosts: collected.AttemptedHosts, fetchBlockerAsync: fetchBlockerAsync,
+                fetchTrackedIssueAsync: fetchTrackedIssueAsync);
 
             return new FleetResult(collected, resolved, []);
         }
@@ -590,10 +595,11 @@ internal static class WaitingCommand
         PaneHistory? history = null,
         string? historyPath = null,
         IReadOnlyList<string?>? attemptedHosts = null,
-        Func<string, int, CancellationToken, Task<BlockerFetch>>? fetchBlockerAsync = null)
+        Func<string, int, CancellationToken, Task<BlockerFetch>>? fetchBlockerAsync = null,
+        Func<int, CancellationToken, Task<TrackedIssueFetch>>? fetchTrackedIssueAsync = null)
         => ResolveAllAsync(
             panes, Wrap(fetchAsync), refreshMergeabilityAsync, now, ct,
-            collectedHosts, allHostsAnswered, history, historyPath, attemptedHosts, fetchBlockerAsync);
+            collectedHosts, allHostsAnswered, history, historyPath, attemptedHosts, fetchBlockerAsync, fetchTrackedIssueAsync);
 
     /// <summary>Adapts a facts-only fetch to the resolution shape: a null read is an unreadable one.</summary>
     private static Func<int, CancellationToken, Task<PrFetch>> Wrap(Func<int, CancellationToken, Task<PrFacts?>> fetchAsync)
@@ -610,7 +616,8 @@ internal static class WaitingCommand
         PaneHistory? history = null,
         string? historyPath = null,
         IReadOnlyList<string?>? attemptedHosts = null,
-        Func<string, int, CancellationToken, Task<BlockerFetch>>? fetchBlockerAsync = null)
+        Func<string, int, CancellationToken, Task<BlockerFetch>>? fetchBlockerAsync = null,
+        Func<int, CancellationToken, Task<TrackedIssueFetch>>? fetchTrackedIssueAsync = null)
     {
         Departed = [];
         Omitted = [];
@@ -809,6 +816,28 @@ internal static class WaitingCommand
             }
         }
 
+        // Resolve every tracked issue number once per sweep (#220): an `issue=` window has no resolved PR
+        // repo to scope a single-repo lookup the way a `blocked=` dependent's own PR does, so each unique
+        // tracked number is searched across every configured repo instead (mirroring #215's PR search). A
+        // null fetcher (no caller supplied one) leaves this empty and every tracking window falls back
+        // through to the unresolved "tracking issue #N; no PR yet" wording untouched.
+        var trackedIssueSeen = new Dictionary<int, TrackedIssueFetch>();
+        if (fetchTrackedIssueAsync is not null)
+        {
+            foreach ((TmuxPane pane, StateReading reading) in readings)
+            {
+                if (reading.Identified is not { IsIssue: true } tracked)
+                {
+                    continue;
+                }
+
+                if (!trackedIssueSeen.ContainsKey(tracked.PrNumber))
+                {
+                    trackedIssueSeen[tracked.PrNumber] = await fetchTrackedIssueAsync(tracked.PrNumber, ct);
+                }
+            }
+        }
+
         var rows = new List<WaitingRow>(readings.Count);
         foreach ((TmuxPane pane, StateReading reading) in readings)
         {
@@ -830,9 +859,14 @@ internal static class WaitingCommand
                 }
             }
 
+            TrackedIssueFetch? trackedIssue = record is { IsIssue: true }
+                && trackedIssueSeen.TryGetValue(record.PrNumber, out TrackedIssueFetch tif)
+                ? tif
+                : null;
+
             WaitingVerdict verdict = WaitingVerdict.ForActivity(pane.Activity, pane.Capture, () =>
                 record is not null
-                    ? WaitingVerdict.Resolve(record, record.IsIssue ? PrFetch.Unavailable : resolved, blockers)
+                    ? WaitingVerdict.Resolve(record, record.IsIssue ? PrFetch.Unavailable : resolved, blockers, trackedIssue)
                     : reading.Unidentified is { } unusable
                         ? WaitingVerdict.Unidentified(unusable)
                         : new WaitingVerdict(
@@ -844,8 +878,8 @@ internal static class WaitingCommand
                 Claim = claims.GetValueOrDefault(Claim.Key(pane), Claim.Sole),
                 Retirement = Retirement.For(verdict, record, pane.Activity),
                 SilentFor = silence.GetValueOrDefault(Claim.Key(pane)),
-                Repo = resolved.Facts?.Repo,
-                FoundIn = resolved.FoundIn,
+                Repo = resolved.Facts?.Repo ?? trackedIssue?.Facts?.Repo,
+                FoundIn = resolved.FoundIn.Count > 0 ? resolved.FoundIn : trackedIssue?.FoundIn ?? [],
             });
         }
 
@@ -875,18 +909,26 @@ internal static class WaitingCommand
 
     /// <summary>
     /// Groups every currently-parked dependent by the (repo, blocker number) it names, keeping only the
-    /// blockers with more than one observed dependent. Computed off the full resolved row set, not the
-    /// rows a run happens to print under the default filter, so a fan-out alert is never hidden behind
-    /// <c>--all</c>.
+    /// blockers with more than one observed dependent. An <c>issue=</c> tracking window (#220) is grouped
+    /// the same way, using its own tracked number as the "blocker" — it has no separate dependent/blocker
+    /// split, just N windows quietly waiting on the same still-open issue. Computed off the full resolved
+    /// row set, not the rows a run happens to print under the default filter, so a fan-out alert is never
+    /// hidden behind <c>--all</c>.
     /// </summary>
     internal static IReadOnlyList<BlockerAlert> BuildBlockerAlerts(IReadOnlyList<WaitingRow> rows)
         => [.. rows
-            .Where(r => r.Record is { Blocked.Count: > 0 } && r.Verdict.State == WaitingState.Holding)
-            .SelectMany(r => r.Record!.Blocked.Select(number => (Number: number, Row: r)))
+            .Where(r => r.Record is not null && r.Verdict.State == WaitingState.Holding
+                && (r.Record.Blocked.Count > 0 || r.Record.IsIssue))
+            .SelectMany(NamedNumbers)
             .GroupBy(x => (x.Number, x.Row.Repo))
             .Where(g => g.Count() > 1)
             .Select(g => new BlockerAlert(g.Key.Number, g.Key.Repo, [.. g.Select(x => x.Row.Pane.Where)]))
             .OrderByDescending(a => a.DependentCount)];
+
+    private static IEnumerable<(int Number, WaitingRow Row)> NamedNumbers(WaitingRow row)
+        => row.Record!.IsIssue
+            ? [(row.Record.PrNumber, row)]
+            : row.Record.Blocked.Select(number => (number, row));
 
     private static WaitingRow Row(TmuxPane pane, StateReading reading, WaitingVerdict verdict, DateTimeOffset now)
         => new()

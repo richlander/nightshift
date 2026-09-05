@@ -41,6 +41,38 @@ public class WaitingBlockerAlertTests
             StoppedFor = TimeSpan.FromMinutes(5),
         };
 
+    private static AgentState Tracking(int issue, string window)
+        => AgentState.Parse($"issue={issue} head=8d5f22a22 rec=continue", window)!;
+
+    [Fact]
+    public void BuildBlockerAlerts_TwoTrackingWindowsOnTheSameIssueProduceOneAlert()
+    {
+        // #220: an issue= pre-PR window has no separate "dependent" and "blocker" — its own tracked number
+        // is the blocker — but the fan-out problem is identical, and the live case (#5835 tracked by three
+        // windows) is what motivated this extension.
+        WaitingVerdict tracking = new(WaitingState.Holding, RowOwner.Nobody, "tracking issue #5835; no PR yet", Assurance.High);
+        WaitingRow[] rows =
+        [
+            Row(Tracking(5835, "i5835-a"), tracking, "night:1", "i5835-a"),
+            Row(Tracking(5835, "i5835-b"), tracking, "night:2", "i5835-b"),
+        ];
+
+        IReadOnlyList<WaitingCommand.BlockerAlert> alerts = WaitingCommand.BuildBlockerAlerts(rows);
+
+        WaitingCommand.BlockerAlert alert = Assert.Single(alerts);
+        Assert.Equal(5835, alert.Number);
+        Assert.Equal(2, alert.DependentCount);
+    }
+
+    [Fact]
+    public void BuildBlockerAlerts_ATrackingWindowAloneIsNotAFanOut()
+    {
+        WaitingVerdict tracking = new(WaitingState.Holding, RowOwner.Nobody, "tracking issue #5835; no PR yet", Assurance.High);
+        WaitingRow[] rows = [Row(Tracking(5835, "i5835"), tracking, "night:1", "i5835")];
+
+        Assert.Empty(WaitingCommand.BuildBlockerAlerts(rows));
+    }
+
     [Fact]
     public void BuildBlockerAlerts_TwoWindowsOnTheSameBlockerProduceOneAlert()
     {

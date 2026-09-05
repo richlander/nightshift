@@ -180,6 +180,73 @@ public class GhBlockerFactsSourceTests
         Assert.False(b.Facts!.Value.IsOpen);
     }
 
+    [Fact]
+    public async Task FetchAcrossReposAsync_ExactlyOneHitWithTheRestAffirmativelyNotFoundIsFound()
+    {
+        var gh = new FakeGh
+        {
+            ["repos/owner/repo-a/issues/5835"] = Response(404, """{"message":"Not Found"}"""),
+            ["repos/owner/repo-b/issues/5835"] = Response(200, """{"state":"open"}"""),
+        };
+
+        var fleet = new GhFleetBlockerFactsSource(new FakeCache(), gh.RunAsync);
+        TrackedIssueFetch fetch = await fleet.FetchAcrossReposAsync(["owner/repo-a", "owner/repo-b"], 5835, TestContext.Current.CancellationToken);
+
+        Assert.Equal(TrackedIssueStatus.Found, fetch.Status);
+        Assert.Equal("owner/repo-b", fetch.Facts!.Value.Repo);
+        Assert.True(fetch.Facts.Value.IsOpen);
+    }
+
+    [Fact]
+    public async Task FetchAcrossReposAsync_TwoHitsIsAProvenCollision()
+    {
+        var gh = new FakeGh
+        {
+            ["repos/owner/repo-a/issues/5835"] = Response(200, """{"state":"open"}"""),
+            ["repos/owner/repo-b/issues/5835"] = Response(200, """{"state":"closed"}"""),
+        };
+
+        var fleet = new GhFleetBlockerFactsSource(new FakeCache(), gh.RunAsync);
+        TrackedIssueFetch fetch = await fleet.FetchAcrossReposAsync(["owner/repo-a", "owner/repo-b"], 5835, TestContext.Current.CancellationToken);
+
+        Assert.Equal(TrackedIssueStatus.Ambiguous, fetch.Status);
+        Assert.Null(fetch.Facts);
+        Assert.Equal(2, fetch.FoundIn.Count);
+    }
+
+    [Fact]
+    public async Task FetchAcrossReposAsync_EveryRepoAnsweringNotFoundIsNotFound()
+    {
+        var gh = new FakeGh
+        {
+            ["repos/owner/repo-a/issues/9999"] = Response(404, """{"message":"Not Found"}"""),
+            ["repos/owner/repo-b/issues/9999"] = Response(404, """{"message":"Not Found"}"""),
+        };
+
+        var fleet = new GhFleetBlockerFactsSource(new FakeCache(), gh.RunAsync);
+        TrackedIssueFetch fetch = await fleet.FetchAcrossReposAsync(["owner/repo-a", "owner/repo-b"], 9999, TestContext.Current.CancellationToken);
+
+        Assert.Equal(TrackedIssueStatus.NotFound, fetch.Status);
+    }
+
+    [Fact]
+    public async Task FetchAcrossReposAsync_AHitBesideAnUnreadRepoIsUnavailableNotFound()
+    {
+        // Uniqueness is unproven when another repo in scope could not be read — a second hit might be
+        // sitting behind that failure, so this must not be reported as the confident single Found.
+        var gh = new FakeGh
+        {
+            ["repos/owner/repo-a/issues/5835"] = Response(200, """{"state":"open"}"""),
+            ["repos/owner/repo-b/issues/5835"] = Response(502, "bad gateway"),
+        };
+
+        var fleet = new GhFleetBlockerFactsSource(new FakeCache(), gh.RunAsync);
+        TrackedIssueFetch fetch = await fleet.FetchAcrossReposAsync(["owner/repo-a", "owner/repo-b"], 5835, TestContext.Current.CancellationToken);
+
+        Assert.Equal(TrackedIssueStatus.Unavailable, fetch.Status);
+        Assert.Single(fetch.FoundIn);
+    }
+
     /// <summary>A gh stand-in that answers by API path and records what it was asked.</summary>
     private sealed class FakeGh : Dictionary<string, string>
     {
