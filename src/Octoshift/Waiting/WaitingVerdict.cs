@@ -189,7 +189,7 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
     /// collides across repos rather than silently picking one. A found PR joins exactly as the
     /// <see cref="Resolve(AgentState, PrFacts?)"/> overload does, against the facts stamped with their repo.
     /// </summary>
-    public static WaitingVerdict Resolve(AgentState state, PrFetch fetch)
+    public static WaitingVerdict Resolve(AgentState state, PrFetch fetch, IReadOnlyDictionary<int, BlockerFetch>? blockers = null)
     {
         ArgumentNullException.ThrowIfNull(state);
 
@@ -197,12 +197,12 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         // single-facts table unchanged. Only the genuinely absent outcomes need the multi-repo wording.
         if (fetch.Facts is { } facts)
         {
-            return Resolve(state, facts);
+            return Resolve(state, facts, blockers);
         }
 
         if (state.IsIssue)
         {
-            return Resolve(state, null);
+            return Resolve(state, null, blockers);
         }
 
         string scope = fetch.Searched.Count > 0 ? string.Join(", ", fetch.Searched) : "the searched repo(s)";
@@ -240,7 +240,7 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
             }
 
             // A pure outage: no repo confirmed the PR, so existence itself is unknown.
-            return Resolve(state, null);
+            return Resolve(state, null, blockers);
         }
 
         // Affirmative not-found: every searched repo answered 404. Distinct from an outage, and its remedy
@@ -260,7 +260,7 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
     /// Resolves a window's state against GitHub's account of the same PR. Pure — the whole decision table
     /// is testable without a pane or a network.
     /// </summary>
-    public static WaitingVerdict Resolve(AgentState state, PrFacts? facts)
+    public static WaitingVerdict Resolve(AgentState state, PrFacts? facts, IReadOnlyDictionary<int, BlockerFetch>? blockers = null)
     {
         ArgumentNullException.ThrowIfNull(state);
 
@@ -371,6 +371,15 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         // handled above, while a contradictory merge recommendation was already made untrustworthy.
         if (state.Blocked.Count > 0)
         {
+            if (blockers is not null)
+            {
+                WaitingVerdict? cleared = EvaluateBlockers(state, blockers, assurance);
+                if (cleared is { } resolved)
+                {
+                    return resolved;
+                }
+            }
+
             return new(WaitingState.Holding, RowOwner.Nobody,
                 $"parked behind {string.Join(", ", state.Blocked.Select(b => "#" + b))}", assurance);
         }
@@ -449,6 +458,71 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
             : assurance;
 
         return new(WaitingState.Ready, RowOwner.Operator, $"reviews {state.ReviewsClean}/{state.ReviewsRequired}, mergeable{ci}", readiness);
+    }
+
+    /// <summary>
+    /// Resolves every number the window named in <c>blocked=</c> against the fleet's blocker reads
+    /// (#218), or null to fall through to the unresolved "parked behind #N" wording when a name was not
+    /// looked up this sweep. A blocker whose read is missing or unavailable keeps the whole set unresolved
+    /// — never treated as cleared — since a blocker that cannot be read is not evidence it closed.
+    /// </summary>
+    private static WaitingVerdict? EvaluateBlockers(AgentState state, IReadOnlyDictionary<int, BlockerFetch> blockers, Assurance assurance)
+    {
+        var open = new List<int>();
+        var cleared = new List<int>();
+
+        foreach (int number in state.Blocked)
+        {
+            if (!blockers.TryGetValue(number, out BlockerFetch fetch))
+            {
+                // Not looked up this sweep (an unreadable dependent repo, or simply not asked) — cannot
+                // assert anything about it, so the whole named set stays the unresolved wording.
+                return null;
+            }
+
+            switch (fetch.Status)
+            {
+                case BlockerFetchStatus.Found when fetch.Facts is { IsOpen: false }:
+                    cleared.Add(number);
+                    break;
+                case BlockerFetchStatus.Found:
+                    open.Add(number);
+                    break;
+                case BlockerFetchStatus.NotFound:
+                    // A blocker that no longer resolves anywhere in its repo cannot be distinguished from
+                    // one that was renumbered or deleted — it is not evidence of a merge or a close, so it
+                    // stays counted as unresolved rather than silently treated as cleared.
+                    return null;
+                case BlockerFetchStatus.Unavailable:
+                    return null;
+            }
+        }
+
+        if (open.Count == 0)
+        {
+            // Every named blocker closed or merged: this is the transition #218 exists to surface. Nothing
+            // here wakes the agent — the row is reported to the operator so a person decides whether the
+            // resumed work is still wanted, exactly as every other Unblocked case does.
+            string names = string.Join(", ", cleared.Select(b => "#" + b));
+            string subject = cleared.Count == 1 ? "it" : "them";
+            return new(WaitingState.Unblocked, RowOwner.Operator,
+                $"blocker {names} cleared; the wait behind {subject} is over", assurance);
+        }
+
+        if (cleared.Count == 0)
+        {
+            // Nothing has changed since the record was written; keep the plain unresolved wording rather
+            // than a redundant "(still open)" on every blocker.
+            return null;
+        }
+
+        // A mixed set: report which of the named blockers are still open so a partial clearance is not
+        // read as a full one, while staying Holding — the agent is not released until every named blocker
+        // is gone.
+        string stillOpen = string.Join(", ", open.Select(b => "#" + b));
+        string alreadyCleared = string.Join(", ", cleared.Select(b => "#" + b));
+        return new(WaitingState.Holding, RowOwner.Nobody,
+            $"parked behind {stillOpen} ({alreadyCleared} cleared)", assurance);
     }
 
     /// <summary>

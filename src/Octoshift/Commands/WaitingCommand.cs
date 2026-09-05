@@ -121,6 +121,7 @@ internal static class WaitingCommand
         }
 
         var facts = new GhFleetPrFactsSource(repos, new FileConditionalCache(), GhProcessRunner.RunGhAsync);
+        var blockerFacts = new GhFleetBlockerFactsSource(new FileConditionalCache(), GhProcessRunner.RunGhAsync);
 
         try
         {
@@ -129,7 +130,8 @@ internal static class WaitingCommand
             // failure and its PARTIAL token — are exercisable without a tmux server.
             FleetResult result = await CollectAndResolveAsync(
                 hosts, scanAsync ?? ((host, token) => new TmuxScanner(host).ScanAsync(token)),
-                facts.FetchDetailedAsync, facts.RefreshMergeabilityAsync, now: null, ct, historyPath: historyPath);
+                facts.FetchDetailedAsync, facts.RefreshMergeabilityAsync, now: null, ct, historyPath: historyPath,
+                fetchBlockerAsync: blockerFacts.FetchAsync);
 
             // An explicitly empty fleet is its own disposition, not a quiet sweep and not a failure: the
             // operator retired every target, so there is nothing to sweep. Lead with a distinct EMPTY token
@@ -181,13 +183,14 @@ internal static class WaitingCommand
             IReadOnlyList<WaitingRow> resolved = result.Rows;
 
             IReadOnlyList<WaitingRow> shown = Present(resolved, all);
+            IReadOnlyList<BlockerAlert> alerts = BuildBlockerAlerts(resolved);
             if (json)
             {
-                WriteJson(Console.OpenStandardOutput(), shown, Budget.From(facts), collected.Unreachable, Omitted, Departed, repos);
+                WriteJson(Console.OpenStandardOutput(), shown, Budget.From(facts, blockerFacts), collected.Unreachable, Omitted, Departed, repos, alerts);
             }
             else
             {
-                WriteTable(Console.Out, shown, Budget.From(facts), collected.Unreachable, Omitted, Departed, repos);
+                WriteTable(Console.Out, shown, Budget.From(facts, blockerFacts), collected.Unreachable, Omitted, Departed, repos, alerts);
             }
 
             // A partly invisible fleet is not a clean sweep, so a single failed host — or a previously
@@ -249,9 +252,10 @@ internal static class WaitingCommand
         DateTimeOffset? now,
         CancellationToken ct,
         string? historyPath = null,
-        TimeSpan? perTargetTimeout = null)
+        TimeSpan? perTargetTimeout = null,
+        Func<string, int, CancellationToken, Task<BlockerFetch>>? fetchBlockerAsync = null)
         => CollectAndResolveAsync(
-            hosts, scanAsync, Wrap(fetchAsync), refreshMergeabilityAsync, now, ct, historyPath, perTargetTimeout);
+            hosts, scanAsync, Wrap(fetchAsync), refreshMergeabilityAsync, now, ct, historyPath, perTargetTimeout, fetchBlockerAsync);
 
     internal static async Task<FleetResult> CollectAndResolveAsync(
         IReadOnlyList<string> hosts,
@@ -261,7 +265,8 @@ internal static class WaitingCommand
         DateTimeOffset? now,
         CancellationToken ct,
         string? historyPath = null,
-        TimeSpan? perTargetTimeout = null)
+        TimeSpan? perTargetTimeout = null,
+        Func<string, int, CancellationToken, Task<BlockerFetch>>? fetchBlockerAsync = null)
     {
         PaneHistory? history = null;
         try
@@ -321,7 +326,7 @@ internal static class WaitingCommand
             IReadOnlyList<WaitingRow> resolved = await ResolveAllAsync(
                 collected.Panes, fetchAsync, refreshMergeabilityAsync, stamped, ct,
                 collected.CollectedHosts, allHostsAnswered: collected.Unreachable.Count == 0, history: history,
-                attemptedHosts: collected.AttemptedHosts);
+                attemptedHosts: collected.AttemptedHosts, fetchBlockerAsync: fetchBlockerAsync);
 
             return new FleetResult(collected, resolved, []);
         }
@@ -584,10 +589,11 @@ internal static class WaitingCommand
         bool allHostsAnswered,
         PaneHistory? history = null,
         string? historyPath = null,
-        IReadOnlyList<string?>? attemptedHosts = null)
+        IReadOnlyList<string?>? attemptedHosts = null,
+        Func<string, int, CancellationToken, Task<BlockerFetch>>? fetchBlockerAsync = null)
         => ResolveAllAsync(
             panes, Wrap(fetchAsync), refreshMergeabilityAsync, now, ct,
-            collectedHosts, allHostsAnswered, history, historyPath, attemptedHosts);
+            collectedHosts, allHostsAnswered, history, historyPath, attemptedHosts, fetchBlockerAsync);
 
     /// <summary>Adapts a facts-only fetch to the resolution shape: a null read is an unreadable one.</summary>
     private static Func<int, CancellationToken, Task<PrFetch>> Wrap(Func<int, CancellationToken, Task<PrFacts?>> fetchAsync)
@@ -603,7 +609,8 @@ internal static class WaitingCommand
         bool allHostsAnswered,
         PaneHistory? history = null,
         string? historyPath = null,
-        IReadOnlyList<string?>? attemptedHosts = null)
+        IReadOnlyList<string?>? attemptedHosts = null,
+        Func<string, int, CancellationToken, Task<BlockerFetch>>? fetchBlockerAsync = null)
     {
         Departed = [];
         Omitted = [];
@@ -771,6 +778,37 @@ internal static class WaitingCommand
             };
         }
 
+        // Resolve every named blocker once per (repo, number) this sweep (#218), scoped to the repo each
+        // dependent's own PR already resolved to rather than searched across the fleet — a dependent has
+        // already proven which repo it lives in, and a blocker it names is overwhelmingly filed alongside
+        // it. Deliberately after the PR passes above, since a blocker's repo is only known once its
+        // dependent's own PR has resolved. A null fetcher (no caller supplied one) leaves this empty and
+        // every blocked record falls back through to the unresolved "parked behind #N" wording untouched.
+        var blockerSeen = new Dictionary<(string Repo, int Number), BlockerFetch>();
+        if (fetchBlockerAsync is not null)
+        {
+            foreach ((TmuxPane pane, StateReading reading) in readings)
+            {
+                if (reading.Identified is not { IsIssue: false, Blocked.Count: > 0 } blockedRecord)
+                {
+                    continue;
+                }
+
+                if (!seen.TryGetValue(blockedRecord.PrNumber, out PrFetch pf) || pf.Facts?.Repo is not { } repo)
+                {
+                    continue;
+                }
+
+                foreach (int number in blockedRecord.Blocked)
+                {
+                    if (!blockerSeen.ContainsKey((repo, number)))
+                    {
+                        blockerSeen[(repo, number)] = await fetchBlockerAsync(repo, number, ct);
+                    }
+                }
+            }
+        }
+
         var rows = new List<WaitingRow>(readings.Count);
         foreach ((TmuxPane pane, StateReading reading) in readings)
         {
@@ -778,9 +816,23 @@ internal static class WaitingCommand
             PrFetch resolved = record is { IsIssue: false } claim
                 ? (seen.TryGetValue(claim.PrNumber, out PrFetch pf) ? pf : PrFetch.Unavailable)
                 : PrFetch.Unavailable;
+
+            Dictionary<int, BlockerFetch>? blockers = null;
+            if (record is { Blocked.Count: > 0 } && resolved.Facts?.Repo is { } blockerRepo)
+            {
+                blockers = [];
+                foreach (int number in record.Blocked)
+                {
+                    if (blockerSeen.TryGetValue((blockerRepo, number), out BlockerFetch bf))
+                    {
+                        blockers[number] = bf;
+                    }
+                }
+            }
+
             WaitingVerdict verdict = WaitingVerdict.ForActivity(pane.Activity, pane.Capture, () =>
                 record is not null
-                    ? WaitingVerdict.Resolve(record, record.IsIssue ? PrFetch.Unavailable : resolved)
+                    ? WaitingVerdict.Resolve(record, record.IsIssue ? PrFetch.Unavailable : resolved, blockers)
                     : reading.Unidentified is { } unusable
                         ? WaitingVerdict.Unidentified(unusable)
                         : new WaitingVerdict(
@@ -809,6 +861,33 @@ internal static class WaitingCommand
             .ThenBy(r => r.Verdict.Severity)
             .ThenByDescending(r => r.StoppedFor ?? TimeSpan.Zero)];
 
+    /// <summary>
+    /// One still-open named blocker with more than one observed dependent parked behind it (#218): a
+    /// single dependent is already visible as its own quiet <c>Holding</c> row, but the tool exists partly
+    /// because a high-fan-out blocker otherwise produces <em>less</em> visible output as its impact grows
+    /// — one more row indistinguishable from every other. Only <c>Holding</c> rows still naming the
+    /// blocker count; a dependent already resolved to <c>Unblocked</c> has nothing left to alert about.
+    /// </summary>
+    internal readonly record struct BlockerAlert(int Number, string? Repo, IReadOnlyList<string> Windows)
+    {
+        public int DependentCount => Windows.Count;
+    }
+
+    /// <summary>
+    /// Groups every currently-parked dependent by the (repo, blocker number) it names, keeping only the
+    /// blockers with more than one observed dependent. Computed off the full resolved row set, not the
+    /// rows a run happens to print under the default filter, so a fan-out alert is never hidden behind
+    /// <c>--all</c>.
+    /// </summary>
+    internal static IReadOnlyList<BlockerAlert> BuildBlockerAlerts(IReadOnlyList<WaitingRow> rows)
+        => [.. rows
+            .Where(r => r.Record is { Blocked.Count: > 0 } && r.Verdict.State == WaitingState.Holding)
+            .SelectMany(r => r.Record!.Blocked.Select(number => (Number: number, Row: r)))
+            .GroupBy(x => (x.Number, x.Row.Repo))
+            .Where(g => g.Count() > 1)
+            .Select(g => new BlockerAlert(g.Key.Number, g.Key.Repo, [.. g.Select(x => x.Row.Pane.Where)]))
+            .OrderByDescending(a => a.DependentCount)];
+
     private static WaitingRow Row(TmuxPane pane, StateReading reading, WaitingVerdict verdict, DateTimeOffset now)
         => new()
         {
@@ -830,6 +909,16 @@ internal static class WaitingCommand
 
         public static Budget From(GhFleetPrFactsSource facts)
             => new(facts.Calls, facts.NotModified, facts.Recomputed, facts.RateLimitRemaining, facts.RateLimited);
+
+        /// <summary>Folds in a blocker resolver's spend (#218): both draw on the one shared REST credential,
+        /// so a reader must see one truthful total rather than a PR budget that looks cheaper than it was.</summary>
+        public static Budget From(GhFleetPrFactsSource facts, GhFleetBlockerFactsSource blockers)
+            => new(
+                facts.Calls + blockers.Calls,
+                facts.NotModified + blockers.NotModified,
+                facts.Recomputed,
+                new[] { facts.RateLimitRemaining, blockers.RateLimitRemaining }.Where(r => r is not null).Min(),
+                facts.RateLimited || blockers.RateLimited);
 
         public override string ToString()
         {
@@ -890,7 +979,8 @@ internal static class WaitingCommand
         IReadOnlyList<string> unreachable,
         IReadOnlyList<string>? omitted = null,
         IReadOnlyList<string>? departed = null,
-        IReadOnlyList<string>? configuredRepos = null)
+        IReadOnlyList<string>? configuredRepos = null,
+        IReadOnlyList<BlockerAlert>? blockerAlerts = null)
     {
         output.WriteLine(Summary(rows, unreachable, omitted));
 
@@ -911,6 +1001,15 @@ internal static class WaitingCommand
         // counted among the rows that did not meet the bar rather than in neither.
         int actionable = rows.Count(r => r.MayAct);
         output.WriteLine($"NOT ACTED nothing was sent to any agent; {actionable} row(s) met the bar to act, {rows.Count - actionable} did not");
+
+        // A high-fan-out blocker (#218): named once here instead of buried as N indistinguishable quiet
+        // HOLDING rows, since impact should increase visibility rather than diminish it.
+        foreach (BlockerAlert alert in blockerAlerts ?? [])
+        {
+            string where = string.Join(", ", alert.Windows.Select(DisplayText.Safe));
+            string repo = alert.Repo is { Length: > 0 } r ? $"{DisplayText.Safe(r)} " : string.Empty;
+            output.WriteLine($"BLOCKED {alert.DependentCount} window(s) parked behind open {repo}#{alert.Number} — {where}");
+        }
 
         // Only worth naming a resolved repo per row when more than one was configured; a single-repo sweep
         // adds nothing by repeating its one scope on every line.
@@ -1087,7 +1186,8 @@ internal static class WaitingCommand
         IReadOnlyList<string> unreachable,
         IReadOnlyList<string>? omitted = null,
         IReadOnlyList<string>? departed = null,
-        IReadOnlyList<string>? configuredRepos = null)
+        IReadOnlyList<string>? configuredRepos = null,
+        IReadOnlyList<BlockerAlert>? blockerAlerts = null)
     {
         using var writer = new Utf8JsonWriter(output, new JsonWriterOptions { Indented = true });
         writer.WriteStartObject();
@@ -1105,6 +1205,34 @@ internal static class WaitingCommand
             foreach (string repo in configuredRepos)
             {
                 writer.WriteStringValue(repo);
+            }
+
+            writer.WriteEndArray();
+        }
+
+        // High-fan-out blockers (#218), computed off the full row set so a consumer sees the fleet-level
+        // alert regardless of any client-side row filtering.
+        if (blockerAlerts is { Count: > 0 })
+        {
+            writer.WriteStartArray("blockers");
+            foreach (BlockerAlert alert in blockerAlerts)
+            {
+                writer.WriteStartObject();
+                writer.WriteNumber("number", alert.Number);
+                if (alert.Repo is { Length: > 0 } repo)
+                {
+                    writer.WriteString("repo", repo);
+                }
+
+                writer.WriteNumber("dependentCount", alert.DependentCount);
+                writer.WriteStartArray("windows");
+                foreach (string where in alert.Windows)
+                {
+                    writer.WriteStringValue(where);
+                }
+
+                writer.WriteEndArray();
+                writer.WriteEndObject();
             }
 
             writer.WriteEndArray();

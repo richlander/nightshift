@@ -86,6 +86,104 @@ public class WaitingVerdictTests
     }
 
     [Fact]
+    public void Resolve_AClosedBlockerUnblocksTheDependent()
+    {
+        // #218's live scenario: the only fact that changed is the named blocker's own lifecycle, and that
+        // alone is enough to turn a quiet Holding row into the operator's Unblocked queue.
+        var blockers = new Dictionary<int, BlockerFetch>
+        {
+            [4629] = BlockerFetch.Found(new BlockerFacts(4629, "owner/repo", IsOpen: false, "Fix", DateTimeOffset.UtcNow)),
+        };
+
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=1/2 blocked=4629 rec=wait"), Facts(), blockers);
+
+        Assert.Equal(WaitingState.Unblocked, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
+        Assert.Contains("#4629", v.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Resolve_AStillOpenBlockerStaysHoldingEvenWhenResolved()
+    {
+        var blockers = new Dictionary<int, BlockerFetch>
+        {
+            [4629] = BlockerFetch.Found(new BlockerFacts(4629, "owner/repo", IsOpen: true, "Fix", null)),
+        };
+
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=1/2 blocked=4629 rec=wait"), Facts(), blockers);
+
+        Assert.Equal(WaitingState.Holding, v.State);
+        Assert.Equal(RowOwner.Nobody, v.Owner);
+    }
+
+    [Fact]
+    public void Resolve_AMixOfClearedAndOpenBlockersStaysHoldingAndNamesBoth()
+    {
+        var blockers = new Dictionary<int, BlockerFetch>
+        {
+            [4629] = BlockerFetch.Found(new BlockerFacts(4629, "owner/repo", IsOpen: false, null, null)),
+            [4630] = BlockerFetch.Found(new BlockerFacts(4630, "owner/repo", IsOpen: true, null, null)),
+        };
+
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=1/2 blocked=4629,4630 rec=wait"), Facts(), blockers);
+
+        Assert.Equal(WaitingState.Holding, v.State);
+        Assert.Contains("#4630", v.Reason, StringComparison.Ordinal);
+        Assert.Contains("#4629", v.Reason, StringComparison.Ordinal);
+        Assert.Contains("cleared", v.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Resolve_AnUnreadableBlockerNeverReadsAsCleared()
+    {
+        // An unavailable read is not evidence of anything: never let a blocker that could not be checked
+        // silently release the dependent.
+        var blockers = new Dictionary<int, BlockerFetch>
+        {
+            [4629] = BlockerFetch.Unavailable,
+        };
+
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=1/2 blocked=4629 rec=wait"), Facts(), blockers);
+
+        Assert.Equal(WaitingState.Holding, v.State);
+        Assert.NotEqual(WaitingState.Unblocked, v.State);
+    }
+
+    [Fact]
+    public void Resolve_ABlockerNumberThatVanishedNeverReadsAsCleared()
+    {
+        var blockers = new Dictionary<int, BlockerFetch>
+        {
+            [4629] = BlockerFetch.NotFound,
+        };
+
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=1/2 blocked=4629 rec=wait"), Facts(), blockers);
+
+        Assert.Equal(WaitingState.Holding, v.State);
+        Assert.NotEqual(WaitingState.Unblocked, v.State);
+    }
+
+    [Fact]
+    public void Resolve_ABlockerNotLookedUpThisSweepFallsBackToTheUnresolvedWording()
+    {
+        // An empty dictionary — nothing was resolved this sweep — must behave exactly like the null case:
+        // the plain "parked behind #N" the tool has always shown.
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=1/2 blocked=4629 rec=wait"),
+            Facts(),
+            new Dictionary<int, BlockerFetch>());
+
+        Assert.Equal(WaitingState.Holding, v.State);
+        Assert.Contains("#4629", v.Reason, StringComparison.Ordinal);
+        Assert.DoesNotContain("cleared", v.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Severity_UnblockedRanksWithTheActionableQueue()
     {
         WaitingVerdict v = WaitingVerdict.Resolve(
