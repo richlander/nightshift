@@ -237,6 +237,68 @@ public class WaitingVerdictTests
     }
 
     [Fact]
+    public void Resolve_AClosedTrackedIssueUnblocksTheDependent()
+    {
+        // #220's live scenario: an issue= window has no PR to check against GitHub, but the tracked issue
+        // itself has a lifecycle, and its closing is exactly the transition #218 gives a blocked= dependent.
+        var tracked = TrackedIssueFetch.Found(new BlockerFacts(4611, "owner/repo", IsOpen: false, "Fix", null), "owner/repo");
+
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            AgentState.Parse("issue=4611 head=8d5f22a22 rec=continue", "i4611")!, null, blockers: null, trackedIssue: tracked);
+
+        Assert.Equal(WaitingState.Unblocked, v.State);
+        Assert.Equal(RowOwner.Operator, v.Owner);
+        Assert.Contains("#4611", v.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Resolve_AStillOpenTrackedIssueStaysHoldingEvenWhenResolved()
+    {
+        var tracked = TrackedIssueFetch.Found(new BlockerFacts(4611, "owner/repo", IsOpen: true, null, null), "owner/repo");
+
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            AgentState.Parse("issue=4611 head=8d5f22a22 rec=continue", "i4611")!, null, blockers: null, trackedIssue: tracked);
+
+        Assert.Equal(WaitingState.Holding, v.State);
+        Assert.Contains("no PR yet", v.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Resolve_AnAmbiguousTrackedIssueNeverReadsAsCleared()
+    {
+        var tracked = TrackedIssueFetch.Ambiguous(["owner/repo-a", "owner/repo-b"]);
+
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            AgentState.Parse("issue=4611 head=8d5f22a22 rec=continue", "i4611")!, null, blockers: null, trackedIssue: tracked);
+
+        Assert.Equal(WaitingState.Holding, v.State);
+        Assert.NotEqual(WaitingState.Unblocked, v.State);
+    }
+
+    [Fact]
+    public void Resolve_ATrackedIssueNotLookedUpThisSweepFallsBackToTheUnresolvedWording()
+    {
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            AgentState.Parse("issue=4611 head=8d5f22a22 rec=continue", "i4611")!, null, blockers: null, trackedIssue: null);
+
+        Assert.Equal(WaitingState.Holding, v.State);
+        Assert.Contains("no PR yet", v.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Resolve_AnExplicitStopOnATrackedIssueStillReachesTheOperatorEvenWhenTheIssueClosed()
+    {
+        // An explicit escalation is the agent asking a person to decide; that request stands regardless of
+        // whether the tracked issue happens to have closed in the same sweep.
+        var tracked = TrackedIssueFetch.Found(new BlockerFacts(4611, "owner/repo", IsOpen: false, null, null), "owner/repo");
+
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            AgentState.Parse("issue=4611 head=8d5f22a22 rec=stop", "i4611")!, null, blockers: null, trackedIssue: tracked);
+
+        Assert.Equal(WaitingState.NeedsOperator, v.State);
+    }
+
+    [Fact]
     public void Resolve_AnIssueWindowAskingToStopReachesTheOperator()
     {
         // The end of the dropped-fields bug: `pr=none … rec=stop` in an i#### window used to resolve as a

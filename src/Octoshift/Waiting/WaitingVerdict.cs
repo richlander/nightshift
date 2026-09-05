@@ -189,7 +189,11 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
     /// collides across repos rather than silently picking one. A found PR joins exactly as the
     /// <see cref="Resolve(AgentState, PrFacts?)"/> overload does, against the facts stamped with their repo.
     /// </summary>
-    public static WaitingVerdict Resolve(AgentState state, PrFetch fetch, IReadOnlyDictionary<int, BlockerFetch>? blockers = null)
+    public static WaitingVerdict Resolve(
+        AgentState state,
+        PrFetch fetch,
+        IReadOnlyDictionary<int, BlockerFetch>? blockers = null,
+        TrackedIssueFetch? trackedIssue = null)
     {
         ArgumentNullException.ThrowIfNull(state);
 
@@ -197,12 +201,12 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
         // single-facts table unchanged. Only the genuinely absent outcomes need the multi-repo wording.
         if (fetch.Facts is { } facts)
         {
-            return Resolve(state, facts, blockers);
+            return Resolve(state, facts, blockers, trackedIssue);
         }
 
         if (state.IsIssue)
         {
-            return Resolve(state, null, blockers);
+            return Resolve(state, null, blockers, trackedIssue);
         }
 
         string scope = fetch.Searched.Count > 0 ? string.Join(", ", fetch.Searched) : "the searched repo(s)";
@@ -240,7 +244,7 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
             }
 
             // A pure outage: no repo confirmed the PR, so existence itself is unknown.
-            return Resolve(state, null, blockers);
+            return Resolve(state, null, blockers, trackedIssue);
         }
 
         // Affirmative not-found: every searched repo answered 404. Distinct from an outage, and its remedy
@@ -260,7 +264,11 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
     /// Resolves a window's state against GitHub's account of the same PR. Pure — the whole decision table
     /// is testable without a pane or a network.
     /// </summary>
-    public static WaitingVerdict Resolve(AgentState state, PrFacts? facts, IReadOnlyDictionary<int, BlockerFetch>? blockers = null)
+    public static WaitingVerdict Resolve(
+        AgentState state,
+        PrFacts? facts,
+        IReadOnlyDictionary<int, BlockerFetch>? blockers = null,
+        TrackedIssueFetch? trackedIssue = null)
     {
         ArgumentNullException.ThrowIfNull(state);
 
@@ -280,7 +288,13 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
                 Recommendation.Merge => new(WaitingState.Untrustworthy, RowOwner.Operator,
                     $"asking to merge issue #{state.PrNumber}, which has no PR to merge", assurance),
 
-                _ => new(WaitingState.Holding, RowOwner.Nobody, $"tracking issue #{state.PrNumber}; no PR yet", assurance),
+                // Once the tracked issue itself closes or merges, the wait behind it is over (#220) — the
+                // same transition #218 gives a `blocked=` dependent, just against the window's own tracked
+                // number rather than a separate one. Falls back to the old plain wording whenever the
+                // tracked issue was not looked up this sweep, or the read proved nothing (not found,
+                // ambiguous, or unavailable): never guess a tracked issue is cleared from an incomplete read.
+                _ => EvaluateTrackedIssue(state.PrNumber, trackedIssue, assurance)
+                    ?? new(WaitingState.Holding, RowOwner.Nobody, $"tracking issue #{state.PrNumber}; no PR yet", assurance),
             };
         }
 
@@ -466,6 +480,19 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
     /// looked up this sweep. A blocker whose read is missing or unavailable keeps the whole set unresolved
     /// — never treated as cleared — since a blocker that cannot be read is not evidence it closed.
     /// </summary>
+    /// <summary>
+    /// The tracked-issue counterpart to <see cref="EvaluateBlockers"/> (#220): an <c>issue=</c> window's
+    /// "blocker" is its own tracked number, resolved by a cross-repo search rather than a single-repo read
+    /// since the window has no PR of its own to anchor the lookup. Only an affirmatively closed, uniquely
+    /// resolved read releases the wait; anything else — not looked up, not found, ambiguous, or
+    /// unavailable — falls back to the caller's plain unresolved wording.
+    /// </summary>
+    private static WaitingVerdict? EvaluateTrackedIssue(int number, TrackedIssueFetch? trackedIssue, Assurance assurance)
+        => trackedIssue is { Status: TrackedIssueStatus.Found, Facts: { IsOpen: false } }
+            ? new(WaitingState.Unblocked, RowOwner.Operator,
+                $"issue #{number} closed; the wait behind it is over", assurance)
+            : null;
+
     private static WaitingVerdict? EvaluateBlockers(AgentState state, IReadOnlyDictionary<int, BlockerFetch> blockers, Assurance assurance)
     {
         var open = new List<int>();

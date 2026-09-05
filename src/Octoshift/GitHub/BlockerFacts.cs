@@ -37,6 +37,39 @@ internal readonly record struct BlockerFetch(BlockerFetchStatus Status, BlockerF
 }
 
 /// <summary>
+/// The distinguishable outcomes of resolving a tracked issue (an <c>issue=</c> pre-PR window, #220) across
+/// every configured repo: unlike a <c>blocked=</c> dependent, this window has no resolved PR repo of its
+/// own to scope the lookup, so the number has to be searched the same way a claimed PR number is (#215) —
+/// and can collide the same way.
+/// </summary>
+internal enum TrackedIssueStatus
+{
+    /// <summary>Exactly one searched repo has the number, and the whole scope was read.</summary>
+    Found,
+
+    /// <summary>More than one searched repo has the number — a proven collision.</summary>
+    Ambiguous,
+
+    /// <summary>Every searched repo affirmatively answered 404.</summary>
+    NotFound,
+
+    /// <summary>The read failed, or the scope could not be fully read, so neither uniqueness nor absence is proven.</summary>
+    Unavailable,
+}
+
+/// <summary>A tracked issue's cross-repo resolution: which repos had it, and the facts when exactly one did.</summary>
+internal readonly record struct TrackedIssueFetch(TrackedIssueStatus Status, BlockerFacts? Facts, IReadOnlyList<string> FoundIn)
+{
+    public static readonly TrackedIssueFetch NotFound = new(TrackedIssueStatus.NotFound, null, []);
+
+    public static readonly TrackedIssueFetch Unavailable = new(TrackedIssueStatus.Unavailable, null, []);
+
+    public static TrackedIssueFetch Found(BlockerFacts facts, string repo) => new(TrackedIssueStatus.Found, facts, [repo]);
+
+    public static TrackedIssueFetch Ambiguous(IReadOnlyList<string> foundIn) => new(TrackedIssueStatus.Ambiguous, null, foundIn);
+}
+
+/// <summary>
 /// Reads one named blocker's open/closed state from one repo, ETag-cached under the same budget
 /// discipline as PR facts (#157, #218): a blocker that has not changed since the last sweep answers 304
 /// and costs nothing, which is what makes resolving every dependent's blocker every sweep cheap rather
@@ -225,6 +258,71 @@ internal sealed class GhFleetBlockerFactsSource
         }
 
         return source.FetchAsync(number, ct);
+    }
+
+    /// <summary>
+    /// Resolves a tracked issue number across every repo in <paramref name="repos"/> (#220) — the same
+    /// search shape <see cref="GhFleetPrFactsSource"/> uses for a claimed PR number, since an <c>issue=</c>
+    /// window has no resolved repo of its own to anchor a single-repo lookup. Exactly one hit with the
+    /// whole scope read is <see cref="TrackedIssueStatus.Found"/>; two hits is
+    /// <see cref="TrackedIssueStatus.Ambiguous"/> without picking either; zero hits with the whole scope
+    /// affirmatively 404 is <see cref="TrackedIssueStatus.NotFound"/>; anything else — a repo unread, or
+    /// the scope cut short by the shared budget — is <see cref="TrackedIssueStatus.Unavailable"/>, since
+    /// neither uniqueness nor absence can be proven against a repo that was not truthfully read.
+    /// </summary>
+    public async Task<TrackedIssueFetch> FetchAcrossReposAsync(IReadOnlyList<string> repos, int number, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(repos);
+
+        var found = new List<(string Repo, BlockerFacts Facts)>();
+        bool anyUnavailable = false;
+
+        // Same early-exit discipline as the PR fleet search: one shared credential behind every repo, so a
+        // read after exhaustion cannot succeed, and a proven collision needs no further reads.
+        bool searchedAll = true;
+        foreach (string repo in repos)
+        {
+            if (RateLimited)
+            {
+                searchedAll = false;
+                break;
+            }
+
+            BlockerFetch read = await FetchAsync(repo, number, ct);
+            switch (read.Status)
+            {
+                case BlockerFetchStatus.Found when read.Facts is { } hit:
+                    found.Add((repo, hit));
+                    break;
+                case BlockerFetchStatus.Unavailable:
+                    anyUnavailable = true;
+                    break;
+            }
+
+            if (found.Count > 1)
+            {
+                searchedAll = false;
+                break;
+            }
+        }
+
+        IReadOnlyList<string> foundIn = [.. found.Select(f => f.Repo)];
+
+        if (found.Count > 1)
+        {
+            return TrackedIssueFetch.Ambiguous(foundIn);
+        }
+
+        bool wholeScopeAnswered = searchedAll && !anyUnavailable;
+
+        if (found.Count == 1)
+        {
+            return wholeScopeAnswered
+                ? TrackedIssueFetch.Found(found[0].Facts, found[0].Repo)
+                : new TrackedIssueFetch(TrackedIssueStatus.Unavailable, null, foundIn);
+        }
+
+        return wholeScopeAnswered ? TrackedIssueFetch.NotFound : TrackedIssueFetch.Unavailable;
     }
 }
 
