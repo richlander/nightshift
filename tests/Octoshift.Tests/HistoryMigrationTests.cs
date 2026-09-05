@@ -141,7 +141,7 @@ public sealed class HistoryMigrationTests
             using (JsonDocument doc = JsonDocument.Parse(saved))
             {
                 Assert.Equal(JsonValueKind.Number, doc.RootElement.GetProperty("version").ValueKind);
-                Assert.Equal(1, doc.RootElement.GetProperty("version").GetInt32());
+                Assert.Equal(2, doc.RootElement.GetProperty("version").GetInt32());
             }
 
             using PaneHistory reopened = await PaneHistory.OpenAsync(path, ct);
@@ -178,7 +178,7 @@ public sealed class HistoryMigrationTests
 
             using (JsonDocument doc = JsonDocument.Parse(File.ReadAllText(path)))
             {
-                Assert.Equal(1, doc.RootElement.GetProperty("version").GetInt32());
+                Assert.Equal(2, doc.RootElement.GetProperty("version").GetInt32());
             }
         }
         finally
@@ -208,7 +208,7 @@ public sealed class HistoryMigrationTests
             Assert.NotEmpty(location.Claims);
             using (JsonDocument doc = JsonDocument.Parse(File.ReadAllText(path)))
             {
-                Assert.Equal(1, doc.RootElement.GetProperty("version").GetInt32());
+                Assert.Equal(2, doc.RootElement.GetProperty("version").GetInt32());
             }
         }
         finally

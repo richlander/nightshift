@@ -1077,4 +1077,106 @@ public class PrCommandTests
             File.Delete(path + ".lock");
         }
     }
+
+    [Fact]
+    public async Task LocateAsync_FallsBackToTheLastKnownClaimant_WhenAWindowMovesOnToADifferentPr()
+    {
+        // Issue #221's exact live shape: a window claims PR 6004, a later sweep observes the same window
+        // now claiming a different PR (5988) instead, and a lookup for 6004 must not just say "no window
+        // claims it" — it has to surface who used to work on it and what happened to that window.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-prlastclaim-{Guid.NewGuid():N}.json");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            TmuxPane claiming6004 = Pane("merritt", "%5", "cp:5", agentState: $"pr=6004 head={HeadA} rec=continue", windowName: "pr6004");
+            await PrCommand.LocateAsync(
+                6004,
+                Collection([claiming6004], ["merritt"]),
+                history: null,
+                (_, _) => Task.FromResult(PrFetch.Unavailable),
+                (_, _) => Task.FromResult<PrFacts?>(null),
+                new DateTimeOffset(2026, 9, 5, 10, 0, 0, TimeSpan.Zero),
+                ct,
+                historyPath: path);
+
+            TmuxPane claiming5988 = Pane("merritt", "%5", "cp:5", agentState: $"pr=5988 head={HeadB} rec=continue", windowName: "pr5988");
+            PrCommand.PrLocation located = await PrCommand.LocateAsync(
+                6004,
+                Collection([claiming5988], ["merritt"]),
+                history: null,
+                (_, _) => Task.FromResult(PrFetch.Unavailable),
+                (_, _) => Task.FromResult<PrFacts?>(null),
+                new DateTimeOffset(2026, 9, 5, 12, 0, 0, TimeSpan.Zero),
+                ct,
+                historyPath: path);
+
+            Assert.Empty(located.Claims);
+            Assert.NotNull(located.LastClaim);
+            PrCommand.LastClaimReport last = located.LastClaim!.Value;
+            Assert.Equal("merritt cp:5", last.Where);
+            Assert.Equal(new DateTimeOffset(2026, 9, 5, 10, 0, 0, TimeSpan.Zero), last.ClaimedAt);
+            Assert.Equal(new DateTimeOffset(2026, 9, 5, 12, 0, 0, TimeSpan.Zero), last.LastSeenAt);
+            Assert.True(last.StillExists);
+            Assert.Equal(5988, last.ClaimsNow);
+
+            using var stream = new MemoryStream();
+            PrCommand.WriteJson(stream, located, new DateTimeOffset(2026, 9, 5, 12, 0, 0, TimeSpan.Zero));
+            string json = Encoding.UTF8.GetString(stream.ToArray());
+            using JsonDocument doc = JsonDocument.Parse(json);
+            JsonElement lastClaimJson = doc.RootElement.GetProperty("lastClaim");
+            Assert.Equal("merritt cp:5", lastClaimJson.GetProperty("where").GetString());
+            Assert.Equal(5988, lastClaimJson.GetProperty("claimsNow").GetInt32());
+            Assert.True(lastClaimJson.GetProperty("stillExists").GetBoolean());
+
+            var writer = new StringWriter();
+            PrCommand.WriteReport(writer, located, new DateTimeOffset(2026, 9, 5, 12, 0, 0, TimeSpan.Zero));
+            string report = writer.ToString();
+            Assert.Contains("last claimed by merritt cp:5", report, StringComparison.Ordinal);
+            Assert.Contains("merritt cp:5 now claims #5988", report, StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
+
+    [Fact]
+    public async Task LocateAsync_ReportsNoHistory_WhenThePrHasNeverBeenClaimed()
+    {
+        // The other half of the distinction #221 asks for: a PR nobody has ever claimed must not be
+        // mistaken for one whose claimant moved on — the two need different next actions from a person.
+        string path = Path.Combine(Path.GetTempPath(), $"octoshift-prnolastclaim-{Guid.NewGuid():N}.json");
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        try
+        {
+            TmuxPane idle = Pane("merritt", "%9", "cp:9", agentState: null, windowName: "idle");
+            PrCommand.PrLocation located = await PrCommand.LocateAsync(
+                9999,
+                Collection([idle], ["merritt"]),
+                history: null,
+                (_, _) => Task.FromResult(PrFetch.Unavailable),
+                (_, _) => Task.FromResult<PrFacts?>(null),
+                new DateTimeOffset(2026, 9, 5, 12, 0, 0, TimeSpan.Zero),
+                ct,
+                historyPath: path);
+
+            Assert.Empty(located.Claims);
+            Assert.Null(located.LastClaim);
+
+            var writer = new StringWriter();
+            PrCommand.WriteReport(writer, located, new DateTimeOffset(2026, 9, 5, 12, 0, 0, TimeSpan.Zero));
+            Assert.Contains("no window claims it", writer.ToString(), StringComparison.Ordinal);
+
+            using var stream = new MemoryStream();
+            PrCommand.WriteJson(stream, located, new DateTimeOffset(2026, 9, 5, 12, 0, 0, TimeSpan.Zero));
+            using JsonDocument doc = JsonDocument.Parse(Encoding.UTF8.GetString(stream.ToArray()));
+            Assert.False(doc.RootElement.TryGetProperty("lastClaim", out _));
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".lock");
+        }
+    }
 }

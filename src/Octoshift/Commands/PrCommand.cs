@@ -138,6 +138,25 @@ internal static class PrCommand
         }
     }
 
+    /// <summary>
+    /// The last known claimant of a PR that no window currently claims — surfaced only when <see
+    /// cref="PaneHistory.LastClaimFor"/> has one, so "claimed once, then moved on" reports differently from
+    /// "never claimed at all" (a null <see cref="PrLocation.LastClaim"/>).
+    /// </summary>
+    /// <param name="Where">The window's display name (<c>host session:window</c>, or just
+    /// <c>session:window</c> local) at the time it made the claim.</param>
+    /// <param name="ClaimedAt">When that window first registered the claim.</param>
+    /// <param name="LastSeenAt">The sweep that first observed the claim gone — an upper bound on when it
+    /// actually ended, not the moment itself.</param>
+    /// <param name="StillExists">Whether the same window still exists in the fleet at all.</param>
+    /// <param name="ClaimsNow">What that window claims now, if it still exists and claims something.</param>
+    internal readonly record struct LastClaimReport(
+        string Where,
+        DateTimeOffset ClaimedAt,
+        DateTimeOffset LastSeenAt,
+        bool StillExists,
+        int? ClaimsNow);
+
     /// <summary>Where a PR was found, and everything the report and the exit code are computed from.</summary>
     /// <param name="PrNumber">The PR asked about.</param>
     /// <param name="Claims">This PR's claimants, owner first.</param>
@@ -155,6 +174,11 @@ internal static class PrCommand
         WaitingCommand.Collection Collected,
         IReadOnlyDictionary<string, TimeSpan?> Silence)
     {
+        /// <summary>The last window known to have claimed this PR, when no window claims it now — null
+        /// both when a window currently claims it (irrelevant) and when this PR has genuinely never been
+        /// claimed (the two a report must not conflate). See <see cref="LastClaimReport"/>.</summary>
+        public LastClaimReport? LastClaim { get; init; }
+
         /// <summary>The repos this PR was actually queried in — narrower than <see cref="Configured"/> when
         /// the search stopped early on a proven collision or an exhausted shared budget.</summary>
         public IReadOnlyList<string> Searched { get; init; } = [];
@@ -351,6 +375,20 @@ internal static class PrCommand
             .ThenBy(m => m.Pane.Host ?? string.Empty, StringComparer.Ordinal)
             .ThenBy(m => m.Pane.PaneId, StringComparer.Ordinal)];
 
+        // No window claims this PR right now: fall back to the last window this tool ever observed
+        // claiming it (issue #221), rather than reporting only "no window claims it" — the one case the
+        // command is most needed for is exactly the one where the agent has since moved on to its next
+        // task. Only ever built from a claim Observe itself witnessed, never inferred from a window name
+        // or a GitHub cross-reference.
+        LastClaimReport? lastClaim = mine.Length > 0 || history.LastClaimFor(prNumber) is not { } last
+            ? null
+            : new LastClaimReport(
+                last.Host is null ? last.Target : $"{last.Host} {last.Target}",
+                last.ClaimedAt,
+                last.LastSeenAt,
+                history.StillExists(last),
+                history.CurrentClaim(last));
+
         PrFetch fetched = await fetchAsync(prNumber, ct);
         PrFacts? prFacts = fetched.Facts;
         if (prFacts is not null && !prFacts.MergeabilityKnown && !prFacts.Merged)
@@ -371,6 +409,7 @@ internal static class PrCommand
             Searched = fetched.Searched,
             FoundIn = fetched.FoundIn,
             Configured = fetched.Configured,
+            LastClaim = lastClaim,
         };
         }
         finally
@@ -433,8 +472,28 @@ internal static class PrCommand
 
         if (claims.Count == 0)
         {
-            string where = collected.Panes.Count == 0 ? "no windows collected" : "no window claims it";
-            output.WriteLine($"  where     {where}");
+            if (collected.Panes.Count == 0)
+            {
+                output.WriteLine("  where     no windows collected");
+            }
+            else if (located.LastClaim is { } last)
+            {
+                // "Claimed once, then moved on" is a different next action from "never claimed at all" — go
+                // find where the work continued, rather than open a new window — so this stays a distinct
+                // line from the plain "no window claims it" below, not folded into the same wording.
+                string ago = Duration(now - last.LastSeenAt);
+                output.WriteLine($"  where     no window claims it now; last claimed by {DisplayText.Safe(last.Where)}, {ago} ago");
+                string since = last.ClaimsNow is { } claimsNow
+                    ? $"            {DisplayText.Safe(last.Where)} now claims #{claimsNow}"
+                    : last.StillExists
+                        ? $"            {DisplayText.Safe(last.Where)} still exists but claims nothing"
+                        : $"            {DisplayText.Safe(last.Where)} no longer exists";
+                output.WriteLine(since);
+            }
+            else
+            {
+                output.WriteLine("  where     no window claims it");
+            }
         }
 
         foreach ((TmuxPane pane, AgentState state, Claim claim) in claims)
@@ -735,6 +794,24 @@ internal static class PrCommand
         if (claims.Count > 1)
         {
             writer.WriteString("order", claims[0].Claim.Basis.ToString().ToLowerInvariant());
+        }
+
+        // The fallback for issue #221: no window claims this PR right now, but a window once did. Emitted
+        // only when a claim was actually witnessed by this tool — never when the PR has genuinely never
+        // been claimed, so a consumer can tell the two cases apart without a sentinel value.
+        if (located.LastClaim is { } last)
+        {
+            writer.WriteStartObject("lastClaim");
+            writer.WriteString("where", last.Where);
+            writer.WriteString("claimedAt", last.ClaimedAt.ToString("O"));
+            writer.WriteString("lastSeenAt", last.LastSeenAt.ToString("O"));
+            writer.WriteBoolean("stillExists", last.StillExists);
+            if (last.ClaimsNow is { } claimsNow)
+            {
+                writer.WriteNumber("claimsNow", claimsNow);
+            }
+
+            writer.WriteEndObject();
         }
 
         // A partly invisible fleet is named in the output as well as the exit code: the requested PR may

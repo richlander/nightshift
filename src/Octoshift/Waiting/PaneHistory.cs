@@ -73,6 +73,49 @@ internal sealed record PaneMemory
 }
 
 /// <summary>
+/// What is remembered about the most recent claimant a PR ever had, kept in a reverse index keyed by the
+/// PR number rather than the pane — so it survives past the moment <see cref="PaneHistory.Observe"/>
+/// overwrites <see cref="PaneMemory.ClaimedPr"/> with a window's next claim, and past the window
+/// disappearing entirely. Without this, "which window was working on PR N" becomes unanswerable exactly
+/// when it matters most: after the agent has already moved on.
+/// </summary>
+internal sealed record LastClaim
+{
+    /// <summary>
+    /// The composite pane key (<see cref="TargetId"/> plus pane id) this claim was made under, so a later
+    /// lookup can tell whether that same window still exists and, if so, what it claims now. A window that
+    /// has since departed simply has no entry under this key any more — evidence, not a bug in the index.
+    /// </summary>
+    [JsonPropertyName("paneKey")]
+    public string PaneKey { get; init; } = string.Empty;
+
+    /// <summary>The window's <c>session:window</c> display name at the time of the claim. Persisted
+    /// separately from <see cref="PaneKey"/> because a departed window can no longer be looked up to
+    /// recover its name — only the pane id at the tail of the key would remain.</summary>
+    [JsonPropertyName("target")]
+    public string Target { get; init; } = string.Empty;
+
+    /// <summary>The host alias this claim was made on, or null for local — for display without decoding
+    /// <see cref="PaneKey"/>.</summary>
+    [JsonPropertyName("host")]
+    public string? Host { get; init; }
+
+    /// <summary>When this window first registered this claim — the same registration time <see
+    /// cref="PaneMemory.ClaimedAt"/> tracked for as long as it held it.</summary>
+    [JsonPropertyName("claimedAt")]
+    public DateTimeOffset ClaimedAt { get; init; }
+
+    /// <summary>
+    /// The transaction time of the sweep that first observed the claim gone — switched to a different PR,
+    /// or the window itself departed. This is an upper bound on when the claim actually ended, not the
+    /// moment itself: the tool only samples once per sweep, so the true end lies somewhere between this
+    /// sweep and the previous one.
+    /// </summary>
+    [JsonPropertyName("lastSeenAt")]
+    public DateTimeOffset LastSeenAt { get; init; }
+}
+
+/// <summary>
 /// Remembers each window's body digest between runs, so silence can be measured rather than guessed.
 /// </summary>
 /// <remarks>
@@ -86,6 +129,10 @@ internal sealed class PaneHistory : IDisposable
     private readonly string _path;
     private readonly Dictionary<string, PaneMemory> _entries;
     private readonly Dictionary<string, HostMemory> _hosts;
+
+    /// <summary>The reverse index from PR number to its most recent claimant, surviving past a claim
+    /// switching away or the window departing. See <see cref="LastClaim"/>.</summary>
+    private readonly Dictionary<int, LastClaim> _lastClaims;
 
     /// <summary>
     /// Every host this tool has ever <em>attempted</em> to collect — targeted over ssh (or the local
@@ -120,7 +167,17 @@ internal sealed class PaneHistory : IDisposable
     /// from a newer or unknown one (fail closed), rather than inferring scheme identity from which members
     /// happen to be present — the inference that bricked every pre-version history on upgrade.
     /// </summary>
-    private const int CurrentVersion = 1;
+    /// <remarks>
+    /// Bumped from 1 to 2 to add <c>lastClaims</c> (the reverse claimant index behind <c>octoshift pr</c>'s
+    /// fallback to a window's last known claim). A version 1 file predates that member and is migrated
+    /// forward with an empty reverse index — the same in-memory migration an unversioned legacy file gets —
+    /// rather than rejected, so an ordinary upgrade never bricks on a version bump.
+    /// </remarks>
+    private const int CurrentVersion = 2;
+
+    /// <summary>The previous schema version, migrated forward rather than rejected on load. See the
+    /// remarks on <see cref="CurrentVersion"/>.</summary>
+    private const int PriorVersion = 1;
 
     private static readonly TimeSpan LockTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan LockRetry = TimeSpan.FromMilliseconds(50);
@@ -155,6 +212,7 @@ internal sealed class PaneHistory : IDisposable
         _entries = loaded.Entries;
         _hosts = loaded.Hosts;
         _attempted = loaded.Attempted;
+        _lastClaims = loaded.LastClaims;
         _initialized = loaded.Initialized;
 
         // A strict (product) load is fully resolved inside Load: a current versioned file is validated
@@ -201,6 +259,16 @@ internal sealed class PaneHistory : IDisposable
             _hosts[key] = SanitizeHost(_hosts[key]);
         }
 
+        // Last-claim reverse index: drop any entry keyed by a non-positive PR number, or carrying a null
+        // record, a malformed pane key, or a default timestamp — the same "impossible for this scheme to
+        // have written" bar the panes and hosts maps are held to.
+        foreach (int number in _lastClaims.Keys
+            .Where(n => n <= 0 || _lastClaims[n] is null || !IsWriterProducedLastClaim(_lastClaims[n]))
+            .ToArray())
+        {
+            _lastClaims.Remove(number);
+        }
+
         // Attempted membership: drop any key not one this scheme minted, and fold in every collected host
         // and every pane's composite host so the persistent invariant (a host that answered, or that a
         // remembered pane sits on, was by definition attempted) holds even for a hand-seeded fixture. The
@@ -227,11 +295,13 @@ internal sealed class PaneHistory : IDisposable
         _initialized = _initialized || _attempted.Count > 0 || _hosts.Count > 0;
     }
 
-    /// <summary>The outcome of a load: the three maps and the initialized flag.</summary>
+    /// <summary>The outcome of a load: the maps, the reverse claim index, the attempted set, and the
+    /// initialized flag.</summary>
     private readonly record struct LoadResult(
         Dictionary<string, PaneMemory> Entries,
         Dictionary<string, HostMemory> Hosts,
         HashSet<string> Attempted,
+        Dictionary<int, LastClaim> LastClaims,
         bool Initialized);
 
     /// <summary>
@@ -250,7 +320,8 @@ internal sealed class PaneHistory : IDisposable
     private static void ValidateVersionedSemantics(
         Dictionary<string, PaneMemory> entries,
         Dictionary<string, HostMemory> hosts,
-        HashSet<string> attempted)
+        HashSet<string> attempted,
+        Dictionary<int, LastClaim> lastClaims)
     {
         foreach ((string key, HostMemory host) in hosts)
         {
@@ -331,6 +402,34 @@ internal sealed class PaneHistory : IDisposable
                 throw new HistoryUnavailableException($"pane history has pane '{key}' on host '{host.Key}', which is not a known fleet member");
             }
         }
+
+        // The reverse claim index is keyed by PR number (already validated as a positive integer parsed
+        // from its string key by ParseLastClaims), and every record must itself be a shape Observe could
+        // have written, and its pane key must belong to a known fleet member — the same membership rule a
+        // live pane's host is held to, since a last claim can equally be migrated forward on a host no
+        // longer collected.
+        foreach ((int number, LastClaim claim) in lastClaims)
+        {
+            if (number <= 0)
+            {
+                throw new HistoryUnavailableException($"pane history has an invalid last-claim number '{number}', so it was not written by this scheme");
+            }
+
+            if (claim is null || !IsWriterProducedLastClaim(claim))
+            {
+                throw new HistoryUnavailableException($"pane history has an impossible last-claim record for PR #{number}");
+            }
+
+            if (TargetId.HostOfComposite(claim.PaneKey) is not { } claimHost || TargetId.IdOfComposite(claim.PaneKey) is not { } claimPaneId || !TmuxScanner.IsPaneId(claimPaneId))
+            {
+                throw new HistoryUnavailableException($"pane history has an invalid last-claim pane key '{claim.PaneKey}' for PR #{number}, so it was not written by this scheme");
+            }
+
+            if (!hosts.ContainsKey(claimHost.Key) && !attempted.Contains(claimHost.Key))
+            {
+                throw new HistoryUnavailableException($"pane history has a last claim for PR #{number} on host '{claimHost.Key}', which is not a known fleet member");
+            }
+        }
     }
 
     /// <summary>
@@ -392,6 +491,19 @@ internal sealed class PaneHistory : IDisposable
     }
 
     /// <summary>
+    /// The last-claim shapes <see cref="Observe"/> can produce: a non-empty pane key and target, and real
+    /// (non-default) claimed-at and last-seen-at timestamps with the claim ending no earlier than it
+    /// began. Anything else — a blank key, a default timestamp, or a last-seen-at before the claimed-at it
+    /// is supposed to follow — is a record this implementation never wrote.
+    /// </summary>
+    private static bool IsWriterProducedLastClaim(LastClaim claim)
+        => claim.PaneKey.Length > 0
+        && claim.Target.Length > 0
+        && claim.ClaimedAt != default
+        && claim.LastSeenAt != default
+        && claim.LastSeenAt >= claim.ClaimedAt;
+
+    /// <summary>
     /// Reads the maps, the attempted-host set and the initialized flag off disk. Absence of the file is a
     /// first run — a genuinely empty history. An existing file that cannot be read or parsed, or that is a
     /// null JSON document, is NOT empty: it is a history whose contents are unknown, and treating it as
@@ -406,7 +518,7 @@ internal sealed class PaneHistory : IDisposable
     {
         if (!File.Exists(path))
         {
-            return new([], [], [], false);
+            return new([], [], [], [], false);
         }
 
         string text;
@@ -421,7 +533,7 @@ internal sealed class PaneHistory : IDisposable
                 throw new HistoryUnavailableException($"could not read pane history from {path}: {ex.Message}", ex);
             }
 
-            return new([], [], [], false);
+            return new([], [], [], [], false);
         }
 
         if (strict)
@@ -438,15 +550,38 @@ internal sealed class PaneHistory : IDisposable
         }
         catch (JsonException)
         {
-            return new([], [], [], false);
+            return new([], [], [], [], false);
         }
 
         if (file is null)
         {
-            return new([], [], [], false);
+            return new([], [], [], [], false);
         }
 
-        return new(file.Panes ?? [], file.Hosts ?? [], [.. file.Attempted ?? []], file.Initialized ?? false);
+        return new(
+            file.Panes ?? [],
+            file.Hosts ?? [],
+            [.. file.Attempted ?? []],
+            ParseLastClaimsForgiving(file.LastClaims ?? []),
+            file.Initialized ?? false);
+    }
+
+    /// <summary>Converts the raw string-keyed last-claim map to its numeric-keyed in-memory form,
+    /// dropping (not throwing on) a key that does not parse as a positive integer. Used only by the
+    /// forgiving test-only loader, whose caller sanitises every map key-by-key afterwards; the strict
+    /// product loader uses <see cref="ParseLastClaims"/>, which rejects the whole file instead.</summary>
+    private static Dictionary<int, LastClaim> ParseLastClaimsForgiving(Dictionary<string, LastClaim> raw)
+    {
+        var result = new Dictionary<int, LastClaim>();
+        foreach ((string key, LastClaim claim) in raw)
+        {
+            if (int.TryParse(key, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int number) && number > 0)
+            {
+                result[number] = claim;
+            }
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -494,22 +629,27 @@ internal sealed class PaneHistory : IDisposable
     }
 
     /// <summary>
-    /// Validates a current <em>versioned</em> file exactly: the root must carry exactly
-    /// <c>version</c>/<c>panes</c>/<c>hosts</c>/<c>attempted</c>/<c>initialized</c>, and the version must be
-    /// the integer this build writes. A version that is newer, older, unknown, or not an integer is not
-    /// something to guess at — it is rejected, bytes untouched, so a future format can change the meaning
-    /// of a field without an old build quietly misreading it. When the version matches, the record shapes
-    /// and semantic invariants are the same ones the writer produces, enforced by
-    /// <see cref="ValidateVersionedSemantics"/>.
+    /// Validates a versioned file exactly: the version must be an integer this build recognises, and the
+    /// root must carry exactly the member set that version wrote — no unknown member, none missing. A
+    /// version that is newer or otherwise unrecognised is not something to guess at — it is rejected,
+    /// bytes untouched, so a future format can change the meaning of a field without an old build quietly
+    /// misreading it. <see cref="PriorVersion"/> (the schema before <c>lastClaims</c> existed) is
+    /// recognised and migrated forward in memory with an empty reverse claim index, exactly as an
+    /// unversioned legacy file is migrated — an ordinary version bump must not brick an existing history.
+    /// The current version's record shapes and semantic invariants, including the reverse index, are
+    /// enforced by <see cref="ValidateVersionedSemantics"/>.
     /// </summary>
     private static LoadResult LoadVersioned(JsonElement root, string text, string path)
     {
-        RequireExactMembers(root, VersionedRootMembers, path, "the root");
-
         JsonElement versionElement = root.GetProperty("version");
         if (versionElement.ValueKind != JsonValueKind.Number || !versionElement.TryGetInt32(out int version))
         {
             throw new HistoryUnavailableException($"pane history at {path} has a non-integer version, so it was not written by this scheme");
+        }
+
+        if (version == PriorVersion)
+        {
+            return LoadPriorVersion(root, text, path);
         }
 
         if (version != CurrentVersion)
@@ -519,17 +659,19 @@ internal sealed class PaneHistory : IDisposable
                 $"pane history at {path} is schema version {version}, but this build reads version {CurrentVersion}; refusing to guess at an {relation} format");
         }
 
+        RequireExactMembers(root, VersionedRootMembers, path, "the root");
         ValidateDictionary(root.GetProperty("hosts"), HostMembers, path, "host");
         ValidateDictionary(root.GetProperty("panes"), PaneMembers, path, "pane");
         ValidateAttemptedArray(root.GetProperty("attempted"), path);
+        ValidateDictionary(root.GetProperty("lastClaims"), LastClaimMembers, path, "last claim");
 
         HistoryFile file = Deserialize(text, path);
 
         // Defence in depth: the raw schema already required every member, but a deserialize that somehow
         // yields a null map or flag is still not a file this scheme wrote.
-        if (file.Panes is null || file.Hosts is null || file.Attempted is null || file.Initialized is null)
+        if (file.Panes is null || file.Hosts is null || file.Attempted is null || file.LastClaims is null || file.Initialized is null)
         {
-            throw new HistoryUnavailableException($"pane history at {path} is missing its panes, hosts, attempted or initialized member, so it was not written by this scheme");
+            throw new HistoryUnavailableException($"pane history at {path} is missing its panes, hosts, attempted, lastClaims or initialized member, so it was not written by this scheme");
         }
 
         // Every write establishes the fleet, so the writer only ever persists initialized = true; a first
@@ -542,8 +684,61 @@ internal sealed class PaneHistory : IDisposable
         }
 
         var attempted = new HashSet<string>(file.Attempted, StringComparer.Ordinal);
-        ValidateVersionedSemantics(file.Panes, file.Hosts, attempted);
-        return new(file.Panes, file.Hosts, attempted, true);
+        Dictionary<int, LastClaim> lastClaims = ParseLastClaims(file.LastClaims, path);
+        ValidateVersionedSemantics(file.Panes, file.Hosts, attempted, lastClaims);
+        return new(file.Panes, file.Hosts, attempted, lastClaims, true);
+    }
+
+    /// <summary>
+    /// Loads a version-1 file — the schema written before <c>lastClaims</c> existed — under its own exact
+    /// member set (no <c>lastClaims</c> to require), then migrates it forward in memory with an empty
+    /// reverse claim index. A version-1 file could never have named a last claim, so there is nothing to
+    /// recover for a PR whose claimant had already moved on before this build was installed; every claim
+    /// live in its panes map is unaffected and carries forward exactly as it validates today.
+    /// </summary>
+    private static LoadResult LoadPriorVersion(JsonElement root, string text, string path)
+    {
+        RequireExactMembers(root, PriorVersionRootMembers, path, "the root");
+        ValidateDictionary(root.GetProperty("hosts"), HostMembers, path, "host");
+        ValidateDictionary(root.GetProperty("panes"), PaneMembers, path, "pane");
+        ValidateAttemptedArray(root.GetProperty("attempted"), path);
+
+        HistoryFile file = Deserialize(text, path);
+        if (file.Panes is null || file.Hosts is null || file.Attempted is null || file.Initialized is null)
+        {
+            throw new HistoryUnavailableException($"pane history at {path} is missing its panes, hosts, attempted or initialized member, so it was not written by this scheme");
+        }
+
+        if (file.Initialized is not true)
+        {
+            throw new HistoryUnavailableException($"pane history at {path} has initialized = false, which this scheme never writes");
+        }
+
+        var attempted = new HashSet<string>(file.Attempted, StringComparer.Ordinal);
+        ValidateVersionedSemantics(file.Panes, file.Hosts, attempted, []);
+        return new(file.Panes, file.Hosts, attempted, [], true);
+    }
+
+    /// <summary>
+    /// Parses the raw <c>lastClaims</c> map, keyed on disk by the PR number as a string (the only key type
+    /// JSON objects allow). A key that is not a positive integer is not one this scheme ever minted —
+    /// <see cref="LastClaim"/> is only ever stored under <see cref="Observe"/>'s <c>claimedPr</c>, which
+    /// <see cref="IsWriterProducedPane"/> already holds to a positive value.
+    /// </summary>
+    private static Dictionary<int, LastClaim> ParseLastClaims(Dictionary<string, LastClaim> raw, string path)
+    {
+        var result = new Dictionary<int, LastClaim>();
+        foreach ((string key, LastClaim claim) in raw)
+        {
+            if (!int.TryParse(key, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int number) || number <= 0)
+            {
+                throw new HistoryUnavailableException($"pane history at {path} has an invalid last-claim key '{key}', so it was not written by this scheme");
+            }
+
+            result[number] = claim;
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -678,7 +873,7 @@ internal sealed class PaneHistory : IDisposable
             || hosts.Count > 0
             || entries.Count > 0;
 
-        return new(entries, hosts, attempted, established);
+        return new(entries, hosts, attempted, [], established);
     }
 
     /// <summary>Deserializes an already raw-schema-validated document, turning the residual failure modes
@@ -747,9 +942,13 @@ internal sealed class PaneHistory : IDisposable
             $"pane history at {path} has an unrecognised member set ({members}), so it was not written by any version of this scheme");
     }
 
-    /// <summary>The exact members of a current versioned root: the version integer plus the two maps, the
-    /// attempted array and the initialized flag.</summary>
-    private static readonly string[] VersionedRootMembers = ["version", "panes", "hosts", "attempted", "initialized"];
+    /// <summary>The exact members of the current versioned root: the version integer, the two maps, the
+    /// reverse claim index, the attempted array and the initialized flag.</summary>
+    private static readonly string[] VersionedRootMembers = ["version", "panes", "hosts", "attempted", "lastClaims", "initialized"];
+
+    /// <summary>The exact members of the version-1 root — the schema before <c>lastClaims</c> existed —
+    /// migrated forward by <see cref="LoadPriorVersion"/>.</summary>
+    private static readonly string[] PriorVersionRootMembers = ["version", "panes", "hosts", "attempted", "initialized"];
 
     /// <summary>The earliest unversioned shape: the two maps, before <c>attempted</c> existed.</summary>
     private static readonly string[] LegacyMembersPanesHosts = ["panes", "hosts"];
@@ -763,6 +962,7 @@ internal sealed class PaneHistory : IDisposable
 
     private static readonly string[] HostMembers = ["epoch", "sweptAt", "continuous"];
     private static readonly string[] PaneMembers = ["digest", "since", "pr", "claimedAt", "witnessed"];
+    private static readonly string[] LastClaimMembers = ["paneKey", "target", "host", "claimedAt", "lastSeenAt"];
 
     /// <summary>The attempted-host set on disk: a JSON array of unique strings. The writer emits target
     /// keys; a non-array, a non-string element, or a repeated key is a shape it never produced, so the
@@ -1259,6 +1459,23 @@ internal sealed class PaneHistory : IDisposable
             : now;
         bool witnessed = claimedPr is not null && (sameClaim ? previous?.Witnessed ?? false : registrationWitnessed);
 
+        // A claim that is ending — switching to a different PR, or dropping to none — is the one moment
+        // its history survives the overwrite below: stash it in the reverse index keyed by the PR it was
+        // claiming, so a later `octoshift pr` on that number can still answer who worked on it and when,
+        // even once this pane's own record has moved on. Overwrites whatever this PR's index entry already
+        // held, since only the most recent claimant is remembered.
+        if (!sameClaim && previous?.ClaimedPr is { } endedPr)
+        {
+            _lastClaims[endedPr] = new LastClaim
+            {
+                PaneKey = key,
+                Host = pane.Host,
+                Target = pane.Target,
+                ClaimedAt = previous.ClaimedAt ?? now,
+                LastSeenAt = now,
+            };
+        }
+
         if (previous is not null && previous.Digest == pane.BodyDigest)
         {
             _entries[key] = previous with { ClaimedPr = claimedPr, ClaimedAt = claimedAt, Witnessed = witnessed };
@@ -1289,6 +1506,27 @@ internal sealed class PaneHistory : IDisposable
     public bool IsWitnessed(TmuxPane pane)
         => _entries.TryGetValue(Key(pane), out PaneMemory? entry) && entry.Witnessed;
 
+    /// <summary>
+    /// The most recent claim ever persisted for this PR — even one made by a window that has since
+    /// switched to a different PR or disappeared entirely — or null if this PR has never been claimed by
+    /// any window this tool observed. See <see cref="LastClaim"/> for the evidence boundary: only a claim
+    /// this tool itself witnessed through <see cref="Observe"/> is ever reported here, never one inferred
+    /// from a window name or a GitHub cross-reference.
+    /// </summary>
+    public LastClaim? LastClaimFor(int prNumber)
+        => _lastClaims.TryGetValue(prNumber, out LastClaim? claim) ? claim : null;
+
+    /// <summary>
+    /// What the window behind a remembered last claim claims right now — the PR it moved on to, or null if
+    /// it currently claims nothing or no longer exists at all. Lets a report distinguish "moved to a
+    /// different PR" from "moved on and released" from "the window itself is gone".
+    /// </summary>
+    public int? CurrentClaim(LastClaim last)
+        => _entries.TryGetValue(last.PaneKey, out PaneMemory? entry) ? entry.ClaimedPr : null;
+
+    /// <summary>Whether the window behind a remembered last claim still exists in this history at all.</summary>
+    public bool StillExists(LastClaim last) => _entries.ContainsKey(last.PaneKey);
+
     private static string Key(TmuxPane pane) => TargetId.ForHost(pane.Host).ComposeWith(pane.PaneId);
 
     /// <summary>
@@ -1298,6 +1536,14 @@ internal sealed class PaneHistory : IDisposable
     /// A window vanishing is an event, not housekeeping. It may be an agent finished and reclaimed, or
     /// one that crashed, or a session someone killed by hand — and the difference matters to whoever is
     /// watching. Pruning it silently, as this did, turns every one of those into the same nothing.
+    ///
+    /// A departing window's claim is <em>not</em> folded into <see cref="LastClaimFor"/> here: this method
+    /// has no fresh transaction time to stamp a new registration's end with, and the pane record it is
+    /// about to discard already carries its own <see cref="PaneMemory.ClaimedAt"/>. The reverse index still
+    /// covers the scenario <see href="https://github.com/richlander/nightshift/issues/221">#221</see>
+    /// documents — a window that keeps existing but switches to a different PR, handled in
+    /// <see cref="Observe"/> — since that is the case where a claimant cannot otherwise be recovered at
+    /// all; a genuinely closed window is reported here, once, in the same sweep it departs.
     /// </remarks>
     /// <param name="live">Windows collected this sweep.</param>
     /// <param name="hosts">
@@ -1412,7 +1658,15 @@ internal sealed class PaneHistory : IDisposable
         {
             Directory.CreateDirectory(dir);
             File.WriteAllText(tmp, JsonSerializer.Serialize(
-                new HistoryFile { Version = CurrentVersion, Panes = _entries, Hosts = _hosts, Attempted = [.. _attempted], Initialized = _initialized },
+                new HistoryFile
+                {
+                    Version = CurrentVersion,
+                    Panes = _entries,
+                    Hosts = _hosts,
+                    Attempted = [.. _attempted],
+                    LastClaims = _lastClaims.ToDictionary(kv => kv.Key.ToString(System.Globalization.CultureInfo.InvariantCulture), kv => kv.Value),
+                    Initialized = _initialized,
+                },
                 PaneHistoryJsonContext.Default.HistoryFile));
             File.Move(tmp, _path, overwrite: true);
         }
@@ -1468,6 +1722,12 @@ internal sealed record HistoryFile
     /// canonical target keys.</summary>
     [JsonPropertyName("attempted")]
     public List<string>? Attempted { get; init; }
+
+    /// <summary>The reverse claimant index, keyed by PR number as its string form — the only key type a
+    /// JSON object allows. Absent on a version-1 file, which predates it; <see cref="LoadPriorVersion"/>
+    /// treats that absence as an empty index rather than a schema violation.</summary>
+    [JsonPropertyName("lastClaims")]
+    public Dictionary<string, LastClaim>? LastClaims { get; init; }
 
     /// <summary>Whether the fleet has been established at least once. The writer only ever persists it
     /// <c>true</c> — a never-initialized fleet is the absent-file case, which is never written — so it
