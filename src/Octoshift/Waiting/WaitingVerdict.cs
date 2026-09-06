@@ -68,7 +68,13 @@ internal enum RowOwner
 /// <param name="Owner">Whose attention this row belongs to.</param>
 /// <param name="Reason">One line naming the specific fact behind the state.</param>
 /// <param name="Assurance">How far the evidence behind it can be relied on, and why not further.</param>
-internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owner, string Reason, Assurance Assurance)
+/// <param name="FailedCheck">
+/// The name of a check GitHub itself reports as failed on this window's PR, when one is known and the
+/// window has not declared done (#224). CI is deliberately never a gate here — this only carries the
+/// fact through so a caller can group it into a fleet-level alert the same way #218 groups <c>blocked=</c>
+/// dependents; it never changes <see cref="State"/>, <see cref="Owner"/>, or <see cref="MayAct"/>.
+/// </param>
+internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owner, string Reason, Assurance Assurance, string? FailedCheck = null)
 {
     public bool NeedsAttention => Owner == RowOwner.Operator;
 
@@ -433,17 +439,26 @@ internal readonly record struct WaitingVerdict(WaitingState State, RowOwner Owne
 
         if (!declaredDone)
         {
+            // A real build failure is a fact worth surfacing even before the agent declares done — the
+            // window that gets there today ("in progress"/"reviews x/y") looks identical to one sitting
+            // behind ordinary review, hiding exactly the case an operator most wants to see, especially
+            // when several windows are red on the same check for a shared reason (#224). Never a gate —
+            // still Holding, still Nobody's — just no longer silent.
+            CheckRunFact? idleFailure = facts.ChecksKnown ? facts.Checks.FirstOrDefault(c => c.IsFailure) : null;
+            string idleCi = idleFailure is not null ? $"; CI red ({idleFailure.Name})" : string.Empty;
+
             // Say which fact is holding it, so a count that meets the bar next to a recommendation that
             // denies it does not read as "so why is this not ready?".
             if (state.ReviewsMeetBar)
             {
                 return new(WaitingState.Holding, RowOwner.Nobody,
-                    $"rec={state.Recommendation.ToString().ToLowerInvariant()}; reviews {state.ReviewsClean}/{state.ReviewsRequired} is not a claim of done", assurance);
+                    $"rec={state.Recommendation.ToString().ToLowerInvariant()}; reviews {state.ReviewsClean}/{state.ReviewsRequired} is not a claim of done{idleCi}",
+                    assurance, idleFailure?.Name);
             }
 
             return state.ReviewsRequired is > 0
-                ? new(WaitingState.Holding, RowOwner.Nobody, $"reviews {state.ReviewsClean ?? 0}/{state.ReviewsRequired}", assurance)
-                : new(WaitingState.Holding, RowOwner.Nobody, "in progress", assurance);
+                ? new(WaitingState.Holding, RowOwner.Nobody, $"reviews {state.ReviewsClean ?? 0}/{state.ReviewsRequired}{idleCi}", assurance, idleFailure?.Name)
+                : new(WaitingState.Holding, RowOwner.Nobody, $"in progress{idleCi}", assurance, idleFailure?.Name);
         }
 
         // Known, and not conflicting, but still not a state that says the branch can merge: `behind`,

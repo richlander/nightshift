@@ -185,13 +185,14 @@ internal static class WaitingCommand
 
             IReadOnlyList<WaitingRow> shown = Present(resolved, all);
             IReadOnlyList<BlockerAlert> alerts = BuildBlockerAlerts(resolved);
+            IReadOnlyList<CheckBreakAlert> checkAlerts = BuildCheckBreakAlerts(resolved);
             if (json)
             {
-                WriteJson(Console.OpenStandardOutput(), shown, Budget.From(facts, blockerFacts), collected.Unreachable, Omitted, Departed, repos, alerts);
+                WriteJson(Console.OpenStandardOutput(), shown, Budget.From(facts, blockerFacts), collected.Unreachable, Omitted, Departed, repos, alerts, checkAlerts);
             }
             else
             {
-                WriteTable(Console.Out, shown, Budget.From(facts, blockerFacts), collected.Unreachable, Omitted, Departed, repos, alerts);
+                WriteTable(Console.Out, shown, Budget.From(facts, blockerFacts), collected.Unreachable, Omitted, Departed, repos, alerts, checkAlerts);
             }
 
             // A partly invisible fleet is not a clean sweep, so a single failed host — or a previously
@@ -930,6 +931,33 @@ internal static class WaitingCommand
             ? [(row.Record.PrNumber, row)]
             : row.Record.Blocked.Select(number => (number, row));
 
+    /// <summary>
+    /// The CI counterpart to <see cref="BlockerAlert"/> (#224): more than one currently-idle, not-yet-done
+    /// window is red on the very same named check, in the same repo — the shared-root-cause case (e.g.
+    /// <c>main</c> itself will not build) that looks, one row at a time, like N ordinary unremarkable
+    /// <c>Holding</c> rows. A single window red on its own check is already visible in its row's reason
+    /// and does not need a separate alert.
+    /// </summary>
+    internal readonly record struct CheckBreakAlert(string CheckName, string? Repo, IReadOnlyList<string> Windows)
+    {
+        public int WindowCount => Windows.Count;
+    }
+
+    /// <summary>
+    /// Groups every currently-<c>Holding</c> row carrying a known failed check (<see
+    /// cref="WaitingVerdict.FailedCheck"/>) by (repo, check name), keeping only checks shared by more than
+    /// one window. Computed off the full resolved row set, not the rows a run happens to print under the
+    /// default filter, so the fan-out alert is never hidden behind <c>--all</c> — the same discipline
+    /// <see cref="BuildBlockerAlerts"/> follows.
+    /// </summary>
+    internal static IReadOnlyList<CheckBreakAlert> BuildCheckBreakAlerts(IReadOnlyList<WaitingRow> rows)
+        => [.. rows
+            .Where(r => r.Verdict.State == WaitingState.Holding && r.Verdict.FailedCheck is { Length: > 0 })
+            .GroupBy(r => (r.Verdict.FailedCheck, r.Repo))
+            .Where(g => g.Count() > 1)
+            .Select(g => new CheckBreakAlert(g.Key.FailedCheck!, g.Key.Repo, [.. g.Select(r => r.Pane.Where)]))
+            .OrderByDescending(a => a.WindowCount)];
+
     private static WaitingRow Row(TmuxPane pane, StateReading reading, WaitingVerdict verdict, DateTimeOffset now)
         => new()
         {
@@ -1022,7 +1050,8 @@ internal static class WaitingCommand
         IReadOnlyList<string>? omitted = null,
         IReadOnlyList<string>? departed = null,
         IReadOnlyList<string>? configuredRepos = null,
-        IReadOnlyList<BlockerAlert>? blockerAlerts = null)
+        IReadOnlyList<BlockerAlert>? blockerAlerts = null,
+        IReadOnlyList<CheckBreakAlert>? checkBreakAlerts = null)
     {
         output.WriteLine(Summary(rows, unreachable, omitted));
 
@@ -1051,6 +1080,15 @@ internal static class WaitingCommand
             string where = string.Join(", ", alert.Windows.Select(DisplayText.Safe));
             string repo = alert.Repo is { Length: > 0 } r ? $"{DisplayText.Safe(r)} " : string.Empty;
             output.WriteLine($"BLOCKED {alert.DependentCount} window(s) parked behind open {repo}#{alert.Number} — {where}");
+        }
+
+        // A shared build break (#224): named once here instead of buried as N indistinguishable quiet
+        // HOLDING rows, the same reasoning #218's blocker alert already applies to a named dependency.
+        foreach (CheckBreakAlert alert in checkBreakAlerts ?? [])
+        {
+            string where = string.Join(", ", alert.Windows.Select(DisplayText.Safe));
+            string repo = alert.Repo is { Length: > 0 } r ? $"{DisplayText.Safe(r)} " : string.Empty;
+            output.WriteLine($"CIRED {alert.WindowCount} window(s) red on {repo}check \"{DisplayText.Safe(alert.CheckName)}\" — {where}");
         }
 
         // Only worth naming a resolved repo per row when more than one was configured; a single-repo sweep
@@ -1229,7 +1267,8 @@ internal static class WaitingCommand
         IReadOnlyList<string>? omitted = null,
         IReadOnlyList<string>? departed = null,
         IReadOnlyList<string>? configuredRepos = null,
-        IReadOnlyList<BlockerAlert>? blockerAlerts = null)
+        IReadOnlyList<BlockerAlert>? blockerAlerts = null,
+        IReadOnlyList<CheckBreakAlert>? checkBreakAlerts = null)
     {
         using var writer = new Utf8JsonWriter(output, new JsonWriterOptions { Indented = true });
         writer.WriteStartObject();
@@ -1267,6 +1306,34 @@ internal static class WaitingCommand
                 }
 
                 writer.WriteNumber("dependentCount", alert.DependentCount);
+                writer.WriteStartArray("windows");
+                foreach (string where in alert.Windows)
+                {
+                    writer.WriteStringValue(where);
+                }
+
+                writer.WriteEndArray();
+                writer.WriteEndObject();
+            }
+
+            writer.WriteEndArray();
+        }
+
+        // Shared build breaks (#224), the CI counterpart to the blocker fan-out above — computed off the
+        // full row set so a consumer sees the fleet-level alert regardless of any client-side row filtering.
+        if (checkBreakAlerts is { Count: > 0 })
+        {
+            writer.WriteStartArray("ciBreaks");
+            foreach (CheckBreakAlert alert in checkBreakAlerts)
+            {
+                writer.WriteStartObject();
+                writer.WriteString("check", alert.CheckName);
+                if (alert.Repo is { Length: > 0 } repo)
+                {
+                    writer.WriteString("repo", repo);
+                }
+
+                writer.WriteNumber("windowCount", alert.WindowCount);
                 writer.WriteStartArray("windows");
                 foreach (string where in alert.Windows)
                 {

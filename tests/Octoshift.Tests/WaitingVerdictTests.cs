@@ -219,6 +219,35 @@ public class WaitingVerdictTests
     }
 
     [Fact]
+    public void Resolve_AnIdleWindowNotYetDoneSurfacesAFailedCheck()
+    {
+        // #224: a window that has not declared done falls through to plain "in progress"/"reviews x/y"
+        // today, hiding a real build failure the tool already fetched. This is additive — still Holding,
+        // still Nobody's — but the reason now names the check, and FailedCheck carries it for the
+        // fleet-level fan-out alert.
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=0/2 rec=wait"),
+            Facts(checks: [new CheckRunFact("build", "completed", "failure")]));
+
+        Assert.Equal(WaitingState.Holding, v.State);
+        Assert.Equal(RowOwner.Nobody, v.Owner);
+        Assert.Contains("CI red (build)", v.Reason, StringComparison.Ordinal);
+        Assert.Equal("build", v.FailedCheck);
+    }
+
+    [Fact]
+    public void Resolve_AnIdleWindowWithGreenChecksNamesNoFailedCheck()
+    {
+        WaitingVerdict v = WaitingVerdict.Resolve(
+            State("pr=4595 head=722512e25 reviews=0/2 rec=wait"),
+            Facts(checks: [new CheckRunFact("build", "completed", "success")]));
+
+        Assert.Equal(WaitingState.Holding, v.State);
+        Assert.DoesNotContain("CI red", v.Reason, StringComparison.Ordinal);
+        Assert.Null(v.FailedCheck);
+    }
+
+    [Fact]
     public void Resolve_WaitingOnMergeAnswersTheUncomputedCase()
     {
         AgentState state = State("pr=4595 head=722512e25 reviews=1/2 waiting=merge rec=wait");
