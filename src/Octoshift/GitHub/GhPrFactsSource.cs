@@ -160,6 +160,48 @@ internal sealed class GhPrFactsSource
     public async Task<PrFacts?> FetchAsync(int prNumber, CancellationToken ct)
         => (await FetchDetailedAsync(prNumber, ct)).Facts;
 
+    /// <summary>
+    /// Lists every open PR number in this repo (#225's abandoned-PR scan): every window the fleet observes
+    /// is checked <em>from</em> its own claim outward, and none of that reaches a PR no window has ever
+    /// claimed. Answering that requires asking GitHub what is open, the one place this membrane looks
+    /// outward instead of following a claim in. Paginated via the response's own <c>Link</c> header rather
+    /// than a fixed page count, and each page still goes through the same conditional-GET/ETag path as
+    /// every other read here, so an unchanged listing re-reads for free. Returns null — never a partial
+    /// list silently short — the moment any page cannot be read, since a truncated open-PR list is a false
+    /// "nothing else is open" the caller must not act on.
+    /// </summary>
+    public async Task<IReadOnlyList<int>?> ListOpenPrNumbersAsync(CancellationToken ct)
+    {
+        var numbers = new List<int>();
+        string? path = $"repos/{_repo}/pulls?state=open&per_page=100";
+        while (path is not null)
+        {
+            Read read = await GetAsync(path, ct);
+            if (read is not { Outcome: ReadOutcome.Ok, Body: { } body })
+            {
+                return null;
+            }
+
+            PullDetailDto[]? page = Deserialize(body, GhPrFactsJsonContext.Default.PullDetailDtoArray);
+            if (page is null)
+            {
+                return null;
+            }
+
+            foreach (PullDetailDto pr in page)
+            {
+                if (pr.Number > 0)
+                {
+                    numbers.Add(pr.Number);
+                }
+            }
+
+            path = GhResponse.NextPageLink(read.Headers) is { Length: > 0 } next ? next : null;
+        }
+
+        return numbers;
+    }
+
     /// <summary>The classification of one conditional GET, kept apart so a 404 is never told from an outage.</summary>
     private enum ReadOutcome
     {
@@ -173,14 +215,18 @@ internal sealed class GhPrFactsSource
         Unavailable,
     }
 
-    /// <summary>One GET reduced to its <see cref="ReadOutcome"/> and, when <see cref="ReadOutcome.Ok"/>, its body.</summary>
-    private readonly record struct Read(ReadOutcome Outcome, string? Body)
+    /// <summary>
+    /// One GET reduced to its <see cref="ReadOutcome"/> and, when <see cref="ReadOutcome.Ok"/>, its body.
+    /// <see cref="Headers"/> is carried only for callers that need a response header beyond status/etag/
+    /// rate-limit (namely <c>Link</c> pagination, #225) — every other caller ignores it.
+    /// </summary>
+    private readonly record struct Read(ReadOutcome Outcome, string? Body, string Headers = "")
     {
         public static readonly Read NotFound = new(ReadOutcome.NotFound, null);
 
         public static readonly Read Unavailable = new(ReadOutcome.Unavailable, null);
 
-        public static Read Ok(string? body) => new(ReadOutcome.Ok, body);
+        public static Read Ok(string? body, string headers = "") => new(ReadOutcome.Ok, body, headers);
     }
 
     /// <summary>
@@ -234,7 +280,7 @@ internal sealed class GhPrFactsSource
             NotModified++;
             // A 304 says the cached body is still current; without a cached body there is nothing to serve,
             // which is an unavailable read, not an affirmative not-found.
-            return cached is not null ? Read.Ok(cached) : Read.Unavailable;
+            return cached is not null ? Read.Ok(cached, headers) : Read.Unavailable;
         }
 
         if (status is 403 or 429 || status >= 500)
@@ -257,7 +303,7 @@ internal sealed class GhPrFactsSource
         }
 
         _cache.Put(path, GhResponse.HeaderValue(headers, "etag"), body);
-        return Read.Ok(body);
+        return Read.Ok(body, headers);
     }
 
     private static bool IsUnknownMergeability(string? mergeableState)
@@ -322,6 +368,44 @@ internal sealed class GhFleetPrFactsSource
 
     /// <summary>The repos this resolver searches, in scope order — the producer-owned label list.</summary>
     public IReadOnlyList<string> Repos => _repos;
+
+    /// <summary>
+    /// Lists every open PR number in each searched repo (#225), keyed by repo so a caller can tell which
+    /// repo a number belongs to without a second lookup. A repo whose listing could not be read is simply
+    /// absent from the result — reported to the caller as an incomplete scan rather than silently mixed
+    /// into a result that looks whole, since a repo that could not be listed is not one that has no open
+    /// PRs.
+    /// </summary>
+    public async Task<IReadOnlyDictionary<string, IReadOnlyList<int>>> ListOpenPrNumbersAsync(CancellationToken ct)
+    {
+        var byRepo = new Dictionary<string, IReadOnlyList<int>>();
+        foreach (GhPrFactsSource source in _sources)
+        {
+            if (RateLimited)
+            {
+                break;
+            }
+
+            IReadOnlyList<int>? numbers = await source.ListOpenPrNumbersAsync(ct);
+            if (numbers is not null)
+            {
+                byRepo[source.Repo] = numbers;
+            }
+        }
+
+        return byRepo;
+    }
+
+    /// <summary>
+    /// Reads one PR's facts from exactly the repo named — used by the abandoned-PR scan (#225), which
+    /// already knows which repo's own open-PR listing a number came from and must not pay a redundant
+    /// cross-repo search (or risk a false <see cref="PrFetchStatus.Ambiguous"/>) to re-confirm it.
+    /// </summary>
+    public Task<PrFacts?> FetchInRepoAsync(string repo, int prNumber, CancellationToken ct)
+    {
+        GhPrFactsSource? source = _sources.FirstOrDefault(s => string.Equals(s.Repo, repo, StringComparison.OrdinalIgnoreCase));
+        return source is null ? Task.FromResult<PrFacts?>(null) : source.FetchAsync(prNumber, ct);
+    }
 
     /// <summary>REST calls spent across every repo this run.</summary>
     public int Calls => _sources.Sum(s => s.Calls);
@@ -581,6 +665,7 @@ internal sealed record CheckRunDto
 
 [JsonSourceGenerationOptions(PropertyNameCaseInsensitive = true)]
 [JsonSerializable(typeof(PullDetailDto))]
+[JsonSerializable(typeof(PullDetailDto[]))]
 [JsonSerializable(typeof(CheckRunsDto))]
 [JsonSerializable(typeof(CacheEntryDto))]
 internal partial class GhPrFactsJsonContext : JsonSerializerContext

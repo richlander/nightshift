@@ -90,6 +90,38 @@ internal static class GhResponse
             && left <= 0;
     }
 
+    /// <summary>
+    /// The <c>rel="next"</c> URL from a paginated REST response's <c>Link</c> header (#225's open-PR
+    /// listing), or null on the last page. GitHub's REST list endpoints paginate this way rather than
+    /// returning a total count, so a caller keeps following <c>next</c> until it disappears.
+    /// </summary>
+    public static string? NextPageLink(string headerBlock)
+    {
+        string? link = HeaderValue(headerBlock, "link");
+        if (link is null)
+        {
+            return null;
+        }
+
+        foreach (string part in link.Split(','))
+        {
+            string segment = part.Trim();
+            if (!segment.EndsWith("rel=\"next\"", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            int open = segment.IndexOf('<');
+            int close = segment.IndexOf('>');
+            if (open >= 0 && close > open)
+            {
+                return segment[(open + 1)..close];
+            }
+        }
+
+        return null;
+    }
+
     /// <summary>Seconds until <c>X-RateLimit-Reset</c>, or 0 when it is absent or already past.</summary>
     public static int SecondsUntilReset(string headerBlock)
     {
