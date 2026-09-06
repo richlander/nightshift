@@ -59,6 +59,25 @@ internal sealed record WaitingRow
     /// <summary>Whether this window's work is over, and what to do about it.</summary>
     public Retirement Retirement { get; init; } = Retirement.None;
 
+    /// <summary>
+    /// How long since this claimed PR's newest commit was pushed (#228). Null until the activity join
+    /// runs — only rows claiming active, unblocked progress pay for it — or when that read failed.
+    /// </summary>
+    public TimeSpan? PushAge { get; init; }
+
+    /// <summary>
+    /// How long since this claimed PR's newest issue-conversation comment (#228). Null when the activity
+    /// join has not run, the read failed, or the PR genuinely has no comments yet.
+    /// </summary>
+    public TimeSpan? CommentAge { get; init; }
+
+    /// <summary>
+    /// True when the last several commits on this claimed PR are all merge commits — nothing but
+    /// re-integrating a moving <c>main</c> since the agent's last real change (#228). Null when the
+    /// activity join has not run or the commits read failed.
+    /// </summary>
+    public bool? ChasingMain { get; init; }
+
     /// <summary>Ways whatever was published contradicts its own contract, identified or not.</summary>
     public IReadOnlyList<string> Defects => Record?.Defects ?? Unidentified?.Defects ?? [];
 
@@ -181,11 +200,12 @@ internal static class WaitingCommand
             }
 
             Collection collected = result.Collected;
-            IReadOnlyList<WaitingRow> resolved = result.Rows;
+            IReadOnlyList<WaitingRow> resolved = await EnrichWithActivityAsync(result.Rows, facts, ct);
 
             IReadOnlyList<WaitingRow> shown = Present(resolved, all);
             IReadOnlyList<BlockerAlert> alerts = BuildBlockerAlerts(resolved);
             IReadOnlyList<CheckBreakAlert> checkAlerts = BuildCheckBreakAlerts(resolved);
+            IReadOnlyList<StaleAgentAlert> staleAlerts = BuildStaleAgentAlerts(resolved);
 
             // Opt-in (#225): the abandoned-PR scan pays its own REST calls listing every open PR in scope,
             // on top of everything the ordinary sweep already reads, so it only runs when asked.
@@ -194,11 +214,11 @@ internal static class WaitingCommand
                 : [];
             if (json)
             {
-                WriteJson(Console.OpenStandardOutput(), shown, Budget.From(facts, blockerFacts), collected.Unreachable, Omitted, Departed, repos, alerts, checkAlerts, abandonedAlerts);
+                WriteJson(Console.OpenStandardOutput(), shown, Budget.From(facts, blockerFacts), collected.Unreachable, Omitted, Departed, repos, alerts, checkAlerts, abandonedAlerts, staleAlerts);
             }
             else
             {
-                WriteTable(Console.Out, shown, Budget.From(facts, blockerFacts), collected.Unreachable, Omitted, Departed, repos, alerts, checkAlerts, abandonedAlerts);
+                WriteTable(Console.Out, shown, Budget.From(facts, blockerFacts), collected.Unreachable, Omitted, Departed, repos, alerts, checkAlerts, abandonedAlerts, staleAlerts);
             }
 
             // A partly invisible fleet is not a clean sweep, so a single failed host — or a previously
@@ -1017,6 +1037,79 @@ internal static class WaitingCommand
         return [.. alerts.OrderBy(a => a.Repo, StringComparer.Ordinal).ThenBy(a => a.Number)];
     }
 
+    /// <summary>
+    /// How long a claimed PR's own activity must be silent, with the agent still claiming active progress,
+    /// before it is called out (#228). Chosen so a normal round-trip — push, wait for CI, review — does
+    /// not itself trip the alert; only a window that has gone quiet well past that is flagged.
+    /// </summary>
+    internal static readonly TimeSpan StaleActivityThreshold = TimeSpan.FromHours(2);
+
+    /// <summary>
+    /// True for a row this sweep's join can meaningfully ask GitHub about: it claims a single-resolved PR
+    /// (not a tracking issue, not an ambiguous/unresolved repo) and its verdict reached the plain
+    /// "in progress" fallthrough of <c>WaitingVerdict.Resolve</c> — no named blocker, no external
+    /// predicate still pending. Those two are legitimately quiet for reasons already visible elsewhere
+    /// (<c>parked behind #N</c>, <c>waiting=check:x</c>); this join exists for the row that looks
+    /// identical to genuine progress and might not be.
+    /// </summary>
+    private static bool ClaimsActiveProgress(WaitingRow row)
+        => row.Verdict.State == WaitingState.Holding
+            && row.Repo is { Length: > 0 }
+            && row.Record is { IsIssue: false } state
+            && state.Blocked.Count == 0
+            && (state.Recommendation == Recommendation.Continue || state.Waiting.Kind == WaitKind.None);
+
+    /// <summary>
+    /// Joins every row claiming active progress (#228) with its PR's own recent GitHub activity — commits
+    /// and comments, which no window self-reports — and returns the enriched row set unchanged in every
+    /// other respect. A row whose activity read fails is returned as-is: an unreadable join is a missing
+    /// fact, not a claim that nothing happened.
+    /// </summary>
+    internal static async Task<IReadOnlyList<WaitingRow>> EnrichWithActivityAsync(
+        IReadOnlyList<WaitingRow> rows, GhFleetPrFactsSource facts, CancellationToken ct)
+    {
+        var enriched = new List<WaitingRow>(rows.Count);
+        foreach (WaitingRow row in rows)
+        {
+            if (!ClaimsActiveProgress(row))
+            {
+                enriched.Add(row);
+                continue;
+            }
+
+            PrActivityFacts? activity = await facts.FetchActivityInRepoAsync(row.Repo!, row.Record!.PrNumber, ct);
+            enriched.Add(activity is null
+                ? row
+                : row with
+                {
+                    PushAge = activity.LastCommitAt is { } pushedAt ? DateTimeOffset.UtcNow - pushedAt : null,
+                    CommentAge = activity.LastCommentAt is { } commentedAt ? DateTimeOffset.UtcNow - commentedAt : null,
+                    ChasingMain = activity.ChasingMain,
+                });
+        }
+
+        return enriched;
+    }
+
+    /// <summary>
+    /// One row whose claimed progress has gone quiet past <see cref="StaleActivityThreshold"/> on both its
+    /// push and its comment activity (#228) — the case that looks, from the window's own self-report,
+    /// identical to an agent still working.
+    /// </summary>
+    internal readonly record struct StaleAgentAlert(string Window, int Number, string Repo, TimeSpan PushAge, TimeSpan? CommentAge, bool? ChasingMain);
+
+    /// <summary>
+    /// Selects the rows enriched by <see cref="EnrichWithActivityAsync"/> whose push age is past
+    /// <see cref="StaleActivityThreshold"/> — the push is the one activity every claimed PR must have, so
+    /// it anchors the alert; comment age is carried along as corroborating evidence but does not gate it
+    /// on its own, since a PR can go a long stretch with no comment while still being actively pushed to.
+    /// </summary>
+    internal static IReadOnlyList<StaleAgentAlert> BuildStaleAgentAlerts(IReadOnlyList<WaitingRow> rows)
+        => [.. rows
+            .Where(r => r.PushAge is { } age && age >= StaleActivityThreshold)
+            .Select(r => new StaleAgentAlert(r.Pane.Where, r.Record!.PrNumber, r.Repo!, r.PushAge!.Value, r.CommentAge, r.ChasingMain))
+            .OrderByDescending(a => a.PushAge)];
+
     private static WaitingRow Row(TmuxPane pane, StateReading reading, WaitingVerdict verdict, DateTimeOffset now)
         => new()
         {
@@ -1111,7 +1204,8 @@ internal static class WaitingCommand
         IReadOnlyList<string>? configuredRepos = null,
         IReadOnlyList<BlockerAlert>? blockerAlerts = null,
         IReadOnlyList<CheckBreakAlert>? checkBreakAlerts = null,
-        IReadOnlyList<AbandonedAlert>? abandonedAlerts = null)
+        IReadOnlyList<AbandonedAlert>? abandonedAlerts = null,
+        IReadOnlyList<StaleAgentAlert>? staleAgentAlerts = null)
     {
         output.WriteLine(Summary(rows, unreachable, omitted));
 
@@ -1157,6 +1251,16 @@ internal static class WaitingCommand
         {
             string title = alert.Title is { Length: > 0 } t ? $" {DisplayText.Safe(t)}" : string.Empty;
             output.WriteLine($"ABANDONED {DisplayText.Safe(alert.Repo)} #{alert.Number}{title} — review-clean and mergeable, no window claims it");
+        }
+
+        // A claimed PR whose own commit/comment activity has gone quiet past the threshold while the
+        // window still claims active progress (#228) — the window's self-report alone cannot tell the
+        // difference between still working and stalled.
+        foreach (StaleAgentAlert alert in staleAgentAlerts ?? [])
+        {
+            string chasing = alert.ChasingMain == true ? "; chasing main, not advancing" : string.Empty;
+            string comment = alert.CommentAge is { } age ? $", last comment {Duration(age)} ago" : ", no comments yet";
+            output.WriteLine($"STALE {DisplayText.Safe(alert.Window)} {DisplayText.Safe(alert.Repo)} #{alert.Number} — last push {Duration(alert.PushAge)} ago{comment}{chasing}");
         }
 
         // Only worth naming a resolved repo per row when more than one was configured; a single-repo sweep
@@ -1212,6 +1316,15 @@ internal static class WaitingCommand
         if (nameRepo && row.Repo is { Length: > 0 } repo)
         {
             detail += $"  [{DisplayText.Safe(repo)}]";
+        }
+
+        // The activity join's raw facts (#228) — always shown when the join ran, never a gate, same
+        // discipline as the CI-red fact folded into the reason string above.
+        if (row.PushAge is { } pushAge)
+        {
+            string comment = row.CommentAge is { } commentAge ? $", comment {Duration(commentAge)} ago" : string.Empty;
+            string chasing = row.ChasingMain == true ? "; chasing main" : string.Empty;
+            detail += $"  (activity: push {Duration(pushAge)} ago{comment}{chasing})";
         }
 
         if (row.Claim.IsContested)
@@ -1337,7 +1450,8 @@ internal static class WaitingCommand
         IReadOnlyList<string>? configuredRepos = null,
         IReadOnlyList<BlockerAlert>? blockerAlerts = null,
         IReadOnlyList<CheckBreakAlert>? checkBreakAlerts = null,
-        IReadOnlyList<AbandonedAlert>? abandonedAlerts = null)
+        IReadOnlyList<AbandonedAlert>? abandonedAlerts = null,
+        IReadOnlyList<StaleAgentAlert>? staleAgentAlerts = null)
     {
         using var writer = new Utf8JsonWriter(output, new JsonWriterOptions { Indented = true });
         writer.WriteStartObject();
@@ -1428,6 +1542,35 @@ internal static class WaitingCommand
                 if (alert.Title is { Length: > 0 } title)
                 {
                     writer.WriteString("title", title);
+                }
+
+                writer.WriteEndObject();
+            }
+
+            writer.WriteEndArray();
+        }
+
+        // Stalled agents (#228): a claimed PR whose own commit/comment activity has gone quiet past
+        // threshold while the window still claims active progress — computed off the full row set, same
+        // discipline as the other fleet-level alerts above.
+        if (staleAgentAlerts is { Count: > 0 })
+        {
+            writer.WriteStartArray("stale");
+            foreach (StaleAgentAlert alert in staleAgentAlerts)
+            {
+                writer.WriteStartObject();
+                writer.WriteString("window", alert.Window);
+                writer.WriteNumber("number", alert.Number);
+                writer.WriteString("repo", alert.Repo);
+                writer.WriteNumber("pushAgeSeconds", alert.PushAge.TotalSeconds);
+                if (alert.CommentAge is { } commentAge)
+                {
+                    writer.WriteNumber("commentAgeSeconds", commentAge.TotalSeconds);
+                }
+
+                if (alert.ChasingMain is { } chasingMain)
+                {
+                    writer.WriteBoolean("chasingMain", chasingMain);
                 }
 
                 writer.WriteEndObject();
@@ -1577,6 +1720,22 @@ internal static class WaitingCommand
             if (row.SilentFor is { } silent)
             {
                 writer.WriteNumber("silentForSeconds", (long)silent.TotalSeconds);
+            }
+
+            // The activity join's raw facts (#228), when the join ran for this row.
+            if (row.PushAge is { } pushAge)
+            {
+                writer.WriteNumber("pushAgeSeconds", (long)pushAge.TotalSeconds);
+            }
+
+            if (row.CommentAge is { } commentAge)
+            {
+                writer.WriteNumber("commentAgeSeconds", (long)commentAge.TotalSeconds);
+            }
+
+            if (row.ChasingMain is { } chasingMain)
+            {
+                writer.WriteBoolean("chasingMain", chasingMain);
             }
 
             writer.WriteEndObject();

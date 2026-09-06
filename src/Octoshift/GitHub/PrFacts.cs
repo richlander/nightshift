@@ -220,3 +220,30 @@ internal sealed record PrFacts
                 Repo = current.Repo,
             };
 }
+
+/// <summary>
+/// The recent-activity half of the join (#228): when the PR's own commits and comments last moved, and
+/// whether the tail of its commit history is just <c>main</c> being re-integrated rather than new work.
+/// Kept apart from <see cref="PrFacts"/> because it costs two more REST calls per PR (commits, comments)
+/// that only the claimed-PR enrichment needs — <c>pr</c> and the ordinary sweep's CI/mergeability read do
+/// not pay for it.
+/// </summary>
+/// <param name="LastCommitAt">
+/// The newest commit's committer date, or null when the PR has no commits (should not happen) or the
+/// commits read failed.
+/// </param>
+/// <param name="LastCommentAt">
+/// The newest issue-conversation comment's creation time, or null when the PR has no comments yet — which
+/// is not staleness, just silence nothing has broken.
+/// </param>
+/// <param name="ChasingMain">
+/// True when every one of the last <see cref="TailSize"/> commits (or all of them, if fewer exist) has 2+
+/// parents — a merge commit — meaning nothing but re-integrating a moving base has happened since the
+/// agent's last real change. Null when the commits read failed, so "chasing main" is never claimed off
+/// evidence that was not actually read.
+/// </param>
+internal sealed record PrActivityFacts(DateTimeOffset? LastCommitAt, DateTimeOffset? LastCommentAt, bool? ChasingMain)
+{
+    /// <summary>How many trailing commits are inspected for the merge-chasing signal.</summary>
+    public const int TailSize = 5;
+}

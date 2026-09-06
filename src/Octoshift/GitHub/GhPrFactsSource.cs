@@ -202,6 +202,64 @@ internal sealed class GhPrFactsSource
         return numbers;
     }
 
+    /// <summary>
+    /// Reads a claimed PR's recent-activity facts (#228): its newest commit and comment times, and whether
+    /// the tail of its commit history is just <c>main</c> being re-integrated. Two REST calls beyond the
+    /// ordinary sweep's read — commits (paginated the same way as <see cref="ListOpenPrNumbersAsync"/>,
+    /// since the commits endpoint returns oldest-first and there is no way to ask for only the newest) and
+    /// the single newest issue comment (<c>per_page=1&amp;sort=created&amp;direction=desc</c>, so that read
+    /// never costs more than one comment's body regardless of how many exist). Returns null the moment the
+    /// commits read fails — a partial commit list would silently mis-answer "chasing main" — but a failed
+    /// or empty comments read is not fatal: it means "no comment activity known", which the caller treats
+    /// as its own case rather than a fetch failure.
+    /// </summary>
+    public async Task<PrActivityFacts?> FetchActivityAsync(int prNumber, CancellationToken ct)
+    {
+        var commitDates = new List<DateTimeOffset>();
+        var parentCounts = new List<int>();
+        string? path = $"repos/{_repo}/pulls/{prNumber}/commits?per_page=100";
+        while (path is not null)
+        {
+            Read read = await GetAsync(path, ct);
+            if (read is not { Outcome: ReadOutcome.Ok, Body: { } body })
+            {
+                return null;
+            }
+
+            PrCommitDto[]? page = Deserialize(body, GhPrFactsJsonContext.Default.PrCommitDtoArray);
+            if (page is null)
+            {
+                return null;
+            }
+
+            foreach (PrCommitDto commit in page)
+            {
+                commitDates.Add(DateTimeOffset.TryParse(commit.Commit?.Committer?.Date, out DateTimeOffset when) ? when : DateTimeOffset.MinValue);
+                parentCounts.Add(commit.Parents?.Length ?? 0);
+            }
+
+            path = GhResponse.NextPageLink(read.Headers) is { Length: > 0 } next ? next : null;
+        }
+
+        DateTimeOffset? lastCommitAt = commitDates.Count > 0 ? commitDates[^1] : null;
+        bool? chasingMain = parentCounts.Count > 0
+            ? parentCounts.TakeLast(PrActivityFacts.TailSize).All(p => p >= 2)
+            : null;
+
+        Read commentsRead = await GetAsync($"repos/{_repo}/issues/{prNumber}/comments?per_page=1&sort=created&direction=desc", ct);
+        DateTimeOffset? lastCommentAt = null;
+        if (commentsRead is { Outcome: ReadOutcome.Ok, Body: { } commentsBody })
+        {
+            IssueCommentDto[]? comments = Deserialize(commentsBody, GhPrFactsJsonContext.Default.IssueCommentDtoArray);
+            if (comments is { Length: > 0 } && DateTimeOffset.TryParse(comments[0].CreatedAt, out DateTimeOffset commented))
+            {
+                lastCommentAt = commented;
+            }
+        }
+
+        return new PrActivityFacts(lastCommitAt, lastCommentAt, chasingMain);
+    }
+
     /// <summary>The classification of one conditional GET, kept apart so a 404 is never told from an outage.</summary>
     private enum ReadOutcome
     {
@@ -405,6 +463,17 @@ internal sealed class GhFleetPrFactsSource
     {
         GhPrFactsSource? source = _sources.FirstOrDefault(s => string.Equals(s.Repo, repo, StringComparison.OrdinalIgnoreCase));
         return source is null ? Task.FromResult<PrFacts?>(null) : source.FetchAsync(prNumber, ct);
+    }
+
+    /// <summary>
+    /// Reads one claimed PR's recent-activity facts (#228) from the repo already resolved for it — the
+    /// same repo-scoping discipline as <see cref="FetchInRepoAsync"/>, since the caller already knows
+    /// which repo the claim resolved to and must not pay a redundant cross-repo search.
+    /// </summary>
+    public Task<PrActivityFacts?> FetchActivityInRepoAsync(string repo, int prNumber, CancellationToken ct)
+    {
+        GhPrFactsSource? source = _sources.FirstOrDefault(s => string.Equals(s.Repo, repo, StringComparison.OrdinalIgnoreCase));
+        return source is null ? Task.FromResult<PrActivityFacts?>(null) : source.FetchActivityAsync(prNumber, ct);
     }
 
     /// <summary>REST calls spent across every repo this run.</summary>
@@ -663,11 +732,46 @@ internal sealed record CheckRunDto
     public string? StartedAt { get; init; }
 }
 
+internal sealed record PrCommitDto
+{
+    [JsonPropertyName("commit")]
+    public PrCommitDetailDto? Commit { get; init; }
+
+    [JsonPropertyName("parents")]
+    public PrCommitParentDto[]? Parents { get; init; }
+}
+
+internal sealed record PrCommitDetailDto
+{
+    [JsonPropertyName("committer")]
+    public PrCommitPersonDto? Committer { get; init; }
+}
+
+internal sealed record PrCommitPersonDto
+{
+    [JsonPropertyName("date")]
+    public string? Date { get; init; }
+}
+
+internal sealed record PrCommitParentDto
+{
+    [JsonPropertyName("sha")]
+    public string? Sha { get; init; }
+}
+
+internal sealed record IssueCommentDto
+{
+    [JsonPropertyName("created_at")]
+    public string? CreatedAt { get; init; }
+}
+
 [JsonSourceGenerationOptions(PropertyNameCaseInsensitive = true)]
 [JsonSerializable(typeof(PullDetailDto))]
 [JsonSerializable(typeof(PullDetailDto[]))]
 [JsonSerializable(typeof(CheckRunsDto))]
 [JsonSerializable(typeof(CacheEntryDto))]
+[JsonSerializable(typeof(PrCommitDto[]))]
+[JsonSerializable(typeof(IssueCommentDto[]))]
 internal partial class GhPrFactsJsonContext : JsonSerializerContext
 {
 }
