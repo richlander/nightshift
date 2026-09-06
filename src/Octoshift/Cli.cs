@@ -63,18 +63,25 @@ public static class Cli
         Option<string[]> host = CreateHostOption();
         var json = new Option<bool>("--json") { Description = "Emit the rows as JSON instead of a table." };
         Option<string[]> repo = CreateRepoOption();
+        var abandoned = new Option<bool>("--abandoned")
+        {
+            Description = "Also list open, review-clean, mergeable PRs no window claims (#225). Costs its own "
+                + "GitHub listing call per repo, on top of the ordinary sweep, so it is opt-in.",
+        };
 
         command.Options.Add(all);
         command.Options.Add(host);
         command.Options.Add(json);
         command.Options.Add(repo);
+        command.Options.Add(abandoned);
 
         command.SetAction(async (parseResult, cancellationToken) => await WaitingCommand.RunAsync(
             parseResult.GetValue(repo) ?? [],
             parseResult.GetValue(host) ?? [],
             parseResult.GetValue(all),
             parseResult.GetValue(json),
-            cancellationToken));
+            cancellationToken,
+            parseResult.GetValue(abandoned)));
 
         return command;
     }

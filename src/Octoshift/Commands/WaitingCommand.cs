@@ -89,7 +89,7 @@ internal static class WaitingCommand
     /// <summary>Hosts collected before but not in this run, so the view is narrower than it has been.</summary>
     internal static IReadOnlyList<string> Omitted { get; private set; } = [];
 
-    public static async Task<int> RunAsync(IReadOnlyList<string> repoFlags, IReadOnlyList<string> hosts, bool all, bool json, CancellationToken ct, string? historyPath = null, Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>>? scanAsync = null)
+    public static async Task<int> RunAsync(IReadOnlyList<string> repoFlags, IReadOnlyList<string> hosts, bool all, bool json, CancellationToken ct, bool abandoned = false, string? historyPath = null, Func<string?, CancellationToken, Task<IReadOnlyList<TmuxPane>>>? scanAsync = null)
     {
         RepoScope.Resolution scope = RepoScope.Resolve(repoFlags);
         if (scope.Error is { } scopeError)
@@ -186,13 +186,19 @@ internal static class WaitingCommand
             IReadOnlyList<WaitingRow> shown = Present(resolved, all);
             IReadOnlyList<BlockerAlert> alerts = BuildBlockerAlerts(resolved);
             IReadOnlyList<CheckBreakAlert> checkAlerts = BuildCheckBreakAlerts(resolved);
+
+            // Opt-in (#225): the abandoned-PR scan pays its own REST calls listing every open PR in scope,
+            // on top of everything the ordinary sweep already reads, so it only runs when asked.
+            IReadOnlyList<AbandonedAlert> abandonedAlerts = abandoned
+                ? await BuildAbandonedAlertsAsync(resolved, facts, ct)
+                : [];
             if (json)
             {
-                WriteJson(Console.OpenStandardOutput(), shown, Budget.From(facts, blockerFacts), collected.Unreachable, Omitted, Departed, repos, alerts, checkAlerts);
+                WriteJson(Console.OpenStandardOutput(), shown, Budget.From(facts, blockerFacts), collected.Unreachable, Omitted, Departed, repos, alerts, checkAlerts, abandonedAlerts);
             }
             else
             {
-                WriteTable(Console.Out, shown, Budget.From(facts, blockerFacts), collected.Unreachable, Omitted, Departed, repos, alerts, checkAlerts);
+                WriteTable(Console.Out, shown, Budget.From(facts, blockerFacts), collected.Unreachable, Omitted, Departed, repos, alerts, checkAlerts, abandonedAlerts);
             }
 
             // A partly invisible fleet is not a clean sweep, so a single failed host — or a previously
@@ -958,6 +964,59 @@ internal static class WaitingCommand
             .Select(g => new CheckBreakAlert(g.Key.FailedCheck!, g.Key.Repo, [.. g.Select(r => r.Pane.Where)]))
             .OrderByDescending(a => a.WindowCount)];
 
+    /// <summary>
+    /// One open, review-clean, mergeable PR that no window claims this sweep (#225): the abandoned-PR
+    /// case. Distinct from every other alert here because it is discovered by asking GitHub what is open
+    /// rather than following a claim in — the one place this scan looks outward instead of inward, which
+    /// is also why it costs its own REST calls and is opt-in behind <c>--abandoned</c> rather than run by
+    /// default.
+    /// </summary>
+    internal readonly record struct AbandonedAlert(int Number, string Repo, string? Title);
+
+    /// <summary>
+    /// Lists every open PR in each searched repo and reports the ones no window's own claim covers this
+    /// sweep, restricted to the GitHub-verified "review-clean and mergeable" signal (<c>mergeable_state ==
+    /// "clean"</c>) — there is no agent left to ask for a self-reported review count, so this leans only
+    /// on what GitHub itself already computed. A PR whose sole historical claimant has since moved to
+    /// different work (#221) is not distinguished from a PR nobody has ever claimed in this first pass;
+    /// both read identically here as "no current claim", and telling them apart needs the per-host claim
+    /// history this call site does not have plumbed through it — left for a follow-up rather than
+    /// papered over.
+    /// </summary>
+    internal static async Task<IReadOnlyList<AbandonedAlert>> BuildAbandonedAlertsAsync(
+        IReadOnlyList<WaitingRow> rows, GhFleetPrFactsSource facts, CancellationToken ct)
+    {
+        // Any window naming this PR this sweep, in whatever state, means the PR is not abandoned — a
+        // window with its own problems (stale, conflicting, contested) already surfaces those elsewhere;
+        // this alert only exists for the PR nothing is watching at all.
+        var claimed = new HashSet<(string? Repo, int Number)>(rows
+            .Where(r => r.Record is { IsIssue: false })
+            .Select(r => (r.Repo, r.Record!.PrNumber)));
+
+        IReadOnlyDictionary<string, IReadOnlyList<int>> open = await facts.ListOpenPrNumbersAsync(ct);
+        var alerts = new List<AbandonedAlert>();
+        foreach ((string repo, IReadOnlyList<int> numbers) in open)
+        {
+            foreach (int number in numbers)
+            {
+                if (claimed.Contains((repo, number)))
+                {
+                    continue;
+                }
+
+                PrFacts? candidate = await facts.FetchInRepoAsync(repo, number, ct);
+                if (candidate is { Merged: false } f
+                    && string.Equals(f.State, "open", StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(f.MergeableState, "clean", StringComparison.OrdinalIgnoreCase))
+                {
+                    alerts.Add(new AbandonedAlert(number, repo, f.Title));
+                }
+            }
+        }
+
+        return [.. alerts.OrderBy(a => a.Repo, StringComparer.Ordinal).ThenBy(a => a.Number)];
+    }
+
     private static WaitingRow Row(TmuxPane pane, StateReading reading, WaitingVerdict verdict, DateTimeOffset now)
         => new()
         {
@@ -1051,7 +1110,8 @@ internal static class WaitingCommand
         IReadOnlyList<string>? departed = null,
         IReadOnlyList<string>? configuredRepos = null,
         IReadOnlyList<BlockerAlert>? blockerAlerts = null,
-        IReadOnlyList<CheckBreakAlert>? checkBreakAlerts = null)
+        IReadOnlyList<CheckBreakAlert>? checkBreakAlerts = null,
+        IReadOnlyList<AbandonedAlert>? abandonedAlerts = null)
     {
         output.WriteLine(Summary(rows, unreachable, omitted));
 
@@ -1089,6 +1149,14 @@ internal static class WaitingCommand
             string where = string.Join(", ", alert.Windows.Select(DisplayText.Safe));
             string repo = alert.Repo is { Length: > 0 } r ? $"{DisplayText.Safe(r)} " : string.Empty;
             output.WriteLine($"CIRED {alert.WindowCount} window(s) red on {repo}check \"{DisplayText.Safe(alert.CheckName)}\" — {where}");
+        }
+
+        // Review-clean, mergeable PRs no window claims at all (#225) — opt-in, since finding them costs a
+        // separate GitHub listing this sweep would not otherwise pay for.
+        foreach (AbandonedAlert alert in abandonedAlerts ?? [])
+        {
+            string title = alert.Title is { Length: > 0 } t ? $" {DisplayText.Safe(t)}" : string.Empty;
+            output.WriteLine($"ABANDONED {DisplayText.Safe(alert.Repo)} #{alert.Number}{title} — review-clean and mergeable, no window claims it");
         }
 
         // Only worth naming a resolved repo per row when more than one was configured; a single-repo sweep
@@ -1268,7 +1336,8 @@ internal static class WaitingCommand
         IReadOnlyList<string>? departed = null,
         IReadOnlyList<string>? configuredRepos = null,
         IReadOnlyList<BlockerAlert>? blockerAlerts = null,
-        IReadOnlyList<CheckBreakAlert>? checkBreakAlerts = null)
+        IReadOnlyList<CheckBreakAlert>? checkBreakAlerts = null,
+        IReadOnlyList<AbandonedAlert>? abandonedAlerts = null)
     {
         using var writer = new Utf8JsonWriter(output, new JsonWriterOptions { Indented = true });
         writer.WriteStartObject();
@@ -1341,6 +1410,26 @@ internal static class WaitingCommand
                 }
 
                 writer.WriteEndArray();
+                writer.WriteEndObject();
+            }
+
+            writer.WriteEndArray();
+        }
+
+        // Abandoned PRs (#225) — opt-in, so this is only ever populated when --abandoned was passed.
+        if (abandonedAlerts is { Count: > 0 })
+        {
+            writer.WriteStartArray("abandoned");
+            foreach (AbandonedAlert alert in abandonedAlerts)
+            {
+                writer.WriteStartObject();
+                writer.WriteNumber("number", alert.Number);
+                writer.WriteString("repo", alert.Repo);
+                if (alert.Title is { Length: > 0 } title)
+                {
+                    writer.WriteString("title", title);
+                }
+
                 writer.WriteEndObject();
             }
 
